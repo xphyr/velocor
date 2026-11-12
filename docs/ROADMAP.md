@@ -26,10 +26,10 @@ This file tracks implementation progress directly inside the Git repository so a
 - [x] Linux Hardware Manager (`internal/hardware`) with boot-disk guard, hugepages, and VFIO/noiommu binding
 
 ## Phase 3: Reconciler, `velod` Control Plane & `veloctl` CLI
-- [ ] Startup & continuous state reconciler (`internal/reconciler`)
-- [ ] Auth manager & token hashing (`internal/auth`)
-- [ ] gRPC + REST server (`cmd/velod`)
-- [ ] CLI client (`cmd/veloctl`)
+- [x] Startup & continuous state reconciler (`internal/reconciler`)
+- [x] Auth manager & token hashing (`internal/auth`)
+- [x] gRPC + REST server (`cmd/velod`)
+- [x] CLI client (`cmd/veloctl`)
 
 ## Phase 4: Fedora Image Mode (`bootc`) & QEMU/KVM Lab
 - [ ] `deploy/bootc/Containerfile` & systemd services
