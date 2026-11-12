@@ -8,9 +8,8 @@ Image=registry.xphyrlab.net/velocor/velocor-velod:latest
 ContainerName=velocor-velod
 AutoUpdate=registry
 Network=host
-PidHost=true
 SecurityLabelDisable=true
-PodmanArgs=--privileged
+PodmanArgs=--privileged --pid=host
 Volume=/var/lib/velocor:/var/lib/velocor:rw
 Volume=/run/velocor:/run/velocor:rw
 Volume=/sys:/sys:rw

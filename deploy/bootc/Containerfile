@@ -35,4 +35,5 @@ COPY --from=registry.xphyrlab.net/velocor/velocor-velod:latest /usr/bin/veloctl 
 COPY deploy/quadlets/velocor-spdk.container /usr/share/containers/systemd/velocor-spdk.container
 COPY deploy/quadlets/velocor-velod.container /usr/share/containers/systemd/velocor-velod.container
 
-RUN bootc container lint
+RUN /usr/lib/systemd/system-generators/podman-system-generator --dryrun >/dev/null && \
+    bootc container lint

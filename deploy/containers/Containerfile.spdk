@@ -63,9 +63,10 @@ RUN dnf install -y \
       procps-ng && \
     dnf clean all && \
     rm -rf /var/cache /var/log/dnf* /var/log/yum* && \
-    mkdir -p /run/velocor
+    mkdir -p /run/velocor /etc/velocor && \
+    printf '{"subsystems":[{"subsystem":"iscsi","config":[{"method":"iscsi_set_options","params":{"max_sessions":16,"pdu_pool_size":2048,"immediate_data_pool_size":512,"data_out_pool_size":512}}]}]}\n' > /etc/velocor/spdk.json
 
 COPY --from=builder /usr/bin/spdk_tgt /usr/bin/spdk_tgt
 
 ENTRYPOINT ["/usr/bin/spdk_tgt"]
-CMD ["-r", "/run/velocor/spdk.sock", "-m", "0x1", "-s", "512"]
+CMD ["-r", "/run/velocor/spdk.sock", "-m", "0x1", "-s", "512", "--json", "/etc/velocor/spdk.json"]

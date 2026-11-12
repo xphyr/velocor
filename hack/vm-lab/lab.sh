@@ -34,6 +34,8 @@ Commands:
   init-disks       Create synthetic NVMe (.raw), SSD (.raw), and cloud-init seed ISOs in ${LAB_DIR}
   up               Start velocor-san (booting Fedora bootc 45) and velocor-initiator QEMU/KVM VMs
   verify           Verify Fedora bootc 45 status, Podman Quadlets, SPDK JSON-RPC, and veloctl APIs
+  ssh-san          Run a command (or interactive shell) on velocor-san as root
+  ssh-init         Run a command (or interactive shell) on velocor-initiator as fedora
   down             Stop running lab VMs cleanly
   status           Show PID and port bindings for lab VMs
   clean            Stop lab VMs and remove ${LAB_DIR}
@@ -188,7 +190,7 @@ build_bootc_disk() {
     fi
     rm -f "${bib_os}"
   }
-  trap cleanup_bib RETURN
+  trap cleanup_bib EXIT RETURN
 
   local ssh_opts=(-i "${LAB_DIR}/id_ed25519" -o IdentitiesOnly=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5)
   echo "Waiting for SSH on builder VM (127.0.0.1:${bib_ssh_port})..."
@@ -234,7 +236,7 @@ podman run --rm --privileged --pid=host \
 # Inject registry auth into the installed ostree deployment so Quadlets can pull on first boot
 if [[ -f /tmp/auth.json ]]; then
   mkdir -p /mnt/bootc-target
-  mount /dev/vdb4 /mnt/bootc-target
+  mount /dev/vdb3 /mnt/bootc-target
   for deploy_dir in /mnt/bootc-target/ostree/deploy/*/deploy/*.0; do
     mkdir -p "${deploy_dir}/etc/ostree" "${deploy_dir}/etc/containers"
     install -m 0600 /tmp/auth.json "${deploy_dir}/etc/ostree/auth.json"
@@ -250,7 +252,7 @@ sync
 EOF
 
   cleanup_bib
-  trap - RETURN
+  trap - EXIT RETURN
   sleep 1
   mv "${target_disk}" "${BOOTC_DISK}"
   echo "Successfully created Fedora bootc 45 disk image: ${BOOTC_DISK}"
@@ -297,6 +299,8 @@ down_vms() {
       rm -f "${pidfile}"
     fi
   done
+  pkill -f "velocor-(san|initiator|bib)" 2>/dev/null || true
+  sleep 1
 }
 
 up_vms() {
@@ -371,10 +375,17 @@ verify_san() {
   done
 
   echo "=== Verifying Fedora Image Mode (bootc 45) & Podman Quadlet Services on velocor-san ==="
+  scp "${ssh_opts[@]}" -P "${SAN_SSH_PORT}" \
+    "${REPO_ROOT}/deploy/quadlets/velocor-spdk.container" \
+    "${REPO_ROOT}/deploy/quadlets/velocor-velod.container" \
+    root@127.0.0.1:/etc/containers/systemd/
   ssh "${ssh_opts[@]}" -p "${SAN_SSH_PORT}" root@127.0.0.1 "bash -s" <<'EOF'
 set -euo pipefail
 echo "--- bootc status ---"
 bootc status
+
+systemctl daemon-reload
+systemctl start velocor-spdk.service velocor-velod.service
 
 echo ""
 echo "--- Waiting for Quadlet containers (velocor-spdk & velocor-velod) to pull and start ---"
@@ -425,10 +436,63 @@ EOF
   fi
 
   echo ""
-  echo "=== Claiming Emulated NVMe (nvme-0000-00-03-0 -> vfio-pci) & SSD (ssd-sda -> io_uring) ==="
+  echo "=== Claiming Emulated NVMe (nvme-0000-00-03-0, nvme-0000-00-04-0 -> vfio-pci) & SSD (ssd-sda -> io_uring) ==="
   "${REPO_ROOT}/bin/veloctl" --endpoint "https://127.0.0.1:${SAN_API_PORT}" --insecure disk claim nvme-0000-00-03-0 >/dev/null
+  "${REPO_ROOT}/bin/veloctl" --endpoint "https://127.0.0.1:${SAN_API_PORT}" --insecure disk claim nvme-0000-00-04-0 >/dev/null
   "${REPO_ROOT}/bin/veloctl" --endpoint "https://127.0.0.1:${SAN_API_PORT}" --insecure disk claim ssd-sda >/dev/null
   "${REPO_ROOT}/bin/veloctl" --endpoint "https://127.0.0.1:${SAN_API_PORT}" --insecure disk list
+
+  echo ""
+  echo "=== Creating SPDK RAID1 Pool & Thin-Provisioned Volumes ==="
+  local pool_id vol_nvmf_id vol_iscsi_id portal_nvmf_id portal_iscsi_id snap1_id snap2_id
+  pool_id="$("${REPO_ROOT}/bin/veloctl" --endpoint "https://127.0.0.1:${SAN_API_PORT}" --insecure pool create --name nvme-pool --raid RAID1 --disks nvme-0000-00-03-0,nvme-0000-00-04-0 | jq -r '.pool.id')"
+  vol_nvmf_id="$("${REPO_ROOT}/bin/veloctl" --endpoint "https://127.0.0.1:${SAN_API_PORT}" --insecure volume create --name vol-nvmf --pool "${pool_id}" --size-gib 2 --thin=true | jq -r '.volume.id')"
+  vol_iscsi_id="$("${REPO_ROOT}/bin/veloctl" --endpoint "https://127.0.0.1:${SAN_API_PORT}" --insecure volume create --name vol-iscsi --pool "${pool_id}" --size-gib 2 --thin=true | jq -r '.volume.id')"
+  "${REPO_ROOT}/bin/veloctl" --endpoint "https://127.0.0.1:${SAN_API_PORT}" --insecure pool list
+  "${REPO_ROOT}/bin/veloctl" --endpoint "https://127.0.0.1:${SAN_API_PORT}" --insecure volume list
+
+  echo ""
+  echo "=== Creating NVMe-oF/TCP & iSCSI Portals and Exports ==="
+  portal_nvmf_id="$("${REPO_ROOT}/bin/veloctl" --endpoint "https://127.0.0.1:${SAN_API_PORT}" --insecure portal create --name nvmf-tcp-0 --protocol NVMEOF_TCP --ip 10.0.2.15 --port 4420 | jq -r '.portal.id')"
+  portal_iscsi_id="$("${REPO_ROOT}/bin/veloctl" --endpoint "https://127.0.0.1:${SAN_API_PORT}" --insecure portal create --name iscsi-0 --protocol ISCSI --ip 10.0.2.15 --port 3260 | jq -r '.portal.id')"
+  "${REPO_ROOT}/bin/veloctl" --endpoint "https://127.0.0.1:${SAN_API_PORT}" --insecure export create --name exp-nvmf --volume "${vol_nvmf_id}" --protocol NVMEOF_TCP --portals "${portal_nvmf_id}" --allow-any-host=true >/dev/null
+  "${REPO_ROOT}/bin/veloctl" --endpoint "https://127.0.0.1:${SAN_API_PORT}" --insecure export create --name exp-iscsi --volume "${vol_iscsi_id}" --protocol ISCSI --portals "${portal_iscsi_id}" --allow-any-host=true >/dev/null
+  "${REPO_ROOT}/bin/veloctl" --endpoint "https://127.0.0.1:${SAN_API_PORT}" --insecure export list
+
+  echo ""
+  echo "=== Testing Live NVMe-oF/TCP Discovery, Connect & Block I/O ==="
+  ssh "${ssh_opts[@]}" -p "${SAN_SSH_PORT}" root@127.0.0.1 "bash -s" <<'EOF'
+set -euo pipefail
+modprobe nvme-tcp
+echo "--- nvme discover -t tcp -a 10.0.2.15 -s 4420 ---"
+nvme discover -t tcp -a 10.0.2.15 -s 4420
+nvme connect -t tcp -n nqn.2026-11.io.velocor:exp-nvmf -a 10.0.2.15 -s 4420
+sleep 1
+nvme list
+dd if=/dev/urandom of=/dev/nvme0n1 bs=64k count=4 seek=0 oflag=direct status=none
+sync
+EOF
+
+  echo ""
+  echo "=== Testing CoW Snapshots & Changed Block Tracking (CBT) on NVMe-oF/TCP Volume ==="
+  snap1_id="$("${REPO_ROOT}/bin/veloctl" --endpoint "https://127.0.0.1:${SAN_API_PORT}" --insecure snapshot create --volume "${vol_nvmf_id}" --name snap-1 | jq -r '.snapshot.id')"
+  ssh "${ssh_opts[@]}" -p "${SAN_SSH_PORT}" root@127.0.0.1 "dd if=/dev/urandom of=/dev/nvme0n1 bs=64k count=2 seek=16 oflag=direct status=none && sync && nvme disconnect -n nqn.2026-11.io.velocor:exp-nvmf"
+  snap2_id="$("${REPO_ROOT}/bin/veloctl" --endpoint "https://127.0.0.1:${SAN_API_PORT}" --insecure snapshot create --volume "${vol_nvmf_id}" --name snap-2 | jq -r '.snapshot.id')"
+  "${REPO_ROOT}/bin/veloctl" --endpoint "https://127.0.0.1:${SAN_API_PORT}" --insecure snapshot changed-blocks --base "${snap1_id}" --target "${snap2_id}"
+
+  echo ""
+  echo "=== Testing Live iSCSI Discovery (SendTargets) ==="
+  ssh "${ssh_opts[@]}" -p "${SAN_SSH_PORT}" root@127.0.0.1 "iscsiadm -m discovery -t sendtargets -p 10.0.2.15:3260"
+}
+
+ssh_san() {
+  local ssh_key="${LAB_DIR}/id_ed25519"
+  exec ssh -i "${ssh_key}" -o IdentitiesOnly=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 -p "${SAN_SSH_PORT}" root@127.0.0.1 "$@"
+}
+
+ssh_init() {
+  local ssh_key="${LAB_DIR}/id_ed25519"
+  exec ssh -i "${ssh_key}" -o IdentitiesOnly=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 -p "${INIT_SSH_PORT}" fedora@127.0.0.1 "$@"
 }
 
 case "${1:-}" in
@@ -437,6 +501,8 @@ case "${1:-}" in
   init-disks)       init_disks ;;
   up)               up_vms ;;
   verify)           verify_san ;;
+  ssh-san)          shift; ssh_san "$@" ;;
+  ssh-init)         shift; ssh_init "$@" ;;
   down)             down_vms ;;
   status)           status_vms ;;
   clean)            down_vms; rm -rf "${LAB_DIR}" ;;

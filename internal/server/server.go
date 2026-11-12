@@ -1209,6 +1209,31 @@ func (s *Server) handleCreateExport(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 		}
+	} else if s.spdk != nil && exp.Protocol == store.ExportProtocolISCSI {
+		pgTag := 1
+		igTag := 1
+		var spdkPortals []spdk.IscsiPortal
+		for _, pid := range exp.PortalIDs {
+			if p, err := s.store.GetPortal(pid); err == nil {
+				spdkPortals = append(spdkPortals, spdk.IscsiPortal{
+					Host: p.IPAddress,
+					Port: strconv.Itoa(int(p.Port)),
+				})
+			}
+		}
+		if len(spdkPortals) > 0 {
+			_ = s.spdk.IscsiCreatePortalGroup(r.Context(), pgTag, spdkPortals)
+		}
+		_ = s.spdk.IscsiCreateInitiatorGroup(r.Context(), igTag, []string{"ANY"}, []string{"0.0.0.0/0"})
+		_ = s.spdk.IscsiCreateTargetNode(
+			r.Context(),
+			exp.TargetIQN,
+			exp.Name,
+			[]spdk.IscsiLun{{BdevName: vol.EffectiveBdevName, LunID: int(exp.LUNID)}},
+			[]spdk.IscsiPgIgMap{{PgTag: pgTag, IgTag: igTag}},
+			64,
+			true, false, false, 0,
+		)
 	}
 
 	writeJSON(w, http.StatusCreated, map[string]any{"export": exp})

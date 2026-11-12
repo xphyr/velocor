@@ -9,17 +9,15 @@ Image=registry.xphyrlab.net/velocor/velocor-spdk:latest
 ContainerName=velocor-spdk
 AutoUpdate=registry
 Network=host
-IPC=host
-PidHost=true
 SecurityLabelDisable=true
-PodmanArgs=--privileged
+PodmanArgs=--privileged --ipc=host --pid=host
 Volume=/dev:/dev:rslave
 Volume=/dev/hugepages:/dev/hugepages:rw
 Volume=/sys:/sys:rw
 Volume=/run/velocor:/run/velocor:rw
 Ulimit=memlock=-1:-1
 Ulimit=nofile=1048576:1048576
-Exec=-r /run/velocor/spdk.sock -m 0x1 -s 512
+Exec=-r /run/velocor/spdk.sock -m 0x1 -s 512 --json /etc/velocor/spdk.json
 
 [Service]
 ExecStartPre=/usr/bin/mkdir -p /run/velocor

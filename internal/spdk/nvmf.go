@@ -65,7 +65,9 @@ func (c *Client) NvmfGetTransports(ctx context.Context) ([]NvmfTransport, error)
 // NvmfCreateTransport initializes an NVMe-oF transport ("TCP" or "RDMA") in spdk_tgt.
 func (c *Client) NvmfCreateTransport(ctx context.Context, trtype string) error {
 	params := map[string]any{
-		"trtype": trtype,
+		"trtype":             trtype,
+		"num_shared_buffers": 512,
+		"buf_cache_size":     32,
 	}
 	return c.Call(ctx, "nvmf_create_transport", params, nil)
 }
