@@ -21,9 +21,9 @@ This file tracks implementation progress directly inside the Git repository so a
   - [x] Unit tests (`bbolt_test.go`)
 
 ## Phase 2: SPDK JSON-RPC 2.0 Client & Hardware Manager
-- [ ] SPDK JSON-RPC 2.0 socket client (`internal/spdk/client.go`)
-- [ ] Typed SPDK RPC methods (`bdev`, `raid`, `lvol`, `fragmap` CBT, `nvmf`, `iscsi`, `iostat`, SMART)
-- [ ] Linux Hardware Manager (`internal/hardware`) with boot-disk guard, hugepages, and VFIO/noiommu binding
+- [x] SPDK JSON-RPC 2.0 socket client (`internal/spdk/client.go`)
+- [x] Typed SPDK RPC methods (`bdev`, `raid`, `lvol`, `fragmap` CBT, `nvmf`, `iscsi`, `iostat`, SMART)
+- [x] Linux Hardware Manager (`internal/hardware`) with boot-disk guard, hugepages, and VFIO/noiommu binding
 
 ## Phase 3: Reconciler, `velod` Control Plane & `veloctl` CLI
 - [ ] Startup & continuous state reconciler (`internal/reconciler`)
