@@ -22,10 +22,12 @@ const (
 
 var (
 	protectedMountpoints = map[string]bool{
-		"/":         true,
-		"/boot":     true,
-		"/boot/efi": true,
-		"/sysroot":  true,
+		"/":                true,
+		"/boot":            true,
+		"/boot/efi":        true,
+		"/sysroot":         true,
+		"/var":             true,
+		"/var/lib/velocor": true,
 	}
 	pciBDFRegex = regexp.MustCompile(`^[0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-7]$`)
 )
@@ -79,22 +81,36 @@ func NewManager(cfg Config) (*Manager, error) {
 	return m, nil
 }
 
-// RefreshBootGuard parses /proc/self/mountinfo to identify all block devices and PCIe BDF
-// addresses backing /, /boot, /boot/efi, and /sysroot. Once marked as a boot device,
+// RefreshBootGuard parses /proc/self/mountinfo (and /proc/1/mountinfo when running in a
+// container with host PID namespace) to identify all block devices and PCIe BDF
+// addresses backing /, /boot, /boot/efi, /sysroot, and /var. Once marked as a boot device,
 // a drive remains permanently protected for the lifetime of the process.
 func (m *Manager) RefreshBootGuard() error {
-	mountinfoPath := filepath.Join(m.cfg.ProcRoot, "self", "mountinfo")
+	candidates := []string{
+		filepath.Join(m.cfg.ProcRoot, "self", "mountinfo"),
+		filepath.Join(m.cfg.ProcRoot, "1", "mountinfo"),
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	for _, mountinfoPath := range candidates {
+		if err := m.scanMountinfoFile(mountinfoPath); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (m *Manager) scanMountinfoFile(mountinfoPath string) error {
 	f, err := os.Open(mountinfoPath)
 	if err != nil {
-		if os.IsNotExist(err) {
+		if os.IsNotExist(err) || os.IsPermission(err) {
 			return nil
 		}
 		return fmt.Errorf("open mountinfo %s: %w", mountinfoPath, err)
 	}
 	defer func() { _ = f.Close() }()
-
-	m.mu.Lock()
-	defer m.mu.Unlock()
 
 	scanner := bufio.NewScanner(f)
 	for scanner.Scan() {
@@ -239,17 +255,22 @@ func (m *Manager) DiscoverDisks() ([]*store.Disk, error) {
 			}
 
 			blockDir := filepath.Join(sysBlockDir, devName)
+			devPath := filepath.Join(m.cfg.DevRoot, devName)
+			pciAddr := m.resolveBlockDevicePCIAddress(devName)
+			isBoot := m.IsBootDevice(pciAddr, devPath)
+
 			rotational := readSysfsString(filepath.Join(blockDir, "queue", "rotational"))
-			if rotational != "0" {
+			if rotational != "0" && !isBoot {
 				continue
 			}
 
 			sectors := readSysfsUint64(filepath.Join(blockDir, "size"), 0)
-			if sectors == 0 {
+			sizeBytes := sectors * 512
+			// Ignore tiny virtual block devices (e.g. < 64 MiB cloud-init cidata volumes).
+			if sizeBytes < 64*1024*1024 {
 				continue
 			}
 			logicalBlockSize := uint32(readSysfsUint64(filepath.Join(blockDir, "queue", "logical_block_size"), 512))
-			sizeBytes := sectors * 512
 
 			model := readSysfsString(filepath.Join(blockDir, "device", "model"))
 			serial := readSysfsString(filepath.Join(blockDir, "device", "serial"))
@@ -261,10 +282,6 @@ func (m *Manager) DiscoverDisks() ([]*store.Disk, error) {
 			if numaNode < 0 {
 				numaNode = 0
 			}
-
-			devPath := filepath.Join(m.cfg.DevRoot, devName)
-			pciAddr := m.resolveBlockDevicePCIAddress(devName)
-			isBoot := m.IsBootDevice(pciAddr, devPath)
 
 			disks = append(disks, &store.Disk{
 				ID:               "ssd-" + devName,

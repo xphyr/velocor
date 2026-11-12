@@ -4,10 +4,11 @@
 
 ## 1. Key Architectural Decisions
 
-1. **Data Plane (`spdk_tgt` in C) vs. Control Plane (`velod` in Go):**
-   - `spdk_tgt` owns the block I/O path in user space.
-   - `velod` owns hardware discovery, VFIO device binding, hugepage allocation, desired-state persistence (`bbolt`), crash/boot reconciliation, authentication, Prometheus metrics, and the gRPC + REST/OpenAPI API.
-   - `velod` communicates with `spdk_tgt` over the local UNIX domain JSON-RPC 2.0 socket (`/var/tmp/spdk.sock`).
+1. **Decoupled Data Plane (`velocor-spdk` container) vs. Control Plane (`velocor-velod` container) on `fedora-bootc:45`:**
+   - **Base OS (`quay.io/fedora/fedora-bootc:45`):** Thin, immutable host image responsible only for the Linux kernel, `vfio-pci` / `nvme_tcp` / `ublk_drv` kernel modules, hugepage sysctls, and **Podman Quadlet** service definitions (`/usr/share/containers/systemd/*.container`).
+   - **Data Plane (`velocor-spdk` container):** Runs `spdk_tgt` in C, owning the user-space block I/O path with `/dev/vfio`, `/dev/hugepages`, and `/dev` (`io_uring`) mounted.
+   - **Control Plane (`velocor-velod` container):** Runs `velod` in Go, owning hardware discovery, VFIO device binding, hugepage allocation, desired-state persistence (`/var/lib/velocor/velocor.db`), crash/boot reconciliation, authentication, Prometheus metrics, and the gRPC + REST/OpenAPI API.
+   - **Zero-Disruption Control-Plane Upgrades:** `velod` and `spdk_tgt` communicate over a shared host socket (`/run/velocor/spdk.sock`), allowing `velocor-velod` to be upgraded or restarted in ~1 second without interrupting active NVMe-oF or iSCSI I/O in `velocor-spdk` or rebooting the host OS.
 
 2. **Two-Tier Flash Support (NVMe + SATA/SAS SSDs):**
    - **NVMe Tier (`bdev_nvme`):** Unbound from the Linux kernel (`nvme` driver) and bound to `vfio-pci` (or `uio_pci_generic` / `vfio-noiommu` in VMs without vIOMMU). Polled directly in user space by SPDK. SMART health is queried via `bdev_nvme_get_controller_health_info`.

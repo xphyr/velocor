@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"slices"
 	"sort"
+	"strings"
 	"time"
 
 	bolt "go.etcd.io/bbolt"
@@ -230,6 +231,26 @@ func (s *BoltStore) UpsertDisk(disk *Disk) error {
 			// Preserve PoolID if the disk belongs to a pool.
 			if existing.PoolID != "" && cp.PoolID == "" {
 				cp.PoolID = existing.PoolID
+			}
+			// Preserve hardware identity & capacity when an NVMe drive is bound to vfio-pci/uio
+			// and its kernel nvme sysfs node is no longer present.
+			if cp.SizeBytes == 0 && existing.SizeBytes > 0 {
+				cp.SizeBytes = existing.SizeBytes
+			}
+			if cp.BlockSize == 0 && existing.BlockSize > 0 {
+				cp.BlockSize = existing.BlockSize
+			}
+			if cp.Model == "" && existing.Model != "" {
+				cp.Model = existing.Model
+			}
+			if cp.SerialNumber == "" && existing.SerialNumber != "" {
+				cp.SerialNumber = existing.SerialNumber
+			}
+			if cp.FirmwareRevision == "" && existing.FirmwareRevision != "" {
+				cp.FirmwareRevision = existing.FirmwareRevision
+			}
+			if (cp.Name == "" || strings.HasPrefix(cp.Name, "nvme_")) && existing.Name != "" && !strings.HasPrefix(existing.Name, "nvme_") {
+				cp.Name = existing.Name
 			}
 		} else if cp.IsBootDevice && cp.Claimed {
 			return ErrBootDeviceProtected

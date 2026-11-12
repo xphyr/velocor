@@ -12,8 +12,9 @@ import (
 )
 
 const (
-	// DefaultSocketPath is the default UNIX domain socket used by spdk_tgt.
-	DefaultSocketPath = "/var/tmp/spdk.sock"
+	// DefaultSocketPath is the default UNIX domain socket shared between the velocor-spdk
+	// and velocor-velod containers on the host (/run/velocor/spdk.sock).
+	DefaultSocketPath = "/run/velocor/spdk.sock"
 	// DefaultTimeout is the default per-RPC timeout when context has no deadline.
 	DefaultTimeout = 15 * time.Second
 )

@@ -31,6 +31,8 @@ This file tracks implementation progress directly inside the Git repository so a
 - [x] gRPC + REST server (`cmd/velod`)
 - [x] CLI client (`cmd/veloctl`)
 
-## Phase 4: Fedora Image Mode (`bootc`) & QEMU/KVM Lab
-- [ ] `deploy/bootc/Containerfile` & systemd services
-- [ ] `hack/vm-lab/` QEMU/KVM 2-node test environment
+## Phase 4: Fedora Image Mode (`bootc` 45), Podman Quadlets & QEMU/KVM Lab
+- [x] Thin `fedora-bootc:45` host OS image (`deploy/bootc/Containerfile`)
+- [x] Decoupled SPDK & `velod` workload containers (`deploy/containers/Containerfile.spdk`, `deploy/containers/Containerfile.velod`)
+- [x] Systemd Podman Quadlet units (`deploy/quadlets/velocor-spdk.container`, `deploy/quadlets/velocor-velod.container`)
+- [x] `hack/vm-lab/` QEMU/KVM 2-node test environment

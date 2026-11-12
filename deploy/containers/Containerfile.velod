@@ -1,0 +1,30 @@
+# Control-Plane Container: velod & veloctl built on Fedora 45
+FROM quay.io/fedora/fedora:45 AS builder
+
+RUN dnf install -y golang git && dnf clean all
+
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+ARG VERSION=v0.1.0
+ARG COMMIT=unknown
+ARG BUILD_TIME=unknown
+
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+    go build -ldflags="-s -w -X github.com/velocor/velocor/internal/version.Version=${VERSION} -X github.com/velocor/velocor/internal/version.Commit=${COMMIT} -X github.com/velocor/velocor/internal/version.BuildTime=${BUILD_TIME}" \
+    -o /out/velod ./cmd/velod && \
+    CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+    go build -ldflags="-s -w -X github.com/velocor/velocor/internal/version.Version=${VERSION} -X github.com/velocor/velocor/internal/version.Commit=${COMMIT} -X github.com/velocor/velocor/internal/version.BuildTime=${BUILD_TIME}" \
+    -o /out/veloctl ./cmd/veloctl
+
+FROM quay.io/fedora/fedora-minimal:45
+
+RUN mkdir -p /var/lib/velocor /run/velocor
+COPY --from=builder /out/velod /usr/bin/velod
+COPY --from=builder /out/veloctl /usr/bin/veloctl
+
+EXPOSE 8443
+ENTRYPOINT ["/usr/bin/velod"]
+CMD ["--listen", ":8443", "--db", "/var/lib/velocor/velocor.db", "--spdk-socket", "/run/velocor/spdk.sock", "--hugepages-mb", "512"]

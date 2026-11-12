@@ -1,0 +1,31 @@
+[Unit]
+Description=Velocor SPDK Data-Plane Container (spdk_tgt)
+Documentation=https://spdk.io/doc/
+After=network-online.target local-fs.target
+Wants=network-online.target
+
+[Container]
+Image=registry.xphyrlab.net/velocor/velocor-spdk:latest
+ContainerName=velocor-spdk
+AutoUpdate=registry
+Network=host
+IPC=host
+PidHost=true
+SecurityLabelDisable=true
+PodmanArgs=--privileged
+Volume=/dev:/dev:rslave
+Volume=/dev/hugepages:/dev/hugepages:rw
+Volume=/sys:/sys:rw
+Volume=/run/velocor:/run/velocor:rw
+Ulimit=memlock=-1:-1
+Ulimit=nofile=1048576:1048576
+Exec=-r /run/velocor/spdk.sock -m 0x1 -s 512
+
+[Service]
+ExecStartPre=/usr/bin/mkdir -p /run/velocor
+ExecStartPre=/usr/bin/rm -f /run/velocor/spdk.sock
+Restart=always
+RestartSec=2s
+
+[Install]
+WantedBy=multi-user.target default.target

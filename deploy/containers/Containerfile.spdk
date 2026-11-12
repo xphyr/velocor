@@ -1,0 +1,71 @@
+# Data-Plane Container: SPDK v26.09 (spdk_tgt) built from source on Fedora 45
+FROM quay.io/fedora/fedora:45 AS builder
+
+ARG SPDK_VERSION=v26.09
+
+RUN dnf install -y \
+      git \
+      gcc \
+      gcc-c++ \
+      make \
+      meson \
+      ninja-build \
+      pkgconf-pkg-config \
+      python3 \
+      python3-pyelftools \
+      libaio-devel \
+      liburing-devel \
+      libuuid-devel \
+      numactl-devel \
+      openssl-devel \
+      ncurses-devel \
+      json-c-devel \
+      fuse3-devel \
+      cunit-devel \
+      findutils \
+      diffutils \
+      patch && \
+    dnf clean all
+
+WORKDIR /src
+RUN git clone --depth 1 --branch ${SPDK_VERSION} --recurse-submodules --shallow-submodules \
+      https://github.com/spdk/spdk.git /src/spdk
+
+WORKDIR /src/spdk
+RUN dnf install -y nasm autoconf automake libtool help2man python3-pyyaml python3-jinja2 python3-tabulate && dnf clean all && \
+    ./configure \
+      --prefix=/usr \
+      --target-arch=x86-64-v2 \
+      --disable-tests \
+      --disable-unit-tests \
+      --disable-examples \
+      --with-uring \
+      --with-raid5f \
+      --without-isal-crypto \
+      --without-crypto \
+      --without-vhost \
+      --without-fsdev && \
+    make -j"$(nproc)" && \
+    cp /src/spdk/build/bin/spdk_tgt /usr/bin/spdk_tgt && \
+    strip /usr/bin/spdk_tgt
+
+FROM quay.io/fedora/fedora:45
+
+RUN dnf install -y \
+      libaio \
+      liburing \
+      libuuid \
+      numactl-libs \
+      openssl-libs \
+      json-c \
+      fuse3-libs \
+      iproute \
+      procps-ng && \
+    dnf clean all && \
+    rm -rf /var/cache /var/log/dnf* /var/log/yum* && \
+    mkdir -p /run/velocor
+
+COPY --from=builder /usr/bin/spdk_tgt /usr/bin/spdk_tgt
+
+ENTRYPOINT ["/usr/bin/spdk_tgt"]
+CMD ["-r", "/run/velocor/spdk.sock", "-m", "0x1", "-s", "512"]

@@ -1,0 +1,8 @@
+.git
+bin/
+dist/
+hack/vm-lab/.vms/
+*.qcow2
+*.raw
+*.iso
+*.db

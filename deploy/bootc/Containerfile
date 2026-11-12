@@ -1,0 +1,38 @@
+# Thin Immutable Appliance Host OS on Fedora Image Mode (bootc) 45
+# Runs spdk_tgt and velod as decoupled Podman Quadlet containers.
+FROM quay.io/fedora/fedora-bootc:45
+
+RUN dnf install -y \
+      podman \
+      skopeo \
+      cloud-init \
+      nvme-cli \
+      iscsi-initiator-utils \
+      pciutils \
+      iproute \
+      ethtool \
+      xfsprogs \
+      jq && \
+    dnf clean all && \
+    rm -rf /var/cache /var/log/dnf* /var/log/yum*
+
+# Kernel modules for user-space PCIe NVMe polling (VFIO/UIO), NVMe-oF TCP, and ublk (Phase 2 NAS)
+RUN mkdir -p \
+      /usr/lib/modules-load.d \
+      /usr/lib/modprobe.d \
+      /usr/lib/sysctl.d \
+      /usr/lib/tmpfiles.d \
+      /usr/share/containers/systemd && \
+    printf "vfio\nvfio_iommu_type1\nvfio_pci\nuio_pci_generic\nnvme_tcp\nublk_drv\n" > /usr/lib/modules-load.d/velocor.conf && \
+    printf "options vfio enable_unsafe_noiommu_mode=1\n" > /usr/lib/modprobe.d/velocor-vfio.conf && \
+    printf "vm.nr_hugepages = 256\n" > /usr/lib/sysctl.d/90-velocor.conf && \
+    printf "d /var/lib/velocor 0700 root root -\nd /run/velocor 0755 root root -\n" > /usr/lib/tmpfiles.d/velocor.conf
+
+# Install operator CLI client on the host
+COPY --from=registry.xphyrlab.net/velocor/velocor-velod:latest /usr/bin/veloctl /usr/bin/veloctl
+
+# Install Podman Quadlet units for decoupled data-plane and control-plane containers
+COPY deploy/quadlets/velocor-spdk.container /usr/share/containers/systemd/velocor-spdk.container
+COPY deploy/quadlets/velocor-velod.container /usr/share/containers/systemd/velocor-velod.container
+
+RUN bootc container lint
