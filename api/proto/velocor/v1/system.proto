@@ -1,0 +1,128 @@
+syntax = "proto3";
+
+package velocor.v1;
+
+import "google/api/annotations.proto";
+import "google/protobuf/timestamp.proto";
+import "velocor/v1/common.proto";
+
+option go_package = "github.com/velocor/velocor/api/gen/go/velocor/v1;velocorv1";
+
+// NodeInfo describes OS, hardware, and build metadata for the Velocor appliance node.
+message NodeInfo {
+  string node_id = 1;
+  string hostname = 2;
+  string version = 3;
+  string commit = 4;
+  string build_time = 5;
+  string kernel_version = 6;
+  string spdk_version = 7;
+  string bootc_image_ref = 8;
+  string bootc_image_digest = 9;
+  uint64 uptime_seconds = 10;
+}
+
+// SpdkStatus describes the runtime state of the spdk_tgt data-plane process.
+message SpdkStatus {
+  bool connected = 1;
+  string socket_path = 2;
+  int32 pid = 3;
+  string reactor_mask = 4;
+  uint64 hugepages_total_mb = 5;
+  uint64 hugepages_free_mb = 6;
+}
+
+// ReconcileState reports the status of the control-plane desired-state reconciler.
+message ReconcileState {
+  bool in_progress = 1;
+  google.protobuf.Timestamp last_reconciled_at = 2;
+  uint64 drift_repaired_count = 3;
+  repeated string degraded_resources = 4;
+  string last_error = 5;
+}
+
+// IoStats provides real-time SPDK bdev I/O counters and latency metrics.
+message IoStats {
+  string bdev_name = 1;
+  uint64 bytes_read = 2;
+  uint64 bytes_written = 3;
+  uint64 num_read_ops = 4;
+  uint64 num_write_ops = 5;
+  double read_latency_us = 6;
+  double write_latency_us = 7;
+}
+
+message GetSystemStatusRequest {}
+
+message GetSystemStatusResponse {
+  HealthStatus overall_health = 1;
+  NodeInfo node = 2;
+  SpdkStatus spdk = 3;
+  ReconcileState reconciler = 4;
+}
+
+message TriggerReconcileRequest {}
+
+message TriggerReconcileResponse {
+  ReconcileState reconciler = 1;
+}
+
+message GetIoStatsRequest {
+  string bdev_name = 1;
+}
+
+message GetIoStatsResponse {
+  uint64 tick_rate = 1;
+  repeated IoStats stats = 2;
+}
+
+message StageSystemUpgradeRequest {
+  string image_ref = 1;
+}
+
+message StageSystemUpgradeResponse {
+  string staged_image_ref = 1;
+  string staged_digest = 2;
+  bool reboot_required = 3;
+}
+
+message RollbackSystemUpgradeRequest {}
+
+message RollbackSystemUpgradeResponse {
+  bool reboot_required = 1;
+}
+
+service SystemService {
+  rpc GetSystemStatus(GetSystemStatusRequest) returns (GetSystemStatusResponse) {
+    option (google.api.http) = {
+      get: "/api/v1/system/status"
+    };
+  }
+
+  rpc TriggerReconcile(TriggerReconcileRequest) returns (TriggerReconcileResponse) {
+    option (google.api.http) = {
+      post: "/api/v1/system/reconcile"
+      body: "*"
+    };
+  }
+
+  rpc GetIoStats(GetIoStatsRequest) returns (GetIoStatsResponse) {
+    option (google.api.http) = {
+      get: "/api/v1/system/iostats"
+    };
+  }
+
+  rpc StageSystemUpgrade(StageSystemUpgradeRequest) returns (StageSystemUpgradeResponse) {
+    option (google.api.http) = {
+      post: "/api/v1/system/upgrade"
+      body: "*"
+    };
+  }
+
+  rpc RollbackSystemUpgrade(RollbackSystemUpgradeRequest) returns (RollbackSystemUpgradeResponse) {
+    option (google.api.http) = {
+      post: "/api/v1/system/rollback"
+      body: "*"
+    };
+  }
+}

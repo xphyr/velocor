@@ -1,0 +1,133 @@
+syntax = "proto3";
+
+package velocor.v1;
+
+import "google/api/annotations.proto";
+import "google/protobuf/timestamp.proto";
+import "velocor/v1/common.proto";
+
+option go_package = "github.com/velocor/velocor/api/gen/go/velocor/v1;velocorv1";
+
+// DiskDriverState indicates whether a block device is bound to the Linux kernel
+// or claimed by SPDK in user space.
+enum DiskDriverState {
+  DISK_DRIVER_STATE_UNSPECIFIED = 0;
+  DISK_DRIVER_STATE_KERNEL = 1;
+  DISK_DRIVER_STATE_VFIO_PCI = 2;
+  DISK_DRIVER_STATE_UIO_PCI_GENERIC = 3;
+  DISK_DRIVER_STATE_URING_CLAIMED = 4;
+}
+
+// SmartHealth captures NVMe/SSD S.M.A.R.T. telemetry queried via SPDK or sysfs.
+message SmartHealth {
+  int32 temperature_celsius = 1;
+  uint32 available_spare_percent = 2;
+  uint32 available_spare_threshold_percent = 3;
+  uint32 percentage_used = 4;
+  uint64 data_units_read = 5;
+  uint64 data_units_written = 6;
+  uint64 media_errors = 7;
+  uint64 power_on_hours = 8;
+  uint64 unsafe_shutdowns = 9;
+  bool critical_warning = 10;
+}
+
+// Disk represents a physical NVMe drive or SATA/SAS SSD on the appliance node.
+message Disk {
+  string id = 1;
+  string name = 2;
+  DiskType type = 3;
+  // PCIe BDF address (e.g., "0000:01:00.0") for NVMe drives.
+  string pci_address = 4;
+  // Linux kernel device node (e.g., "/dev/sdb") for SSDs or unclaimed NVMe drives.
+  string device_path = 5;
+  string serial_number = 6;
+  string model = 7;
+  string firmware_revision = 8;
+  int32 numa_node = 9;
+  uint64 size_bytes = 10;
+  uint32 block_size = 11;
+  DiskDriverState driver_state = 12;
+  // Permanently true if the drive backs /, /boot, /boot/efi, or /sysroot.
+  bool is_boot_device = 13;
+  bool claimed = 14;
+  string pool_id = 15;
+  string spdk_bdev_name = 16;
+  HealthStatus health_status = 17;
+  SmartHealth smart = 18;
+  google.protobuf.Timestamp updated_at = 19;
+}
+
+message ListDisksRequest {
+  DiskType type_filter = 1;
+  bool unclaimed_only = 2;
+}
+
+message ListDisksResponse {
+  repeated Disk disks = 1;
+}
+
+message GetDiskRequest {
+  string id = 1;
+}
+
+message GetDiskResponse {
+  Disk disk = 1;
+}
+
+message ScanDisksRequest {}
+
+message ScanDisksResponse {
+  repeated Disk disks = 1;
+}
+
+message ClaimDiskRequest {
+  string id = 1;
+}
+
+message ClaimDiskResponse {
+  Disk disk = 1;
+}
+
+message ReleaseDiskRequest {
+  string id = 1;
+}
+
+message ReleaseDiskResponse {
+  Disk disk = 1;
+}
+
+service DiskService {
+  rpc ListDisks(ListDisksRequest) returns (ListDisksResponse) {
+    option (google.api.http) = {
+      get: "/api/v1/disks"
+    };
+  }
+
+  rpc GetDisk(GetDiskRequest) returns (GetDiskResponse) {
+    option (google.api.http) = {
+      get: "/api/v1/disks/{id}"
+    };
+  }
+
+  rpc ScanDisks(ScanDisksRequest) returns (ScanDisksResponse) {
+    option (google.api.http) = {
+      post: "/api/v1/disks:scan"
+      body: "*"
+    };
+  }
+
+  rpc ClaimDisk(ClaimDiskRequest) returns (ClaimDiskResponse) {
+    option (google.api.http) = {
+      post: "/api/v1/disks/{id}:claim"
+      body: "*"
+    };
+  }
+
+  rpc ReleaseDisk(ReleaseDiskRequest) returns (ReleaseDiskResponse) {
+    option (google.api.http) = {
+      post: "/api/v1/disks/{id}:release"
+      body: "*"
+    };
+  }
+}

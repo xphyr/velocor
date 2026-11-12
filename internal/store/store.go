@@ -1,0 +1,92 @@
+package store
+
+import (
+	"errors"
+	"time"
+)
+
+var (
+	// ErrNotFound is returned when a requested resource does not exist in the store.
+	ErrNotFound = errors.New("resource not found")
+	// ErrAlreadyExists is returned when creating a resource that violates an ID or name uniqueness constraint.
+	ErrAlreadyExists = errors.New("resource already exists")
+	// ErrInUse is returned when attempting to delete or release a resource that has active dependents.
+	ErrInUse = errors.New("resource is in use by dependent resources")
+	// ErrInvalidArgument is returned when required resource fields are missing or invalid.
+	ErrInvalidArgument = errors.New("invalid argument")
+	// ErrBootDeviceProtected is returned when attempting to claim or modify a disk marked as a boot device.
+	ErrBootDeviceProtected = errors.New("boot device is protected and cannot be claimed or modified")
+	// ErrAttachmentConflict is returned when a volume's attachment state conflicts with the requested operation.
+	ErrAttachmentConflict = errors.New("volume attachment state conflict")
+)
+
+// Store defines the transactional persistence interface for velod desired and observed state.
+type Store interface {
+	// Lifecycle
+	Close() error
+
+	// System & Auth
+	GetSystemConfig() (*SystemConfig, error)
+	SaveSystemConfig(cfg *SystemConfig) error
+	GetAdminUser(username string) (*AdminUser, error)
+	SaveAdminUser(user *AdminUser) error
+	CreateApiToken(token *ApiToken) error
+	GetApiToken(id string) (*ApiToken, error)
+	UpdateApiTokenLastUsed(id string, lastUsed time.Time) error
+	ListApiTokens() ([]*ApiToken, error)
+	DeleteApiToken(id string) error
+
+	// Disks
+	UpsertDisk(disk *Disk) error
+	GetDisk(id string) (*Disk, error)
+	ListDisks() ([]*Disk, error)
+	ClaimDisk(id string, driverState DiskDriverState, spdkBdevName string) (*Disk, error)
+	ReleaseDisk(id string) (*Disk, error)
+	DeleteDisk(id string) error
+
+	// Pools
+	CreatePool(pool *Pool) error
+	GetPool(id string) (*Pool, error)
+	GetPoolByName(name string) (*Pool, error)
+	UpdatePool(pool *Pool) error
+	ListPools() ([]*Pool, error)
+	DeletePool(id string) error
+
+	// Volumes
+	CreateVolume(vol *Volume) error
+	GetVolume(id string) (*Volume, error)
+	GetVolumeByName(poolID, name string) (*Volume, error)
+	UpdateVolume(vol *Volume) error
+	SetVolumeAttachmentState(id string, state AttachmentState) (*Volume, error)
+	ListVolumes(poolID string) ([]*Volume, error)
+	DeleteVolume(id string) error
+
+	// Snapshots
+	CreateSnapshot(snap *Snapshot) error
+	GetSnapshot(id string) (*Snapshot, error)
+	GetSnapshotByName(volumeID, name string) (*Snapshot, error)
+	ListSnapshots(poolID, volumeID string) ([]*Snapshot, error)
+	DeleteSnapshot(id string) error
+
+	// Portals
+	CreatePortal(portal *Portal) error
+	GetPortal(id string) (*Portal, error)
+	GetPortalByName(name string) (*Portal, error)
+	ListPortals(protocolFilter ExportProtocol) ([]*Portal, error)
+	DeletePortal(id string) error
+
+	// InitiatorGroups
+	CreateInitiatorGroup(group *InitiatorGroup) error
+	GetInitiatorGroup(id string) (*InitiatorGroup, error)
+	GetInitiatorGroupByName(name string) (*InitiatorGroup, error)
+	ListInitiatorGroups() ([]*InitiatorGroup, error)
+	DeleteInitiatorGroup(id string) error
+
+	// Exports
+	CreateExport(exp *Export) error
+	GetExport(id string) (*Export, error)
+	GetExportByName(name string) (*Export, error)
+	UpdateExport(exp *Export) error
+	ListExports(volumeID string, protocolFilter ExportProtocol) ([]*Export, error)
+	DeleteExport(id string) error
+}

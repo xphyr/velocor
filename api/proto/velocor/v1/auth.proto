@@ -1,0 +1,108 @@
+syntax = "proto3";
+
+package velocor.v1;
+
+import "google/api/annotations.proto";
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/velocor/velocor/api/gen/go/velocor/v1;velocorv1";
+
+// Role defines RBAC permission tiers for human sessions and service tokens.
+enum Role {
+  ROLE_UNSPECIFIED = 0;
+  // Full administrative control over hardware, pools, volumes, exports, and system upgrades.
+  ROLE_ADMIN = 1;
+  // Scoped permissions for Kubernetes CSI provisioners (volumes, snapshots, CBT, exports).
+  ROLE_CSI_PROVISIONER = 2;
+  // Read-only visibility into inventory, metrics, and health status.
+  ROLE_READONLY = 3;
+}
+
+// ApiToken represents a scoped Personal/Service Access Token (velo_pat_...).
+// The raw token secret is never stored or returned after initial creation.
+message ApiToken {
+  string id = 1;
+  string name = 2;
+  string prefix = 3;
+  Role role = 4;
+  google.protobuf.Timestamp created_at = 5;
+  google.protobuf.Timestamp expires_at = 6;
+  google.protobuf.Timestamp last_used_at = 7;
+}
+
+message LoginRequest {
+  string username = 1;
+  string password = 2;
+}
+
+message LoginResponse {
+  string access_token = 1;
+  google.protobuf.Timestamp expires_at = 2;
+  Role role = 3;
+}
+
+message ChangePasswordRequest {
+  string current_password = 1;
+  string new_password = 2;
+}
+
+message ChangePasswordResponse {}
+
+message CreateApiTokenRequest {
+  string name = 1;
+  Role role = 2;
+  int64 ttl_seconds = 3;
+}
+
+message CreateApiTokenResponse {
+  ApiToken token = 1;
+  // Plaintext token string (velo_pat_<id>_<secret>), returned only once upon creation.
+  string secret_token = 2;
+}
+
+message ListApiTokensRequest {}
+
+message ListApiTokensResponse {
+  repeated ApiToken tokens = 1;
+}
+
+message RevokeApiTokenRequest {
+  string id = 1;
+}
+
+message RevokeApiTokenResponse {}
+
+service AuthService {
+  rpc Login(LoginRequest) returns (LoginResponse) {
+    option (google.api.http) = {
+      post: "/api/v1/auth/login"
+      body: "*"
+    };
+  }
+
+  rpc ChangePassword(ChangePasswordRequest) returns (ChangePasswordResponse) {
+    option (google.api.http) = {
+      post: "/api/v1/auth/password"
+      body: "*"
+    };
+  }
+
+  rpc CreateApiToken(CreateApiTokenRequest) returns (CreateApiTokenResponse) {
+    option (google.api.http) = {
+      post: "/api/v1/auth/tokens"
+      body: "*"
+    };
+  }
+
+  rpc ListApiTokens(ListApiTokensRequest) returns (ListApiTokensResponse) {
+    option (google.api.http) = {
+      get: "/api/v1/auth/tokens"
+    };
+  }
+
+  rpc RevokeApiToken(RevokeApiTokenRequest) returns (RevokeApiTokenResponse) {
+    option (google.api.http) = {
+      delete: "/api/v1/auth/tokens/{id}"
+    };
+  }
+}

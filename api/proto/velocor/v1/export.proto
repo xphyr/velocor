@@ -1,0 +1,239 @@
+syntax = "proto3";
+
+package velocor.v1;
+
+import "google/api/annotations.proto";
+import "google/protobuf/timestamp.proto";
+import "velocor/v1/common.proto";
+
+option go_package = "github.com/velocor/velocor/api/gen/go/velocor/v1;velocorv1";
+
+// ExportProtocol specifies the SAN fabric transport used to expose a Volume.
+enum ExportProtocol {
+  EXPORT_PROTOCOL_UNSPECIFIED = 0;
+  EXPORT_PROTOCOL_NVMEOF_TCP = 1;
+  EXPORT_PROTOCOL_NVMEOF_RDMA = 2;
+  EXPORT_PROTOCOL_ISCSI = 3;
+}
+
+// AnaState defines Asymmetric Namespace Access state for NVMe-oF multipath failover.
+enum AnaState {
+  ANA_STATE_UNSPECIFIED = 0;
+  ANA_STATE_OPTIMIZED = 1;
+  ANA_STATE_NON_OPTIMIZED = 2;
+  ANA_STATE_INACCESSIBLE = 3;
+}
+
+// Portal defines an IP/Port listener endpoint for NVMe-oF or iSCSI traffic.
+message Portal {
+  string id = 1;
+  string name = 2;
+  ExportProtocol protocol = 3;
+  string ip_address = 4;
+  uint32 port = 5;
+  google.protobuf.Timestamp created_at = 6;
+}
+
+// InitiatorGroup defines host ACLs (NVMe-oF Host NQNs, iSCSI Initiator IQNs, CIDRs, CHAP).
+message InitiatorGroup {
+  string id = 1;
+  string name = 2;
+  repeated string host_nqns = 3;
+  repeated string initiator_iqns = 4;
+  repeated string allowed_cidrs = 5;
+  string chap_user = 6;
+  string mutual_chap_user = 7;
+  google.protobuf.Timestamp created_at = 8;
+}
+
+// Export maps a Volume's effective_bdev_name to an NVMe-oF Subsystem/Namespace or iSCSI Target/LUN.
+message Export {
+  string id = 1;
+  string name = 2;
+  string volume_id = 3;
+  ExportProtocol protocol = 4;
+  // NVMe-oF fields.
+  string subsystem_nqn = 5;
+  uint32 namespace_id = 6;
+  AnaState ana_state = 7;
+  // iSCSI fields.
+  string target_iqn = 8;
+  uint32 lun_id = 9;
+  // Shared network & access bindings.
+  repeated string portal_ids = 10;
+  repeated string initiator_group_ids = 11;
+  bool allow_any_host = 12;
+  HealthStatus health_status = 13;
+  google.protobuf.Timestamp created_at = 14;
+}
+
+message CreatePortalRequest {
+  string name = 1;
+  ExportProtocol protocol = 2;
+  string ip_address = 3;
+  uint32 port = 4;
+}
+
+message CreatePortalResponse {
+  Portal portal = 1;
+}
+
+message ListPortalsRequest {
+  ExportProtocol protocol_filter = 1;
+}
+
+message ListPortalsResponse {
+  repeated Portal portals = 1;
+}
+
+message DeletePortalRequest {
+  string id = 1;
+}
+
+message DeletePortalResponse {}
+
+message CreateInitiatorGroupRequest {
+  string name = 1;
+  repeated string host_nqns = 2;
+  repeated string initiator_iqns = 3;
+  repeated string allowed_cidrs = 4;
+  string chap_user = 5;
+  string chap_secret = 6;
+  string mutual_chap_user = 7;
+  string mutual_chap_secret = 8;
+}
+
+message CreateInitiatorGroupResponse {
+  InitiatorGroup initiator_group = 1;
+}
+
+message GetInitiatorGroupRequest {
+  string id = 1;
+}
+
+message GetInitiatorGroupResponse {
+  InitiatorGroup initiator_group = 1;
+}
+
+message ListInitiatorGroupsRequest {}
+
+message ListInitiatorGroupsResponse {
+  repeated InitiatorGroup initiator_groups = 1;
+}
+
+message DeleteInitiatorGroupRequest {
+  string id = 1;
+}
+
+message DeleteInitiatorGroupResponse {}
+
+message CreateExportRequest {
+  string name = 1;
+  string volume_id = 2;
+  ExportProtocol protocol = 3;
+  string subsystem_nqn = 4;
+  uint32 namespace_id = 5;
+  string target_iqn = 6;
+  uint32 lun_id = 7;
+  repeated string portal_ids = 8;
+  repeated string initiator_group_ids = 9;
+  bool allow_any_host = 10;
+}
+
+message CreateExportResponse {
+  Export export = 1;
+}
+
+message GetExportRequest {
+  string id = 1;
+}
+
+message GetExportResponse {
+  Export export = 1;
+}
+
+message ListExportsRequest {
+  string volume_id = 1;
+  ExportProtocol protocol_filter = 2;
+}
+
+message ListExportsResponse {
+  repeated Export exports = 1;
+}
+
+message DeleteExportRequest {
+  string id = 1;
+}
+
+message DeleteExportResponse {}
+
+service ExportService {
+  rpc CreatePortal(CreatePortalRequest) returns (CreatePortalResponse) {
+    option (google.api.http) = {
+      post: "/api/v1/portals"
+      body: "*"
+    };
+  }
+
+  rpc ListPortals(ListPortalsRequest) returns (ListPortalsResponse) {
+    option (google.api.http) = {
+      get: "/api/v1/portals"
+    };
+  }
+
+  rpc DeletePortal(DeletePortalRequest) returns (DeletePortalResponse) {
+    option (google.api.http) = {
+      delete: "/api/v1/portals/{id}"
+    };
+  }
+
+  rpc CreateInitiatorGroup(CreateInitiatorGroupRequest) returns (CreateInitiatorGroupResponse) {
+    option (google.api.http) = {
+      post: "/api/v1/initiator-groups"
+      body: "*"
+    };
+  }
+
+  rpc GetInitiatorGroup(GetInitiatorGroupRequest) returns (GetInitiatorGroupResponse) {
+    option (google.api.http) = {
+      get: "/api/v1/initiator-groups/{id}"
+    };
+  }
+
+  rpc ListInitiatorGroups(ListInitiatorGroupsRequest) returns (ListInitiatorGroupsResponse) {
+    option (google.api.http) = {
+      get: "/api/v1/initiator-groups"
+    };
+  }
+
+  rpc DeleteInitiatorGroup(DeleteInitiatorGroupRequest) returns (DeleteInitiatorGroupResponse) {
+    option (google.api.http) = {
+      delete: "/api/v1/initiator-groups/{id}"
+    };
+  }
+
+  rpc CreateExport(CreateExportRequest) returns (CreateExportResponse) {
+    option (google.api.http) = {
+      post: "/api/v1/exports"
+      body: "*"
+    };
+  }
+
+  rpc GetExport(GetExportRequest) returns (GetExportResponse) {
+    option (google.api.http) = {
+      get: "/api/v1/exports/{id}"
+    };
+  }
+
+  rpc ListExports(ListExportsRequest) returns (ListExportsResponse) {
+    option (google.api.http) = {
+      get: "/api/v1/exports"
+    };
+  }
+
+  rpc DeleteExport(DeleteExportRequest) returns (DeleteExportResponse) {
+    option (google.api.http) = {
+      delete: "/api/v1/exports/{id}"
+    };
+  }
+}

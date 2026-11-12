@@ -1,0 +1,278 @@
+package store
+
+import "time"
+
+// HealthStatus represents the operational health of a resource.
+type HealthStatus string
+
+const (
+	HealthStatusUnspecified HealthStatus = "UNSPECIFIED"
+	HealthStatusOnline      HealthStatus = "ONLINE"
+	HealthStatusDegraded    HealthStatus = "DEGRADED"
+	HealthStatusOffline     HealthStatus = "OFFLINE"
+	HealthStatusFaulted     HealthStatus = "FAULTED"
+	HealthStatusReconciling HealthStatus = "RECONCILING"
+)
+
+// DiskType categorizes physical flash media tiers.
+type DiskType string
+
+const (
+	DiskTypeUnspecified DiskType = "UNSPECIFIED"
+	DiskTypeNVMe        DiskType = "NVME"
+	DiskTypeSSD         DiskType = "SSD"
+)
+
+// DiskDriverState indicates kernel vs SPDK user-space driver binding.
+type DiskDriverState string
+
+const (
+	DiskDriverStateUnspecified   DiskDriverState = "UNSPECIFIED"
+	DiskDriverStateKernel        DiskDriverState = "KERNEL"
+	DiskDriverStateVfioPCI       DiskDriverState = "VFIO_PCI"
+	DiskDriverStateUioPCIGeneric DiskDriverState = "UIO_PCI_GENERIC"
+	DiskDriverStateUringClaimed  DiskDriverState = "URING_CLAIMED"
+)
+
+// RaidLevel enumerates SPDK bdev_raid levels supported for Pools.
+type RaidLevel string
+
+const (
+	RaidLevelUnspecified RaidLevel = "UNSPECIFIED"
+	RaidLevel0           RaidLevel = "RAID0"
+	RaidLevel1           RaidLevel = "RAID1"
+	RaidLevel10          RaidLevel = "RAID10"
+	RaidLevel5F          RaidLevel = "RAID5F"
+)
+
+// CompressionAlgorithm defines supported SPDK bdev_compress algorithms.
+type CompressionAlgorithm string
+
+const (
+	CompressionAlgorithmUnspecified CompressionAlgorithm = "UNSPECIFIED"
+	CompressionAlgorithmLZ4         CompressionAlgorithm = "LZ4"
+	CompressionAlgorithmDeflate     CompressionAlgorithm = "DEFLATE"
+)
+
+// AttachmentState enforces exclusive ownership of a Volume between SAN exports
+// and Phase 2 local NAS filesystem attachment (SPDK ublk).
+type AttachmentState string
+
+const (
+	AttachmentStateUnspecified AttachmentState = "UNSPECIFIED"
+	AttachmentStateUnattached  AttachmentState = "UNATTACHED"
+	AttachmentStateBlockExport AttachmentState = "BLOCK_EXPORT"
+	AttachmentStateFilesystem  AttachmentState = "FILESYSTEM"
+)
+
+// ExportProtocol specifies the SAN fabric transport used to expose a Volume.
+type ExportProtocol string
+
+const (
+	ExportProtocolUnspecified ExportProtocol = "UNSPECIFIED"
+	ExportProtocolNVMeoFTCP   ExportProtocol = "NVMEOF_TCP"
+	ExportProtocolNVMeoFRDMA  ExportProtocol = "NVMEOF_RDMA"
+	ExportProtocolISCSI       ExportProtocol = "ISCSI"
+)
+
+// AnaState defines Asymmetric Namespace Access state for NVMe-oF multipath failover.
+type AnaState string
+
+const (
+	AnaStateUnspecified  AnaState = "UNSPECIFIED"
+	AnaStateOptimized    AnaState = "OPTIMIZED"
+	AnaStateNonOptimized AnaState = "NON_OPTIMIZED"
+	AnaStateInaccessible AnaState = "INACCESSIBLE"
+)
+
+// Role defines RBAC permission tiers for human sessions and service tokens.
+type Role string
+
+const (
+	RoleUnspecified    Role = "UNSPECIFIED"
+	RoleAdmin          Role = "ADMIN"
+	RoleCSIProvisioner Role = "CSI_PROVISIONER"
+	RoleReadOnly       Role = "READONLY"
+)
+
+// DefaultClusterSizeBytes is the default SPDK lvol_store cluster size (64 KiB)
+// used to optimize thin provisioning and Changed Block Tracking (CBT).
+const DefaultClusterSizeBytes uint32 = 64 * 1024
+
+// FilterPolicy defines stackable SPDK filter bdev layers (crypto / compression).
+type FilterPolicy struct {
+	EncryptionEnabled  bool                 `json:"encryption_enabled"`
+	KeyID              string               `json:"key_id,omitempty"`
+	CompressionEnabled bool                 `json:"compression_enabled"`
+	CompressionAlgo    CompressionAlgorithm `json:"compression_algo,omitempty"`
+}
+
+// QosPolicy configures SPDK bdev rate limits (IOPS and bandwidth).
+type QosPolicy struct {
+	RwIosPerSec    uint64 `json:"rw_ios_per_sec"`
+	RwMbytesPerSec uint64 `json:"rw_mbytes_per_sec"`
+	RMbytesPerSec  uint64 `json:"r_mbytes_per_sec"`
+	WMbytesPerSec  uint64 `json:"w_mbytes_per_sec"`
+}
+
+// SmartHealth captures NVMe/SSD S.M.A.R.T. health telemetry.
+type SmartHealth struct {
+	TemperatureCelsius             int32  `json:"temperature_celsius"`
+	AvailableSparePercent          uint32 `json:"available_spare_percent"`
+	AvailableSpareThresholdPercent uint32 `json:"available_spare_threshold_percent"`
+	PercentageUsed                 uint32 `json:"percentage_used"`
+	DataUnitsRead                  uint64 `json:"data_units_read"`
+	DataUnitsWritten               uint64 `json:"data_units_written"`
+	MediaErrors                    uint64 `json:"media_errors"`
+	PowerOnHours                   uint64 `json:"power_on_hours"`
+	UnsafeShutdowns                uint64 `json:"unsafe_shutdowns"`
+	CriticalWarning                bool   `json:"critical_warning"`
+}
+
+// Disk represents a physical NVMe drive or SATA/SAS SSD on the node.
+type Disk struct {
+	ID               string          `json:"id"`
+	Name             string          `json:"name"`
+	Type             DiskType        `json:"type"`
+	PCIAddress       string          `json:"pci_address,omitempty"`
+	DevicePath       string          `json:"device_path,omitempty"`
+	SerialNumber     string          `json:"serial_number"`
+	Model            string          `json:"model"`
+	FirmwareRevision string          `json:"firmware_revision"`
+	NUMANode         int32           `json:"numa_node"`
+	SizeBytes        uint64          `json:"size_bytes"`
+	BlockSize        uint32          `json:"block_size"`
+	DriverState      DiskDriverState `json:"driver_state"`
+	IsBootDevice     bool            `json:"is_boot_device"`
+	Claimed          bool            `json:"claimed"`
+	PoolID           string          `json:"pool_id,omitempty"`
+	SPDKBdevName     string          `json:"spdk_bdev_name,omitempty"`
+	HealthStatus     HealthStatus    `json:"health_status"`
+	Smart            SmartHealth     `json:"smart"`
+	UpdatedAt        time.Time       `json:"updated_at"`
+}
+
+// Pool aggregates one or more claimed Disks into an SPDK RAID bdev + lvol_store.
+type Pool struct {
+	ID                string       `json:"id"`
+	Name              string       `json:"name"`
+	RaidLevel         RaidLevel    `json:"raid_level"`
+	DiskIDs           []string     `json:"disk_ids"`
+	StripSizeKB       uint32       `json:"strip_size_kb"`
+	ClusterSizeBytes  uint32       `json:"cluster_size_bytes"`
+	BaseBdevName      string       `json:"base_bdev_name"`
+	EffectiveBdevName string       `json:"effective_bdev_name"`
+	LVSUUID           string       `json:"lvs_uuid"`
+	LVSName           string       `json:"lvs_name"`
+	TotalBytes        uint64       `json:"total_bytes"`
+	FreeBytes         uint64       `json:"free_bytes"`
+	AllocatedBytes    uint64       `json:"allocated_bytes"`
+	FilterPolicy      FilterPolicy `json:"filter_policy"`
+	HealthStatus      HealthStatus `json:"health_status"`
+	CreatedAt         time.Time    `json:"created_at"`
+}
+
+// Volume represents a logical volume (SPDK bdev_lvol) inside a Pool.
+type Volume struct {
+	ID                string            `json:"id"`
+	Name              string            `json:"name"`
+	PoolID            string            `json:"pool_id"`
+	UUID              string            `json:"uuid"`
+	LvolBdevName      string            `json:"lvol_bdev_name"`
+	EffectiveBdevName string            `json:"effective_bdev_name"`
+	SizeBytes         uint64            `json:"size_bytes"`
+	AllocatedBytes    uint64            `json:"allocated_bytes"`
+	ThinProvision     bool              `json:"thin_provision"`
+	ReadOnly          bool              `json:"read_only"`
+	ParentSnapshotID  string            `json:"parent_snapshot_id,omitempty"`
+	FilterPolicy      FilterPolicy      `json:"filter_policy"`
+	QosPolicy         QosPolicy         `json:"qos_policy"`
+	AttachmentState   AttachmentState   `json:"attachment_state"`
+	HealthStatus      HealthStatus      `json:"health_status"`
+	Labels            map[string]string `json:"labels,omitempty"`
+	CreatedAt         time.Time         `json:"created_at"`
+}
+
+// Snapshot represents an immutable point-in-time SPDK bdev_lvol_snapshot.
+type Snapshot struct {
+	ID               string    `json:"id"`
+	Name             string    `json:"name"`
+	VolumeID         string    `json:"volume_id"`
+	PoolID           string    `json:"pool_id"`
+	UUID             string    `json:"uuid"`
+	LvolBdevName     string    `json:"lvol_bdev_name"`
+	SizeBytes        uint64    `json:"size_bytes"`
+	AllocatedBytes   uint64    `json:"allocated_bytes"`
+	ParentSnapshotID string    `json:"parent_snapshot_id,omitempty"`
+	SequenceNumber   uint64    `json:"sequence_number"`
+	CreatedAt        time.Time `json:"created_at"`
+}
+
+// Portal defines an IP/Port listener endpoint for NVMe-oF or iSCSI traffic.
+type Portal struct {
+	ID        string         `json:"id"`
+	Name      string         `json:"name"`
+	Protocol  ExportProtocol `json:"protocol"`
+	IPAddress string         `json:"ip_address"`
+	Port      uint32         `json:"port"`
+	CreatedAt time.Time      `json:"created_at"`
+}
+
+// InitiatorGroup defines host ACLs (NVMe-oF Host NQNs, iSCSI Initiator IQNs, CIDRs, CHAP).
+type InitiatorGroup struct {
+	ID                        string    `json:"id"`
+	Name                      string    `json:"name"`
+	HostNQNs                  []string  `json:"host_nqns,omitempty"`
+	InitiatorIQNs             []string  `json:"initiator_iqns,omitempty"`
+	AllowedCIDRs              []string  `json:"allowed_cidrs,omitempty"`
+	CHAPUser                  string    `json:"chap_user,omitempty"`
+	CHAPSecretEncrypted       []byte    `json:"chap_secret_encrypted,omitempty"`
+	MutualCHAPUser            string    `json:"mutual_chap_user,omitempty"`
+	MutualCHAPSecretEncrypted []byte    `json:"mutual_chap_secret_encrypted,omitempty"`
+	CreatedAt                 time.Time `json:"created_at"`
+}
+
+// Export maps a Volume's EffectiveBdevName to an NVMe-oF Subsystem/Namespace or iSCSI Target/LUN.
+type Export struct {
+	ID                string         `json:"id"`
+	Name              string         `json:"name"`
+	VolumeID          string         `json:"volume_id"`
+	Protocol          ExportProtocol `json:"protocol"`
+	SubsystemNQN      string         `json:"subsystem_nqn,omitempty"`
+	NamespaceID       uint32         `json:"namespace_id,omitempty"`
+	AnaState          AnaState       `json:"ana_state,omitempty"`
+	TargetIQN         string         `json:"target_iqn,omitempty"`
+	LUNID             uint32         `json:"lun_id,omitempty"`
+	PortalIDs         []string       `json:"portal_ids"`
+	InitiatorGroupIDs []string       `json:"initiator_group_ids,omitempty"`
+	AllowAnyHost      bool           `json:"allow_any_host"`
+	HealthStatus      HealthStatus   `json:"health_status"`
+	CreatedAt         time.Time      `json:"created_at"`
+}
+
+// AdminUser stores the local administrator credentials.
+type AdminUser struct {
+	Username     string    `json:"username"`
+	PasswordHash string    `json:"password_hash"`
+	UpdatedAt    time.Time `json:"updated_at"`
+}
+
+// ApiToken represents a scoped Personal/Service Access Token (velo_pat_...).
+type ApiToken struct {
+	ID         string     `json:"id"`
+	Name       string     `json:"name"`
+	Prefix     string     `json:"prefix"`
+	TokenHash  string     `json:"token_hash"`
+	Role       Role       `json:"role"`
+	CreatedAt  time.Time  `json:"created_at"`
+	ExpiresAt  *time.Time `json:"expires_at,omitempty"`
+	LastUsedAt *time.Time `json:"last_used_at,omitempty"`
+}
+
+// SystemConfig stores node-wide persistent cryptographic and identity metadata.
+type SystemConfig struct {
+	NodeID        string    `json:"node_id"`
+	JWTSecret     []byte    `json:"jwt_secret"`
+	MasterKeySalt []byte    `json:"master_key_salt"`
+	InitializedAt time.Time `json:"initialized_at"`
+}

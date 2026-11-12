@@ -1,0 +1,23 @@
+# Binaries
+bin/
+velod
+veloctl
+
+# Go build / test artifacts
+*.exe
+*.test
+*.out
+coverage.txt
+vendor/
+
+# Local development state & sockets
+*.db
+*.sock
+*.qcow2
+*.raw
+hack/vm-lab/.vms/
+
+# IDE / OS
+.DS_Store
+.vscode/
+.idea/

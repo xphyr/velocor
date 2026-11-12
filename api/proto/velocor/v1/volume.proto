@@ -1,0 +1,284 @@
+syntax = "proto3";
+
+package velocor.v1;
+
+import "google/api/annotations.proto";
+import "google/protobuf/timestamp.proto";
+import "velocor/v1/common.proto";
+
+option go_package = "github.com/velocor/velocor/api/gen/go/velocor/v1;velocorv1";
+
+// AttachmentState enforces exclusive ownership of a Volume between SAN exports
+// and local NAS filesystem attachment (SPDK ublk).
+enum AttachmentState {
+  ATTACHMENT_STATE_UNSPECIFIED = 0;
+  ATTACHMENT_STATE_UNATTACHED = 1;
+  ATTACHMENT_STATE_BLOCK_EXPORT = 2;
+  ATTACHMENT_STATE_FILESYSTEM = 3;
+}
+
+// QosPolicy configures SPDK bdev rate limits (IOPS and bandwidth).
+message QosPolicy {
+  uint64 rw_ios_per_sec = 1;
+  uint64 rw_mbytes_per_sec = 2;
+  uint64 r_mbytes_per_sec = 3;
+  uint64 w_mbytes_per_sec = 4;
+}
+
+// Volume represents a logical volume (SPDK bdev_lvol) inside a Pool.
+message Volume {
+  string id = 1;
+  string name = 2;
+  string pool_id = 3;
+  string uuid = 4;
+  // Raw SPDK lvol bdev alias (e.g., "<lvs_name>/<vol_name>").
+  string lvol_bdev_name = 5;
+  // Top-level bdev name exposed to exports after optional crypto/compress filter wrapping.
+  string effective_bdev_name = 6;
+  uint64 size_bytes = 7;
+  uint64 allocated_bytes = 8;
+  bool thin_provision = 9;
+  bool read_only = 10;
+  string parent_snapshot_id = 11;
+  FilterPolicy filter_policy = 12;
+  QosPolicy qos_policy = 13;
+  AttachmentState attachment_state = 14;
+  HealthStatus health_status = 15;
+  map<string, string> labels = 16;
+  google.protobuf.Timestamp created_at = 17;
+}
+
+// Snapshot represents an immutable point-in-time SPDK bdev_lvol_snapshot.
+message Snapshot {
+  string id = 1;
+  string name = 2;
+  string volume_id = 3;
+  string pool_id = 4;
+  string uuid = 5;
+  string lvol_bdev_name = 6;
+  uint64 size_bytes = 7;
+  uint64 allocated_bytes = 8;
+  string parent_snapshot_id = 9;
+  uint64 sequence_number = 10;
+  google.protobuf.Timestamp created_at = 11;
+}
+
+// BlockExtent describes a contiguous range of allocated or changed clusters
+// for Changed Block Tracking (CBT) and Kubernetes CSI SnapshotMetadata.
+message BlockExtent {
+  uint64 offset_bytes = 1;
+  uint64 size_bytes = 2;
+}
+
+message CreateVolumeRequest {
+  string name = 1;
+  string pool_id = 2;
+  uint64 size_bytes = 3;
+  bool thin_provision = 4;
+  FilterPolicy filter_policy = 5;
+  QosPolicy qos_policy = 6;
+  map<string, string> labels = 7;
+}
+
+message CreateVolumeResponse {
+  Volume volume = 1;
+}
+
+message GetVolumeRequest {
+  string id = 1;
+}
+
+message GetVolumeResponse {
+  Volume volume = 1;
+}
+
+message ListVolumesRequest {
+  string pool_id = 1;
+}
+
+message ListVolumesResponse {
+  repeated Volume volumes = 1;
+}
+
+message ResizeVolumeRequest {
+  string id = 1;
+  uint64 new_size_bytes = 2;
+}
+
+message ResizeVolumeResponse {
+  Volume volume = 1;
+}
+
+message SetVolumeQosRequest {
+  string id = 1;
+  QosPolicy qos_policy = 2;
+}
+
+message SetVolumeQosResponse {
+  Volume volume = 1;
+}
+
+message DeleteVolumeRequest {
+  string id = 1;
+}
+
+message DeleteVolumeResponse {}
+
+message CreateSnapshotRequest {
+  string volume_id = 1;
+  string name = 2;
+}
+
+message CreateSnapshotResponse {
+  Snapshot snapshot = 1;
+}
+
+message GetSnapshotRequest {
+  string id = 1;
+}
+
+message GetSnapshotResponse {
+  Snapshot snapshot = 1;
+}
+
+message ListSnapshotsRequest {
+  string volume_id = 1;
+  string pool_id = 2;
+}
+
+message ListSnapshotsResponse {
+  repeated Snapshot snapshots = 1;
+}
+
+message DeleteSnapshotRequest {
+  string id = 1;
+}
+
+message DeleteSnapshotResponse {}
+
+message CloneSnapshotRequest {
+  string snapshot_id = 1;
+  string clone_name = 2;
+  FilterPolicy filter_policy = 3;
+  QosPolicy qos_policy = 4;
+  map<string, string> labels = 5;
+}
+
+message CloneSnapshotResponse {
+  Volume volume = 1;
+}
+
+message GetSnapshotAllocatedBlocksRequest {
+  string snapshot_id = 1;
+  uint64 starting_offset_bytes = 2;
+  uint64 max_results = 3;
+}
+
+message GetSnapshotAllocatedBlocksResponse {
+  string snapshot_id = 1;
+  uint64 volume_size_bytes = 2;
+  uint32 cluster_size_bytes = 3;
+  repeated BlockExtent extents = 4;
+  uint64 next_offset_bytes = 5;
+}
+
+message GetSnapshotChangedBlocksRequest {
+  string base_snapshot_id = 1;
+  string target_snapshot_id = 2;
+  uint64 starting_offset_bytes = 3;
+  uint64 max_results = 4;
+}
+
+message GetSnapshotChangedBlocksResponse {
+  string base_snapshot_id = 1;
+  string target_snapshot_id = 2;
+  uint64 volume_size_bytes = 3;
+  uint32 cluster_size_bytes = 4;
+  repeated BlockExtent extents = 5;
+  uint64 next_offset_bytes = 6;
+}
+
+service VolumeService {
+  rpc CreateVolume(CreateVolumeRequest) returns (CreateVolumeResponse) {
+    option (google.api.http) = {
+      post: "/api/v1/volumes"
+      body: "*"
+    };
+  }
+
+  rpc GetVolume(GetVolumeRequest) returns (GetVolumeResponse) {
+    option (google.api.http) = {
+      get: "/api/v1/volumes/{id}"
+    };
+  }
+
+  rpc ListVolumes(ListVolumesRequest) returns (ListVolumesResponse) {
+    option (google.api.http) = {
+      get: "/api/v1/volumes"
+    };
+  }
+
+  rpc ResizeVolume(ResizeVolumeRequest) returns (ResizeVolumeResponse) {
+    option (google.api.http) = {
+      post: "/api/v1/volumes/{id}:resize"
+      body: "*"
+    };
+  }
+
+  rpc SetVolumeQos(SetVolumeQosRequest) returns (SetVolumeQosResponse) {
+    option (google.api.http) = {
+      put: "/api/v1/volumes/{id}/qos"
+      body: "*"
+    };
+  }
+
+  rpc DeleteVolume(DeleteVolumeRequest) returns (DeleteVolumeResponse) {
+    option (google.api.http) = {
+      delete: "/api/v1/volumes/{id}"
+    };
+  }
+
+  rpc CreateSnapshot(CreateSnapshotRequest) returns (CreateSnapshotResponse) {
+    option (google.api.http) = {
+      post: "/api/v1/volumes/{volume_id}/snapshots"
+      body: "*"
+    };
+  }
+
+  rpc GetSnapshot(GetSnapshotRequest) returns (GetSnapshotResponse) {
+    option (google.api.http) = {
+      get: "/api/v1/snapshots/{id}"
+    };
+  }
+
+  rpc ListSnapshots(ListSnapshotsRequest) returns (ListSnapshotsResponse) {
+    option (google.api.http) = {
+      get: "/api/v1/snapshots"
+    };
+  }
+
+  rpc DeleteSnapshot(DeleteSnapshotRequest) returns (DeleteSnapshotResponse) {
+    option (google.api.http) = {
+      delete: "/api/v1/snapshots/{id}"
+    };
+  }
+
+  rpc CloneSnapshot(CloneSnapshotRequest) returns (CloneSnapshotResponse) {
+    option (google.api.http) = {
+      post: "/api/v1/snapshots/{snapshot_id}:clone"
+      body: "*"
+    };
+  }
+
+  rpc GetSnapshotAllocatedBlocks(GetSnapshotAllocatedBlocksRequest) returns (GetSnapshotAllocatedBlocksResponse) {
+    option (google.api.http) = {
+      get: "/api/v1/snapshots/{snapshot_id}/blocks:allocated"
+    };
+  }
+
+  rpc GetSnapshotChangedBlocks(GetSnapshotChangedBlocksRequest) returns (GetSnapshotChangedBlocksResponse) {
+    option (google.api.http) = {
+      get: "/api/v1/snapshots/{target_snapshot_id}/blocks:changed"
+    };
+  }
+}

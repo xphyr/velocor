@@ -1,0 +1,52 @@
+syntax = "proto3";
+
+package velocor.v1;
+
+option go_package = "github.com/velocor/velocor/api/gen/go/velocor/v1;velocorv1";
+
+// HealthStatus represents the operational state of a managed storage resource.
+enum HealthStatus {
+  HEALTH_STATUS_UNSPECIFIED = 0;
+  HEALTH_STATUS_ONLINE = 1;
+  HEALTH_STATUS_DEGRADED = 2;
+  HEALTH_STATUS_OFFLINE = 3;
+  HEALTH_STATUS_FAULTED = 4;
+  HEALTH_STATUS_RECONCILING = 5;
+}
+
+// DiskType categorizes physical flash media tiers.
+enum DiskType {
+  DISK_TYPE_UNSPECIFIED = 0;
+  // PCIe NVMe flash bound to vfio-pci/uio and polled via SPDK bdev_nvme.
+  DISK_TYPE_NVME = 1;
+  // SATA/SAS SSD claimed exclusively via Linux io_uring (SPDK bdev_uring).
+  DISK_TYPE_SSD = 2;
+}
+
+// CompressionAlgorithm defines supported SPDK bdev_compress algorithms.
+enum CompressionAlgorithm {
+  COMPRESSION_ALGORITHM_UNSPECIFIED = 0;
+  COMPRESSION_ALGORITHM_LZ4 = 1;
+  COMPRESSION_ALGORITHM_DEFLATE = 2;
+}
+
+// FilterPolicy defines stackable SPDK filter bdev layers (crypto / compression)
+// applied transparently over a Pool base bdev or Volume lvol bdev.
+message FilterPolicy {
+  bool encryption_enabled = 1;
+  string key_id = 2;
+  bool compression_enabled = 3;
+  CompressionAlgorithm compression_algo = 4;
+}
+
+// PaginationRequest specifies page size and cursor token for list operations.
+message PaginationRequest {
+  int32 page_size = 1;
+  string page_token = 2;
+}
+
+// PaginationResponse returns the next page cursor token and total count.
+message PaginationResponse {
+  string next_page_token = 1;
+  int32 total_count = 2;
+}
