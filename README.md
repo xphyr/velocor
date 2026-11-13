@@ -484,3 +484,9 @@ spec:
 - [Architecture Guide](docs/ARCHITECTURE.md) — Decoupled control/data planes, two-tier flash management, filter bdevs, CBT, and unified API design.
 - [Implementation Roadmap](docs/ROADMAP.md) — Phase-by-phase breakdown of completed subsystems.
 - [QEMU/KVM 2-Node Lab Guide](hack/vm-lab/README.md) — Local virtualized SAN + initiator testing instructions.
+
+---
+
+## License
+
+Velocor is licensed under the [Apache License 2.0](LICENSE).
