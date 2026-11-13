@@ -1,7 +1,8 @@
 # Binaries
-bin/
-velod
-veloctl
+/bin/
+/velod
+/veloctl
+/velocor-csi
 
 # Go build / test artifacts
 *.exe
