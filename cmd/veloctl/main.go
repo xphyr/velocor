@@ -105,6 +105,8 @@ func dispatch(cfg *cliConfig, args []string) error {
 		return runInitiatorGroup(cfg, sub)
 	case "export":
 		return runExport(cfg, sub)
+	case "group-snapshot", "gsnap", "vgs":
+		return runGroupSnapshot(cfg, sub)
 	default:
 		return fmt.Errorf("unknown command %q (run 'veloctl -h' for usage)", cmd)
 	}
@@ -284,7 +286,7 @@ func runToken(cfg *cliConfig, args []string) error {
 
 func runSystem(cfg *cliConfig, args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("subcommand required: status | reconcile | iostats | upgrade | rollback")
+		return fmt.Errorf("subcommand required: status | os | reconcile | iostats | upgrade | rollback | reboot | check-updates | update-containers")
 	}
 	switch args[0] {
 	case "status":
@@ -330,10 +332,11 @@ func runSystem(cfg *cliConfig, args []string) error {
 		return tw.Flush()
 
 	case "upgrade":
-		if len(args) < 2 {
-			return fmt.Errorf("usage: veloctl system upgrade <oci-image-ref>")
+		imageRef := ""
+		if len(args) >= 2 {
+			imageRef = args[1]
 		}
-		resp, err := cfg.request("POST", "/api/v1/system/upgrade", map[string]any{"image_ref": args[1]})
+		resp, err := cfg.request("POST", "/api/v1/system/upgrade", map[string]any{"image_ref": imageRef})
 		if err != nil {
 			return err
 		}
@@ -341,6 +344,59 @@ func runSystem(cfg *cliConfig, args []string) error {
 
 	case "rollback":
 		resp, err := cfg.request("POST", "/api/v1/system/rollback", map[string]any{})
+		if err != nil {
+			return err
+		}
+		return printJSON(resp)
+
+	case "os":
+		resp, err := cfg.request("GET", "/api/v1/system/os", nil)
+		if err != nil {
+			return err
+		}
+		if cfg.jsonOutput {
+			return printJSON(resp)
+		}
+		fmt.Printf("Bootc Available: %v\n", resp["available"])
+		if msg, ok := resp["message"].(string); ok && msg != "" {
+			fmt.Printf("Message:         %s\n", msg)
+		}
+		for _, slot := range []string{"booted", "staged", "rollback"} {
+			if m, ok := resp[slot].(map[string]any); ok {
+				fmt.Printf("%-16s %v (version=%v digest=%v)\n", strings.ToUpper(slot)+":", m["image"], m["version"], m["image_digest"])
+			}
+		}
+		return nil
+
+	case "reboot":
+		resp, err := cfg.request("POST", "/api/v1/system/reboot", map[string]any{})
+		if err != nil {
+			return err
+		}
+		return printJSON(resp)
+
+	case "check-updates", "containers":
+		resp, err := cfg.request("GET", "/api/v1/system/containers/updates", nil)
+		if err != nil {
+			return err
+		}
+		if cfg.jsonOutput {
+			return printJSON(resp)
+		}
+		fmt.Printf("Updates Available: %v (checked %v)\n", resp["updates_available"], resp["checked_at"])
+		tw := newTabWriter()
+		fmt.Fprintln(tw, "UNIT\tCONTAINER\tIMAGE\tUPDATE STATUS\tRUNNING")
+		for _, c := range sliceOfMaps(resp["containers"]) {
+			fmt.Fprintf(tw, "%v\t%v\t%v\t%v\t%v\n",
+				c["unit"], c["container_name"], c["image"], c["update_status"], c["running_status"])
+		}
+		return tw.Flush()
+
+	case "update-containers":
+		fs := flag.NewFlagSet("system update-containers", flag.ExitOnError)
+		unit := fs.String("unit", "", "Optional systemd unit name (e.g. velocor-velod.service)")
+		_ = fs.Parse(args[1:])
+		resp, err := cfg.request("POST", "/api/v1/system/containers/update", map[string]any{"unit": *unit})
 		if err != nil {
 			return err
 		}
@@ -660,6 +716,78 @@ func runSnapshot(cfg *cliConfig, args []string) error {
 	}
 }
 
+func runGroupSnapshot(cfg *cliConfig, args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("subcommand required: list | get | create | delete")
+	}
+	switch args[0] {
+	case "list":
+		resp, err := cfg.request("GET", "/api/v1/volume-group-snapshots", nil)
+		if err != nil {
+			return err
+		}
+		if cfg.jsonOutput {
+			return printJSON(resp)
+		}
+		tw := newTabWriter()
+		fmt.Fprintln(tw, "ID\tNAME\tVOLUMES\tSNAPSHOTS\tREADY\tCREATED")
+		for _, g := range sliceOfMaps(resp["volume_group_snapshots"]) {
+			vols, _ := g["volume_ids"].([]any)
+			snaps, _ := g["snapshot_ids"].([]any)
+			fmt.Fprintf(tw, "%v\t%v\t%d\t%d\t%v\t%v\n",
+				g["id"], g["name"], len(vols), len(snaps), g["ready_to_use"], g["created_at"])
+		}
+		return tw.Flush()
+
+	case "get":
+		if len(args) < 2 {
+			return fmt.Errorf("usage: veloctl group-snapshot get <group-snapshot-id>")
+		}
+		resp, err := cfg.request("GET", "/api/v1/volume-group-snapshots/"+args[1], nil)
+		if err != nil {
+			return err
+		}
+		return printJSON(resp)
+
+	case "create":
+		fs := flag.NewFlagSet("group-snapshot create", flag.ExitOnError)
+		name := fs.String("name", "", "Group snapshot name")
+		volumesCSV := fs.String("volumes", "", "Comma-separated volume IDs")
+		_ = fs.Parse(args[1:])
+		if *name == "" || *volumesCSV == "" {
+			return fmt.Errorf("--name and --volumes are required")
+		}
+		var volIDs []string
+		for _, v := range strings.Split(*volumesCSV, ",") {
+			if trimmed := strings.TrimSpace(v); trimmed != "" {
+				volIDs = append(volIDs, trimmed)
+			}
+		}
+		resp, err := cfg.request("POST", "/api/v1/volume-group-snapshots", map[string]any{
+			"name":       *name,
+			"volume_ids": volIDs,
+		})
+		if err != nil {
+			return err
+		}
+		return printJSON(resp)
+
+	case "delete":
+		if len(args) < 2 {
+			return fmt.Errorf("usage: veloctl group-snapshot delete <group-snapshot-id>")
+		}
+		_, err := cfg.request("DELETE", "/api/v1/volume-group-snapshots/"+args[1], nil)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("Deleted volume group snapshot %s\n", args[1])
+		return nil
+
+	default:
+		return fmt.Errorf("unknown group-snapshot subcommand %q", args[0])
+	}
+}
+
 func runPortal(cfg *cliConfig, args []string) error {
 	if len(args) == 0 {
 		return fmt.Errorf("subcommand required: list | create | delete")
@@ -943,11 +1071,12 @@ Usage:
 Commands:
   login             Authenticate admin session and cache JWT
   token             Manage scoped service tokens (list, create, revoke)
-  system            Appliance status, reconcile, iostats, bootc upgrade/rollback
+  system            Appliance status, OS/container updates, bootc upgrade/rollback
   disk              List, scan, claim, or release NVMe and SSD drives
   pool              Create, list, or delete SPDK RAID + lvol_store pools
   volume            Create, list, resize, set QoS, or delete logical volumes
   snapshot          Create, list, clone, delete snapshots & query CBT blocks
+  group-snapshot    Create, list, get, or delete consistency group snapshots
   portal            Manage NVMe-oF and iSCSI network portals
   initiator-group   Manage host NQN/IQN ACL initiator groups
   export            Create, list, or delete NVMe-oF and iSCSI volume exports

@@ -89,6 +89,36 @@ make containers IMAGE_PREFIX=registry.example.com/velocor
 make push-containers IMAGE_PREFIX=registry.example.com/velocor
 ```
 
+### Build a Local `qcow2` VM Image
+
+To build a bootable `qcow2` disk image locally for running `velocor-os` on another hypervisor or VM host (via `bootc-image-builder`):
+
+```bash
+# Builds container-bootc and writes output/qcow2/disk.qcow2 (requires sudo for bootc-image-builder)
+make qcow2
+```
+
+If you want to customize the output directory, root filesystem, or `bootc` image tag:
+
+```bash
+make qcow2 QCOW2_OUTPUT_DIR=./build-qcow2 QCOW2_ROOTFS=xfs BOOTC_IMAGE=registry.example.com/velocor/velocor-os:latest
+```
+
+#### Adding a Custom User or SSH Key to the `qcow2` Image
+
+Before running `make qcow2`, create `deploy/bootc/config.toml` (or pass `BIB_CONFIG=/path/to/config.toml`). The `Makefile` automatically mounts it into `bootc-image-builder` when present:
+
+```toml
+[[customizations.user]]
+name = "velocor"
+# Optional password (or hashed password); omit to allow SSH key login only
+password = "changeme"
+key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI... operator@workstation"
+groups = ["wheel"]
+```
+
+You can also inject an SSH key for `root` by adding a second `[[customizations.user]]` block with `name = "root"` and `key = "ssh-ed25519 ..."`. Then run `make qcow2` and boot `output/qcow2/disk.qcow2` on your target machine.
+
 ---
 
 ## Installing the Velocor Storage Appliance

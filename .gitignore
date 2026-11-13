@@ -16,6 +16,7 @@ vendor/
 *.sock
 *.qcow2
 *.raw
+/output/
 hack/vm-lab/.vms/
 
 # IDE / OS

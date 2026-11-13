@@ -7,6 +7,7 @@
     pools: [],
     volumes: [],
     snapshots: [],
+    groupSnapshots: [],
     portals: [],
     hosts: [],
     initiatorGroups: [],
@@ -15,6 +16,9 @@
     tokens: [],
     me: { username: "", role: "" },
     iostats: { tick_rate: 0, stats: [] },
+    osStatus: null,
+    containerUpdates: null,
+    network: null,
     prevIostat: null,
     prevIostatAt: 0,
     pollTimer: null,
@@ -119,18 +123,22 @@
       return;
     }
     try {
-      const [me, sys, disks, pools, vols, snaps, portals, hosts, igs, exps, iostats] = await Promise.all([
+      const [me, sys, disks, pools, vols, snaps, gsnaps, portals, hosts, igs, exps, iostats, osStatus, containerUpdates, network] = await Promise.all([
         api("GET", "/api/v1/auth/me").catch(() => ({ username: "", role: "" })),
         api("GET", "/api/v1/system/status"),
         api("GET", "/api/v1/disks"),
         api("GET", "/api/v1/pools"),
         api("GET", "/api/v1/volumes"),
         api("GET", "/api/v1/snapshots"),
+        api("GET", "/api/v1/volume-group-snapshots").catch(() => ({ volume_group_snapshots: [] })),
         api("GET", "/api/v1/portals"),
         api("GET", "/api/v1/hosts"),
         api("GET", "/api/v1/initiator-groups"),
         api("GET", "/api/v1/exports"),
         api("GET", "/api/v1/system/iostats").catch(() => ({ tick_rate: 0, stats: [] })),
+        api("GET", "/api/v1/system/os").catch(() => null),
+        api("GET", "/api/v1/system/containers/updates").catch(() => null),
+        api("GET", "/api/v1/system/network").catch(() => null),
       ]);
       state.me = me || { username: "", role: "" };
       state.system = sys;
@@ -138,10 +146,14 @@
       state.pools = pools.pools || [];
       state.volumes = vols.volumes || [];
       state.snapshots = snaps.snapshots || [];
+      state.groupSnapshots = gsnaps.volume_group_snapshots || [];
       state.portals = portals.portals || [];
       state.hosts = hosts.hosts || [];
       state.initiatorGroups = igs.initiator_groups || [];
       state.exports = exps.exports || [];
+      state.osStatus = osStatus;
+      state.containerUpdates = containerUpdates;
+      state.network = network;
       updateIostats(iostats);
 
       if (state.tab === "access" && isAdmin()) {
@@ -175,14 +187,17 @@
   function renderAll() {
     renderTopbar();
     renderOverview();
+    renderLifecycle();
     renderDisks();
     renderPools();
     renderVolumes();
     renderSnapshots();
+    renderGroupSnapshots();
     renderExports();
     renderPortals();
     renderHosts();
     renderInitiatorGroups();
+    renderNetwork();
     if (state.tab === "access") {
       const admin = isAdmin();
       $("users-card").classList.toggle("hidden", !admin);
@@ -390,6 +405,148 @@
           <td><div class="actions-cell">
             <button class="btn btn-sm" data-snap-clone="${escapeHtml(sn.id)}">Clone</button>
             <button class="btn btn-danger btn-sm" data-snap-delete="${escapeHtml(sn.id)}">Delete</button>
+          </div></td>
+        </tr>
+      `;
+    }).join("");
+  }
+
+  function renderGroupSnapshots() {
+    const tbody = $("gsnaps-tbody");
+    if (!tbody) return;
+    if (!state.groupSnapshots.length) {
+      tbody.innerHTML = `<tr><td colspan="6" class="muted">No volume group snapshots created yet</td></tr>`;
+      return;
+    }
+    const volById = {};
+    for (const v of state.volumes) volById[v.id] = v.name;
+    tbody.innerHTML = state.groupSnapshots.map((gs) => {
+      const volNames = (gs.volume_ids || []).map((id) => volById[id] || id).join(", ");
+      const snapCount = (gs.snapshot_ids || []).length;
+      return `
+        <tr>
+          <td><strong>${escapeHtml(gs.name)}</strong></td>
+          <td class="mono">${escapeHtml(gs.id)}</td>
+          <td>${escapeHtml(volNames || "--")}</td>
+          <td>${snapCount} snapshot(s)</td>
+          <td class="mono">${escapeHtml(gs.created_at || "--")}</td>
+          <td><div class="actions-cell">
+            <button class="btn btn-danger btn-sm" data-gsnap-delete="${escapeHtml(gs.id)}">Delete</button>
+          </div></td>
+        </tr>
+      `;
+    }).join("");
+  }
+
+  function renderLifecycle() {
+    const summaryEl = $("os-status-summary");
+    const tbody = $("containers-tbody");
+    if (!summaryEl || !tbody) return;
+
+    const os = state.osStatus;
+    const cu = state.containerUpdates;
+
+    const booted = os && os.booted ? os.booted : null;
+    const staged = os && os.staged ? os.staged : null;
+    const rollback = os && os.rollback ? os.rollback : null;
+
+    const osStateLabel = !os
+      ? "Unavailable"
+      : os.available
+        ? (staged ? "Upgrade Staged" : "Booted")
+        : "Not bootc";
+
+    const updateSummary = !cu
+      ? "Unavailable"
+      : !cu.available
+        ? "Not available"
+        : cu.updates_available
+          ? "Updates Available"
+          : "Up to Date";
+
+    summaryEl.innerHTML = `
+      <div class="card">
+        <div class="kpi-label">Bootc OS</div>
+        <div class="kpi-value">${escapeHtml(booted ? (booted.version || "booted") : osStateLabel)}</div>
+        <div class="kpi-sub mono">${escapeHtml(booted ? booted.image : (os && os.message ? os.message : "bootc status unavailable"))}</div>
+      </div>
+      <div class="card">
+        <div class="kpi-label">Staged / Rollback</div>
+        <div class="kpi-value">${escapeHtml(staged ? (staged.version || "staged") : (rollback ? (rollback.version || "rollback ready") : "None"))}</div>
+        <div class="kpi-sub mono">${escapeHtml(staged ? staged.image : (rollback ? `Rollback: ${rollback.image}` : "No pending OS deployment"))}</div>
+      </div>
+      <div class="card">
+        <div class="kpi-label">Container Updates</div>
+        <div class="kpi-value">${escapeHtml(updateSummary)}</div>
+        <div class="kpi-sub">${escapeHtml(cu && cu.last_update_state ? `Last apply: ${cu.last_update_state} — ${cu.last_update_message || ""}` : (cu && cu.message ? cu.message : "Checked via podman auto-update"))}</div>
+      </div>
+    `;
+
+    const containers = (cu && cu.containers) || [];
+    if (!containers.length) {
+      tbody.innerHTML = `<tr><td colspan="7" class="muted">No Quadlet / AutoUpdate containers reported (${escapeHtml((cu && cu.message) || "unavailable")})</td></tr>`;
+      return;
+    }
+
+    tbody.innerHTML = containers.map((c) => {
+      const badgeClass = c.update_available ? "badge-warn" : "badge-ok";
+      const updateText = c.update_available ? "Update available" : (c.update_status || "Up to date");
+      return `
+        <tr>
+          <td class="mono">${escapeHtml(c.unit || "--")}</td>
+          <td class="mono">${escapeHtml(c.container_name || "--")}</td>
+          <td class="mono">${escapeHtml(c.image || "--")}</td>
+          <td>${escapeHtml(c.policy || "--")}</td>
+          <td>${escapeHtml(c.running_status || "--")}</td>
+          <td><span class="badge ${badgeClass}">${escapeHtml(updateText)}</span></td>
+          <td><div class="actions-cell">
+            <button class="btn btn-sm" data-container-update="${escapeHtml(c.unit || "")}" ${c.unit ? "" : "disabled"}>Update</button>
+          </div></td>
+        </tr>
+      `;
+    }).join("");
+  }
+
+  function renderNetwork() {
+    const summaryEl = $("network-summary");
+    const tbody = $("network-tbody");
+    if (!summaryEl || !tbody) return;
+
+    const net = state.network;
+    if (!net || !net.available) {
+      summaryEl.textContent = (net && net.message) || "Network interface telemetry unavailable";
+      tbody.innerHTML = `<tr><td colspan="9" class="muted">No network interfaces reported</td></tr>`;
+      return;
+    }
+
+    const canEdit = Boolean(net.nmcli_available) && isAdmin();
+    summaryEl.textContent = `Host: ${net.hostname || "--"} · NetworkManager: ${net.nmcli_available ? "active (configurable)" : "not detected (read-only)"}${!isAdmin() ? " · Admin role required to modify" : ""}`;
+
+    const ifaces = net.interfaces || [];
+    if (!ifaces.length) {
+      tbody.innerHTML = `<tr><td colspan="9" class="muted">No physical or bridge interfaces detected</td></tr>`;
+      return;
+    }
+
+    tbody.innerHTML = ifaces.map((iface) => {
+      const badgeCls = iface.link_up ? "badge-ok" : "badge-muted";
+      const addrs = (iface.addresses || []).join(", ") || "--";
+      const gwDns = [
+        iface.gateway ? `GW ${iface.gateway}` : "",
+        (iface.dns && iface.dns.length) ? `DNS ${iface.dns.join(", ")}` : "",
+      ].filter(Boolean).join(" · ") || "--";
+      return `
+        <tr>
+          <td><strong>${escapeHtml(iface.name)}</strong>${iface.connection ? `<div class="muted" style="font-size:0.75rem">${escapeHtml(iface.connection)}</div>` : ""}</td>
+          <td>${escapeHtml(iface.type || "--")}</td>
+          <td><span class="badge ${badgeCls}">${escapeHtml(iface.state || "UNKNOWN")}</span></td>
+          <td class="mono">${escapeHtml(iface.mac || "--")}</td>
+          <td class="mono">${escapeHtml(iface.mtu || "--")}</td>
+          <td>${escapeHtml(iface.method || "--")}</td>
+          <td class="mono">${escapeHtml(addrs)}</td>
+          <td class="mono">${escapeHtml(gwDns)}</td>
+          <td><div class="actions-cell">
+            <button class="btn btn-sm" data-net-config="${escapeHtml(iface.name)}" ${canEdit ? "" : "disabled"}>Configure</button>
           </div></td>
         </tr>
       `;
@@ -1147,6 +1304,209 @@
       e.target.reset();
       toast("Password updated");
     } catch (err) { toast(err.message, "err"); }
+  });
+
+  $("btn-open-create-gsnap").addEventListener("click", () => {
+    const volChecks = state.volumes.map((v) => `
+      <label style="display:flex;align-items:center;gap:0.5rem;padding:0.25rem 0">
+        <input type="checkbox" name="volume_ids" value="${escapeHtml(v.id)}" />
+        <span><strong>${escapeHtml(v.name)}</strong> <span class="muted mono">(${escapeHtml(v.id)})</span></span>
+      </label>
+    `).join("");
+    openModal("Create Volume Group Snapshot", `
+      <form id="form-gsnap" style="display:flex;flex-direction:column;gap:0.85rem">
+        <div class="field"><label>Group Snapshot Name</label><input name="name" required placeholder="app-consistent-snap-01" /></div>
+        <div class="field">
+          <label>Member Volumes</label>
+          <div style="max-height:180px;overflow:auto;border:1px solid var(--border);border-radius:6px;padding:0.5rem">
+            ${volChecks || `<span class="muted">No volumes available</span>`}
+          </div>
+        </div>
+        <div class="modal-footer"><button type="submit" class="btn btn-primary" ${state.volumes.length ? "" : "disabled"}>Create Group Snapshot</button></div>
+      </form>
+    `, () => {
+      $("form-gsnap").addEventListener("submit", async (e) => {
+        e.preventDefault();
+        const fd = new FormData(e.target);
+        const volumeIds = fd.getAll("volume_ids").map(String);
+        if (!volumeIds.length) {
+          toast("Select at least one volume", "err");
+          return;
+        }
+        try {
+          await api("POST", "/api/v1/volume-group-snapshots", {
+            name: fd.get("name"),
+            volume_ids: volumeIds,
+          });
+          closeModal();
+          toast("Volume group snapshot created");
+          await refreshAll();
+        } catch (err) { toast(err.message, "err"); }
+      });
+    });
+  });
+
+  $("gsnaps-tbody").addEventListener("click", async (e) => {
+    const delBtn = e.target.closest("[data-gsnap-delete]");
+    if (!delBtn) return;
+    const id = delBtn.dataset.gsnapDelete;
+    if (!confirm(`Delete volume group snapshot ${id} and its member snapshots?`)) return;
+    try {
+      await api("DELETE", `/api/v1/volume-group-snapshots/${encodeURIComponent(id)}`);
+      toast("Volume group snapshot deleted");
+      await refreshAll();
+    } catch (err) { toast(err.message, "err"); }
+  });
+
+  $("btn-check-updates").addEventListener("click", async () => {
+    try {
+      state.containerUpdates = await api("GET", "/api/v1/system/containers/updates");
+      renderLifecycle();
+      toast(state.containerUpdates.updates_available ? "Container updates available" : "Containers checked");
+    } catch (err) { toast(err.message, "err"); }
+  });
+
+  async function triggerContainerUpdate(unit) {
+    const label = unit ? `unit ${unit}` : "all AutoUpdate containers";
+    if (!confirm(`Apply container updates for ${label}? Running services may briefly restart.`)) return;
+    try {
+      const res = await api("POST", "/api/v1/system/containers/update", { unit: unit || "" });
+      toast(res.message || "Container update scheduled");
+      setTimeout(() => refreshAll(), 1500);
+    } catch (err) { toast(err.message, "err"); }
+  }
+
+  $("btn-apply-updates").addEventListener("click", () => triggerContainerUpdate(""));
+  $("containers-tbody").addEventListener("click", (e) => {
+    const btn = e.target.closest("[data-container-update]");
+    if (!btn) return;
+    triggerContainerUpdate(btn.dataset.containerUpdate);
+  });
+
+  $("btn-os-upgrade").addEventListener("click", () => {
+    openModal("Upgrade / Switch velocor-os (bootc)", `
+      <form id="form-os-upgrade" style="display:flex;flex-direction:column;gap:0.85rem">
+        <div class="field">
+          <label>OCI Image Reference (leave blank for bootc upgrade)</label>
+          <input name="image_ref" placeholder="ghcr.io/markd/velocor-os:latest" />
+        </div>
+        <div class="modal-footer"><button type="submit" class="btn btn-primary">Stage OS Upgrade</button></div>
+      </form>
+    `, () => {
+      $("form-os-upgrade").addEventListener("submit", async (e) => {
+        e.preventDefault();
+        const fd = new FormData(e.target);
+        try {
+          const res = await api("POST", "/api/v1/system/upgrade", {
+            image_ref: String(fd.get("image_ref") || "").trim(),
+          });
+          closeModal();
+          toast(res.message || "OS upgrade staged");
+          await refreshAll();
+        } catch (err) { toast(err.message, "err"); }
+      });
+    });
+  });
+
+  $("btn-os-rollback").addEventListener("click", async () => {
+    if (!confirm("Stage rollback to the previous bootc OS deployment?")) return;
+    try {
+      const res = await api("POST", "/api/v1/system/rollback", {});
+      toast(res.message || "OS rollback staged");
+      await refreshAll();
+    } catch (err) { toast(err.message, "err"); }
+  });
+
+  $("btn-os-reboot").addEventListener("click", async () => {
+    if (!confirm("Reboot the velocor-os appliance now? Active storage I/O will be interrupted.")) return;
+    try {
+      const res = await api("POST", "/api/v1/system/reboot", {});
+      toast(res.message || "Appliance reboot initiated");
+    } catch (err) { toast(err.message, "err"); }
+  });
+
+  $("btn-refresh-network").addEventListener("click", async () => {
+    try {
+      state.network = await api("GET", "/api/v1/system/network");
+      renderNetwork();
+      toast("Network interfaces refreshed");
+    } catch (err) { toast(err.message, "err"); }
+  });
+
+  $("network-tbody").addEventListener("click", (e) => {
+    const btn = e.target.closest("[data-net-config]");
+    if (!btn) return;
+    const ifName = btn.dataset.netConfig;
+    const iface = ((state.network && state.network.interfaces) || []).find((i) => i.name === ifName);
+    if (!iface) return;
+    const currentMethod = (iface.method === "manual" || iface.method === "disabled") ? iface.method : "dhcp";
+    const currentAddr = (iface.addresses && iface.addresses[0]) || "";
+    const currentDNS = (iface.dns || []).join(", ");
+
+    openModal(`Configure Interface: ${ifName}`, `
+      <form id="form-net-config" style="display:flex;flex-direction:column;gap:0.85rem">
+        <div class="muted" style="font-size:0.85rem">
+          Applying changes to the management interface may disconnect your active browser session.
+        </div>
+        <div class="form-grid">
+          <div class="field">
+            <label>IPv4 Method</label>
+            <select name="method" id="net-method-select">
+              <option value="dhcp" ${currentMethod === "dhcp" ? "selected" : ""}>DHCP (Automatic)</option>
+              <option value="manual" ${currentMethod === "manual" ? "selected" : ""}>Static / Manual</option>
+              <option value="disabled" ${currentMethod === "disabled" ? "selected" : ""}>Disabled</option>
+            </select>
+          </div>
+          <div class="field">
+            <label>MTU (576–9216, e.g. 9000 for SAN jumbo frames)</label>
+            <input type="number" name="mtu" min="576" max="9216" value="${escapeHtml(iface.mtu || 1500)}" />
+          </div>
+        </div>
+        <div class="field">
+          <label>IPv4 Address / CIDR (required for Static)</label>
+          <input name="address" id="net-address-input" value="${escapeHtml(currentAddr)}" placeholder="10.10.10.20/24" />
+        </div>
+        <div class="form-grid">
+          <div class="field">
+            <label>Gateway (optional)</label>
+            <input name="gateway" id="net-gateway-input" value="${escapeHtml(iface.gateway || "")}" placeholder="10.10.10.1" />
+          </div>
+          <div class="field">
+            <label>DNS Servers (comma-separated, optional)</label>
+            <input name="dns" id="net-dns-input" value="${escapeHtml(currentDNS)}" placeholder="1.1.1.1, 8.8.8.8" />
+          </div>
+        </div>
+        <div class="modal-footer"><button type="submit" class="btn btn-primary">Apply Interface Config</button></div>
+      </form>
+    `, () => {
+      const toggleFields = () => {
+        const m = $("net-method-select").value;
+        const isManual = m === "manual";
+        $("net-address-input").disabled = !isManual;
+        $("net-gateway-input").disabled = !isManual;
+        $("net-dns-input").disabled = m === "disabled";
+      };
+      $("net-method-select").addEventListener("change", toggleFields);
+      toggleFields();
+
+      $("form-net-config").addEventListener("submit", async (e) => {
+        e.preventDefault();
+        const fd = new FormData(e.target);
+        try {
+          const res = await api("PUT", `/api/v1/system/network/interfaces/${encodeURIComponent(ifName)}`, {
+            method: String(fd.get("method") || "dhcp"),
+            address: String(fd.get("address") || "").trim(),
+            gateway: String(fd.get("gateway") || "").trim(),
+            dns: String(fd.get("dns") || "").trim(),
+            mtu: Number(fd.get("mtu") || 0),
+          });
+          if (res.network) state.network = res.network;
+          closeModal();
+          toast(res.message || `Interface ${ifName} updated`);
+          renderNetwork();
+        } catch (err) { toast(err.message, "err"); }
+      });
+    });
   });
 
   // Live polling loop

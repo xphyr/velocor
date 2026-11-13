@@ -18,12 +18,16 @@ SPDK_IMAGE ?= $(IMAGE_PREFIX)/velocor-spdk:latest
 VELOD_IMAGE ?= $(IMAGE_PREFIX)/velocor-velod:latest
 CSI_IMAGE ?= $(IMAGE_PREFIX)/velocor-csi:latest
 BOOTC_IMAGE ?= $(IMAGE_PREFIX)/velocor-os:latest
+BOOTC_BUILDER_IMAGE ?= quay.io/centos-bootc/bootc-image-builder:latest
+QCOW2_OUTPUT_DIR ?= output
+QCOW2_ROOTFS ?= xfs
+BIB_CONFIG ?= deploy/bootc/config.toml
 PODMAN ?= podman
 SKOPEO ?= skopeo
 
 .PHONY: all build build-velod build-veloctl build-csi proto proto-lint test lint clean \
 	containers container-spdk container-velod container-csi container-bootc \
-	push-containers push-spdk push-velod push-csi push-bootc
+	push-containers push-spdk push-velod push-csi push-bootc qcow2
 
 all: build
 
@@ -79,6 +83,26 @@ push-csi: container-csi
 
 push-bootc: container-bootc
 	$(PODMAN) push $(BOOTC_IMAGE)
+
+qcow2: container-bootc
+	@mkdir -p $(QCOW2_OUTPUT_DIR)
+	@if [ "$$(id -u)" -ne 0 ]; then \
+		echo "Syncing $(BOOTC_IMAGE) into root container storage for bootc-image-builder..."; \
+		$(PODMAN) save $(BOOTC_IMAGE) | sudo $(PODMAN) load; \
+	fi
+	$(if $(shell [ "$$(id -u)" -eq 0 ] || echo sudo),sudo ,)$(PODMAN) run --rm --privileged \
+		--pull=newer \
+		--security-opt label=type:unconfined_t \
+		-v $(CURDIR)/$(QCOW2_OUTPUT_DIR):/output \
+		-v /var/lib/containers/storage:/var/lib/containers/storage \
+		$(if $(wildcard $(BIB_CONFIG)),-v $(CURDIR)/$(BIB_CONFIG):/config.toml:ro,) \
+		$(BOOTC_BUILDER_IMAGE) \
+		--type qcow2 \
+		--rootfs $(QCOW2_ROOTFS) \
+		--local \
+		$(if $(wildcard $(BIB_CONFIG)),--config /config.toml,) \
+		$(BOOTC_IMAGE)
+	@echo "qcow2 image written to $(QCOW2_OUTPUT_DIR)/qcow2/disk.qcow2"
 
 proto:
 	buf generate

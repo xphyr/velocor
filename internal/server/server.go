@@ -17,7 +17,6 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"os/exec"
 	"strconv"
 	"strings"
 	"time"
@@ -149,8 +148,14 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /api/v1/system/status", s.withAuth(store.RoleReadOnly, s.handleSystemStatus))
 	s.mux.HandleFunc("POST /api/v1/system/reconcile", s.withAuth(store.RoleAdmin, s.handleTriggerReconcile))
 	s.mux.HandleFunc("GET /api/v1/system/iostats", s.withAuth(store.RoleReadOnly, s.handleGetIoStats))
+	s.mux.HandleFunc("GET /api/v1/system/os", s.withAuth(store.RoleReadOnly, s.handleGetOSStatus))
 	s.mux.HandleFunc("POST /api/v1/system/upgrade", s.withAuth(store.RoleAdmin, s.handleStageUpgrade))
 	s.mux.HandleFunc("POST /api/v1/system/rollback", s.withAuth(store.RoleAdmin, s.handleRollbackUpgrade))
+	s.mux.HandleFunc("POST /api/v1/system/reboot", s.withAuth(store.RoleAdmin, s.handleRebootSystem))
+	s.mux.HandleFunc("GET /api/v1/system/containers/updates", s.withAuth(store.RoleReadOnly, s.handleCheckContainerUpdates))
+	s.mux.HandleFunc("POST /api/v1/system/containers/update", s.withAuth(store.RoleAdmin, s.handleApplyContainerUpdates))
+	s.mux.HandleFunc("GET /api/v1/system/network", s.withAuth(store.RoleReadOnly, s.handleGetNetwork))
+	s.mux.HandleFunc("PUT /api/v1/system/network/interfaces/{name}", s.withAuth(store.RoleAdmin, s.handleUpdateNetworkInterface))
 }
 
 type contextKey string
@@ -1768,36 +1773,6 @@ func (s *Server) handleGetIoStats(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"tick_rate": res.TickRate,
 		"stats":     res.Bdevs,
-	})
-}
-
-func (s *Server) handleStageUpgrade(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		ImageRef string `json:"image_ref"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || strings.TrimSpace(req.ImageRef) == "" {
-		writeError(w, fmt.Errorf("%w: image_ref is required", store.ErrInvalidArgument))
-		return
-	}
-	cmd := exec.CommandContext(r.Context(), "bootc", "switch", req.ImageRef)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		writeError(w, fmt.Errorf("bootc switch %s failed: %v (%s)", req.ImageRef, err, strings.TrimSpace(string(out))))
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"staged_image_ref": req.ImageRef,
-		"reboot_required":  true,
-	})
-}
-
-func (s *Server) handleRollbackUpgrade(w http.ResponseWriter, r *http.Request) {
-	cmd := exec.CommandContext(r.Context(), "bootc", "rollback")
-	if out, err := cmd.CombinedOutput(); err != nil {
-		writeError(w, fmt.Errorf("bootc rollback failed: %v (%s)", err, strings.TrimSpace(string(out))))
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"reboot_required": true,
 	})
 }
 
