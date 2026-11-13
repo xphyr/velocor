@@ -1,0 +1,47 @@
+{{- if .Values.storageClasses.nvmeTcp.enabled }}
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: {{ .Values.storageClasses.nvmeTcp.name }}
+  labels:
+    {{- include "velocor-csi.labels" . | nindent 4 }}
+  {{- if .Values.storageClasses.nvmeTcp.isDefault }}
+  annotations:
+    storageclass.kubernetes.io/is-default-class: "true"
+  {{- end }}
+provisioner: {{ .Values.driverName }}
+allowVolumeExpansion: {{ .Values.storageClasses.nvmeTcp.allowVolumeExpansion }}
+reclaimPolicy: {{ .Values.storageClasses.nvmeTcp.reclaimPolicy }}
+volumeBindingMode: {{ .Values.storageClasses.nvmeTcp.volumeBindingMode }}
+parameters:
+  protocol: NVMEOF_TCP
+  thin: {{ .Values.storageClasses.nvmeTcp.thin | quote }}
+  csi.storage.k8s.io/fstype: {{ .Values.storageClasses.nvmeTcp.fsType | quote }}
+  {{- if .Values.storageClasses.nvmeTcp.pool }}
+  pool: {{ .Values.storageClasses.nvmeTcp.pool | quote }}
+  {{- end }}
+{{- end }}
+{{- if .Values.storageClasses.iscsi.enabled }}
+---
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: {{ .Values.storageClasses.iscsi.name }}
+  labels:
+    {{- include "velocor-csi.labels" . | nindent 4 }}
+  {{- if .Values.storageClasses.iscsi.isDefault }}
+  annotations:
+    storageclass.kubernetes.io/is-default-class: "true"
+  {{- end }}
+provisioner: {{ .Values.driverName }}
+allowVolumeExpansion: {{ .Values.storageClasses.iscsi.allowVolumeExpansion }}
+reclaimPolicy: {{ .Values.storageClasses.iscsi.reclaimPolicy }}
+volumeBindingMode: {{ .Values.storageClasses.iscsi.volumeBindingMode }}
+parameters:
+  protocol: ISCSI
+  thin: {{ .Values.storageClasses.iscsi.thin | quote }}
+  csi.storage.k8s.io/fstype: {{ .Values.storageClasses.iscsi.fsType | quote }}
+  {{- if .Values.storageClasses.iscsi.pool }}
+  pool: {{ .Values.storageClasses.iscsi.pool | quote }}
+  {{- end }}
+{{- end }}

@@ -367,6 +367,15 @@ Apply the CSI driver manifest (creates the `CSIDriver`, RBAC roles, `velocor-csi
 kubectl apply -f deploy/k8s/csi/velocor-csi.yaml
 ```
 
+Or install using the Helm chart ([deploy/charts/velocor-csi](deploy/charts/velocor-csi)):
+
+```bash
+helm install velocor-csi deploy/charts/velocor-csi \
+  --namespace velocor-csi \
+  --create-namespace \
+  --set auth.existingSecret=velocor-csi-auth
+```
+
 Optionally, install the `VolumeSnapshotClass` and `VolumeGroupSnapshotClass`:
 
 ```bash

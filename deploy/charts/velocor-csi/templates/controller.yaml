@@ -1,0 +1,114 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: velocor-csi-controller
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "velocor-csi.labels" . | nindent 4 }}
+    app: velocor-csi-controller
+spec:
+  replicas: {{ .Values.controller.replicas }}
+  selector:
+    matchLabels:
+      app: velocor-csi-controller
+  template:
+    metadata:
+      labels:
+        app: velocor-csi-controller
+        {{- include "velocor-csi.labels" . | nindent 8 }}
+    spec:
+      serviceAccountName: velocor-csi-controller
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.controller.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.controller.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.controller.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: velocor-csi
+          image: {{ include "velocor-csi.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - --mode=controller
+            - --endpoint=unix:///csi/csi.sock
+            - --driver-name={{ .Values.driverName }}
+          envFrom:
+            - secretRef:
+                name: {{ include "velocor-csi.secretName" . }}
+          {{- if .Values.auth.portalOverride }}
+          env:
+            - name: VELOCOR_PORTAL_OVERRIDE
+              value: {{ .Values.auth.portalOverride | quote }}
+          {{- end }}
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+          {{- with .Values.controller.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+        - name: csi-provisioner
+          image: {{ .Values.sidecars.provisioner.image }}
+          args:
+            - --csi-address=/csi/csi.sock
+            - --feature-gates=Topology=false
+            - --leader-election={{ .Values.controller.leaderElection }}
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+          {{- with .Values.sidecars.provisioner.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+        - name: csi-attacher
+          image: {{ .Values.sidecars.attacher.image }}
+          args:
+            - --csi-address=/csi/csi.sock
+            - --leader-election={{ .Values.controller.leaderElection }}
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+          {{- with .Values.sidecars.attacher.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+        - name: csi-resizer
+          image: {{ .Values.sidecars.resizer.image }}
+          args:
+            - --csi-address=/csi/csi.sock
+            - --leader-election={{ .Values.controller.leaderElection }}
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+          {{- with .Values.sidecars.resizer.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+        - name: csi-snapshotter
+          image: {{ .Values.sidecars.snapshotter.image }}
+          args:
+            - --csi-address=/csi/csi.sock
+            - --leader-election={{ .Values.controller.leaderElection }}
+            {{- if .Values.snapshots.sidecar.groupSnapshotsEnabled }}
+            - --enable-volume-group-snapshots=true
+            {{- end }}
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+          {{- with .Values.sidecars.snapshotter.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+      volumes:
+        - name: socket-dir
+          emptyDir: {}

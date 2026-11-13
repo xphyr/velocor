@@ -1,0 +1,111 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: velocor-csi-node
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "velocor-csi.labels" . | nindent 4 }}
+    app: velocor-csi-node
+spec:
+  selector:
+    matchLabels:
+      app: velocor-csi-node
+  template:
+    metadata:
+      labels:
+        app: velocor-csi-node
+        {{- include "velocor-csi.labels" . | nindent 8 }}
+    spec:
+      serviceAccountName: velocor-csi-node
+      hostNetwork: true
+      hostPID: true
+      dnsPolicy: ClusterFirstWithHostNet
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.node.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.node.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.node.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: velocor-csi
+          image: {{ include "velocor-csi.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            privileged: true
+            capabilities:
+              add: ["SYS_ADMIN"]
+            allowPrivilegeEscalation: true
+          args:
+            - --mode=node
+            - --endpoint=unix:///csi/csi.sock
+            - --driver-name={{ .Values.driverName }}
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+            - name: kubelet-dir
+              mountPath: {{ .Values.node.kubeletDir }}
+              mountPropagation: Bidirectional
+            - name: dev-dir
+              mountPath: /dev
+            - name: etc-iscsi
+              mountPath: /etc/iscsi
+            - name: etc-nvme
+              mountPath: /etc/nvme
+          {{- with .Values.node.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+        - name: csi-node-driver-registrar
+          image: {{ .Values.sidecars.nodeDriverRegistrar.image }}
+          args:
+            - --csi-address=/csi/csi.sock
+            - --kubelet-registration-path={{ .Values.node.kubeletDir }}/plugins/{{ .Values.driverName }}/csi.sock
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+            - name: registration-dir
+              mountPath: /registration
+          {{- with .Values.sidecars.nodeDriverRegistrar.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+      volumes:
+        - name: socket-dir
+          hostPath:
+            path: {{ .Values.node.kubeletDir }}/plugins/{{ .Values.driverName }}
+            type: DirectoryOrCreate
+        - name: registration-dir
+          hostPath:
+            path: {{ .Values.node.kubeletDir }}/plugins_registry
+            type: Directory
+        - name: kubelet-dir
+          hostPath:
+            path: {{ .Values.node.kubeletDir }}
+            type: Directory
+        - name: dev-dir
+          hostPath:
+            path: /dev
+            type: Directory
+        - name: etc-iscsi
+          hostPath:
+            path: /etc/iscsi
+            type: DirectoryOrCreate
+        - name: etc-nvme
+          hostPath:
+            path: /etc/nvme
+            type: DirectoryOrCreate

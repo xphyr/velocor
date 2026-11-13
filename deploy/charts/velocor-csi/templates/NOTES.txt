@@ -1,0 +1,7 @@
+Velocor CSI driver ({{ .Values.driverName }}) has been deployed to namespace {{ .Release.Namespace }}.
+
+Verify the controller and node pods:
+  kubectl -n {{ .Release.Namespace }} get pods -o wide
+
+Check available StorageClasses:
+  kubectl get storageclass

@@ -1,0 +1,90 @@
+driverName: csi.velocor.io
+
+image:
+  repository: ghcr.io/velocor/velocor-csi
+  tag: "" # Defaults to Chart.appVersion
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+# Velocor API authentication
+auth:
+  # Name of an existing Secret containing VELOCOR_ENDPOINT, VELOCOR_TOKEN, and VELOCOR_INSECURE.
+  # If empty and endpoint/token are provided, the chart creates a Secret automatically.
+  existingSecret: ""
+  secretName: velocor-csi-auth
+  endpoint: ""
+  token: ""
+  insecure: "true"
+  # Optional portal IP:port override (useful for NAT'd lab environments)
+  portalOverride: ""
+
+controller:
+  replicas: 1
+  leaderElection: false
+  resources: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+node:
+  kubeletDir: /var/lib/kubelet
+  resources: {}
+  nodeSelector: {}
+  tolerations:
+    - operator: Exists
+  affinity: {}
+
+sidecars:
+  provisioner:
+    image: registry.k8s.io/sig-storage/csi-provisioner:v5.1.0
+    resources: {}
+  attacher:
+    image: registry.k8s.io/sig-storage/csi-attacher:v4.7.0
+    resources: {}
+  resizer:
+    image: registry.k8s.io/sig-storage/csi-resizer:v1.12.0
+    resources: {}
+  snapshotter:
+    image: registry.k8s.io/sig-storage/csi-snapshotter:v8.1.0
+    resources: {}
+  nodeDriverRegistrar:
+    image: registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.12.0
+    resources: {}
+
+storageClasses:
+  nvmeTcp:
+    enabled: true
+    name: velocor-nvme-tcp
+    isDefault: false
+    reclaimPolicy: Delete
+    volumeBindingMode: Immediate
+    allowVolumeExpansion: true
+    thin: "true"
+    pool: ""
+    fsType: ext4
+  iscsi:
+    enabled: true
+    name: velocor-iscsi
+    isDefault: false
+    reclaimPolicy: Delete
+    volumeBindingMode: Immediate
+    allowVolumeExpansion: true
+    thin: "true"
+    pool: ""
+    fsType: ext4
+
+snapshots:
+  volumeSnapshotClass:
+    enabled: true
+    name: velocor-snapshots
+    deletionPolicy: Delete
+    isDefault: false
+  volumeGroupSnapshotClass:
+    # Enable when groupsnapshot.storage.k8s.io CRDs are installed on the cluster
+    enabled: false
+    name: velocor-group-snapshots
+    deletionPolicy: Delete
+  sidecar:
+    # Enables --enable-volume-group-snapshots=true on csi-snapshotter
+    groupSnapshotsEnabled: false

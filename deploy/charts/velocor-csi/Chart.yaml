@@ -1,0 +1,16 @@
+apiVersion: v2
+name: velocor-csi
+description: Kubernetes CSI driver for Velocor all-flash SAN appliances (NVMe-oF/TCP, iSCSI, Snapshots, VolumeGroupSnapshots, and CBT)
+type: application
+version: 0.1.0
+appVersion: "v0.1.0"
+keywords:
+  - csi
+  - storage
+  - nvme-of
+  - iscsi
+  - spdk
+  - velocor
+home: https://github.com/velocor/velocor
+maintainers:
+  - name: Velocor Authors
