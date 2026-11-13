@@ -218,10 +218,22 @@ type Portal struct {
 	CreatedAt time.Time      `json:"created_at"`
 }
 
-// InitiatorGroup defines host ACLs (NVMe-oF Host NQNs, iSCSI Initiator IQNs, CIDRs, CHAP).
+// Host represents a registered SAN initiator host (ESXi, Linux, Kubernetes worker)
+// with its NVMe-oF Host NQN and/or iSCSI Initiator IQN.
+type Host struct {
+	ID           string    `json:"id"`
+	Name         string    `json:"name"`
+	HostNQN      string    `json:"host_nqn,omitempty"`
+	InitiatorIQN string    `json:"initiator_iqn,omitempty"`
+	IPAddress    string    `json:"ip_address,omitempty"`
+	CreatedAt    time.Time `json:"created_at"`
+}
+
+// InitiatorGroup defines host ACLs (registered Host IDs, NVMe-oF Host NQNs, iSCSI Initiator IQNs, CIDRs, CHAP).
 type InitiatorGroup struct {
 	ID                        string    `json:"id"`
 	Name                      string    `json:"name"`
+	HostIDs                   []string  `json:"host_ids,omitempty"`
 	HostNQNs                  []string  `json:"host_nqns,omitempty"`
 	InitiatorIQNs             []string  `json:"initiator_iqns,omitempty"`
 	AllowedCIDRs              []string  `json:"allowed_cidrs,omitempty"`
@@ -250,10 +262,12 @@ type Export struct {
 	CreatedAt         time.Time      `json:"created_at"`
 }
 
-// AdminUser stores the local administrator credentials.
+// AdminUser stores local user credentials and RBAC role.
 type AdminUser struct {
 	Username     string    `json:"username"`
 	PasswordHash string    `json:"password_hash"`
+	Role         Role      `json:"role,omitempty"`
+	CreatedAt    time.Time `json:"created_at,omitempty"`
 	UpdatedAt    time.Time `json:"updated_at"`
 }
 

@@ -36,3 +36,9 @@ This file tracks implementation progress directly inside the Git repository so a
 - [x] Decoupled SPDK & `velod` workload containers (`deploy/containers/Containerfile.spdk`, `deploy/containers/Containerfile.velod`)
 - [x] Systemd Podman Quadlet units (`deploy/quadlets/velocor-spdk.container`, `deploy/quadlets/velocor-velod.container`)
 - [x] `hack/vm-lab/` QEMU/KVM 2-node test environment
+
+## Phase 5: Embedded Web UI Console
+- [x] Zero-dependency HTML/CSS/JS SPA embedded in `velod` via `go:embed` (`internal/server/web/`)
+- [x] JWT login, password management & Personal Access Token (`velo_pat_...`) UI
+- [x] Live SPDK bdev I/O telemetry (`bdev_get_iostat` polling with IOPS, MB/s, and latency)
+- [x] Disks (boot-disk guard, claim/release), Pools, Volumes (QoS/resize), Snapshots & CBT inspector, and SAN Exports (with copyable `nvme`/`iscsiadm` commands)

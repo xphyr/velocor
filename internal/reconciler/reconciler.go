@@ -377,6 +377,11 @@ func (r *Reconciler) ReconcileOnce(ctx context.Context) (State, error) {
 					}
 					for _, gid := range exp.InitiatorGroupIDs {
 						if ig, err := r.store.GetInitiatorGroup(gid); err == nil {
+							for _, hid := range ig.HostIDs {
+								if h, err := r.store.GetHost(hid); err == nil && h.HostNQN != "" {
+									_ = r.spdk.NvmfSubsystemAddHost(ctx, exp.SubsystemNQN, h.HostNQN)
+								}
+							}
 							for _, nqn := range ig.HostNQNs {
 								_ = r.spdk.NvmfSubsystemAddHost(ctx, exp.SubsystemNQN, nqn)
 							}

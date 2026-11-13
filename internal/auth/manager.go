@@ -90,10 +90,13 @@ func NewManager(st store.Store, initPassword string) (*Manager, error) {
 		if err != nil {
 			return nil, fmt.Errorf("hash bootstrap password: %w", err)
 		}
+		now := time.Now().UTC()
 		if err := st.SaveAdminUser(&store.AdminUser{
 			Username:     DefaultAdminUsername,
 			PasswordHash: hash,
-			UpdatedAt:    time.Now().UTC(),
+			Role:         store.RoleAdmin,
+			CreatedAt:    now,
+			UpdatedAt:    now,
 		}); err != nil {
 			return nil, fmt.Errorf("save bootstrap admin user: %w", err)
 		}
@@ -118,11 +121,16 @@ func (m *Manager) Login(username, password string) (string, time.Time, store.Rol
 		return "", time.Time{}, "", ErrUnauthorized
 	}
 
+	role := user.Role
+	if role == "" {
+		role = store.RoleAdmin
+	}
+
 	now := time.Now().UTC()
 	expiresAt := now.Add(m.sessionTTL)
 	claims := Claims{
 		Subject:   user.Username,
-		Role:      store.RoleAdmin,
+		Role:      role,
 		IssuedAt:  now.Unix(),
 		ExpiresAt: expiresAt.Unix(),
 	}
@@ -130,7 +138,7 @@ func (m *Manager) Login(username, password string) (string, time.Time, store.Rol
 	if err != nil {
 		return "", time.Time{}, "", err
 	}
-	return token, expiresAt, store.RoleAdmin, nil
+	return token, expiresAt, role, nil
 }
 
 // ChangePassword updates an admin user's password after verifying the current password.
@@ -154,14 +162,126 @@ func (m *Manager) ChangePassword(username, currentPassword, newPassword string) 
 	return m.store.SaveAdminUser(user)
 }
 
+// ValidateRole verifies that role is a supported RBAC role.
+func ValidateRole(role store.Role) error {
+	switch role {
+	case store.RoleAdmin, store.RoleCSIProvisioner, store.RoleReadOnly:
+		return nil
+	default:
+		return fmt.Errorf("%w: invalid role %q", store.ErrInvalidArgument, role)
+	}
+}
+
+// CreateUser provisions a new local user with the given role and password.
+func (m *Manager) CreateUser(username, password string, role store.Role) (*store.AdminUser, error) {
+	username = strings.TrimSpace(username)
+	if username == "" || strings.ContainsAny(username, " \t\r\n:") {
+		return nil, fmt.Errorf("%w: username must be non-empty without whitespace or colons", store.ErrInvalidArgument)
+	}
+	if len(password) < 8 {
+		return nil, fmt.Errorf("%w: password must be at least 8 characters", store.ErrInvalidArgument)
+	}
+	if role == "" {
+		role = store.RoleReadOnly
+	}
+	if err := ValidateRole(role); err != nil {
+		return nil, err
+	}
+	if _, err := m.store.GetAdminUser(username); err == nil {
+		return nil, fmt.Errorf("%w: user %q already exists", store.ErrAlreadyExists, username)
+	} else if !errors.Is(err, store.ErrNotFound) {
+		return nil, err
+	}
+	hash, err := HashPassword(password)
+	if err != nil {
+		return nil, err
+	}
+	now := time.Now().UTC()
+	user := &store.AdminUser{
+		Username:     username,
+		PasswordHash: hash,
+		Role:         role,
+		CreatedAt:    now,
+		UpdatedAt:    now,
+	}
+	if err := m.store.SaveAdminUser(user); err != nil {
+		return nil, err
+	}
+	return user, nil
+}
+
+// UpdateUser updates an existing user's role and/or password.
+func (m *Manager) UpdateUser(username string, role *store.Role, newPassword *string) (*store.AdminUser, error) {
+	user, err := m.store.GetAdminUser(username)
+	if err != nil {
+		return nil, err
+	}
+	if role != nil {
+		if err := ValidateRole(*role); err != nil {
+			return nil, err
+		}
+		if user.Role == store.RoleAdmin && *role != store.RoleAdmin {
+			if err := m.ensureOtherAdminExists(username); err != nil {
+				return nil, err
+			}
+		}
+		user.Role = *role
+	}
+	if newPassword != nil {
+		if len(*newPassword) < 8 {
+			return nil, fmt.Errorf("%w: new password must be at least 8 characters", store.ErrInvalidArgument)
+		}
+		hash, err := HashPassword(*newPassword)
+		if err != nil {
+			return nil, err
+		}
+		user.PasswordHash = hash
+	}
+	user.UpdatedAt = time.Now().UTC()
+	if err := m.store.SaveAdminUser(user); err != nil {
+		return nil, err
+	}
+	return user, nil
+}
+
+// DeleteUser removes a local user, preventing self-deletion and deletion of the last admin.
+func (m *Manager) DeleteUser(username, actingUsername string) error {
+	if username == actingUsername {
+		return fmt.Errorf("%w: cannot delete the currently signed-in user", store.ErrInvalidArgument)
+	}
+	user, err := m.store.GetAdminUser(username)
+	if err != nil {
+		return err
+	}
+	if user.Role == store.RoleAdmin {
+		if err := m.ensureOtherAdminExists(username); err != nil {
+			return err
+		}
+	}
+	return m.store.DeleteUser(username)
+}
+
+func (m *Manager) ensureOtherAdminExists(excludingUsername string) error {
+	users, err := m.store.ListUsers()
+	if err != nil {
+		return err
+	}
+	for _, u := range users {
+		if u.Username != excludingUsername && u.Role == store.RoleAdmin {
+			return nil
+		}
+	}
+	return fmt.Errorf("%w: at least one ADMIN user must remain", store.ErrInUse)
+}
+
 // CreateApiToken creates a new scoped API token (velo_pat_<id>_<secret>) and stores
 // only its SHA-256 hash in the state store. Returns the metadata and plaintext token string.
 func (m *Manager) CreateApiToken(name string, role store.Role, ttl time.Duration) (*store.ApiToken, string, error) {
 	if strings.TrimSpace(name) == "" {
 		return nil, "", fmt.Errorf("%w: token name is required", store.ErrInvalidArgument)
 	}
-	if role != store.RoleAdmin && role != store.RoleCSIProvisioner && role != store.RoleReadOnly {
-		return nil, "", fmt.Errorf("%w: invalid role %q", store.ErrInvalidArgument, role)
+	if err := ValidateRole(role); err != nil {
+		return nil, "", err
 	}
 
 	idBytes, err := randomBytes(6)

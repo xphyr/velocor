@@ -20,6 +20,7 @@ var (
 	bucketVolumes         = []byte("volumes")
 	bucketSnapshots       = []byte("snapshots")
 	bucketPortals         = []byte("portals")
+	bucketHosts           = []byte("hosts")
 	bucketInitiatorGroups = []byte("initiator_groups")
 	bucketExports         = []byte("exports")
 
@@ -35,6 +36,7 @@ var allBuckets = [][]byte{
 	bucketVolumes,
 	bucketSnapshots,
 	bucketPortals,
+	bucketHosts,
 	bucketInitiatorGroups,
 	bucketExports,
 }
@@ -114,6 +116,9 @@ func (s *BoltStore) GetAdminUser(username string) (*AdminUser, error) {
 	if err != nil {
 		return nil, err
 	}
+	if user.Role == "" {
+		user.Role = RoleAdmin
+	}
 	return &user, nil
 }
 
@@ -122,11 +127,52 @@ func (s *BoltStore) SaveAdminUser(user *AdminUser) error {
 	if user == nil || user.Username == "" || user.PasswordHash == "" {
 		return fmt.Errorf("%w: username and password_hash are required", ErrInvalidArgument)
 	}
+	now := time.Now().UTC()
+	if user.Role == "" {
+		user.Role = RoleAdmin
+	}
+	if user.CreatedAt.IsZero() {
+		user.CreatedAt = now
+	}
 	if user.UpdatedAt.IsZero() {
-		user.UpdatedAt = time.Now().UTC()
+		user.UpdatedAt = now
 	}
 	return s.db.Update(func(tx *bolt.Tx) error {
 		return putJSON(tx.Bucket(bucketUsers), []byte(user.Username), user)
+	})
+}
+
+// ListUsers returns all persisted local users.
+func (s *BoltStore) ListUsers() ([]*AdminUser, error) {
+	var users []*AdminUser
+	err := s.db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketUsers)
+		return b.ForEach(func(_, v []byte) error {
+			var u AdminUser
+			if err := json.Unmarshal(v, &u); err != nil {
+				return err
+			}
+			if u.Role == "" {
+				u.Role = RoleAdmin
+			}
+			users = append(users, &u)
+			return nil
+		})
+	})
+	return users, err
+}
+
+// DeleteUser removes a local user by username.
+func (s *BoltStore) DeleteUser(username string) error {
+	if username == "" {
+		return fmt.Errorf("%w: username is required", ErrInvalidArgument)
+	}
+	return s.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketUsers)
+		if b.Get([]byte(username)) == nil {
+			return fmt.Errorf("%w: user %q", ErrNotFound, username)
+		}
+		return b.Delete([]byte(username))
 	})
 }
 
@@ -1110,17 +1156,144 @@ func (s *BoltStore) DeletePortal(id string) error {
 	})
 }
 
+// CreateHost registers a SAN initiator Host record.
+func (s *BoltStore) CreateHost(host *Host) error {
+	if host == nil || host.ID == "" || host.Name == "" {
+		return fmt.Errorf("%w: host id and name are required", ErrInvalidArgument)
+	}
+	cp := *host
+	if cp.CreatedAt.IsZero() {
+		cp.CreatedAt = time.Now().UTC()
+	}
+	return s.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketHosts)
+		if b.Get([]byte(cp.ID)) != nil {
+			return fmt.Errorf("%w: host id %s", ErrAlreadyExists, cp.ID)
+		}
+		err := b.ForEach(func(_, v []byte) error {
+			var existing Host
+			if err := json.Unmarshal(v, &existing); err != nil {
+				return err
+			}
+			if existing.Name == cp.Name {
+				return fmt.Errorf("%w: host name %s", ErrAlreadyExists, cp.Name)
+			}
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+		if err := putJSON(b, []byte(cp.ID), &cp); err != nil {
+			return err
+		}
+		*host = cp
+		return nil
+	})
+}
+
+// GetHost retrieves a Host by ID.
+func (s *BoltStore) GetHost(id string) (*Host, error) {
+	var host Host
+	err := s.db.View(func(tx *bolt.Tx) error {
+		return getJSON(tx.Bucket(bucketHosts), []byte(id), &host)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &host, nil
+}
+
+// GetHostByName retrieves a Host by Name.
+func (s *BoltStore) GetHostByName(name string) (*Host, error) {
+	var found *Host
+	err := s.db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketHosts)
+		return b.ForEach(func(_, v []byte) error {
+			var h Host
+			if err := json.Unmarshal(v, &h); err != nil {
+				return err
+			}
+			if h.Name == name {
+				found = &h
+			}
+			return nil
+		})
+	})
+	if err != nil {
+		return nil, err
+	}
+	if found == nil {
+		return nil, ErrNotFound
+	}
+	return found, nil
+}
+
+// ListHosts returns all registered Hosts ordered by CreatedAt.
+func (s *BoltStore) ListHosts() ([]*Host, error) {
+	var hosts []*Host
+	err := s.db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketHosts)
+		return b.ForEach(func(_, v []byte) error {
+			var h Host
+			if err := json.Unmarshal(v, &h); err != nil {
+				return err
+			}
+			hosts = append(hosts, &h)
+			return nil
+		})
+	})
+	if err != nil {
+		return nil, err
+	}
+	sort.Slice(hosts, func(i, j int) bool {
+		return hosts[i].CreatedAt.Before(hosts[j].CreatedAt)
+	})
+	return hosts, nil
+}
+
+// DeleteHost deletes a Host if no InitiatorGroup references it.
+func (s *BoltStore) DeleteHost(id string) error {
+	return s.db.Update(func(tx *bolt.Tx) error {
+		hostsB := tx.Bucket(bucketHosts)
+		if hostsB.Get([]byte(id)) == nil {
+			return ErrNotFound
+		}
+		groupsB := tx.Bucket(bucketInitiatorGroups)
+		err := groupsB.ForEach(func(_, v []byte) error {
+			var g InitiatorGroup
+			if err := json.Unmarshal(v, &g); err != nil {
+				return err
+			}
+			if slices.Contains(g.HostIDs, id) {
+				return fmt.Errorf("%w: host %s is used by initiator group %s", ErrInUse, id, g.ID)
+			}
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+		return hostsB.Delete([]byte(id))
+	})
+}
+
 // CreateInitiatorGroup creates a host InitiatorGroup ACL record.
 func (s *BoltStore) CreateInitiatorGroup(group *InitiatorGroup) error {
 	if group == nil || group.ID == "" || group.Name == "" {
 		return fmt.Errorf("%w: initiator group id and name are required", ErrInvalidArgument)
 	}
 	cp := *group
+	cp.HostIDs = slices.Clone(group.HostIDs)
 	if cp.CreatedAt.IsZero() {
 		cp.CreatedAt = time.Now().UTC()
 	}
 
 	return s.db.Update(func(tx *bolt.Tx) error {
+		hostsB := tx.Bucket(bucketHosts)
+		for _, hid := range cp.HostIDs {
+			if hostsB.Get([]byte(hid)) == nil {
+				return fmt.Errorf("%w: host %s not found", ErrNotFound, hid)
+			}
+		}
 		b := tx.Bucket(bucketInitiatorGroups)
 		if b.Get([]byte(cp.ID)) != nil {
 			return fmt.Errorf("%w: initiator group id %s", ErrAlreadyExists, cp.ID)

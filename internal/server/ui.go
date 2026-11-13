@@ -1,99 +1,31 @@
 package server
 
-const embeddedDashboardHTML = `<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Velocor All-Flash SAN Appliance</title>
-  <style>
-    :root {
-      --bg: #0b0f19;
-      --panel: #131b2e;
-      --border: #23304d;
-      --accent: #38bdf8;
-      --text: #e2e8f0;
-      --muted: #94a3b8;
-      --ok: #22c55e;
-      --warn: #f59e0b;
-    }
-    * { box-sizing: border-box; }
-    body {
-      margin: 0;
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, monospace;
-      background: var(--bg);
-      color: var(--text);
-      padding: 2rem;
-    }
-    header {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      border-bottom: 1px solid var(--border);
-      padding-bottom: 1rem;
-      margin-bottom: 1.5rem;
-    }
-    h1 { margin: 0; font-size: 1.4rem; color: var(--accent); }
-    .badge {
-      padding: 0.25rem 0.65rem;
-      border-radius: 999px;
-      font-size: 0.78rem;
-      font-weight: 600;
-      background: rgba(34, 197, 94, 0.15);
-      color: var(--ok);
-      border: 1px solid rgba(34, 197, 94, 0.4);
-    }
-    .grid {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
-      gap: 1rem;
-    }
-    .card {
-      background: var(--panel);
-      border: 1px solid var(--border);
-      border-radius: 8px;
-      padding: 1.1rem;
-    }
-    .card h2 {
-      margin: 0 0 0.65rem 0;
-      font-size: 0.9rem;
-      text-transform: uppercase;
-      letter-spacing: 0.05em;
-      color: var(--muted);
-    }
-    code {
-      color: var(--accent);
-      font-size: 0.85rem;
-    }
-  </style>
-</head>
-<body>
-  <header>
-    <div>
-      <h1>VELOCOR // SPDK All-Flash Appliance</h1>
-      <small style="color: var(--muted)">Control Plane API &amp; Telemetry Endpoint</small>
-    </div>
-    <span class="badge">API v1 READY</span>
-  </header>
-  <div class="grid">
-    <div class="card">
-      <h2>REST &amp; OpenAPI</h2>
-      <p>Base Path: <code>/api/v1</code></p>
-      <p>OpenAPI Spec: <a href="/api/v1/openapi.json" style="color:var(--accent)">/api/v1/openapi.json</a></p>
-    </div>
-    <div class="card">
-      <h2>Prometheus Telemetry</h2>
-      <p>Scrape Endpoint: <a href="/metrics" style="color:var(--accent)">/metrics</a></p>
-      <p>Includes SPDK bdev IOPS/latency, pool cluster usage, and NVMe SMART health.</p>
-    </div>
-    <div class="card">
-      <h2>CLI Management</h2>
-      <p>Authenticate with <code>veloctl login</code> or pass a scoped <code>velo_pat_...</code> service token.</p>
-    </div>
-  </div>
-</body>
-</html>
-`
+import (
+	"embed"
+	"io/fs"
+	"net/http"
+)
+
+//go:embed web
+var webAssetsFS embed.FS
+
+func (s *Server) handleDashboard(w http.ResponseWriter, _ *http.Request) {
+	data, err := webAssetsFS.ReadFile("web/index.html")
+	if err != nil {
+		http.Error(w, "dashboard not found", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_, _ = w.Write(data)
+}
+
+func (s *Server) handleWebAssets() http.Handler {
+	sub, err := fs.Sub(webAssetsFS, "web")
+	if err != nil {
+		return http.NotFoundHandler()
+	}
+	return http.StripPrefix("/assets/", http.FileServer(http.FS(sub)))
+}
 
 const embeddedOpenAPIJSON = `{
   "openapi": "3.0.3",

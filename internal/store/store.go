@@ -30,6 +30,8 @@ type Store interface {
 	SaveSystemConfig(cfg *SystemConfig) error
 	GetAdminUser(username string) (*AdminUser, error)
 	SaveAdminUser(user *AdminUser) error
+	ListUsers() ([]*AdminUser, error)
+	DeleteUser(username string) error
 	CreateApiToken(token *ApiToken) error
 	GetApiToken(id string) (*ApiToken, error)
 	UpdateApiTokenLastUsed(id string, lastUsed time.Time) error
@@ -74,6 +76,13 @@ type Store interface {
 	GetPortalByName(name string) (*Portal, error)
 	ListPortals(protocolFilter ExportProtocol) ([]*Portal, error)
 	DeletePortal(id string) error
+
+	// Hosts
+	CreateHost(host *Host) error
+	GetHost(id string) (*Host, error)
+	GetHostByName(name string) (*Host, error)
+	ListHosts() ([]*Host, error)
+	DeleteHost(id string) error
 
 	// InitiatorGroups
 	CreateInitiatorGroup(group *InitiatorGroup) error

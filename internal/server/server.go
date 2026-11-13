@@ -77,12 +77,18 @@ func (s *Server) Handler() http.Handler {
 func (s *Server) registerRoutes() {
 	// Public routes (UI, OpenAPI spec, login, Prometheus scrape)
 	s.mux.HandleFunc("GET /{$}", s.handleDashboard)
+	s.mux.Handle("GET /assets/", s.handleWebAssets())
 	s.mux.HandleFunc("GET /api/v1/openapi.json", s.handleOpenAPI)
 	s.mux.HandleFunc("GET /metrics", s.handleMetrics)
 	s.mux.HandleFunc("POST /api/v1/auth/login", s.handleLogin)
 
-	// Auth & Token management (ADMIN)
-	s.mux.HandleFunc("POST /api/v1/auth/password", s.withAuth(store.RoleAdmin, s.handleChangePassword))
+	// Auth, User & Token management
+	s.mux.HandleFunc("GET /api/v1/auth/me", s.withAuth(store.RoleReadOnly, s.handleAuthMe))
+	s.mux.HandleFunc("POST /api/v1/auth/password", s.withAuth(store.RoleReadOnly, s.handleChangePassword))
+	s.mux.HandleFunc("GET /api/v1/auth/users", s.withAuth(store.RoleAdmin, s.handleListUsers))
+	s.mux.HandleFunc("POST /api/v1/auth/users", s.withAuth(store.RoleAdmin, s.handleCreateUser))
+	s.mux.HandleFunc("PATCH /api/v1/auth/users/{username}", s.withAuth(store.RoleAdmin, s.handleUpdateUser))
+	s.mux.HandleFunc("DELETE /api/v1/auth/users/{username}", s.withAuth(store.RoleAdmin, s.handleDeleteUser))
 	s.mux.HandleFunc("GET /api/v1/auth/tokens", s.withAuth(store.RoleAdmin, s.handleListTokens))
 	s.mux.HandleFunc("POST /api/v1/auth/tokens", s.withAuth(store.RoleAdmin, s.handleCreateToken))
 	s.mux.HandleFunc("DELETE /api/v1/auth/tokens/{id}", s.withAuth(store.RoleAdmin, s.handleDeleteToken))
@@ -113,10 +119,15 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("POST /api/v1/snapshots/", s.withAuth(store.RoleCSIProvisioner, s.handleSnapshotAction))
 	s.mux.HandleFunc("DELETE /api/v1/snapshots/{id}", s.withAuth(store.RoleCSIProvisioner, s.handleDeleteSnapshot))
 
-	// Portals, InitiatorGroups & Exports
+	// Portals, Hosts, InitiatorGroups & Exports
 	s.mux.HandleFunc("GET /api/v1/portals", s.withAuth(store.RoleReadOnly, s.handleListPortals))
 	s.mux.HandleFunc("POST /api/v1/portals", s.withAuth(store.RoleAdmin, s.handleCreatePortal))
 	s.mux.HandleFunc("DELETE /api/v1/portals/{id}", s.withAuth(store.RoleAdmin, s.handleDeletePortal))
+
+	s.mux.HandleFunc("GET /api/v1/hosts", s.withAuth(store.RoleReadOnly, s.handleListHosts))
+	s.mux.HandleFunc("POST /api/v1/hosts", s.withAuth(store.RoleCSIProvisioner, s.handleCreateHost))
+	s.mux.HandleFunc("GET /api/v1/hosts/{id}", s.withAuth(store.RoleReadOnly, s.handleGetHost))
+	s.mux.HandleFunc("DELETE /api/v1/hosts/{id}", s.withAuth(store.RoleCSIProvisioner, s.handleDeleteHost))
 
 	s.mux.HandleFunc("GET /api/v1/initiator-groups", s.withAuth(store.RoleReadOnly, s.handleListInitiatorGroups))
 	s.mux.HandleFunc("POST /api/v1/initiator-groups", s.withAuth(store.RoleCSIProvisioner, s.handleCreateInitiatorGroup))
@@ -138,7 +149,20 @@ func (s *Server) registerRoutes() {
 
 type contextKey string
 
-const subjectContextKey contextKey = "subject"
+const (
+	subjectContextKey contextKey = "subject"
+	roleContextKey    contextKey = "role"
+)
+
+func subjectFromContext(ctx context.Context) string {
+	v, _ := ctx.Value(subjectContextKey).(string)
+	return v
+}
+
+func roleFromContext(ctx context.Context) store.Role {
+	v, _ := ctx.Value(roleContextKey).(store.Role)
+	return v
+}
 
 func (s *Server) withAuth(requiredRole store.Role, next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -158,13 +182,9 @@ func (s *Server) withAuth(requiredRole store.Role, next http.HandlerFunc) http.H
 			return
 		}
 		ctx := context.WithValue(r.Context(), subjectContextKey, sub)
+		ctx = context.WithValue(ctx, roleContextKey, role)
 		next(w, r.WithContext(ctx))
 	}
-}
-
-func (s *Server) handleDashboard(w http.ResponseWriter, _ *http.Request) {
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	_, _ = w.Write([]byte(embeddedDashboardHTML))
 }
 
 func (s *Server) handleOpenAPI(w http.ResponseWriter, _ *http.Request) {
@@ -191,11 +211,24 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"access_token": tok,
 		"expires_at":   exp,
+		"username":     req.Username,
 		"role":         role,
 	})
 }
 
+func (s *Server) handleAuthMe(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{
+		"username": subjectFromContext(r.Context()),
+		"role":     roleFromContext(r.Context()),
+	})
+}
+
 func (s *Server) handleChangePassword(w http.ResponseWriter, r *http.Request) {
+	sub := subjectFromContext(r.Context())
+	if sub == "" || strings.HasPrefix(sub, "token:") {
+		writeError(w, auth.ErrForbidden)
+		return
+	}
 	var req struct {
 		CurrentPassword string `json:"current_password"`
 		NewPassword     string `json:"new_password"`
@@ -204,7 +237,82 @@ func (s *Server) handleChangePassword(w http.ResponseWriter, r *http.Request) {
 		writeError(w, fmt.Errorf("%w: invalid json body", store.ErrInvalidArgument))
 		return
 	}
-	if err := s.auth.ChangePassword(auth.DefaultAdminUsername, req.CurrentPassword, req.NewPassword); err != nil {
+	if err := s.auth.ChangePassword(sub, req.CurrentPassword, req.NewPassword); err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{})
+}
+
+type userView struct {
+	Username  string     `json:"username"`
+	Role      store.Role `json:"role"`
+	CreatedAt time.Time  `json:"created_at,omitempty"`
+	UpdatedAt time.Time  `json:"updated_at"`
+}
+
+func toUserView(u *store.AdminUser) userView {
+	return userView{
+		Username:  u.Username,
+		Role:      u.Role,
+		CreatedAt: u.CreatedAt,
+		UpdatedAt: u.UpdatedAt,
+	}
+}
+
+func (s *Server) handleListUsers(w http.ResponseWriter, _ *http.Request) {
+	users, err := s.store.ListUsers()
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	views := make([]userView, 0, len(users))
+	for _, u := range users {
+		views = append(views, toUserView(u))
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"users": views})
+}
+
+func (s *Server) handleCreateUser(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Username string     `json:"username"`
+		Password string     `json:"password"`
+		Role     store.Role `json:"role"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, fmt.Errorf("%w: invalid json body", store.ErrInvalidArgument))
+		return
+	}
+	user, err := s.auth.CreateUser(req.Username, req.Password, req.Role)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{"user": toUserView(user)})
+}
+
+func (s *Server) handleUpdateUser(w http.ResponseWriter, r *http.Request) {
+	username := r.PathValue("username")
+	var req struct {
+		Role     *store.Role `json:"role"`
+		Password *string     `json:"password"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, fmt.Errorf("%w: invalid json body", store.ErrInvalidArgument))
+		return
+	}
+	user, err := s.auth.UpdateUser(username, req.Role, req.Password)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"user": toUserView(user)})
+}
+
+func (s *Server) handleDeleteUser(w http.ResponseWriter, r *http.Request) {
+	username := r.PathValue("username")
+	acting := subjectFromContext(r.Context())
+	if err := s.auth.DeleteUser(username, acting); err != nil {
 		writeError(w, err)
 		return
 	}
@@ -1044,6 +1152,57 @@ func (s *Server) handleDeletePortal(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{})
 }
 
+func (s *Server) handleListHosts(w http.ResponseWriter, _ *http.Request) {
+	hosts, err := s.store.ListHosts()
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"hosts": hosts})
+}
+
+func (s *Server) handleGetHost(w http.ResponseWriter, r *http.Request) {
+	host, err := s.store.GetHost(r.PathValue("id"))
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"host": host})
+}
+
+func (s *Server) handleCreateHost(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Name         string `json:"name"`
+		HostNQN      string `json:"host_nqn"`
+		InitiatorIQN string `json:"initiator_iqn"`
+		IPAddress    string `json:"ip_address"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, fmt.Errorf("%w: invalid json body", store.ErrInvalidArgument))
+		return
+	}
+	host := &store.Host{
+		ID:           newResourceID("host"),
+		Name:         req.Name,
+		HostNQN:      strings.TrimSpace(req.HostNQN),
+		InitiatorIQN: strings.TrimSpace(req.InitiatorIQN),
+		IPAddress:    strings.TrimSpace(req.IPAddress),
+	}
+	if err := s.store.CreateHost(host); err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{"host": host})
+}
+
+func (s *Server) handleDeleteHost(w http.ResponseWriter, r *http.Request) {
+	if err := s.store.DeleteHost(r.PathValue("id")); err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{})
+}
+
 func (s *Server) handleListInitiatorGroups(w http.ResponseWriter, _ *http.Request) {
 	groups, err := s.store.ListInitiatorGroups()
 	if err != nil {
@@ -1065,6 +1224,7 @@ func (s *Server) handleGetInitiatorGroup(w http.ResponseWriter, r *http.Request)
 func (s *Server) handleCreateInitiatorGroup(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Name          string   `json:"name"`
+		HostIDs       []string `json:"host_ids"`
 		HostNQNs      []string `json:"host_nqns"`
 		InitiatorIQNs []string `json:"initiator_iqns"`
 		AllowedCIDRs  []string `json:"allowed_cidrs"`
@@ -1077,6 +1237,7 @@ func (s *Server) handleCreateInitiatorGroup(w http.ResponseWriter, r *http.Reque
 	group := &store.InitiatorGroup{
 		ID:            newResourceID("ig"),
 		Name:          req.Name,
+		HostIDs:       req.HostIDs,
 		HostNQNs:      req.HostNQNs,
 		InitiatorIQNs: req.InitiatorIQNs,
 		AllowedCIDRs:  req.AllowedCIDRs,
@@ -1095,6 +1256,58 @@ func (s *Server) handleDeleteInitiatorGroup(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{})
+}
+
+func (s *Server) resolveInitiatorGroupACLs(ig *store.InitiatorGroup) (hostNQNs, initiatorIQNs, cidrs []string) {
+	seenNQN := make(map[string]bool)
+	seenIQN := make(map[string]bool)
+	seenCIDR := make(map[string]bool)
+
+	addNQN := func(v string) {
+		v = strings.TrimSpace(v)
+		if v != "" && !seenNQN[v] {
+			seenNQN[v] = true
+			hostNQNs = append(hostNQNs, v)
+		}
+	}
+	addIQN := func(v string) {
+		v = strings.TrimSpace(v)
+		if v != "" && !seenIQN[v] {
+			seenIQN[v] = true
+			initiatorIQNs = append(initiatorIQNs, v)
+		}
+	}
+	addCIDR := func(v string) {
+		v = strings.TrimSpace(v)
+		if v != "" && !seenCIDR[v] {
+			seenCIDR[v] = true
+			cidrs = append(cidrs, v)
+		}
+	}
+
+	for _, hid := range ig.HostIDs {
+		if h, err := s.store.GetHost(hid); err == nil {
+			addNQN(h.HostNQN)
+			addIQN(h.InitiatorIQN)
+			if h.IPAddress != "" {
+				if strings.Contains(h.IPAddress, "/") {
+					addCIDR(h.IPAddress)
+				} else {
+					addCIDR(h.IPAddress + "/32")
+				}
+			}
+		}
+	}
+	for _, nqn := range ig.HostNQNs {
+		addNQN(nqn)
+	}
+	for _, iqn := range ig.InitiatorIQNs {
+		addIQN(iqn)
+	}
+	for _, cidr := range ig.AllowedCIDRs {
+		addCIDR(cidr)
+	}
+	return hostNQNs, initiatorIQNs, cidrs
 }
 
 func (s *Server) handleListExports(w http.ResponseWriter, r *http.Request) {
@@ -1198,7 +1411,8 @@ func (s *Server) handleCreateExport(w http.ResponseWriter, r *http.Request) {
 			_, _ = s.spdk.NvmfSubsystemAddNs(r.Context(), exp.SubsystemNQN, vol.EffectiveBdevName, exp.NamespaceID, "")
 			for _, gid := range exp.InitiatorGroupIDs {
 				if ig, err := s.store.GetInitiatorGroup(gid); err == nil {
-					for _, nqn := range ig.HostNQNs {
+					nqns, _, _ := s.resolveInitiatorGroupACLs(ig)
+					for _, nqn := range nqns {
 						_ = s.spdk.NvmfSubsystemAddHost(r.Context(), exp.SubsystemNQN, nqn)
 					}
 				}
@@ -1224,7 +1438,25 @@ func (s *Server) handleCreateExport(w http.ResponseWriter, r *http.Request) {
 		if len(spdkPortals) > 0 {
 			_ = s.spdk.IscsiCreatePortalGroup(r.Context(), pgTag, spdkPortals)
 		}
-		_ = s.spdk.IscsiCreateInitiatorGroup(r.Context(), igTag, []string{"ANY"}, []string{"0.0.0.0/1", "128.0.0.0/1"})
+		iqns := []string{"ANY"}
+		netmasks := []string{"0.0.0.0/1", "128.0.0.0/1"}
+		if !exp.AllowAnyHost && len(exp.InitiatorGroupIDs) > 0 {
+			var resolvedIQNs, resolvedCIDRs []string
+			for _, gid := range exp.InitiatorGroupIDs {
+				if ig, err := s.store.GetInitiatorGroup(gid); err == nil {
+					_, gIQNs, gCIDRs := s.resolveInitiatorGroupACLs(ig)
+					resolvedIQNs = append(resolvedIQNs, gIQNs...)
+					resolvedCIDRs = append(resolvedCIDRs, gCIDRs...)
+				}
+			}
+			if len(resolvedIQNs) > 0 {
+				iqns = resolvedIQNs
+			}
+			if len(resolvedCIDRs) > 0 {
+				netmasks = resolvedCIDRs
+			}
+		}
+		_ = s.spdk.IscsiCreateInitiatorGroup(r.Context(), igTag, iqns, netmasks)
 		_ = s.spdk.IscsiCreateTargetNode(
 			r.Context(),
 			exp.TargetIQN,
