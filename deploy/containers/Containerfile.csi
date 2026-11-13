@@ -1,0 +1,24 @@
+FROM quay.io/fedora/fedora:45 AS builder
+
+RUN dnf install -y golang git && dnf clean all
+
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+ARG VERSION=v0.1.0
+ARG COMMIT=unknown
+ARG BUILD_TIME=unknown
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+    go build -ldflags="-s -w -X github.com/velocor/velocor/internal/version.Version=${VERSION} -X github.com/velocor/velocor/internal/version.Commit=${COMMIT} -X github.com/velocor/velocor/internal/version.BuildTime=${BUILD_TIME}" \
+    -o /out/velocor-csi ./cmd/velocor-csi
+
+FROM quay.io/fedora/fedora-minimal:45
+
+RUN microdnf install -y nvme-cli iscsi-initiator-utils e2fsprogs xfsprogs util-linux && microdnf clean all
+RUN mkdir -p /csi /var/lib/kubelet
+
+COPY --from=builder /out/velocor-csi /usr/bin/velocor-csi
+
+ENTRYPOINT ["/usr/bin/velocor-csi"]

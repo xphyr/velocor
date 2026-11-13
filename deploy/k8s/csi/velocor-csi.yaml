@@ -1,0 +1,243 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: velocor-csi
+---
+apiVersion: storage.k8s.io/v1
+kind: CSIDriver
+metadata:
+  name: csi.velocor.io
+spec:
+  attachRequired: true
+  podInfoOnMount: true
+  fsGroupPolicy: File
+  volumeLifecycleModes:
+    - Persistent
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: velocor-csi-controller
+  namespace: velocor-csi
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: velocor-csi-controller-role
+rules:
+  - apiGroups: [""]
+    resources: ["persistentvolumes"]
+    verbs: ["get", "list", "watch", "create", "delete", "patch"]
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["get", "list", "watch", "update"]
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims/status"]
+    verbs: ["patch"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["storageclasses", "csinodes", "volumeattachments", "volumeattachments/status"]
+    verbs: ["get", "list", "watch", "patch"]
+  - apiGroups: [""]
+    resources: ["nodes", "pods"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["list", "watch", "create", "update", "patch"]
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "watch", "list", "delete", "update", "create"]
+  - apiGroups: ["snapshot.storage.k8s.io"]
+    resources: ["volumesnapshotclasses", "volumesnapshotcontents", "volumesnapshotcontents/status", "volumesnapshots"]
+    verbs: ["get", "list", "watch", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: velocor-csi-controller-binding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: velocor-csi-controller-role
+subjects:
+  - kind: ServiceAccount
+    name: velocor-csi-controller
+    namespace: velocor-csi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: velocor-csi-controller
+  namespace: velocor-csi
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: velocor-csi-controller
+  template:
+    metadata:
+      labels:
+        app: velocor-csi-controller
+    spec:
+      serviceAccountName: velocor-csi-controller
+      containers:
+        - name: velocor-csi
+          image: registry.xphyrlab.net/velocor/velocor-csi:latest
+          imagePullPolicy: IfNotPresent
+          args:
+            - --mode=controller
+            - --endpoint=unix:///csi/csi.sock
+          envFrom:
+            - secretRef:
+                name: velocor-csi-auth
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+        - name: csi-provisioner
+          image: registry.k8s.io/sig-storage/csi-provisioner:v5.1.0
+          args:
+            - --csi-address=/csi/csi.sock
+            - --feature-gates=Topology=false
+            - --leader-election=false
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+        - name: csi-attacher
+          image: registry.k8s.io/sig-storage/csi-attacher:v4.7.0
+          args:
+            - --csi-address=/csi/csi.sock
+            - --leader-election=false
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+        - name: csi-resizer
+          image: registry.k8s.io/sig-storage/csi-resizer:v1.12.0
+          args:
+            - --csi-address=/csi/csi.sock
+            - --leader-election=false
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+        - name: csi-snapshotter
+          image: registry.k8s.io/sig-storage/csi-snapshotter:v8.1.0
+          args:
+            - --csi-address=/csi/csi.sock
+            - --leader-election=false
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+      volumes:
+        - name: socket-dir
+          emptyDir: {}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: velocor-csi-node
+  namespace: velocor-csi
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: velocor-csi-node
+  namespace: velocor-csi
+spec:
+  selector:
+    matchLabels:
+      app: velocor-csi-node
+  template:
+    metadata:
+      labels:
+        app: velocor-csi-node
+    spec:
+      serviceAccountName: velocor-csi-node
+      hostNetwork: true
+      hostPID: true
+      dnsPolicy: ClusterFirstWithHostNet
+      containers:
+        - name: velocor-csi
+          image: registry.xphyrlab.net/velocor/velocor-csi:latest
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            privileged: true
+            capabilities:
+              add: ["SYS_ADMIN"]
+            allowPrivilegeEscalation: true
+          args:
+            - --mode=node
+            - --endpoint=unix:///csi/csi.sock
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+            - name: kubelet-dir
+              mountPath: /var/lib/kubelet
+              mountPropagation: Bidirectional
+            - name: dev-dir
+              mountPath: /dev
+            - name: etc-iscsi
+              mountPath: /etc/iscsi
+            - name: etc-nvme
+              mountPath: /etc/nvme
+        - name: csi-node-driver-registrar
+          image: registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.12.0
+          args:
+            - --csi-address=/csi/csi.sock
+            - --kubelet-registration-path=/var/lib/kubelet/plugins/csi.velocor.io/csi.sock
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+            - name: registration-dir
+              mountPath: /registration
+      volumes:
+        - name: socket-dir
+          hostPath:
+            path: /var/lib/kubelet/plugins/csi.velocor.io
+            type: DirectoryOrCreate
+        - name: registration-dir
+          hostPath:
+            path: /var/lib/kubelet/plugins_registry
+            type: Directory
+        - name: kubelet-dir
+          hostPath:
+            path: /var/lib/kubelet
+            type: Directory
+        - name: dev-dir
+          hostPath:
+            path: /dev
+            type: Directory
+        - name: etc-iscsi
+          hostPath:
+            path: /etc/iscsi
+            type: DirectoryOrCreate
+        - name: etc-nvme
+          hostPath:
+            path: /etc/nvme
+            type: DirectoryOrCreate
+---
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: velocor-nvme-tcp
+provisioner: csi.velocor.io
+allowVolumeExpansion: true
+reclaimPolicy: Delete
+volumeBindingMode: Immediate
+parameters:
+  protocol: NVMEOF_TCP
+  thin: "true"
+---
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: velocor-iscsi
+provisioner: csi.velocor.io
+allowVolumeExpansion: true
+reclaimPolicy: Delete
+volumeBindingMode: Immediate
+parameters:
+  protocol: ISCSI
+  thin: "true"

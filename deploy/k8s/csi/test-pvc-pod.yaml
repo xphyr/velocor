@@ -1,0 +1,28 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: test-velocor-pvc
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: velocor-nvme-tcp
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: test-velocor-pod
+spec:
+  containers:
+    - name: app
+      image: quay.io/fedora/fedora-minimal:45
+      command: ["/bin/sh", "-c", "echo hello-velocor-csi > /data/test.txt && df -h /data && sleep 3600"]
+      volumeMounts:
+        - name: data
+          mountPath: /data
+  volumes:
+    - name: data
+      persistentVolumeClaim:
+        claimName: test-velocor-pvc
