@@ -22,3 +22,6 @@ hack/vm-lab/.vms/
 .DS_Store
 .vscode/
 .idea/
+
+# auth files for testing
+*.priv
