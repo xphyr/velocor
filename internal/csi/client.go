@@ -52,6 +52,12 @@ type BlockMetadataResult struct {
 	Extents          []BlockExtent `json:"extents"`
 }
 
+// VolumeGroupSnapshotResult represents a VolumeGroupSnapshot and its member Snapshots.
+type VolumeGroupSnapshotResult struct {
+	GroupSnapshot *store.VolumeGroupSnapshot `json:"volume_group_snapshot"`
+	Snapshots     []*store.Snapshot          `json:"snapshots"`
+}
+
 // CreateVolumeRequest specifies parameters for creating a Velocor volume.
 type CreateVolumeRequest struct {
 	Name          string            `json:"name"`
@@ -90,6 +96,10 @@ type VelocorClient interface {
 	CloneSnapshot(ctx context.Context, snapID, cloneName string, labels map[string]string) (*store.Volume, error)
 	GetSnapshotAllocatedBlocks(ctx context.Context, snapID string) (*BlockMetadataResult, error)
 	GetSnapshotChangedBlocks(ctx context.Context, targetSnapID, baseSnapID string) (*BlockMetadataResult, error)
+
+	CreateVolumeGroupSnapshot(ctx context.Context, name string, volumeIDs []string) (*VolumeGroupSnapshotResult, error)
+	GetVolumeGroupSnapshot(ctx context.Context, id string) (*VolumeGroupSnapshotResult, error)
+	DeleteVolumeGroupSnapshot(ctx context.Context, id string) error
 
 	ListPortals(ctx context.Context) ([]*store.Portal, error)
 	ListHosts(ctx context.Context) ([]*store.Host, error)
@@ -255,6 +265,25 @@ func (c *HTTPClient) CreateSnapshot(ctx context.Context, volumeID, name string, 
 
 func (c *HTTPClient) DeleteSnapshot(ctx context.Context, id string) error {
 	return c.doJSON(ctx, http.MethodDelete, "/api/v1/snapshots/"+url.PathEscape(id), nil, nil)
+}
+
+func (c *HTTPClient) CreateVolumeGroupSnapshot(ctx context.Context, name string, volumeIDs []string) (*VolumeGroupSnapshotResult, error) {
+	var resp VolumeGroupSnapshotResult
+	err := c.doJSON(ctx, http.MethodPost, "/api/v1/volume-group-snapshots", map[string]any{
+		"name":       name,
+		"volume_ids": volumeIDs,
+	}, &resp)
+	return &resp, err
+}
+
+func (c *HTTPClient) GetVolumeGroupSnapshot(ctx context.Context, id string) (*VolumeGroupSnapshotResult, error) {
+	var resp VolumeGroupSnapshotResult
+	err := c.doJSON(ctx, http.MethodGet, "/api/v1/volume-group-snapshots/"+url.PathEscape(id), nil, &resp)
+	return &resp, err
+}
+
+func (c *HTTPClient) DeleteVolumeGroupSnapshot(ctx context.Context, id string) error {
+	return c.doJSON(ctx, http.MethodDelete, "/api/v1/volume-group-snapshots/"+url.PathEscape(id), nil, nil)
 }
 
 func (c *HTTPClient) CloneSnapshot(ctx context.Context, snapID, cloneName string, labels map[string]string) (*store.Volume, error) {

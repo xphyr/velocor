@@ -15,7 +15,9 @@ import (
 	"github.com/velocor/velocor/internal/server"
 	"github.com/velocor/velocor/internal/store"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 )
 
 type fakeMounter struct {
@@ -280,5 +282,193 @@ func TestSnapshotMetadataCBT(t *testing.T) {
 	}
 	if len(resp.GetBlockMetadata()) != 1 || resp.GetBlockMetadata()[0].GetByteOffset() != 8<<20 {
 		t.Fatalf("unexpected delta metadata: %+v", resp.GetBlockMetadata())
+	}
+}
+
+func TestVolumeGroupSnapshot(t *testing.T) {
+	tmp := t.TempDir()
+	db, err := store.OpenBoltStore(filepath.Join(tmp, "velocor.db"))
+	if err != nil {
+		t.Fatalf("OpenBoltStore: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	if err := db.UpsertDisk(&store.Disk{
+		ID:           "disk-1",
+		PCIAddress:   "0000:00:05.0",
+		SizeBytes:    100 << 30,
+		DriverState:  store.DiskDriverStateKernel,
+		HealthStatus: store.HealthStatusOnline,
+	}); err != nil {
+		t.Fatalf("UpsertDisk: %v", err)
+	}
+	if _, err := db.ClaimDisk("disk-1", store.DiskDriverStateVfioPCI, "Nvme0n1"); err != nil {
+		t.Fatalf("ClaimDisk: %v", err)
+	}
+	if err := db.CreatePool(&store.Pool{
+		ID:         "pool-1",
+		Name:       "pool-1",
+		LVSName:    "lvs0",
+		DiskIDs:    []string{"disk-1"},
+		TotalBytes: 10 << 30,
+		FreeBytes:  10 << 30,
+	}); err != nil {
+		t.Fatalf("CreatePool: %v", err)
+	}
+	for _, vid := range []string{"vol-a", "vol-b"} {
+		if err := db.CreateVolume(&store.Volume{
+			ID:           vid,
+			Name:         vid,
+			PoolID:       "pool-1",
+			LvolBdevName: "lvs0/" + vid,
+			SizeBytes:    1 << 30,
+		}); err != nil {
+			t.Fatalf("CreateVolume %s: %v", vid, err)
+		}
+	}
+
+	authMgr, err := auth.NewManager(db, "test-pass-123")
+	if err != nil {
+		t.Fatalf("auth.NewManager: %v", err)
+	}
+	_, rawToken, err := authMgr.CreateApiToken("vgs-test", store.RoleCSIProvisioner, time.Hour)
+	if err != nil {
+		t.Fatalf("CreateApiToken: %v", err)
+	}
+
+	srv := server.New(db, nil, nil, authMgr, nil, nil)
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	sockPath := filepath.Join(tmp, "vgs.sock")
+	endpoint := "unix://" + sockPath
+	drv, err := NewDriver(DriverConfig{
+		Endpoint: endpoint,
+		Mode:     ModeController,
+		Client:   NewHTTPClient(ts.URL, rawToken, true),
+	})
+	if err != nil {
+		t.Fatalf("NewDriver: %v", err)
+	}
+	go func() { _ = drv.Run() }()
+	defer drv.Stop()
+
+	for i := 0; i < 50; i++ {
+		if _, err := os.Stat(sockPath); err == nil {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	conn, err := grpc.NewClient(endpoint, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatalf("grpc.NewClient: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	ctx := context.Background()
+	idClient := csi.NewIdentityClient(conn)
+	caps, err := idClient.GetPluginCapabilities(ctx, &csi.GetPluginCapabilitiesRequest{})
+	if err != nil {
+		t.Fatalf("GetPluginCapabilities: %v", err)
+	}
+	hasGroupCap := false
+	for _, c := range caps.GetCapabilities() {
+		if svc := c.GetService(); svc != nil && svc.GetType() == csi.PluginCapability_Service_GROUP_CONTROLLER_SERVICE {
+			hasGroupCap = true
+		}
+	}
+	if !hasGroupCap {
+		t.Fatalf("missing GROUP_CONTROLLER_SERVICE plugin capability")
+	}
+
+	gc := csi.NewGroupControllerClient(conn)
+	gCaps, err := gc.GroupControllerGetCapabilities(ctx, &csi.GroupControllerGetCapabilitiesRequest{})
+	if err != nil {
+		t.Fatalf("GroupControllerGetCapabilities: %v", err)
+	}
+	if len(gCaps.GetCapabilities()) == 0 {
+		t.Fatalf("expected non-empty group controller capabilities")
+	}
+
+	// Create VolumeGroupSnapshot across vol-a and vol-b.
+	created, err := gc.CreateVolumeGroupSnapshot(ctx, &csi.CreateVolumeGroupSnapshotRequest{
+		Name:            "vgs-1",
+		SourceVolumeIds: []string{"vol-a", "vol-b"},
+	})
+	if err != nil {
+		t.Fatalf("CreateVolumeGroupSnapshot: %v", err)
+	}
+	vgs := created.GetGroupSnapshot()
+	if vgs.GetGroupSnapshotId() == "" || !vgs.GetReadyToUse() || len(vgs.GetSnapshots()) != 2 {
+		t.Fatalf("unexpected group snapshot: %+v", vgs)
+	}
+
+	// Idempotent retry with same volume set succeeds.
+	retry, err := gc.CreateVolumeGroupSnapshot(ctx, &csi.CreateVolumeGroupSnapshotRequest{
+		Name:            "vgs-1",
+		SourceVolumeIds: []string{"vol-b", "vol-a"},
+	})
+	if err != nil {
+		t.Fatalf("idempotent CreateVolumeGroupSnapshot: %v", err)
+	}
+	if retry.GetGroupSnapshot().GetGroupSnapshotId() != vgs.GetGroupSnapshotId() {
+		t.Fatalf("expected same group snapshot ID on retry")
+	}
+
+	// Same name with different volume set returns AlreadyExists.
+	if _, err := gc.CreateVolumeGroupSnapshot(ctx, &csi.CreateVolumeGroupSnapshotRequest{
+		Name:            "vgs-1",
+		SourceVolumeIds: []string{"vol-a"},
+	}); status.Code(err) != codes.AlreadyExists {
+		t.Fatalf("expected AlreadyExists on mismatched volume set, got %v", err)
+	}
+
+	// GetVolumeGroupSnapshot succeeds and checks snapshot_ids consistency.
+	snapIDs := []string{vgs.GetSnapshots()[0].GetSnapshotId(), vgs.GetSnapshots()[1].GetSnapshotId()}
+	got, err := gc.GetVolumeGroupSnapshot(ctx, &csi.GetVolumeGroupSnapshotRequest{
+		GroupSnapshotId: vgs.GetGroupSnapshotId(),
+		SnapshotIds:     snapIDs,
+	})
+	if err != nil {
+		t.Fatalf("GetVolumeGroupSnapshot: %v", err)
+	}
+	if len(got.GetGroupSnapshot().GetSnapshots()) != 2 {
+		t.Fatalf("expected 2 snapshots in GetVolumeGroupSnapshot, got %d", len(got.GetGroupSnapshot().GetSnapshots()))
+	}
+
+	if _, err := gc.GetVolumeGroupSnapshot(ctx, &csi.GetVolumeGroupSnapshotRequest{
+		GroupSnapshotId: vgs.GetGroupSnapshotId(),
+		SnapshotIds:     []string{"snap-wrong"},
+	}); status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("expected InvalidArgument on snapshot_ids mismatch, got %v", err)
+	}
+
+	// DeleteVolumeGroupSnapshot removes group and member snapshots, and is idempotent.
+	if _, err := gc.DeleteVolumeGroupSnapshot(ctx, &csi.DeleteVolumeGroupSnapshotRequest{
+		GroupSnapshotId: vgs.GetGroupSnapshotId(),
+		SnapshotIds:     snapIDs,
+	}); err != nil {
+		t.Fatalf("DeleteVolumeGroupSnapshot: %v", err)
+	}
+	if _, err := gc.DeleteVolumeGroupSnapshot(ctx, &csi.DeleteVolumeGroupSnapshotRequest{
+		GroupSnapshotId: vgs.GetGroupSnapshotId(),
+		SnapshotIds:     snapIDs,
+	}); err != nil {
+		t.Fatalf("idempotent DeleteVolumeGroupSnapshot: %v", err)
+	}
+
+	if _, err := gc.GetVolumeGroupSnapshot(ctx, &csi.GetVolumeGroupSnapshotRequest{
+		GroupSnapshotId: vgs.GetGroupSnapshotId(),
+	}); status.Code(err) != codes.NotFound {
+		t.Fatalf("expected NotFound after delete, got %v", err)
+	}
+
+	snaps, err := db.ListSnapshots("", "")
+	if err != nil {
+		t.Fatalf("ListSnapshots: %v", err)
+	}
+	if len(snaps) != 0 {
+		t.Fatalf("expected 0 remaining snapshots after group delete, got %d", len(snaps))
 	}
 }

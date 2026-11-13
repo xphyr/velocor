@@ -52,6 +52,13 @@ func (s *IdentityServer) GetPluginCapabilities(_ context.Context, _ *csi.GetPlug
 			{
 				Type: &csi.PluginCapability_Service_{
 					Service: &csi.PluginCapability_Service{
+						Type: csi.PluginCapability_Service_GROUP_CONTROLLER_SERVICE,
+					},
+				},
+			},
+			{
+				Type: &csi.PluginCapability_Service_{
+					Service: &csi.PluginCapability_Service{
 						Type: csi.PluginCapability_Service_SNAPSHOT_METADATA_SERVICE,
 					},
 				},

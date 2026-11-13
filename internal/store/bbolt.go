@@ -17,9 +17,10 @@ var (
 	bucketTokens          = []byte("tokens")
 	bucketDisks           = []byte("disks")
 	bucketPools           = []byte("pools")
-	bucketVolumes         = []byte("volumes")
-	bucketSnapshots       = []byte("snapshots")
-	bucketPortals         = []byte("portals")
+	bucketVolumes              = []byte("volumes")
+	bucketSnapshots            = []byte("snapshots")
+	bucketVolumeGroupSnapshots = []byte("volume_group_snapshots")
+	bucketPortals              = []byte("portals")
 	bucketHosts           = []byte("hosts")
 	bucketInitiatorGroups = []byte("initiator_groups")
 	bucketExports         = []byte("exports")
@@ -35,6 +36,7 @@ var allBuckets = [][]byte{
 	bucketPools,
 	bucketVolumes,
 	bucketSnapshots,
+	bucketVolumeGroupSnapshots,
 	bucketPortals,
 	bucketHosts,
 	bucketInitiatorGroups,
@@ -1025,6 +1027,124 @@ func (s *BoltStore) DeleteSnapshot(id string) error {
 		}
 
 		return snapsB.Delete([]byte(id))
+	})
+}
+
+// CreateVolumeGroupSnapshot persists a consistent group of snapshots.
+func (s *BoltStore) CreateVolumeGroupSnapshot(vgs *VolumeGroupSnapshot) error {
+	if vgs == nil || vgs.ID == "" || vgs.Name == "" || len(vgs.VolumeIDs) == 0 {
+		return fmt.Errorf("%w: group snapshot id, name, and volume_ids are required", ErrInvalidArgument)
+	}
+	cp := *vgs
+	cp.VolumeIDs = append([]string(nil), vgs.VolumeIDs...)
+	cp.SnapshotIDs = append([]string(nil), vgs.SnapshotIDs...)
+	if cp.CreatedAt.IsZero() {
+		cp.CreatedAt = time.Now().UTC()
+	}
+
+	return s.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketVolumeGroupSnapshots)
+		if b.Get([]byte(cp.ID)) != nil {
+			return fmt.Errorf("%w: volume group snapshot id %s", ErrAlreadyExists, cp.ID)
+		}
+		err := b.ForEach(func(_, v []byte) error {
+			var existing VolumeGroupSnapshot
+			if err := json.Unmarshal(v, &existing); err != nil {
+				return err
+			}
+			if existing.Name == cp.Name {
+				return fmt.Errorf("%w: volume group snapshot %s", ErrAlreadyExists, cp.Name)
+			}
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+		for _, snapID := range cp.SnapshotIDs {
+			var snap Snapshot
+			if err := getJSON(tx.Bucket(bucketSnapshots), []byte(snapID), &snap); err != nil {
+				return fmt.Errorf("snapshot %s: %w", snapID, err)
+			}
+		}
+		if err := putJSON(b, []byte(cp.ID), &cp); err != nil {
+			return err
+		}
+		*vgs = cp
+		return nil
+	})
+}
+
+// GetVolumeGroupSnapshot retrieves a VolumeGroupSnapshot by ID.
+func (s *BoltStore) GetVolumeGroupSnapshot(id string) (*VolumeGroupSnapshot, error) {
+	var vgs VolumeGroupSnapshot
+	err := s.db.View(func(tx *bolt.Tx) error {
+		return getJSON(tx.Bucket(bucketVolumeGroupSnapshots), []byte(id), &vgs)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &vgs, nil
+}
+
+// GetVolumeGroupSnapshotByName retrieves a VolumeGroupSnapshot by Name.
+func (s *BoltStore) GetVolumeGroupSnapshotByName(name string) (*VolumeGroupSnapshot, error) {
+	var found *VolumeGroupSnapshot
+	err := s.db.View(func(tx *bolt.Tx) error {
+		return tx.Bucket(bucketVolumeGroupSnapshots).ForEach(func(_, v []byte) error {
+			var vgs VolumeGroupSnapshot
+			if err := json.Unmarshal(v, &vgs); err != nil {
+				return err
+			}
+			if vgs.Name == name {
+				cp := vgs
+				found = &cp
+				return nil
+			}
+			return nil
+		})
+	})
+	if err != nil {
+		return nil, err
+	}
+	if found == nil {
+		return nil, fmt.Errorf("%w: volume group snapshot %s", ErrNotFound, name)
+	}
+	return found, nil
+}
+
+// ListVolumeGroupSnapshots returns all VolumeGroupSnapshots ordered by CreatedAt.
+func (s *BoltStore) ListVolumeGroupSnapshots() ([]*VolumeGroupSnapshot, error) {
+	var out []*VolumeGroupSnapshot
+	err := s.db.View(func(tx *bolt.Tx) error {
+		return tx.Bucket(bucketVolumeGroupSnapshots).ForEach(func(_, v []byte) error {
+			var vgs VolumeGroupSnapshot
+			if err := json.Unmarshal(v, &vgs); err != nil {
+				return err
+			}
+			out = append(out, &vgs)
+			return nil
+		})
+	})
+	if err != nil {
+		return nil, err
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].CreatedAt.Equal(out[j].CreatedAt) {
+			return out[i].ID < out[j].ID
+		}
+		return out[i].CreatedAt.Before(out[j].CreatedAt)
+	})
+	return out, nil
+}
+
+// DeleteVolumeGroupSnapshot removes a VolumeGroupSnapshot record by ID.
+func (s *BoltStore) DeleteVolumeGroupSnapshot(id string) error {
+	return s.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketVolumeGroupSnapshots)
+		if b.Get([]byte(id)) == nil {
+			return fmt.Errorf("%w: volume group snapshot %s", ErrNotFound, id)
+		}
+		return b.Delete([]byte(id))
 	})
 }
 

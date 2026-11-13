@@ -70,6 +70,13 @@ type Store interface {
 	ListSnapshots(poolID, volumeID string) ([]*Snapshot, error)
 	DeleteSnapshot(id string) error
 
+	// Volume Group Snapshots (Consistency Groups)
+	CreateVolumeGroupSnapshot(vgs *VolumeGroupSnapshot) error
+	GetVolumeGroupSnapshot(id string) (*VolumeGroupSnapshot, error)
+	GetVolumeGroupSnapshotByName(name string) (*VolumeGroupSnapshot, error)
+	ListVolumeGroupSnapshots() ([]*VolumeGroupSnapshot, error)
+	DeleteVolumeGroupSnapshot(id string) error
+
 	// Portals
 	CreatePortal(portal *Portal) error
 	GetPortal(id string) (*Portal, error)

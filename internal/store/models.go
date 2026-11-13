@@ -208,6 +208,16 @@ type Snapshot struct {
 	CreatedAt        time.Time `json:"created_at"`
 }
 
+// VolumeGroupSnapshot represents a point-in-time consistent group of snapshots across multiple volumes.
+type VolumeGroupSnapshot struct {
+	ID          string    `json:"id"`
+	Name        string    `json:"name"`
+	VolumeIDs   []string  `json:"volume_ids"`
+	SnapshotIDs []string  `json:"snapshot_ids"`
+	ReadyToUse  bool      `json:"ready_to_use"`
+	CreatedAt   time.Time `json:"created_at"`
+}
+
 // Portal defines an IP/Port listener endpoint for NVMe-oF or iSCSI traffic.
 type Portal struct {
 	ID        string         `json:"id"`

@@ -61,10 +61,12 @@ func NewDriver(cfg DriverConfig) (*Driver, error) {
 	switch cfg.Mode {
 	case ModeAll:
 		csi.RegisterControllerServer(srv, NewControllerServer(cfg.Client, cfg.NodeID))
+		csi.RegisterGroupControllerServer(srv, NewGroupControllerServer(cfg.Client))
 		csi.RegisterSnapshotMetadataServer(srv, NewSnapshotMetadataServer(cfg.Client))
 		csi.RegisterNodeServer(srv, NewNodeServer(cfg.NodeID, cfg.Mounter))
 	case ModeController:
 		csi.RegisterControllerServer(srv, NewControllerServer(cfg.Client))
+		csi.RegisterGroupControllerServer(srv, NewGroupControllerServer(cfg.Client))
 		csi.RegisterSnapshotMetadataServer(srv, NewSnapshotMetadataServer(cfg.Client))
 	case ModeNode:
 		csi.RegisterNodeServer(srv, NewNodeServer(cfg.NodeID, cfg.Mounter))

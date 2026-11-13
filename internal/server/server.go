@@ -119,6 +119,12 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("POST /api/v1/snapshots/", s.withAuth(store.RoleCSIProvisioner, s.handleSnapshotAction))
 	s.mux.HandleFunc("DELETE /api/v1/snapshots/{id}", s.withAuth(store.RoleCSIProvisioner, s.handleDeleteSnapshot))
 
+	// Volume Group Snapshots (Consistency Groups)
+	s.mux.HandleFunc("POST /api/v1/volume-group-snapshots", s.withAuth(store.RoleCSIProvisioner, s.handleCreateVolumeGroupSnapshot))
+	s.mux.HandleFunc("GET /api/v1/volume-group-snapshots", s.withAuth(store.RoleReadOnly, s.handleListVolumeGroupSnapshots))
+	s.mux.HandleFunc("GET /api/v1/volume-group-snapshots/{id}", s.withAuth(store.RoleReadOnly, s.handleGetVolumeGroupSnapshot))
+	s.mux.HandleFunc("DELETE /api/v1/volume-group-snapshots/{id}", s.withAuth(store.RoleCSIProvisioner, s.handleDeleteVolumeGroupSnapshot))
+
 	// Portals, Hosts, InitiatorGroups & Exports
 	s.mux.HandleFunc("GET /api/v1/portals", s.withAuth(store.RoleReadOnly, s.handleListPortals))
 	s.mux.HandleFunc("POST /api/v1/portals", s.withAuth(store.RoleAdmin, s.handleCreatePortal))
@@ -1095,6 +1101,193 @@ func (s *Server) handleDeleteSnapshot(w http.ResponseWriter, r *http.Request) {
 		_ = s.spdk.BdevLvolDelete(r.Context(), snap.LvolBdevName)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{})
+}
+
+func (s *Server) handleCreateVolumeGroupSnapshot(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Name      string   `json:"name"`
+		VolumeIDs []string `json:"volume_ids"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, fmt.Errorf("%w: invalid json body", store.ErrInvalidArgument))
+		return
+	}
+	if req.Name == "" || len(req.VolumeIDs) == 0 {
+		writeError(w, fmt.Errorf("%w: name and non-empty volume_ids are required", store.ErrInvalidArgument))
+		return
+	}
+
+	seen := make(map[string]struct{}, len(req.VolumeIDs))
+	dedupVolIDs := make([]string, 0, len(req.VolumeIDs))
+	for _, id := range req.VolumeIDs {
+		if id == "" {
+			writeError(w, fmt.Errorf("%w: volume_ids must not contain empty values", store.ErrInvalidArgument))
+			return
+		}
+		if _, dup := seen[id]; dup {
+			continue
+		}
+		seen[id] = struct{}{}
+		dedupVolIDs = append(dedupVolIDs, id)
+	}
+
+	// Idempotent by Name when volume sets match; AlreadyExists on mismatch.
+	if existing, err := s.store.GetVolumeGroupSnapshotByName(req.Name); err == nil {
+		if !equalStringSets(existing.VolumeIDs, dedupVolIDs) {
+			writeError(w, fmt.Errorf("%w: volume group snapshot %s already exists with different volumes", store.ErrAlreadyExists, req.Name))
+			return
+		}
+		snaps := s.resolveGroupSnapshots(existing.SnapshotIDs)
+		writeJSON(w, http.StatusOK, map[string]any{
+			"volume_group_snapshot": existing,
+			"snapshots":             snaps,
+		})
+		return
+	}
+
+	// Pre-validate all volumes and pools exist before creating any snapshots.
+	type volPool struct {
+		vol  *store.Volume
+		pool *store.Pool
+	}
+	targets := make([]volPool, 0, len(dedupVolIDs))
+	for _, volID := range dedupVolIDs {
+		vol, err := s.store.GetVolume(volID)
+		if err != nil {
+			writeError(w, err)
+			return
+		}
+		pool, err := s.store.GetPool(vol.PoolID)
+		if err != nil {
+			writeError(w, err)
+			return
+		}
+		targets = append(targets, volPool{vol: vol, pool: pool})
+	}
+
+	// Take snapshots across all member volumes in a tight coordinated loop.
+	createdSnaps := make([]*store.Snapshot, 0, len(targets))
+	snapIDs := make([]string, 0, len(targets))
+	rollback := func() {
+		for _, cs := range createdSnaps {
+			_ = s.store.DeleteSnapshot(cs.ID)
+			if s.spdk != nil {
+				_ = s.spdk.BdevLvolDelete(r.Context(), cs.LvolBdevName)
+			}
+		}
+	}
+
+	for _, t := range targets {
+		snapName := fmt.Sprintf("%s-%s", req.Name, t.vol.ID)
+		snap := &store.Snapshot{
+			ID:           newResourceID("snap"),
+			Name:         snapName,
+			VolumeID:     t.vol.ID,
+			PoolID:       t.pool.ID,
+			LvolBdevName: fmt.Sprintf("%s/%s", t.pool.LVSName, snapName),
+			SizeBytes:    t.vol.SizeBytes,
+		}
+		if s.spdk != nil {
+			if uuid, err := s.spdk.BdevLvolSnapshot(r.Context(), t.vol.LvolBdevName, snapName); err == nil {
+				snap.UUID = uuid
+			}
+		}
+		if err := s.store.CreateSnapshot(snap); err != nil {
+			rollback()
+			writeError(w, err)
+			return
+		}
+		createdSnaps = append(createdSnaps, snap)
+		snapIDs = append(snapIDs, snap.ID)
+	}
+
+	vgs := &store.VolumeGroupSnapshot{
+		ID:          newResourceID("vgs"),
+		Name:        req.Name,
+		VolumeIDs:   dedupVolIDs,
+		SnapshotIDs: snapIDs,
+		ReadyToUse:  true,
+	}
+	if err := s.store.CreateVolumeGroupSnapshot(vgs); err != nil {
+		rollback()
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{
+		"volume_group_snapshot": vgs,
+		"snapshots":             createdSnaps,
+	})
+}
+
+func (s *Server) handleListVolumeGroupSnapshots(w http.ResponseWriter, r *http.Request) {
+	list, err := s.store.ListVolumeGroupSnapshots()
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"volume_group_snapshots": list})
+}
+
+func (s *Server) handleGetVolumeGroupSnapshot(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	vgs, err := s.store.GetVolumeGroupSnapshot(id)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"volume_group_snapshot": vgs,
+		"snapshots":             s.resolveGroupSnapshots(vgs.SnapshotIDs),
+	})
+}
+
+func (s *Server) handleDeleteVolumeGroupSnapshot(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	vgs, err := s.store.GetVolumeGroupSnapshot(id)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	if err := s.store.DeleteVolumeGroupSnapshot(id); err != nil {
+		writeError(w, err)
+		return
+	}
+	for _, snapID := range vgs.SnapshotIDs {
+		snap, err := s.store.GetSnapshot(snapID)
+		if err != nil {
+			continue
+		}
+		if err := s.store.DeleteSnapshot(snapID); err == nil && s.spdk != nil {
+			_ = s.spdk.BdevLvolDelete(r.Context(), snap.LvolBdevName)
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{})
+}
+
+func (s *Server) resolveGroupSnapshots(snapIDs []string) []*store.Snapshot {
+	snaps := make([]*store.Snapshot, 0, len(snapIDs))
+	for _, snapID := range snapIDs {
+		if snap, err := s.store.GetSnapshot(snapID); err == nil {
+			snaps = append(snaps, snap)
+		}
+	}
+	return snaps
+}
+
+func equalStringSets(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	set := make(map[string]struct{}, len(a))
+	for _, v := range a {
+		set[v] = struct{}{}
+	}
+	for _, v := range b {
+		if _, ok := set[v]; !ok {
+			return false
+		}
+	}
+	return true
 }
 
 // --- Portal, InitiatorGroup & Export Handlers ---
