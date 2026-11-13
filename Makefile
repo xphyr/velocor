@@ -61,7 +61,10 @@ container-csi:
 		-t $(CSI_IMAGE) -f deploy/containers/Containerfile.csi .
 
 container-bootc:
-	$(PODMAN) build -t $(BOOTC_IMAGE) -f deploy/bootc/Containerfile .
+	$(PODMAN) build \
+		--build-arg VELOD_IMAGE=$(VELOD_IMAGE) \
+		--build-arg SPDK_IMAGE=$(SPDK_IMAGE) \
+		-t $(BOOTC_IMAGE) -f deploy/bootc/Containerfile .
 
 push-containers: push-spdk push-velod push-csi push-bootc
 

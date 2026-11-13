@@ -1,0 +1,322 @@
+name: Build, Test & Release Velocor
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  test:
+    name: Test & Verify Binaries
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Run go vet
+        run: go vet ./...
+
+      - name: Run unit & CSI sanity tests
+        run: make test
+
+      - name: Build all binaries (velod, veloctl, velocor-csi)
+        run: make build
+
+  build-cli:
+    name: Build veloctl CLI Release Binaries
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Cross-compile veloctl and package archives
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+
+          VERSION="$(git describe --tags --always --dirty 2>/dev/null || echo 'v0.1.0-dev')"
+          COMMIT="$(git rev-parse --short HEAD 2>/dev/null || echo 'none')"
+          BUILD_TIME="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          LDFLAGS="-s -w -X github.com/velocor/velocor/internal/version.Version=${VERSION} -X github.com/velocor/velocor/internal/version.Commit=${COMMIT} -X github.com/velocor/velocor/internal/version.BuildTime=${BUILD_TIME}"
+
+          TARGETS=(
+            "linux:amd64"
+            "linux:arm64"
+            "darwin:amd64"
+            "darwin:arm64"
+            "windows:amd64"
+          )
+
+          for target in "${TARGETS[@]}"; do
+            GOOS="${target%%:*}"
+            GOARCH="${target##*:}"
+            STAGE_DIR="$(mktemp -d)"
+            BIN_NAME="veloctl"
+            if [[ "${GOOS}" == "windows" ]]; then
+              BIN_NAME="veloctl.exe"
+            fi
+
+            echo "Building ${BIN_NAME} for ${GOOS}/${GOARCH} (${VERSION})..."
+            CGO_ENABLED=0 GOOS="${GOOS}" GOARCH="${GOARCH}" \
+              go build -trimpath -ldflags "${LDFLAGS}" -o "${STAGE_DIR}/${BIN_NAME}" ./cmd/veloctl
+
+            cp README.md "${STAGE_DIR}/"
+
+            if [[ "${GOOS}" == "windows" ]]; then
+              (cd "${STAGE_DIR}" && zip -q "${GITHUB_WORKSPACE}/dist/veloctl-${GOOS}-${GOARCH}.zip" "${BIN_NAME}" README.md)
+            else
+              tar -C "${STAGE_DIR}" -czf "${GITHUB_WORKSPACE}/dist/veloctl-${GOOS}-${GOARCH}.tar.gz" "${BIN_NAME}" README.md
+            fi
+            rm -rf "${STAGE_DIR}"
+          done
+
+          (cd dist && sha256sum veloctl-* > checksums.txt)
+          ls -lh dist/
+
+      - name: Upload veloctl release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: veloctl-binaries
+          path: dist/*
+          if-no-files-found: error
+
+  build-containers:
+    name: Build Container (${{ matrix.image }})
+    needs: test
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: velocor-velod
+            containerfile: deploy/containers/Containerfile.velod
+          - image: velocor-spdk
+            containerfile: deploy/containers/Containerfile.spdk
+          - image: velocor-csi
+            containerfile: deploy/containers/Containerfile.csi
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve build version metadata
+        id: vars
+        run: |
+          OWNER_LC="$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
+          VERSION="$(git describe --tags --always 2>/dev/null || echo 'v0.1.0-dev')"
+          COMMIT="$(git rev-parse --short HEAD 2>/dev/null || echo 'none')"
+          BUILD_TIME="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          echo "owner_lc=${OWNER_LC}" >> "${GITHUB_OUTPUT}"
+          echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
+          echo "commit=${COMMIT}" >> "${GITHUB_OUTPUT}"
+          echo "build_time=${BUILD_TIME}" >> "${GITHUB_OUTPUT}"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Docker metadata for ${{ matrix.image }}
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ steps.vars.outputs.owner_lc }}/${{ matrix.image }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern=v{{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,prefix=sha-
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push ${{ matrix.image }}
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.containerfile }}
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ steps.vars.outputs.version }}
+            COMMIT=${{ steps.vars.outputs.commit }}
+            BUILD_TIME=${{ steps.vars.outputs.build_time }}
+          cache-from: type=gha,scope=${{ matrix.image }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image }}
+
+  build-os:
+    name: Build Bootc Appliance OS (velocor-os)
+    needs:
+      - build-cli
+      - build-containers
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download veloctl linux-amd64 binary for OS image
+        uses: actions/download-artifact@v4
+        with:
+          name: veloctl-binaries
+          path: /tmp/veloctl-dist
+
+      - name: Prepare velod-bin build context and Quadlet image references
+        id: vars
+        run: |
+          mkdir -p /tmp/velod-rootfs/usr/bin
+          tar -xzf /tmp/veloctl-dist/veloctl-linux-amd64.tar.gz -C /tmp/velod-rootfs/usr/bin veloctl
+          chmod 0755 /tmp/velod-rootfs/usr/bin/veloctl
+
+          OWNER_LC="$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            QUADLET_TAG="${GITHUB_REF_NAME}"
+          else
+            QUADLET_TAG="latest"
+          fi
+          echo "owner_lc=${OWNER_LC}" >> "${GITHUB_OUTPUT}"
+          echo "velod_image=${REGISTRY}/${OWNER_LC}/velocor-velod:${QUADLET_TAG}" >> "${GITHUB_OUTPUT}"
+          echo "spdk_image=${REGISTRY}/${OWNER_LC}/velocor-spdk:${QUADLET_TAG}" >> "${GITHUB_OUTPUT}"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Docker metadata for velocor-os
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ steps.vars.outputs.owner_lc }}/velocor-os
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern=v{{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,prefix=sha-
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push velocor-os (bootc)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/bootc/Containerfile
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-contexts: |
+            velod-bin=/tmp/velod-rootfs
+          build-args: |
+            VELOD_IMAGE=${{ steps.vars.outputs.velod_image }}
+            SPDK_IMAGE=${{ steps.vars.outputs.spdk_image }}
+          cache-from: type=gha,scope=velocor-os
+          cache-to: type=gha,mode=max,scope=velocor-os
+
+  release:
+    name: Publish GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs:
+      - test
+      - build-cli
+      - build-containers
+      - build-os
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download veloctl release binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: veloctl-binaries
+          path: dist
+
+      - name: Package Kubernetes CSI manifests for release
+        id: meta
+        run: |
+          OWNER_LC="$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
+          TAG="${GITHUB_REF_NAME}"
+          CSI_IMAGE="${REGISTRY}/${OWNER_LC}/velocor-csi:${TAG}"
+
+          sed "s|image: registry.xphyrlab.net/velocor/velocor-csi:latest|image: ${CSI_IMAGE}|g" \
+            deploy/k8s/csi/velocor-csi.yaml > dist/velocor-csi.yaml
+          cp deploy/k8s/csi/volumesnapshotclass.yaml dist/volumesnapshotclass.yaml
+          cp deploy/k8s/csi/volumegroupsnapshotclass.yaml dist/volumegroupsnapshotclass.yaml
+
+          (cd dist && sha256sum veloctl-* *.yaml > checksums.txt)
+          echo "owner_lc=${OWNER_LC}" >> "${GITHUB_OUTPUT}"
+          echo "tag=${TAG}" >> "${GITHUB_OUTPUT}"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            dist/veloctl-*
+            dist/velocor-csi.yaml
+            dist/volumesnapshotclass.yaml
+            dist/volumegroupsnapshotclass.yaml
+            dist/checksums.txt
+          body: |
+            ## Container & Bootc OS Images (`${{ steps.meta.outputs.tag }}`)
+
+            - **Appliance OS (`bootc`)**: `${{ env.REGISTRY }}/${{ steps.meta.outputs.owner_lc }}/velocor-os:${{ steps.meta.outputs.tag }}`
+            - **Control Plane (`velod`)**: `${{ env.REGISTRY }}/${{ steps.meta.outputs.owner_lc }}/velocor-velod:${{ steps.meta.outputs.tag }}`
+            - **Data Plane (`spdk_tgt`)**: `${{ env.REGISTRY }}/${{ steps.meta.outputs.owner_lc }}/velocor-spdk:${{ steps.meta.outputs.tag }}`
+            - **Kubernetes CSI Driver (`velocor-csi`)**: `${{ env.REGISTRY }}/${{ steps.meta.outputs.owner_lc }}/velocor-csi:${{ steps.meta.outputs.tag }}`
+
+            ## CLI (`veloctl`) & Kubernetes CSI Manifests
+
+            Download the `veloctl` archive for your platform below, or deploy the Kubernetes CSI driver directly from this release:
+
+            ```bash
+            kubectl apply -f https://github.com/${{ github.repository }}/releases/download/${{ steps.meta.outputs.tag }}/velocor-csi.yaml
+            ```

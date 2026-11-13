@@ -1,6 +1,12 @@
 # Thin Immutable Appliance Host OS on Fedora Image Mode (bootc) 45
 # Runs spdk_tgt and velod as decoupled Podman Quadlet containers.
+ARG VELOD_IMAGE=registry.xphyrlab.net/velocor/velocor-velod:latest
+FROM ${VELOD_IMAGE} AS velod-bin
+
 FROM quay.io/fedora/fedora-bootc:45
+
+ARG VELOD_IMAGE=registry.xphyrlab.net/velocor/velocor-velod:latest
+ARG SPDK_IMAGE=registry.xphyrlab.net/velocor/velocor-spdk:latest
 
 RUN dnf install -y \
       podman \
@@ -29,11 +35,13 @@ RUN mkdir -p \
     printf "d /var/lib/velocor 0700 root root -\nd /run/velocor 0755 root root -\n" > /usr/lib/tmpfiles.d/velocor.conf
 
 # Install operator CLI client on the host
-COPY --from=registry.xphyrlab.net/velocor/velocor-velod:latest /usr/bin/veloctl /usr/bin/veloctl
+COPY --from=velod-bin /usr/bin/veloctl /usr/bin/veloctl
 
 # Install Podman Quadlet units for decoupled data-plane and control-plane containers
 COPY deploy/quadlets/velocor-spdk.container /usr/share/containers/systemd/velocor-spdk.container
 COPY deploy/quadlets/velocor-velod.container /usr/share/containers/systemd/velocor-velod.container
 
-RUN /usr/lib/systemd/system-generators/podman-system-generator --dryrun >/dev/null && \
+RUN sed -i "s|^Image=.*|Image=${SPDK_IMAGE}|" /usr/share/containers/systemd/velocor-spdk.container && \
+    sed -i "s|^Image=.*|Image=${VELOD_IMAGE}|" /usr/share/containers/systemd/velocor-velod.container && \
+    /usr/lib/systemd/system-generators/podman-system-generator --dryrun >/dev/null && \
     bootc container lint
