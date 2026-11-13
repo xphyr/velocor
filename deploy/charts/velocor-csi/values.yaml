@@ -81,10 +81,15 @@ snapshots:
     deletionPolicy: Delete
     isDefault: false
   volumeGroupSnapshotClass:
-    # Enable when groupsnapshot.storage.k8s.io CRDs are installed on the cluster
-    enabled: false
+    # "auto" enables when groupsnapshot.storage.k8s.io/v1beta1 CRD exists; true/false forces on/off
+    enabled: auto
     name: velocor-group-snapshots
     deletionPolicy: Delete
   sidecar:
-    # Enables --enable-volume-group-snapshots=true on csi-snapshotter
-    groupSnapshotsEnabled: false
+    # "auto" enables --enable-volume-group-snapshots=true when groupsnapshot.storage.k8s.io/v1beta1 CRD exists
+    groupSnapshotsEnabled: auto
+
+openshift:
+  scc:
+    # "auto" binds the OpenShift privileged SCC to velocor-csi-node when security.openshift.io/v1 is present
+    enabled: auto

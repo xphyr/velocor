@@ -12,7 +12,8 @@ metadata:
 driver: {{ .Values.driverName }}
 deletionPolicy: {{ .Values.snapshots.volumeSnapshotClass.deletionPolicy }}
 {{- end }}
-{{- if .Values.snapshots.volumeGroupSnapshotClass.enabled }}
+{{- $vgsEnabled := or (eq (toString .Values.snapshots.volumeGroupSnapshotClass.enabled) "true") (and (eq (toString .Values.snapshots.volumeGroupSnapshotClass.enabled) "auto") (.Capabilities.APIVersions.Has "groupsnapshot.storage.k8s.io/v1beta1")) }}
+{{- if $vgsEnabled }}
 ---
 apiVersion: groupsnapshot.storage.k8s.io/v1beta1
 kind: VolumeGroupSnapshotClass

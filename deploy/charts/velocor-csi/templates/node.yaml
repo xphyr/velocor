@@ -54,6 +54,10 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: spec.nodeName
+            {{- if .Values.auth.portalOverride }}
+            - name: VELOCOR_PORTAL_OVERRIDE
+              value: {{ .Values.auth.portalOverride | quote }}
+            {{- end }}
           volumeMounts:
             - name: socket-dir
               mountPath: /csi

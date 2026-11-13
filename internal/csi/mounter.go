@@ -2,6 +2,7 @@ package csi
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -89,7 +90,7 @@ func (m *LinuxMounter) ConnectTarget(ctx context.Context, publishCtx map[string]
 		}
 		args := []string{"connect", "-t", "tcp", "-a", ip, "-s", port, "-n", nqn}
 		if hostNQN != "" {
-			args = append(args, "-q", hostNQN)
+			args = append(args, "-q", hostNQN, "-I", deterministicHostID(hostNQN))
 		}
 		out, err := exec.CommandContext(ctx, "nvme", args...).CombinedOutput()
 		if err != nil && !strings.Contains(strings.ToLower(string(out)), "already connected") {
@@ -117,6 +118,13 @@ func (m *LinuxMounter) DisconnectTarget(ctx context.Context, publishCtx map[stri
 		}
 		return nil
 	}
+}
+
+func deterministicHostID(hostNQN string) string {
+	sum := sha256.Sum256([]byte(hostNQN))
+	sum[6] = (sum[6] & 0x0f) | 0x40
+	sum[8] = (sum[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x", sum[0:4], sum[4:6], sum[6:8], sum[8:10], sum[10:16])
 }
 
 func (m *LinuxMounter) FormatAndMount(ctx context.Context, source, target, fsType string, mountOpts []string) error {

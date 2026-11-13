@@ -122,10 +122,13 @@ jobs:
         include:
           - image: velocor-velod
             containerfile: deploy/containers/Containerfile.velod
+            platforms: linux/amd64
           - image: velocor-spdk
             containerfile: deploy/containers/Containerfile.spdk
+            platforms: linux/amd64
           - image: velocor-csi
             containerfile: deploy/containers/Containerfile.csi
+            platforms: linux/amd64,linux/arm64
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
@@ -143,6 +146,10 @@ jobs:
           echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
           echo "commit=${COMMIT}" >> "${GITHUB_OUTPUT}"
           echo "build_time=${BUILD_TIME}" >> "${GITHUB_OUTPUT}"
+
+      - name: Set up QEMU (for multi-arch builds)
+        if: contains(matrix.platforms, 'arm64')
+        uses: docker/setup-qemu-action@v4
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
@@ -176,6 +183,7 @@ jobs:
         with:
           context: .
           file: ${{ matrix.containerfile }}
+          platforms: ${{ matrix.platforms }}
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
@@ -232,6 +240,10 @@ jobs:
           echo "owner_lc=${OWNER_LC}" >> "${GITHUB_OUTPUT}"
           echo "velod_image=${REGISTRY}/${OWNER_LC}/velocor-velod:${QUADLET_TAG}" >> "${GITHUB_OUTPUT}"
           echo "spdk_image=${REGISTRY}/${OWNER_LC}/velocor-spdk:${QUADLET_TAG}" >> "${GITHUB_OUTPUT}"
+
+      - name: Set up QEMU (for multi-arch builds)
+        if: contains(matrix.platforms, 'arm64')
+        uses: docker/setup-qemu-action@v4
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4

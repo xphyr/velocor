@@ -42,3 +42,24 @@ This file tracks implementation progress directly inside the Git repository so a
 - [x] JWT login, password management & Personal Access Token (`velo_pat_...`) UI
 - [x] Live SPDK bdev I/O telemetry (`bdev_get_iostat` polling with IOPS, MB/s, and latency)
 - [x] Disks (boot-disk guard, claim/release), Pools, Volumes (QoS/resize), Snapshots & CBT inspector, and SAN Exports (with copyable `nvme`/`iscsiadm` commands)
+
+## Phase 6: Kubernetes CSI Driver (`velocor-csi`), Helm Chart & Release Pipeline
+- [x] CSI v1.x driver (`cmd/velocor-csi`, `internal/csi`) with NVMe-oF/TCP & iSCSI support, online expansion, CoW snapshots, cloning, and usage reporting (`NodeGetVolumeStats`, `GetCapacity`)
+- [x] Per-node Host & InitiatorGroup ACL automation during `ControllerPublishVolume`
+- [x] Changed Block Tracking (`SnapshotMetadata` / KEP-3314) & Volume Group Snapshots (`GroupController` / KEP-3476)
+- [x] Official CSI sanity suite (`csi-test/v5`: 82 passed, 0 failed) & `k3s` VM lab end-to-end verification
+- [x] Multi-arch (`linux/amd64`, `linux/arm64`) `velocor-csi` container build & Helm chart (`deploy/charts/velocor-csi`)
+- [x] GitHub Actions CI/CD release pipeline (`.github/workflows/ci-release.yml`) with Cosign keyless signing, SPDX SBOMs, SLSA build provenance, and OCI Helm publishing
+- [x] OpenShift cluster validation (SCC/SELinux, NVMe-oF/TCP, `VolumeSnapshot`, online expansion; `VolumeGroupSnapshot` skipped where CRD absent)
+
+## Phase 7: Operator Parity & Appliance Lifecycle Management (`veloctl` & Web UI)
+- [ ] `veloctl` CLI and Web UI support for Volume Group Snapshots (Consistency Groups)
+- [ ] Web UI & `veloctl` parity for `velocor-os` (`bootc`) status, upgrades, and rollbacks
+- [ ] Container update checker for running Quadlet services (`velocor-velod`, `velocor-spdk`) against registry digests (`podman auto-update --dry-run` / OCI manifest check)
+- [ ] Web UI & `veloctl` trigger to apply container updates safely with status reporting
+
+## Phase 8: Hardening & Storage Failure-Mode Testing
+- [ ] Control-plane & API hardening (audit logging, rate limiting, TLS/auth hardening, input validation, least-privilege container/host posture)
+- [ ] Resolve degraded RAID / lvol reclaim error on `spdk_tgt` restart (`bdev Nvme_* already claimed by module lvol` / `raid_bdev_configure_base_bdev` ordering during reconciler recovery)
+- [ ] Storage failure & fault-injection test suite (NVMe/SSD removal & fault handling, degraded RAID pool behavior, `spdk_tgt` & `velod` restart/crash recovery)
+- [ ] Initiator & CSI resilience testing (network drop/reconnect, multi-path/portal failover, node reboot & ungraceful detach recovery)

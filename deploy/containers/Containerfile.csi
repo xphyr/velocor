@@ -1,4 +1,4 @@
-FROM quay.io/fedora/fedora:45 AS builder
+FROM --platform=$BUILDPLATFORM quay.io/fedora/fedora:45 AS builder
 
 RUN dnf install -y golang git && dnf clean all
 
@@ -7,10 +7,12 @@ COPY go.mod go.sum ./
 RUN go mod download
 
 COPY . .
+ARG TARGETOS=linux
+ARG TARGETARCH=amd64
 ARG VERSION=v0.1.0
 ARG COMMIT=unknown
 ARG BUILD_TIME=unknown
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
     go build -ldflags="-s -w -X github.com/velocor/velocor/internal/version.Version=${VERSION} -X github.com/velocor/velocor/internal/version.Commit=${COMMIT} -X github.com/velocor/velocor/internal/version.BuildTime=${BUILD_TIME}" \
     -o /out/velocor-csi ./cmd/velocor-csi
 
