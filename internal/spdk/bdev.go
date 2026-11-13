@@ -25,7 +25,7 @@ type BdevInfo struct {
 
 // BdevGetBdevs queries SPDK for all bdevs, or a single bdev if name is non-empty.
 func (c *Client) BdevGetBdevs(ctx context.Context, name string) ([]BdevInfo, error) {
-	var params map[string]any
+	var params any
 	if name != "" {
 		params = map[string]any{"name": name}
 	}
@@ -215,7 +215,7 @@ type BdevGetIostatResponse struct {
 
 // BdevGetIostat queries real-time I/O counters and tick latency for all bdevs or a single bdev.
 func (c *Client) BdevGetIostat(ctx context.Context, name string) (*BdevGetIostatResponse, error) {
-	var params map[string]any
+	var params any
 	if name != "" {
 		params = map[string]any{"name": name}
 	}

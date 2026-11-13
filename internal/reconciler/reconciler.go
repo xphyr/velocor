@@ -236,7 +236,7 @@ func (r *Reconciler) ReconcileOnce(ctx context.Context) (State, error) {
 				}
 			}
 			if len(baseBdevs) == len(pool.DiskIDs) && len(baseBdevs) > 0 {
-				if err := r.spdk.BdevRaidCreate(ctx, pool.BaseBdevName, string(pool.RaidLevel), pool.StripSizeKB, baseBdevs, true); err != nil {
+				if err := r.spdk.BdevRaidCreate(ctx, pool.BaseBdevName, string(pool.RaidLevel), pool.StripSizeKB, baseBdevs, false); err != nil {
 					pool.HealthStatus = store.HealthStatusDegraded
 					degraded = append(degraded, "pool:"+pool.ID)
 					errs = append(errs, fmt.Sprintf("create raid %s: %v", pool.BaseBdevName, err))

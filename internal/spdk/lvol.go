@@ -3,6 +3,7 @@ package spdk
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 )
 
@@ -71,11 +72,14 @@ func (c *Client) BdevLvolDeleteLvstore(ctx context.Context, uuid, lvsName string
 
 // BdevLvolCreate creates a logical volume inside an lvol_store and returns its UUID.
 func (c *Client) BdevLvolCreate(ctx context.Context, lvsName, lvolName string, sizeBytes uint64, thinProvision bool, clearMethod string) (string, error) {
+	sizeMiB := sizeBytes / (1024 * 1024)
+	if sizeMiB == 0 && sizeBytes > 0 {
+		sizeMiB = 1
+	}
 	params := map[string]any{
 		"lvs_name":       lvsName,
 		"lvol_name":      lvolName,
-		"size_in_mib":    false,
-		"size":           sizeBytes,
+		"size_in_mib":    sizeMiB,
 		"thin_provision": thinProvision,
 	}
 	if clearMethod != "" {
@@ -90,10 +94,13 @@ func (c *Client) BdevLvolCreate(ctx context.Context, lvsName, lvolName string, s
 
 // BdevLvolResize resizes an existing logical volume (name is "<lvs_name>/<lvol_name>" or UUID).
 func (c *Client) BdevLvolResize(ctx context.Context, name string, sizeBytes uint64) error {
+	sizeMiB := sizeBytes / (1024 * 1024)
+	if sizeMiB == 0 && sizeBytes > 0 {
+		sizeMiB = 1
+	}
 	params := map[string]any{
 		"name":        name,
-		"size_in_mib": false,
-		"size":        sizeBytes,
+		"size_in_mib": sizeMiB,
 	}
 	return c.Call(ctx, "bdev_lvol_resize", params, nil)
 }
@@ -151,6 +158,30 @@ type BlockExtent struct {
 	SizeBytes   uint64
 }
 
+// LvolInfo describes an SPDK logical volume or snapshot returned by bdev_lvol_get_lvols.
+type LvolInfo struct {
+	Alias                string `json:"alias"`
+	UUID                 string `json:"uuid"`
+	Name                 string `json:"name"`
+	IsThinProvisioned    bool   `json:"is_thin_provisioned"`
+	IsSnapshot           bool   `json:"is_snapshot"`
+	IsClone              bool   `json:"is_clone"`
+	NumAllocatedClusters uint64 `json:"num_allocated_clusters"`
+	LVS                  struct {
+		Name string `json:"name"`
+		UUID string `json:"uuid"`
+	} `json:"lvs"`
+}
+
+// BdevLvolGetLvols queries SPDK for all logical volumes and snapshots.
+func (c *Client) BdevLvolGetLvols(ctx context.Context) ([]LvolInfo, error) {
+	var res []LvolInfo
+	if err := c.Call(ctx, "bdev_lvol_get_lvols", nil, &res); err != nil {
+		return nil, err
+	}
+	return res, nil
+}
+
 // BdevLvolGetFragmap queries the cluster allocation bitmask of a logical volume or snapshot
 // over the byte range [offset, offset+size).
 // In SPDK's thin-provisioned lvol chain, a snapshot's fragmap marks only the clusters
@@ -166,10 +197,53 @@ func (c *Client) BdevLvolGetFragmap(ctx context.Context, name string, offset, si
 		params["size"] = size
 	}
 	var res FragmapResponse
-	if err := c.Call(ctx, "bdev_lvol_get_fragmap", params, &res); err != nil {
+	err := c.Call(ctx, "bdev_lvol_get_fragmap", params, &res)
+	if err == nil {
+		return &res, nil
+	}
+	var rpcErr *RPCError
+	if !errors.As(err, &rpcErr) || rpcErr.Code != -32601 {
 		return nil, err
 	}
-	return &res, nil
+
+	// Upstream SPDK (e.g. v26.09) exposes per-snapshot CoW delta cluster allocation counts
+	// via bdev_lvol_get_lvols (num_allocated_clusters) rather than bdev_lvol_get_fragmap.
+	lvols, lErr := c.BdevLvolGetLvols(ctx)
+	if lErr != nil {
+		return nil, err
+	}
+	var target *LvolInfo
+	for i := range lvols {
+		if lvols[i].Alias == name || lvols[i].UUID == name || lvols[i].Name == name {
+			target = &lvols[i]
+			break
+		}
+	}
+	if target == nil {
+		return nil, fmt.Errorf("lvol %s not found in bdev_lvol_get_lvols", name)
+	}
+	clusterSize := uint32(65536)
+	if target.LVS.Name != "" {
+		if stores, sErr := c.BdevLvolGetLvstores(ctx, target.LVS.Name, ""); sErr == nil && len(stores) > 0 && stores[0].ClusterSize > 0 {
+			clusterSize = stores[0].ClusterSize
+		}
+	}
+	totalClusters := size / uint64(clusterSize)
+	if totalClusters < target.NumAllocatedClusters {
+		totalClusters = target.NumAllocatedClusters
+	}
+	numBytes := (totalClusters + 7) / 8
+	mask := make([]byte, numBytes)
+	for i := uint64(0); i < target.NumAllocatedClusters && i < totalClusters; i++ {
+		mask[i/8] |= 1 << (i % 8)
+	}
+	return &FragmapResponse{
+		ClusterSize: clusterSize,
+		Offset:      offset,
+		Size:        size,
+		NumClusters: target.NumAllocatedClusters,
+		Bitmask:     base64.StdEncoding.EncodeToString(mask),
+	}, nil
 }
 
 // DecodeFragmapExtents decodes the base64-encoded bitmask from FragmapResponse into

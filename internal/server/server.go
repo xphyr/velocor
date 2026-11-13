@@ -497,7 +497,7 @@ func (s *Server) handleCreatePool(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if s.spdk != nil && len(baseBdevs) == len(req.DiskIDs) {
-		if err := s.spdk.BdevRaidCreate(r.Context(), pool.BaseBdevName, string(pool.RaidLevel), pool.StripSizeKB, baseBdevs, true); err == nil {
+		if err := s.spdk.BdevRaidCreate(r.Context(), pool.BaseBdevName, string(pool.RaidLevel), pool.StripSizeKB, baseBdevs, false); err == nil {
 			if lvsUUID, err := s.spdk.BdevLvolCreateLvstore(r.Context(), pool.EffectiveBdevName, pool.LVSName, pool.ClusterSizeBytes, ""); err == nil {
 				pool.LVSUUID = lvsUUID
 				_ = s.store.UpdatePool(pool)
@@ -1224,7 +1224,7 @@ func (s *Server) handleCreateExport(w http.ResponseWriter, r *http.Request) {
 		if len(spdkPortals) > 0 {
 			_ = s.spdk.IscsiCreatePortalGroup(r.Context(), pgTag, spdkPortals)
 		}
-		_ = s.spdk.IscsiCreateInitiatorGroup(r.Context(), igTag, []string{"ANY"}, []string{"0.0.0.0/0"})
+		_ = s.spdk.IscsiCreateInitiatorGroup(r.Context(), igTag, []string{"ANY"}, []string{"0.0.0.0/1", "128.0.0.0/1"})
 		_ = s.spdk.IscsiCreateTargetNode(
 			r.Context(),
 			exp.TargetIQN,

@@ -307,6 +307,7 @@ up_vms() {
   down_vms
   fetch_image
   build_bootc_disk
+  rm -f "${LAB_DIR}/san-nvme"*.raw "${LAB_DIR}/san-ssd"*.raw
   init_disks
 
   san_os="${LAB_DIR}/san-os.qcow2"
@@ -481,8 +482,18 @@ EOF
   "${REPO_ROOT}/bin/veloctl" --endpoint "https://127.0.0.1:${SAN_API_PORT}" --insecure snapshot changed-blocks --base "${snap1_id}" --target "${snap2_id}"
 
   echo ""
-  echo "=== Testing Live iSCSI Discovery (SendTargets) ==="
-  ssh "${ssh_opts[@]}" -p "${SAN_SSH_PORT}" root@127.0.0.1 "iscsiadm -m discovery -t sendtargets -p 10.0.2.15:3260"
+  echo "=== Testing Live iSCSI Discovery (SendTargets), Login & Block I/O ==="
+  ssh "${ssh_opts[@]}" -p "${SAN_SSH_PORT}" root@127.0.0.1 "bash -s" <<'EOF'
+set -euo pipefail
+echo "--- iscsiadm -m discovery -t sendtargets -p 10.0.2.15:3260 ---"
+iscsiadm -m discovery -t sendtargets -p 10.0.2.15:3260
+iscsiadm -m node -T iqn.2026-11.io.velocor:exp-iscsi -p 10.0.2.15:3260 --login
+sleep 1
+lsblk -S
+dd if=/dev/urandom of=/dev/sdc bs=64k count=4 oflag=direct status=none
+sync
+iscsiadm -m node -T iqn.2026-11.io.velocor:exp-iscsi -p 10.0.2.15:3260 --logout
+EOF
 }
 
 ssh_san() {
