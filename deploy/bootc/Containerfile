@@ -1,7 +1,8 @@
 # Thin Immutable Appliance Host OS on Fedora Image Mode (bootc) 45
 # Runs spdk_tgt and velod as decoupled Podman Quadlet containers.
 ARG VELOD_IMAGE=registry.xphyrlab.net/velocor/velocor-velod:latest
-FROM ${VELOD_IMAGE} AS velod-bin
+ARG VELOCTL_FROM=${VELOD_IMAGE}
+FROM ${VELOCTL_FROM} AS velod-bin
 
 FROM quay.io/fedora/fedora-bootc:45
 
@@ -31,7 +32,7 @@ RUN mkdir -p \
       /usr/share/containers/systemd && \
     printf "vfio\nvfio_iommu_type1\nvfio_pci\nuio_pci_generic\nnvme_tcp\nublk_drv\n" > /usr/lib/modules-load.d/velocor.conf && \
     printf "options vfio enable_unsafe_noiommu_mode=1\n" > /usr/lib/modprobe.d/velocor-vfio.conf && \
-    printf "vm.nr_hugepages = 256\n" > /usr/lib/sysctl.d/90-velocor.conf && \
+    printf "vm.nr_hugepages = 512\n" > /usr/lib/sysctl.d/90-velocor.conf && \
     printf "d /var/lib/velocor 0700 root root -\nd /run/velocor 0755 root root -\n" > /usr/lib/tmpfiles.d/velocor.conf
 
 # Install operator CLI client on the host

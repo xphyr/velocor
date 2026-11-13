@@ -27,4 +27,4 @@ COPY --from=builder /out/veloctl /usr/bin/veloctl
 
 EXPOSE 8443
 ENTRYPOINT ["/usr/bin/velod"]
-CMD ["--listen", ":8443", "--db", "/var/lib/velocor/velocor.db", "--spdk-socket", "/run/velocor/spdk.sock", "--hugepages-mb", "512"]
+CMD ["--listen", ":8443", "--db", "/var/lib/velocor/velocor.db", "--spdk-socket", "/run/velocor/spdk.sock", "--hugepages-mb", "1024"]

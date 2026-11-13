@@ -165,8 +165,8 @@ You can run Velocor on an existing **Fedora 45+**, **RHEL / CentOS Stream 9/10**
    # Enable noiommu fallback only if running inside a VM without vIOMMU
    echo "options vfio enable_unsafe_noiommu_mode=1" | sudo tee /etc/modprobe.d/velocor-vfio.conf
 
-   # Allocate at least 512 MiB of 2 MiB hugepages for SPDK
-   echo "vm.nr_hugepages = 256" | sudo tee /etc/sysctl.d/90-velocor.conf
+   # Allocate at least 1024 MiB of 2 MiB hugepages for SPDK
+   echo "vm.nr_hugepages = 512" | sudo tee /etc/sysctl.d/90-velocor.conf
 
    sudo systemd-modules-load
    sudo sysctl --system
@@ -359,7 +359,7 @@ kubectl -n velocor-csi create secret generic velocor-csi-auth \
 
 ### 4. Deploy the CSI Driver & Snapshot Classes
 
-> **Custom Registry Note:** If you pushed `velocor-csi` to a custom registry, update the `image:` field in [deploy/k8s/csi/velocor-csi.yaml](deploy/k8s/csi/velocor-csi.yaml) (default: `registry.xphyrlab.net/velocor/velocor-csi:latest`).
+> **Custom Registry & Release Manifests:** If you pushed `velocor-csi` to a custom registry, update the `image:` field in [deploy/k8s/csi/velocor-csi.yaml](deploy/k8s/csi/velocor-csi.yaml) (default: `registry.xphyrlab.net/velocor/velocor-csi:latest`). For tagged GitHub Releases, a pre-configured `velocor-csi.yaml` pointing to `ghcr.io/<owner>/velocor-csi:<tag>` is attached directly to the release assets.
 
 Apply the CSI driver manifest (creates the `CSIDriver`, RBAC roles, `velocor-csi-controller` Deployment, `velocor-csi-node` DaemonSet, and the `velocor-nvme-tcp` and `velocor-iscsi` StorageClasses):
 

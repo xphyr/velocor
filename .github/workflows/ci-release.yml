@@ -161,6 +161,7 @@ jobs:
           tags: |
             type=ref,event=branch
             type=ref,event=pr
+            type=ref,event=tag
             type=semver,pattern={{version}}
             type=semver,pattern=v{{version}}
             type=semver,pattern={{major}}.{{minor}}
@@ -236,6 +237,7 @@ jobs:
           tags: |
             type=ref,event=branch
             type=ref,event=pr
+            type=ref,event=tag
             type=semver,pattern={{version}}
             type=semver,pattern=v{{version}}
             type=semver,pattern={{major}}.{{minor}}
@@ -253,6 +255,7 @@ jobs:
           build-contexts: |
             velod-bin=/tmp/velod-rootfs
           build-args: |
+            VELOCTL_FROM=velod-bin
             VELOD_IMAGE=${{ steps.vars.outputs.velod_image }}
             SPDK_IMAGE=${{ steps.vars.outputs.spdk_image }}
           cache-from: type=gha,scope=velocor-os

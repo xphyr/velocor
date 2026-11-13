@@ -14,7 +14,7 @@ Volume=/var/lib/velocor:/var/lib/velocor:rw
 Volume=/run/velocor:/run/velocor:rw
 Volume=/sys:/sys:rw
 Volume=/dev:/dev:rslave
-Exec=--listen :8443 --db /var/lib/velocor/velocor.db --spdk-socket /run/velocor/spdk.sock --hugepages-mb 512
+Exec=--listen :8443 --db /var/lib/velocor/velocor.db --spdk-socket /run/velocor/spdk.sock --hugepages-mb 1024
 
 [Service]
 ExecStartPre=/usr/bin/mkdir -p /var/lib/velocor /run/velocor
