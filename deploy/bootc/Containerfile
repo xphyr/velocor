@@ -2,12 +2,13 @@
 # Runs spdk_tgt and velod as decoupled Podman Quadlet containers.
 ARG VELOD_IMAGE=registry.xphyrlab.net/velocor/velocor-velod:latest
 ARG VELOCTL_FROM=${VELOD_IMAGE}
+ARG PRELOAD_IMAGES_FROM=preload-empty
+
 FROM ${VELOCTL_FROM} AS velod-bin
 
 FROM quay.io/fedora/fedora-bootc:45 AS preload-empty
 RUN mkdir -p /preload-images
 
-ARG PRELOAD_IMAGES_FROM=preload-empty
 FROM ${PRELOAD_IMAGES_FROM} AS preload-images
 
 FROM quay.io/fedora/fedora-bootc:45
