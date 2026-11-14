@@ -262,9 +262,10 @@ func (m *Manager) DiscoverDisks() ([]*store.Disk, error) {
 			devPath := filepath.Join(m.cfg.DevRoot, devName)
 			pciAddr := m.resolveBlockDevicePCIAddress(devName)
 			isBoot := m.IsBootDevice(pciAddr, devPath)
+			model := readSysfsString(filepath.Join(blockDir, "device", "model"))
 
 			rotational := readSysfsString(filepath.Join(blockDir, "queue", "rotational"))
-			if rotational != "0" && !isBoot {
+			if rotational != "0" && !isBoot && !isVirtualDiskModel(model) {
 				continue
 			}
 
@@ -276,7 +277,6 @@ func (m *Manager) DiscoverDisks() ([]*store.Disk, error) {
 			}
 			logicalBlockSize := uint32(readSysfsUint64(filepath.Join(blockDir, "queue", "logical_block_size"), 512))
 
-			model := readSysfsString(filepath.Join(blockDir, "device", "model"))
 			serial := readSysfsString(filepath.Join(blockDir, "device", "serial"))
 			if serial == "" {
 				serial = readSysfsString(filepath.Join(blockDir, "serial"))
@@ -566,6 +566,16 @@ func stripPartitionSuffix(devName string) string {
 
 func isCandidateSSDBlockName(name string) bool {
 	return strings.HasPrefix(name, "sd") || strings.HasPrefix(name, "vd")
+}
+
+func isVirtualDiskModel(model string) bool {
+	m := strings.ToLower(strings.TrimSpace(model))
+	for _, kw := range []string{"qemu", "vmware", "vbox", "virtio", "virtual disk"} {
+		if strings.Contains(m, kw) {
+			return true
+		}
+	}
+	return false
 }
 
 func readSysfsString(path string) string {

@@ -98,6 +98,16 @@ func TestHardwareDiscoveryBootGuardAndVFIOBinding(t *testing.T) {
 	mustWriteFile(t, filepath.Join(sysfs, "block", "sdc", "queue", "rotational"), "1\n")
 	mustWriteFile(t, filepath.Join(sysfs, "block", "sdc", "size"), "1000000000\n")
 
+	// Virtual hypervisor disk (QEMU HARDDISK) with rotational=1 sharing the SATA HBA must still be discovered as non-boot.
+	sddTarget := filepath.Join(hbaDir, "ata3", "host2", "target2:0:0", "2:0:0:0")
+	mustWriteFile(t, filepath.Join(sddTarget, "model"), "QEMU HARDDISK\n")
+	mustWriteFile(t, filepath.Join(sysfs, "block", "sdd", "queue", "rotational"), "1\n")
+	mustWriteFile(t, filepath.Join(sysfs, "block", "sdd", "size"), "419430400\n")
+	mustWriteFile(t, filepath.Join(sysfs, "block", "sdd", "queue", "logical_block_size"), "512\n")
+	if err := os.Symlink(sddTarget, filepath.Join(sysfs, "block", "sdd", "device")); err != nil {
+		t.Fatalf("symlink sdd device: %v", err)
+	}
+
 	// 5. Setup hugepages in sysfs.
 	hpDir := filepath.Join(sysfs, "kernel", "mm", "hugepages", "hugepages-2048kB")
 	mustWriteFile(t, filepath.Join(hpDir, "nr_hugepages"), "0\n")
@@ -126,10 +136,10 @@ func TestHardwareDiscoveryBootGuardAndVFIOBinding(t *testing.T) {
 	if err != nil {
 		t.Fatalf("DiscoverDisks failed: %v", err)
 	}
-	// Expect 4 disks: nvme-0000-00-04-0 (boot), nvme-0000-01-00-0 (data), ssd-sda (boot), ssd-sdb (data).
-	// Rotational sdc must be ignored.
-	if len(disks) != 4 {
-		t.Fatalf("expected 4 non-rotational disks, got %d: %+v", len(disks), disks)
+	// Expect 5 disks: nvme-0000-00-04-0 (boot), nvme-0000-01-00-0 (data), ssd-sda (boot), ssd-sdb (data), ssd-sdd (virtual data).
+	// Bare rotational HDD sdc must be ignored.
+	if len(disks) != 5 {
+		t.Fatalf("expected 5 disks, got %d: %+v", len(disks), disks)
 	}
 
 	byID := make(map[string]*store.Disk)
@@ -148,6 +158,9 @@ func TestHardwareDiscoveryBootGuardAndVFIOBinding(t *testing.T) {
 	}
 	if byID["ssd-sdb"].IsBootDevice || byID["ssd-sdb"].BlockSize != 4096 {
 		t.Fatalf("unexpected data SSD disk: %+v", byID["ssd-sdb"])
+	}
+	if byID["ssd-sdd"] == nil || byID["ssd-sdd"].IsBootDevice {
+		t.Fatalf("expected virtual QEMU HARDDISK sdd to be discovered as non-boot: %+v", byID["ssd-sdd"])
 	}
 
 	// Verify BindNVMeToUserspace refuses the boot NVMe controller.

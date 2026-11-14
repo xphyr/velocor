@@ -169,6 +169,7 @@ type Pool struct {
 	AllocatedBytes    uint64       `json:"allocated_bytes"`
 	FilterPolicy      FilterPolicy `json:"filter_policy"`
 	HealthStatus      HealthStatus `json:"health_status"`
+	StatusMessage     string       `json:"status_message,omitempty"`
 	CreatedAt         time.Time    `json:"created_at"`
 }
 

@@ -64,7 +64,7 @@ var (
 func hostCommand(ctx context.Context, name string, args ...string) *exec.Cmd {
 	if isInContainer() {
 		if _, err := exec.LookPath("nsenter"); err == nil {
-			nsArgs := append([]string{"-t", "1", "-m", "-u", "-i", "-n", "--", name}, args...)
+			nsArgs := append([]string{"-t", "1", "-m", "-u", "-i", "-n", "--", "env", "-u", "container", name}, args...)
 			return exec.CommandContext(ctx, "nsenter", nsArgs...)
 		}
 	}

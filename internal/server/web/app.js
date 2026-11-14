@@ -348,7 +348,7 @@
             <div class="muted mono">${pct}%</div>
           </td>
           <td class="mono">${escapeHtml(p.lvs_name)}</td>
-          <td>${healthBadge(p.health_status)}</td>
+          <td>${healthBadge(p.health_status)}${p.status_message ? `<div class="muted" style="font-size:0.75rem;margin-top:0.2rem">${escapeHtml(p.status_message)}</div>` : ""}</td>
           <td><div class="actions-cell">
             <button class="btn btn-danger btn-sm" data-pool-delete="${escapeHtml(p.id)}">Delete</button>
           </div></td>
@@ -767,40 +767,49 @@
         toast("Disk released back to Linux kernel");
         await refreshAll();
       } else if (t.dataset.poolDelete) {
+        if (!confirm(`Are you sure you want to delete storage pool "${t.dataset.poolDelete}"?`)) return;
         await api("DELETE", `/api/v1/pools/${encodeURIComponent(t.dataset.poolDelete)}`);
         toast("Pool deleted");
         await refreshAll();
       } else if (t.dataset.volDelete) {
+        if (!confirm(`Are you sure you want to delete volume "${t.dataset.volDelete}"?`)) return;
         await api("DELETE", `/api/v1/volumes/${encodeURIComponent(t.dataset.volDelete)}`);
         toast("Volume deleted");
         await refreshAll();
       } else if (t.dataset.snapDelete) {
+        if (!confirm(`Are you sure you want to delete snapshot "${t.dataset.snapDelete}"?`)) return;
         await api("DELETE", `/api/v1/snapshots/${encodeURIComponent(t.dataset.snapDelete)}`);
         toast("Snapshot deleted");
         await refreshAll();
       } else if (t.dataset.exportDelete) {
+        if (!confirm(`Are you sure you want to delete SAN export "${t.dataset.exportDelete}"?`)) return;
         await api("DELETE", `/api/v1/exports/${encodeURIComponent(t.dataset.exportDelete)}`);
         toast("Export deleted");
         await refreshAll();
       } else if (t.dataset.portalDelete) {
+        if (!confirm(`Are you sure you want to delete SAN portal "${t.dataset.portalDelete}"?`)) return;
         await api("DELETE", `/api/v1/portals/${encodeURIComponent(t.dataset.portalDelete)}`);
         toast("Portal deleted");
         await refreshAll();
       } else if (t.dataset.hostDelete) {
+        if (!confirm(`Are you sure you want to delete host "${t.dataset.hostDelete}"?`)) return;
         await api("DELETE", `/api/v1/hosts/${encodeURIComponent(t.dataset.hostDelete)}`);
         toast("Host deleted");
         await refreshAll();
       } else if (t.dataset.igDelete) {
+        if (!confirm(`Are you sure you want to delete initiator group "${t.dataset.igDelete}"?`)) return;
         await api("DELETE", `/api/v1/initiator-groups/${encodeURIComponent(t.dataset.igDelete)}`);
         toast("Initiator group deleted");
         await refreshAll();
       } else if (t.dataset.userEdit) {
         openEditUserModal(t.dataset.userEdit);
       } else if (t.dataset.userDelete) {
+        if (!confirm(`Are you sure you want to delete user "${t.dataset.userDelete}"?`)) return;
         await api("DELETE", `/api/v1/auth/users/${encodeURIComponent(t.dataset.userDelete)}`);
         toast("User deleted");
         await refreshAll();
       } else if (t.dataset.tokenDelete) {
+        if (!confirm(`Are you sure you want to revoke token "${t.dataset.tokenDelete}"?`)) return;
         await api("DELETE", `/api/v1/auth/tokens/${encodeURIComponent(t.dataset.tokenDelete)}`);
         toast("Token revoked");
         await refreshAll();
@@ -1033,32 +1042,77 @@
   });
 
   $("btn-open-create-portal").addEventListener("click", () => {
+    const defaultPorts = { NVMEOF_TCP: 4420, NVMEOF_RDMA: 4420, ISCSI: 3260 };
+    const ipOptions = [];
+    const seenIPs = new Set();
+    for (const iface of ((state.network && state.network.interfaces) || [])) {
+      for (const cidr of (iface.addresses || [])) {
+        const ip = String(cidr).split("/")[0].trim();
+        if (ip && !seenIPs.has(ip)) {
+          seenIPs.add(ip);
+          ipOptions.push(`<option value="${escapeHtml(ip)}">${escapeHtml(ip)} (${escapeHtml(iface.name)})</option>`);
+        }
+      }
+    }
+    ipOptions.push(`<option value="0.0.0.0">0.0.0.0 (All interfaces)</option>`);
+    ipOptions.push(`<option value="__custom__">Custom IP address...</option>`);
+
     openModal("Create SAN Portal", `
       <form id="form-portal" style="display:flex;flex-direction:column;gap:0.85rem">
         <div class="field"><label>Portal Name</label><input name="name" required placeholder="nvmf-tcp-0" /></div>
         <div class="form-grid">
           <div class="field">
             <label>Protocol</label>
-            <select name="protocol">
+            <select name="protocol" id="portal-protocol">
               <option value="NVMEOF_TCP">NVMEOF_TCP</option>
               <option value="ISCSI">ISCSI</option>
               <option value="NVMEOF_RDMA">NVMEOF_RDMA</option>
             </select>
           </div>
-          <div class="field"><label>Port</label><input type="number" name="port" value="4420" required /></div>
+          <div class="field"><label>Port</label><input type="number" name="port" id="portal-port" value="4420" required /></div>
         </div>
-        <div class="field"><label>IP Address</label><input name="ip_address" value="0.0.0.0" required /></div>
+        <div class="field">
+          <label>IP Address</label>
+          <select name="ip_select" id="portal-ip-select">
+            ${ipOptions.join("")}
+          </select>
+        </div>
+        <div class="field hidden" id="portal-ip-custom-wrap">
+          <label>Custom IP Address</label>
+          <input name="ip_custom" id="portal-ip-custom" placeholder="10.10.10.20" />
+        </div>
         <div class="modal-footer"><button type="submit" class="btn btn-primary">Create Portal</button></div>
       </form>
     `, () => {
+      const protoEl = $("portal-protocol");
+      const portEl = $("portal-port");
+      const ipSel = $("portal-ip-select");
+      const customWrap = $("portal-ip-custom-wrap");
+      const customInput = $("portal-ip-custom");
+
+      protoEl.addEventListener("change", () => {
+        if (defaultPorts[protoEl.value]) {
+          portEl.value = String(defaultPorts[protoEl.value]);
+        }
+      });
+
+      const toggleCustomIP = () => {
+        const isCustom = ipSel.value === "__custom__";
+        customWrap.classList.toggle("hidden", !isCustom);
+        customInput.required = isCustom;
+      };
+      ipSel.addEventListener("change", toggleCustomIP);
+      toggleCustomIP();
+
       $("form-portal").addEventListener("submit", async (e) => {
         e.preventDefault();
         const fd = new FormData(e.target);
+        const chosenIP = ipSel.value === "__custom__" ? String(fd.get("ip_custom") || "").trim() : ipSel.value;
         try {
           await api("POST", "/api/v1/portals", {
             name: fd.get("name"),
             protocol: fd.get("protocol"),
-            ip_address: fd.get("ip_address"),
+            ip_address: chosenIP,
             port: Number(fd.get("port")),
           });
           closeModal();
@@ -1131,7 +1185,6 @@
 
   $("btn-open-create-export").addEventListener("click", () => {
     const volOpts = state.volumes.map((v) => `<option value="${escapeHtml(v.id)}">${escapeHtml(v.name)}</option>`).join("");
-    const portalBoxes = state.portals.map((p) => `<label class="checkbox-row"><input type="checkbox" name="portal_ids" value="${escapeHtml(p.id)}" /> <span class="mono">${escapeHtml(p.name)} (${escapeHtml(p.protocol)} ${escapeHtml(p.ip_address)}:${p.port})</span></label>`).join("") || `<div class="muted">Create a portal first.</div>`;
     const igBoxes = state.initiatorGroups.map((g) => `<label class="checkbox-row"><input type="checkbox" name="initiator_group_ids" value="${escapeHtml(g.id)}" /> <span class="mono">${escapeHtml(g.name)}</span></label>`).join("") || `<div class="muted">No initiator groups defined.</div>`;
     openModal("Create SAN Export", `
       <form id="form-export" style="display:flex;flex-direction:column;gap:0.85rem">
@@ -1140,18 +1193,28 @@
           <div class="field"><label>Volume</label><select name="volume_id" required>${volOpts}</select></div>
           <div class="field">
             <label>Protocol</label>
-            <select name="protocol">
+            <select name="protocol" id="export-protocol">
               <option value="NVMEOF_TCP">NVMEOF_TCP</option>
               <option value="ISCSI">ISCSI</option>
             </select>
           </div>
         </div>
-        <div class="field"><label>Portals</label>${portalBoxes}</div>
+        <div class="field"><label>Portals</label><div id="export-portals-wrap"></div></div>
         <label class="checkbox-row"><input type="checkbox" name="allow_any_host" id="chk-allow-any-host" checked /> Allow Any Host</label>
         <div class="field hidden" id="export-igs-wrap"><label>Allowed Initiator Groups</label>${igBoxes}</div>
         <div class="modal-footer"><button type="submit" class="btn btn-primary">Create Export</button></div>
       </form>
     `, () => {
+      const renderExportPortals = () => {
+        const proto = $("export-protocol").value;
+        const matching = state.portals.filter((p) => p.protocol === proto);
+        $("export-portals-wrap").innerHTML = matching.map((p) =>
+          `<label class="checkbox-row"><input type="checkbox" name="portal_ids" value="${escapeHtml(p.id)}" /> <span class="mono">${escapeHtml(p.name)} (${escapeHtml(p.protocol)} ${escapeHtml(p.ip_address)}:${p.port})</span></label>`
+        ).join("") || `<div class="muted">No ${escapeHtml(proto)} portals defined. Create one first.</div>`;
+      };
+      $("export-protocol").addEventListener("change", renderExportPortals);
+      renderExportPortals();
+
       $("chk-allow-any-host").addEventListener("change", (e) => {
         $("export-igs-wrap").classList.toggle("hidden", e.target.checked);
       });

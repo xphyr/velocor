@@ -228,6 +228,7 @@ func (r *Reconciler) ReconcileOnce(ctx context.Context) (State, error) {
 		errs = append(errs, fmt.Sprintf("list pools: %v", err))
 	}
 	for _, pool := range pools {
+		var poolReasons []string
 		if _, exists := raidMap[pool.BaseBdevName]; !exists {
 			var baseBdevs []string
 			for _, diskID := range pool.DiskIDs {
@@ -237,15 +238,20 @@ func (r *Reconciler) ReconcileOnce(ctx context.Context) (State, error) {
 			}
 			if len(baseBdevs) == len(pool.DiskIDs) && len(baseBdevs) > 0 {
 				if err := r.spdk.BdevRaidCreate(ctx, pool.BaseBdevName, string(pool.RaidLevel), pool.StripSizeKB, baseBdevs, false); err != nil {
+					reason := fmt.Sprintf("create raid %s: %v", pool.BaseBdevName, err)
 					pool.HealthStatus = store.HealthStatusDegraded
+					poolReasons = append(poolReasons, reason)
 					degraded = append(degraded, "pool:"+pool.ID)
-					errs = append(errs, fmt.Sprintf("create raid %s: %v", pool.BaseBdevName, err))
+					errs = append(errs, reason)
 				} else {
 					repaired++
 				}
 			} else {
+				reason := fmt.Sprintf("waiting for member disk SPDK bdevs (%d/%d ready)", len(baseBdevs), len(pool.DiskIDs))
 				pool.HealthStatus = store.HealthStatusDegraded
+				poolReasons = append(poolReasons, reason)
 				degraded = append(degraded, "pool:"+pool.ID)
+				errs = append(errs, fmt.Sprintf("pool %s: %s", pool.ID, reason))
 			}
 		}
 
@@ -253,9 +259,11 @@ func (r *Reconciler) ReconcileOnce(ctx context.Context) (State, error) {
 		if !lvsExists {
 			uuid, err := r.spdk.BdevLvolCreateLvstore(ctx, pool.EffectiveBdevName, pool.LVSName, pool.ClusterSizeBytes, "")
 			if err != nil {
+				reason := fmt.Sprintf("create lvstore %s: %v", pool.LVSName, err)
 				pool.HealthStatus = store.HealthStatusDegraded
+				poolReasons = append(poolReasons, reason)
 				degraded = append(degraded, "pool:"+pool.ID)
-				errs = append(errs, fmt.Sprintf("create lvstore %s: %v", pool.LVSName, err))
+				errs = append(errs, reason)
 			} else {
 				pool.LVSUUID = uuid
 				pool.HealthStatus = store.HealthStatusOnline
@@ -278,6 +286,11 @@ func (r *Reconciler) ReconcileOnce(ctx context.Context) (State, error) {
 				pool.AllocatedBytes = pool.TotalBytes - pool.FreeBytes
 			}
 			pool.HealthStatus = store.HealthStatusOnline
+		}
+		if pool.HealthStatus == store.HealthStatusOnline {
+			pool.StatusMessage = ""
+		} else {
+			pool.StatusMessage = strings.Join(poolReasons, "; ")
 		}
 		_ = r.store.UpdatePool(pool)
 	}
