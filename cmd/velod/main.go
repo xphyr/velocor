@@ -109,13 +109,15 @@ func main() {
 			errCh <- httpServer.ListenAndServeTLS(*tlsCertFile, *tlsKeyFile)
 			return
 		}
-		tlsCfg, err := server.GenerateSelfSignedTLSConfig()
+		certPath := filepath.Join(filepath.Dir(*dbPath), "tls.crt")
+		keyPath := filepath.Join(filepath.Dir(*dbPath), "tls.key")
+		tlsCfg, err := server.LoadOrGenerateSelfSignedTLSConfig(certPath, keyPath)
 		if err != nil {
-			errCh <- fmt.Errorf("generate self-signed tls cert: %w", err)
+			errCh <- fmt.Errorf("load/generate self-signed tls cert: %w", err)
 			return
 		}
 		httpServer.TLSConfig = tlsCfg
-		logger.Info("serving HTTPS with auto-generated self-signed TLS certificate", "addr", *listenAddr)
+		logger.Info("serving HTTPS with persistent self-signed TLS certificate", "addr", *listenAddr, "cert", certPath)
 		ln, err := tls.Listen("tcp", *listenAddr, tlsCfg)
 		if err != nil {
 			errCh <- err

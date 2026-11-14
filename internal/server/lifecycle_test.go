@@ -143,3 +143,21 @@ func TestLifecycleEndpointsAndRBAC(t *testing.T) {
 		t.Fatalf("expected 400 for invalid MTU, got %d", code)
 	}
 }
+
+func TestLoadOrGenerateSelfSignedTLSConfigPersists(t *testing.T) {
+	dir := t.TempDir()
+	certPath := filepath.Join(dir, "tls.crt")
+	keyPath := filepath.Join(dir, "tls.key")
+
+	cfg1, err := LoadOrGenerateSelfSignedTLSConfig(certPath, keyPath)
+	if err != nil {
+		t.Fatalf("first LoadOrGenerateSelfSignedTLSConfig failed: %v", err)
+	}
+	cfg2, err := LoadOrGenerateSelfSignedTLSConfig(certPath, keyPath)
+	if err != nil {
+		t.Fatalf("second LoadOrGenerateSelfSignedTLSConfig failed: %v", err)
+	}
+	if !bytes.Equal(cfg1.Certificates[0].Certificate[0], cfg2.Certificates[0].Certificate[0]) {
+		t.Fatalf("expected persisted TLS certificate to be reused across reloads")
+	}
+}

@@ -140,8 +140,12 @@ func (m *Manager) scanMountinfoFile(mountinfoPath string) error {
 		baseDevs := m.resolveBaseBlockDevices(devName)
 		for _, baseDev := range baseDevs {
 			m.bootDevs[baseDev] = true
-			if pci := m.resolveBlockDevicePCIAddress(baseDev); pci != "" {
-				m.bootPCIAddr[pci] = true
+			// Only NVMe controllers are unbound as whole PCI devices (vfio-pci);
+			// SATA/SAS/VirtIO-SCSI HBAs can host both boot (sda) and data (sdb, sdc) disks.
+			if strings.HasPrefix(baseDev, "nvme") {
+				if pci := m.resolveBlockDevicePCIAddress(baseDev); pci != "" {
+					m.bootPCIAddr[pci] = true
+				}
 			}
 		}
 	}

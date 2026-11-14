@@ -1,0 +1,6 @@
+#!/bin/bash
+case "${2:-}" in
+  up|down|dhcp4-change|connectivity-change)
+    /usr/libexec/velocor-console-banner || true
+    ;;
+esac

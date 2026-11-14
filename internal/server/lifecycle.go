@@ -316,9 +316,26 @@ func (s *Server) handleApplyContainerUpdates(w http.ResponseWriter, r *http.Requ
 		var out []byte
 		var err error
 		if unit == "" {
-			out, err = hostCommand(ctx, "podman", "auto-update", "--format", "json").CombinedOutput()
+			// Run podman auto-update in its own transient host systemd unit so restarting
+			// velocor-velod.service does not kill the updater mid-flight.
+			out, err = hostCommand(ctx, "systemd-run", "--no-block", "--collect",
+				"--unit=velocor-container-update",
+				"podman", "auto-update").CombinedOutput()
+			if err != nil {
+				out, err = hostCommand(ctx, "podman", "auto-update", "--format", "json").CombinedOutput()
+			}
 		} else {
-			out, err = hostCommand(ctx, "systemctl", "restart", unit).CombinedOutput()
+			containerName := strings.TrimSuffix(unit, ".service")
+			script := fmt.Sprintf(
+				`img="$(podman inspect --format '{{.ImageName}}' %q 2>/dev/null || true)"; if [ -n "$img" ]; then podman pull "$img"; fi; systemctl restart %q`,
+				containerName, unit,
+			)
+			out, err = hostCommand(ctx, "systemd-run", "--no-block", "--collect",
+				"--unit=velocor-container-update",
+				"/bin/sh", "-c", script).CombinedOutput()
+			if err != nil {
+				out, err = hostCommand(ctx, "/bin/sh", "-c", script).CombinedOutput()
+			}
 		}
 
 		doneAt := time.Now().UTC()

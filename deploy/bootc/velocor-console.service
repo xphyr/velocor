@@ -1,0 +1,11 @@
+[Unit]
+Description=Update Velocor appliance console splash screen (/etc/issue)
+After=network-online.target velocor-spdk.service velocor-velod.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/libexec/velocor-console-banner
+
+[Install]
+WantedBy=multi-user.target

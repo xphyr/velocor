@@ -21,7 +21,7 @@ BOOTC_IMAGE ?= $(IMAGE_PREFIX)/velocor-os:latest
 BOOTC_BUILDER_IMAGE ?= quay.io/centos-bootc/bootc-image-builder:latest
 QCOW2_OUTPUT_DIR ?= output
 QCOW2_ROOTFS ?= xfs
-BIB_CONFIG ?= deploy/bootc/config.toml
+BIB_CONFIG ?= $(if $(wildcard deploy/bootc/config.local.toml),deploy/bootc/config.local.toml,deploy/bootc/config.toml)
 PODMAN ?= podman
 SKOPEO ?= skopeo
 

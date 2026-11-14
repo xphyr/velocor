@@ -10,6 +10,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/hex"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -17,6 +18,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -426,7 +428,7 @@ func (s *Server) handleScanDisks(w http.ResponseWriter, _ *http.Request) {
 					d.PoolID = existing.PoolID
 				}
 			}
-			if err := s.store.UpsertDisk(d); err != nil {
+			if err := s.store.SyncDiscoveredDisk(d); err != nil {
 				writeError(w, err)
 				return
 			}
@@ -1861,6 +1863,80 @@ func GenerateSelfSignedTLSConfig() (*tls.Config, error) {
 	cert := tls.Certificate{
 		Certificate: [][]byte{derBytes},
 		PrivateKey:  priv,
+	}
+	return &tls.Config{
+		MinVersion:   tls.VersionTLS12,
+		Certificates: []tls.Certificate{cert},
+	}, nil
+}
+
+// LoadOrGenerateSelfSignedTLSConfig loads an existing TLS certificate/key pair from disk,
+// or generates and persists a new ECDSA P-256 self-signed certificate so restarts/upgrades
+// preserve the appliance's TLS identity.
+func LoadOrGenerateSelfSignedTLSConfig(certPath, keyPath string) (*tls.Config, error) {
+	if cert, err := tls.LoadX509KeyPair(certPath, keyPath); err == nil {
+		return &tls.Config{
+			MinVersion:   tls.VersionTLS12,
+			Certificates: []tls.Certificate{cert},
+		}, nil
+	}
+
+	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return nil, err
+	}
+	serial, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
+	if err != nil {
+		return nil, err
+	}
+
+	dnsNames := []string{"localhost", "velocor.local"}
+	if hn, err := os.Hostname(); err == nil && hn != "" {
+		dnsNames = append(dnsNames, hn)
+	}
+	ips := []net.IP{net.ParseIP("127.0.0.1"), net.ParseIP("::1")}
+	if addrs, err := net.InterfaceAddrs(); err == nil {
+		for _, a := range addrs {
+			if ipNet, ok := a.(*net.IPNet); ok && ipNet.IP != nil && !ipNet.IP.IsLoopback() {
+				ips = append(ips, ipNet.IP)
+			}
+		}
+	}
+
+	tmpl := x509.Certificate{
+		SerialNumber: serial,
+		Subject: pkix.Name{
+			Organization: []string{"Velocor Storage Appliance"},
+			CommonName:   "velocor.local",
+		},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(3650 * 24 * time.Hour),
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+		DNSNames:              dnsNames,
+		IPAddresses:           ips,
+	}
+	derBytes, err := x509.CreateCertificate(rand.Reader, &tmpl, &tmpl, &priv.PublicKey, priv)
+	if err != nil {
+		return nil, err
+	}
+	keyBytes, err := x509.MarshalECPrivateKey(priv)
+	if err != nil {
+		return nil, err
+	}
+
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: derBytes})
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyBytes})
+
+	if err := os.MkdirAll(filepath.Dir(certPath), 0o755); err == nil {
+		_ = os.WriteFile(certPath, certPEM, 0o644)
+		_ = os.WriteFile(keyPath, keyPEM, 0o600)
+	}
+
+	cert, err := tls.X509KeyPair(certPEM, keyPEM)
+	if err != nil {
+		return nil, err
 	}
 	return &tls.Config{
 		MinVersion:   tls.VersionTLS12,

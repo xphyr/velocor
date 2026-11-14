@@ -19,7 +19,9 @@ RUN dnf install -y \
       iproute \
       ethtool \
       xfsprogs \
-      jq && \
+      jq \
+      open-vm-tools \
+      qemu-guest-agent && \
     dnf clean all && \
     rm -rf /var/cache /var/log/dnf* /var/log/yum*
 
@@ -42,7 +44,23 @@ COPY --from=velod-bin /usr/bin/veloctl /usr/bin/veloctl
 COPY deploy/quadlets/velocor-spdk.container /usr/share/containers/systemd/velocor-spdk.container
 COPY deploy/quadlets/velocor-velod.container /usr/share/containers/systemd/velocor-velod.container
 
+# Install ESXi-style appliance console splash banner (/etc/issue)
+COPY deploy/bootc/velocor-console-banner.sh /usr/libexec/velocor-console-banner
+COPY deploy/bootc/velocor-console.service /usr/lib/systemd/system/velocor-console.service
+COPY deploy/bootc/90-velocor-banner /usr/lib/NetworkManager/dispatcher.d/90-velocor-banner
+
+# Preload velocor-spdk and velocor-velod images so first boot works without pulling
+COPY deploy/bootc/velocor-preload-images.sh /usr/libexec/velocor-preload-images
+COPY deploy/bootc/velocor-preload-images.service /usr/lib/systemd/system/velocor-preload-images.service
+
 RUN sed -i "s|^Image=.*|Image=${SPDK_IMAGE}|" /usr/share/containers/systemd/velocor-spdk.container && \
     sed -i "s|^Image=.*|Image=${VELOD_IMAGE}|" /usr/share/containers/systemd/velocor-velod.container && \
+    ARCH="$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')" && \
+    mkdir -p /usr/share/velocor/images && \
+    skopeo copy --override-arch "${ARCH}" "docker://${SPDK_IMAGE}" "docker-archive:/usr/share/velocor/images/velocor-spdk.tar:${SPDK_IMAGE}" && \
+    skopeo copy --override-arch "${ARCH}" "docker://${VELOD_IMAGE}" "docker-archive:/usr/share/velocor/images/velocor-velod.tar:${VELOD_IMAGE}" && \
+    chmod 0755 /usr/libexec/velocor-console-banner /usr/libexec/velocor-preload-images /usr/lib/NetworkManager/dispatcher.d/90-velocor-banner && \
+    systemctl disable bootc-fetch-apply-updates.timer && \
+    systemctl enable velocor-console.service velocor-preload-images.service vmtoolsd.service qemu-guest-agent.service && \
     /usr/lib/systemd/system-generators/podman-system-generator --dryrun >/dev/null && \
     bootc container lint

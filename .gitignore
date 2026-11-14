@@ -26,3 +26,4 @@ hack/vm-lab/.vms/
 
 # auth files for testing
 *.priv
+deploy/bootc/config.local.toml

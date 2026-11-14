@@ -108,7 +108,7 @@ func (r *Reconciler) ReconcileOnce(ctx context.Context) (State, error) {
 						d.PoolID = existing.PoolID
 					}
 				}
-				_ = r.store.UpsertDisk(d)
+				_ = r.store.SyncDiscoveredDisk(d)
 			}
 		} else {
 			errs = append(errs, fmt.Sprintf("hardware scan: %v", err))

@@ -258,6 +258,16 @@ func (s *BoltStore) DeleteApiToken(id string) error {
 // UpsertDisk inserts or updates a discovered Disk while preserving boot-device protection
 // and existing claim/pool state if not explicitly overwritten.
 func (s *BoltStore) UpsertDisk(disk *Disk) error {
+	return s.upsertDisk(disk, false)
+}
+
+// SyncDiscoveredDisk updates disk metadata from an authoritative hardware scan,
+// allowing IsBootDevice to be updated when boot-guard classification changes.
+func (s *BoltStore) SyncDiscoveredDisk(disk *Disk) error {
+	return s.upsertDisk(disk, true)
+}
+
+func (s *BoltStore) upsertDisk(disk *Disk, syncBoot bool) error {
 	if disk == nil || disk.ID == "" {
 		return fmt.Errorf("%w: disk id is required", ErrInvalidArgument)
 	}
@@ -269,8 +279,8 @@ func (s *BoltStore) UpsertDisk(disk *Disk) error {
 		b := tx.Bucket(bucketDisks)
 		var existing Disk
 		if err := getJSON(b, []byte(cp.ID), &existing); err == nil {
-			// Once marked as a boot device, a disk can never lose boot protection.
-			if existing.IsBootDevice {
+			// Once marked as a boot device, non-authoritative upserts preserve boot protection.
+			if !syncBoot && existing.IsBootDevice {
 				cp.IsBootDevice = true
 			}
 			if cp.IsBootDevice && cp.Claimed {

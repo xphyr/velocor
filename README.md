@@ -91,7 +91,7 @@ make push-containers IMAGE_PREFIX=registry.example.com/velocor
 
 ### Build a Local `qcow2` VM Image
 
-To build a bootable `qcow2` disk image locally for running `velocor-os` on another hypervisor or VM host (via `bootc-image-builder`):
+To build a bootable 32 GiB `qcow2` disk image locally for running `velocor-os` on another hypervisor or VM host (via `bootc-image-builder`):
 
 ```bash
 # Builds container-bootc and writes output/qcow2/disk.qcow2 (requires sudo for bootc-image-builder)
@@ -104,9 +104,11 @@ If you want to customize the output directory, root filesystem, or `bootc` image
 make qcow2 QCOW2_OUTPUT_DIR=./build-qcow2 QCOW2_ROOTFS=xfs BOOTC_IMAGE=registry.example.com/velocor/velocor-os:latest
 ```
 
+The default [deploy/bootc/config.toml](deploy/bootc/config.toml) sets the root filesystem `minsize` to `32 GiB` (`[[customizations.filesystem]]`).
+
 #### Adding a Custom User or SSH Key to the `qcow2` Image
 
-Before running `make qcow2`, create `deploy/bootc/config.toml` (or pass `BIB_CONFIG=/path/to/config.toml`). The `Makefile` automatically mounts it into `bootc-image-builder` when present:
+Copy [deploy/bootc/config.toml](deploy/bootc/config.toml) to `deploy/bootc/config.local.toml` (which is gitignored) and add your `[[customizations.user]]` block there, or pass `BIB_CONFIG=/path/to/config.toml`. `make qcow2` automatically uses `deploy/bootc/config.local.toml` when present:
 
 ```toml
 [[customizations.user]]

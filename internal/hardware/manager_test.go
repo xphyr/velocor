@@ -71,17 +71,29 @@ func TestHardwareDiscoveryBootGuardAndVFIOBinding(t *testing.T) {
 	mustWriteFile(t, filepath.Join(sysfs, "bus", "pci", "drivers_probe"), "")
 	mustWriteFile(t, filepath.Join(sysfs, "module", "vfio", "parameters", "enable_unsafe_noiommu_mode"), "0\n")
 
-	// 4. Setup /sys/block/sda (boot SSD), /sys/block/sdb (data SSD), /sys/block/sdc (rotational HDD).
+	// 4. Setup /sys/block/sda (boot SSD) and /sys/block/sdb (data SSD) sharing the same SATA HBA PCIe BDF,
+	// plus /sys/block/sdc (rotational HDD).
+	hbaDir := filepath.Join(sysfs, "devices", "pci0000:00", "0000:00:1f.2")
+	mustWriteFile(t, filepath.Join(hbaDir, "class"), "0x010601\n")
+	sdaTarget := filepath.Join(hbaDir, "ata1", "host0", "target0:0:0", "0:0:0:0")
+	sdbTarget := filepath.Join(hbaDir, "ata2", "host1", "target1:0:0", "1:0:0:0")
+
+	mustWriteFile(t, filepath.Join(sdaTarget, "model"), "Boot SATA SSD\n")
 	mustWriteFile(t, filepath.Join(sysfs, "block", "sda", "queue", "rotational"), "0\n")
 	mustWriteFile(t, filepath.Join(sysfs, "block", "sda", "size"), "104857600\n")
 	mustWriteFile(t, filepath.Join(sysfs, "block", "sda", "queue", "logical_block_size"), "512\n")
-	mustWriteFile(t, filepath.Join(sysfs, "block", "sda", "device", "model"), "Boot SATA SSD\n")
+	if err := os.Symlink(sdaTarget, filepath.Join(sysfs, "block", "sda", "device")); err != nil {
+		t.Fatalf("symlink sda device: %v", err)
+	}
 
+	mustWriteFile(t, filepath.Join(sdbTarget, "model"), "Samsung Enterprise SSD\n")
+	mustWriteFile(t, filepath.Join(sdbTarget, "serial"), "SSD-SDB-01\n")
 	mustWriteFile(t, filepath.Join(sysfs, "block", "sdb", "queue", "rotational"), "0\n")
 	mustWriteFile(t, filepath.Join(sysfs, "block", "sdb", "size"), "419430400\n")
 	mustWriteFile(t, filepath.Join(sysfs, "block", "sdb", "queue", "logical_block_size"), "4096\n")
-	mustWriteFile(t, filepath.Join(sysfs, "block", "sdb", "device", "model"), "Samsung Enterprise SSD\n")
-	mustWriteFile(t, filepath.Join(sysfs, "block", "sdb", "device", "serial"), "SSD-SDB-01\n")
+	if err := os.Symlink(sdbTarget, filepath.Join(sysfs, "block", "sdb", "device")); err != nil {
+		t.Fatalf("symlink sdb device: %v", err)
+	}
 
 	mustWriteFile(t, filepath.Join(sysfs, "block", "sdc", "queue", "rotational"), "1\n")
 	mustWriteFile(t, filepath.Join(sysfs, "block", "sdc", "size"), "1000000000\n")

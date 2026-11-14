@@ -40,6 +40,7 @@ type Store interface {
 
 	// Disks
 	UpsertDisk(disk *Disk) error
+	SyncDiscoveredDisk(disk *Disk) error
 	GetDisk(id string) (*Disk, error)
 	ListDisks() ([]*Disk, error)
 	ClaimDisk(id string, driverState DiskDriverState, spdkBdevName string) (*Disk, error)
