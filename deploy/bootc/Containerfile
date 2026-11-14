@@ -4,10 +4,17 @@ ARG VELOD_IMAGE=registry.xphyrlab.net/velocor/velocor-velod:latest
 ARG VELOCTL_FROM=${VELOD_IMAGE}
 FROM ${VELOCTL_FROM} AS velod-bin
 
+FROM quay.io/fedora/fedora-bootc:45 AS preload-empty
+RUN mkdir -p /preload-images
+
+ARG PRELOAD_IMAGES_FROM=preload-empty
+FROM ${PRELOAD_IMAGES_FROM} AS preload-images
+
 FROM quay.io/fedora/fedora-bootc:45
 
 ARG VELOD_IMAGE=registry.xphyrlab.net/velocor/velocor-velod:latest
 ARG SPDK_IMAGE=registry.xphyrlab.net/velocor/velocor-spdk:latest
+ARG PRELOAD_IMAGES=true
 
 RUN dnf install -y \
       podman \
@@ -52,13 +59,23 @@ COPY deploy/bootc/90-velocor-banner /usr/lib/NetworkManager/dispatcher.d/90-velo
 # Preload velocor-spdk and velocor-velod images so first boot works without pulling
 COPY deploy/bootc/velocor-preload-images.sh /usr/libexec/velocor-preload-images
 COPY deploy/bootc/velocor-preload-images.service /usr/lib/systemd/system/velocor-preload-images.service
+COPY --from=preload-images /preload-images /tmp/preload-images
 
 RUN sed -i "s|^Image=.*|Image=${SPDK_IMAGE}|" /usr/share/containers/systemd/velocor-spdk.container && \
     sed -i "s|^Image=.*|Image=${VELOD_IMAGE}|" /usr/share/containers/systemd/velocor-velod.container && \
     ARCH="$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')" && \
     mkdir -p /usr/share/velocor/images && \
-    skopeo copy --override-arch "${ARCH}" "docker://${SPDK_IMAGE}" "docker-archive:/usr/share/velocor/images/velocor-spdk.tar:${SPDK_IMAGE}" && \
-    skopeo copy --override-arch "${ARCH}" "docker://${VELOD_IMAGE}" "docker-archive:/usr/share/velocor/images/velocor-velod.tar:${VELOD_IMAGE}" && \
+    if [ -f /tmp/preload-images/velocor-spdk.tar ]; then \
+      mv /tmp/preload-images/velocor-spdk.tar /usr/share/velocor/images/velocor-spdk.tar; \
+    elif [ "${PRELOAD_IMAGES}" = "true" ]; then \
+      skopeo copy --override-arch "${ARCH}" "docker://${SPDK_IMAGE}" "docker-archive:/usr/share/velocor/images/velocor-spdk.tar:${SPDK_IMAGE}"; \
+    fi && \
+    if [ -f /tmp/preload-images/velocor-velod.tar ]; then \
+      mv /tmp/preload-images/velocor-velod.tar /usr/share/velocor/images/velocor-velod.tar; \
+    elif [ "${PRELOAD_IMAGES}" = "true" ]; then \
+      skopeo copy --override-arch "${ARCH}" "docker://${VELOD_IMAGE}" "docker-archive:/usr/share/velocor/images/velocor-velod.tar:${VELOD_IMAGE}"; \
+    fi && \
+    rm -rf /tmp/preload-images && \
     chmod 0755 /usr/libexec/velocor-console-banner /usr/libexec/velocor-preload-images /usr/lib/NetworkManager/dispatcher.d/90-velocor-banner && \
     systemctl disable bootc-fetch-apply-updates.timer && \
     systemctl enable velocor-console.service velocor-preload-images.service vmtoolsd.service qemu-guest-agent.service && \

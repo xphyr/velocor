@@ -256,6 +256,16 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Prepare preloaded container image archives for bootc
+        run: |
+          mkdir -p /tmp/preload-images/preload-images
+          if [[ "${{ github.event_name }}" != "pull_request" ]]; then
+            docker pull "${{ steps.vars.outputs.spdk_image }}"
+            docker save -o /tmp/preload-images/preload-images/velocor-spdk.tar "${{ steps.vars.outputs.spdk_image }}"
+            docker pull "${{ steps.vars.outputs.velod_image }}"
+            docker save -o /tmp/preload-images/preload-images/velocor-velod.tar "${{ steps.vars.outputs.velod_image }}"
+          fi
+
       - name: Extract Docker metadata for velocor-os
         id: meta
         uses: docker/metadata-action@v6
@@ -284,8 +294,11 @@ jobs:
           provenance: ${{ github.event_name != 'pull_request' && 'mode=max' || false }}
           build-contexts: |
             velod-bin=/tmp/velod-rootfs
+            preload-images=/tmp/preload-images
           build-args: |
             VELOCTL_FROM=velod-bin
+            PRELOAD_IMAGES_FROM=preload-images
+            PRELOAD_IMAGES=${{ github.event_name != 'pull_request' }}
             VELOD_IMAGE=${{ steps.vars.outputs.velod_image }}
             SPDK_IMAGE=${{ steps.vars.outputs.spdk_image }}
           cache-from: type=gha,scope=velocor-os
