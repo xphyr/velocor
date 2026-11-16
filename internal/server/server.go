@@ -45,6 +45,38 @@ type Server struct {
 
 	loginLimiter  *loginLimiter
 	metricsPublic bool
+	insecureHTTP  bool
+	bootstrapFile string
+}
+
+// WithInsecureHTTP records that the API is served over plain HTTP, so status can warn about it.
+func WithInsecureHTTP(insecure bool) Option {
+	return func(s *Server) { s.insecureHTTP = insecure }
+}
+
+// WithBootstrapPasswordFile lets status warn while the generated bootstrap password file exists.
+func WithBootstrapPasswordFile(path string) Option {
+	return func(s *Server) { s.bootstrapFile = path }
+}
+
+// warnings lists configuration problems an operator should fix, for every UI screen.
+func (s *Server) warnings() []string {
+	out := []string{}
+	if s.bootstrapFile != "" {
+		if _, err := os.Stat(s.bootstrapFile); err == nil {
+			out = append(out, "The initial admin password file "+s.bootstrapFile+" still exists. Delete it once the password has been changed.")
+		}
+	}
+	if s.insecureHTTP {
+		out = append(out, "The API is served over plain HTTP, so passwords and tokens cross the network unencrypted.")
+	}
+	if s.metricsPublic {
+		out = append(out, "/metrics is served without authentication.")
+	}
+	if s.hw != nil && s.hw.UnsafeNoIOMMUAllowed() {
+		out = append(out, "Unsafe no-IOMMU mode is allowed: SPDK can DMA anywhere in host memory. Use this only in lab VMs.")
+	}
+	return out
 }
 
 // Option customises a Server.
@@ -173,6 +205,10 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("POST /api/v1/exports", s.withAuth(store.RoleCSIProvisioner, s.handleCreateExport))
 	s.mux.HandleFunc("GET /api/v1/exports/{id}", s.withAuth(store.RoleReadOnly, s.handleGetExport))
 	s.mux.HandleFunc("DELETE /api/v1/exports/{id}", s.withAuth(store.RoleCSIProvisioner, s.handleDeleteExport))
+	s.mux.HandleFunc("PATCH /api/v1/exports/{id}", s.withAuth(store.RoleCSIProvisioner, s.handleUpdateExport))
+	s.mux.HandleFunc("GET /api/v1/exports/{id}/connections", s.withAuth(store.RoleReadOnly, s.handleExportConnections))
+	s.mux.HandleFunc("PATCH /api/v1/initiator-groups/{id}", s.withAuth(store.RoleCSIProvisioner, s.handleUpdateInitiatorGroup))
+	s.mux.HandleFunc("GET /api/v1/volumes/{id}/usage", s.withAuth(store.RoleReadOnly, s.handleVolumeUsage))
 
 	// System
 	s.mux.HandleFunc("GET /api/v1/system/status", s.withAuth(store.RoleReadOnly, s.handleSystemStatus))
@@ -850,6 +886,7 @@ func (s *Server) handleSystemStatus(w http.ResponseWriter, r *http.Request) {
 			"hugepages_free_mb":  hpFreeMB,
 		},
 		"reconciler": recState,
+		"warnings":   s.warnings(),
 	})
 }
 

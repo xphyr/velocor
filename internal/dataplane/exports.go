@@ -47,39 +47,63 @@ type ACL struct {
 // ResolveACL expands initiator groups (and the hosts they reference) into a deduplicated ACL.
 func ResolveACL(st store.Store, groupIDs []string) (ACL, error) {
 	var acl ACL
-	add := func(list *[]string, v string) {
-		v = strings.TrimSpace(v)
-		if v != "" && !slices.Contains(*list, v) {
-			*list = append(*list, v)
-		}
-	}
 	for _, gid := range groupIDs {
 		ig, err := st.GetInitiatorGroup(gid)
 		if err != nil {
 			return ACL{}, fmt.Errorf("initiator group %s: %w", gid, err)
 		}
-		for _, hid := range ig.HostIDs {
-			h, err := st.GetHost(hid)
-			if err != nil {
-				return ACL{}, fmt.Errorf("host %s in initiator group %s: %w", hid, gid, err)
-			}
-			add(&acl.HostNQNs, h.HostNQN)
-			add(&acl.IQNs, h.InitiatorIQN)
-			if ip := strings.TrimSpace(h.IPAddress); ip != "" {
-				add(&acl.CIDRs, hostCIDR(ip))
-			}
+		g, err := ResolveGroup(st, ig)
+		if err != nil {
+			return ACL{}, err
 		}
-		for _, v := range ig.HostNQNs {
-			add(&acl.HostNQNs, v)
-		}
-		for _, v := range ig.InitiatorIQNs {
-			add(&acl.IQNs, v)
-		}
-		for _, v := range ig.AllowedCIDRs {
-			add(&acl.CIDRs, v)
-		}
+		acl.merge(g)
 	}
 	return acl, nil
+}
+
+// ResolveGroup expands a single initiator group (and the hosts it references).
+func ResolveGroup(st store.Store, ig *store.InitiatorGroup) (ACL, error) {
+	var acl ACL
+	for _, hid := range ig.HostIDs {
+		h, err := st.GetHost(hid)
+		if err != nil {
+			return ACL{}, fmt.Errorf("host %s in initiator group %s: %w", hid, ig.ID, err)
+		}
+		addUnique(&acl.HostNQNs, h.HostNQN)
+		addUnique(&acl.IQNs, h.InitiatorIQN)
+		if ip := strings.TrimSpace(h.IPAddress); ip != "" {
+			addUnique(&acl.CIDRs, hostCIDR(ip))
+		}
+	}
+	for _, v := range ig.HostNQNs {
+		addUnique(&acl.HostNQNs, v)
+	}
+	for _, v := range ig.InitiatorIQNs {
+		addUnique(&acl.IQNs, v)
+	}
+	for _, v := range ig.AllowedCIDRs {
+		addUnique(&acl.CIDRs, v)
+	}
+	return acl, nil
+}
+
+func (a *ACL) merge(b ACL) {
+	for _, v := range b.HostNQNs {
+		addUnique(&a.HostNQNs, v)
+	}
+	for _, v := range b.IQNs {
+		addUnique(&a.IQNs, v)
+	}
+	for _, v := range b.CIDRs {
+		addUnique(&a.CIDRs, v)
+	}
+}
+
+func addUnique(list *[]string, v string) {
+	v = strings.TrimSpace(v)
+	if v != "" && !slices.Contains(*list, v) {
+		*list = append(*list, v)
+	}
 }
 
 func hostCIDR(ip string) string {
@@ -123,9 +147,48 @@ func AddressFamily(ip string) string {
 	return "IPv4"
 }
 
-// EnsureExport converges spdk_tgt so that exp exposes vol with exactly the configured ACL.
+// EnsureExport converges spdk_tgt so that the export with exp.ID exposes vol with exactly
+// its configured ACL. The export is re-read from the store under the per-export lock, so a
+// caller holding a stale copy (such as a reconciler pass) can never re-apply an ACL that
+// has since been changed. A deleted export is a no-op.
 func EnsureExport(ctx context.Context, c *spdk.Client, st store.Store, exp *store.Export, vol *store.Volume) error {
 	defer lockExport(exp.ID)()
+	cur, err := st.GetExport(exp.ID)
+	if errors.Is(err, store.ErrNotFound) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	return ensureLocked(ctx, c, st, cur, vol)
+}
+
+// UpdateExport applies mutate to the export's access settings, converges SPDK to the result
+// and only then persists it, all under the per-export lock. If SPDK cannot be converged the
+// previous configuration is re-applied and the store is left unchanged.
+func UpdateExport(ctx context.Context, c *spdk.Client, st store.Store, id string, vol *store.Volume, mutate func(*store.Export) error) (*store.Export, error) {
+	defer lockExport(id)()
+	old, err := st.GetExport(id)
+	if err != nil {
+		return nil, err
+	}
+	next := *old
+	next.InitiatorGroupIDs = slices.Clone(old.InitiatorGroupIDs)
+	next.PortalIDs = slices.Clone(old.PortalIDs)
+	if err := mutate(&next); err != nil {
+		return nil, err
+	}
+	if err := ensureLocked(ctx, c, st, &next, vol); err != nil {
+		_ = ensureLocked(context.WithoutCancel(ctx), c, st, old, vol)
+		return nil, err
+	}
+	return st.MutateExport(id, func(e *store.Export) error {
+		e.InitiatorGroupIDs, e.AllowAnyHost = next.InitiatorGroupIDs, next.AllowAnyHost
+		return nil
+	})
+}
+
+func ensureLocked(ctx context.Context, c *spdk.Client, st store.Store, exp *store.Export, vol *store.Volume) error {
 	acl, err := ResolveACL(st, exp.InitiatorGroupIDs)
 	if err != nil {
 		return err
@@ -149,6 +212,42 @@ func EnsureExport(ctx context.Context, c *spdk.Client, st store.Store, exp *stor
 	default:
 		return fmt.Errorf("%w: unsupported export protocol %q", store.ErrInvalidArgument, exp.Protocol)
 	}
+}
+
+// Connection is a host session on an export.
+type Connection struct {
+	Host    string `json:"host,omitempty"`    // host NQN (NVMe-oF)
+	Address string `json:"address,omitempty"` // initiator address (iSCSI)
+	Queues  int    `json:"queues,omitempty"`  // I/O queue pairs (NVMe-oF)
+}
+
+// Connections lists the hosts currently connected to exp.
+func Connections(ctx context.Context, c *spdk.Client, exp *store.Export) ([]Connection, error) {
+	out := []Connection{}
+	switch {
+	case IsNVMe(exp.Protocol):
+		ctrls, err := c.NvmfSubsystemGetControllers(ctx, exp.SubsystemNQN)
+		if spdk.IsNotFound(err) {
+			return out, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+		for _, ct := range ctrls {
+			out = append(out, Connection{Host: ct.HostNQN, Queues: int(ct.NumIOQpairs)})
+		}
+	case exp.Protocol == store.ExportProtocolISCSI:
+		conns, err := c.IscsiGetConnections(ctx)
+		if err != nil {
+			return nil, err
+		}
+		for _, cn := range conns {
+			if cn.TargetNodeName == exp.TargetIQN {
+				out = append(out, Connection{Address: cn.InitiatorAddr})
+			}
+		}
+	}
+	return out, nil
 }
 
 // RemoveExport tears down the SPDK objects owned by exp. Missing objects are not an error.

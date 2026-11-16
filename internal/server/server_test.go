@@ -35,9 +35,10 @@ func TestServerEmbeddedWebUI(t *testing.T) {
 		path string
 		want string
 	}{
-		{"/", "VELOCOR"},
-		{"/assets/styles.css", "--accent:"},
-		{"/assets/app.js", "/api/v1/system/status"},
+		{"/", "<title>Velocor</title>"},
+		{"/assets/style.css", "--accent:"},
+		{"/assets/favicon.svg", "<svg"},
+		{"/assets/app.js", "\"/system/status\""},
 	} {
 		resp, err := http.Get(ts.URL + tc.path)
 		if err != nil {

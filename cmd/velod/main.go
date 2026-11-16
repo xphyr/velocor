@@ -111,7 +111,10 @@ func main() {
 
 	go rec.Start(ctx, *reconcileInterval)
 
-	srv := server.New(st, spdkClient, hwMgr, authMgr, rec, logger, server.WithPublicMetrics(*metricsPublic))
+	srv := server.New(st, spdkClient, hwMgr, authMgr, rec, logger,
+		server.WithPublicMetrics(*metricsPublic),
+		server.WithInsecureHTTP(*insecureHTTP),
+		server.WithBootstrapPasswordFile(filepath.Join(filepath.Dir(*dbPath), "initial-admin-password")))
 	httpServer := &http.Server{
 		Addr:              *listenAddr,
 		Handler:           srv.Handler(),

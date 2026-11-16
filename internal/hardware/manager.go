@@ -88,6 +88,11 @@ func NewManager(cfg Config) (*Manager, error) {
 	return m, nil
 }
 
+// UnsafeNoIOMMUAllowed reports whether binding drives without an IOMMU was opted into.
+func (m *Manager) UnsafeNoIOMMUAllowed() bool {
+	return m.cfg.AllowUnsafeNoIOMMU
+}
+
 // RefreshBootGuard parses /proc/self/mountinfo, /proc/1/mountinfo and /proc/swaps to find
 // every whole disk (and NVMe controller) that backs a mounted filesystem or active swap,
 // resolving through partitions, device-mapper (LVM, LUKS), md and NVMe multipath.

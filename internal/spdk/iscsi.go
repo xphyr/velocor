@@ -180,3 +180,20 @@ func (c *Client) IscsiInitiatorGroupRemoveInitiators(ctx context.Context, tag in
 	}
 	return c.Call(ctx, "iscsi_initiator_group_remove_initiators", params, nil)
 }
+
+// IscsiConnection is an active iSCSI session connection.
+type IscsiConnection struct {
+	ID             int    `json:"id"`
+	InitiatorAddr  string `json:"initiator_addr"`
+	TargetAddr     string `json:"target_addr"`
+	TargetNodeName string `json:"target_node_name"`
+}
+
+// IscsiGetConnections lists active iSCSI connections.
+func (c *Client) IscsiGetConnections(ctx context.Context) ([]IscsiConnection, error) {
+	var res []IscsiConnection
+	if err := c.Call(ctx, "iscsi_get_connections", nil, &res); err != nil {
+		return nil, err
+	}
+	return res, nil
+}

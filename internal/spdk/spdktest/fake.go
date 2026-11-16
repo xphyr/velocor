@@ -119,7 +119,8 @@ type Fake struct {
 	portalGroups map[int][]spdk.IscsiPortal
 	initGroups   map[int]spdk.IscsiInitiatorGroup
 	targetNodes  map[string]*spdk.IscsiTargetNode
-	failures     map[string]int // method -> remaining failures (<0 = forever)
+	nvmeConns    map[string][]spdk.NvmfController // subsystem NQN -> connected hosts
+	failures     map[string]int                   // method -> remaining failures (<0 = forever)
 	calls        []string
 	uuidCounter  int
 }
@@ -306,6 +307,14 @@ func (f *Fake) resetRuntime() {
 	f.portalGroups = map[int][]spdk.IscsiPortal{}
 	f.initGroups = map[int]spdk.IscsiInitiatorGroup{}
 	f.targetNodes = map[string]*spdk.IscsiTargetNode{}
+	f.nvmeConns = map[string][]spdk.NvmfController{}
+}
+
+// ConnectHost simulates hostNQN connecting to an NVMe-oF subsystem.
+func (f *Fake) ConnectHost(nqn, hostNQN string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.nvmeConns[nqn] = append(f.nvmeConns[nqn], spdk.NvmfController{Cntlid: uint32(len(f.nvmeConns[nqn]) + 1), HostNQN: hostNQN, NumIOQpairs: 4})
 }
 
 func (f *Fake) serve() {
@@ -1088,6 +1097,15 @@ var handlers = map[string]handler{
 			return nil, errf(codeInvalidParams, "Unable to find subsystem")
 		}
 		return true, nil
+	},
+	"nvmf_subsystem_get_controllers": func(f *Fake, p map[string]any) (any, *rpcErr) {
+		if _, ok := f.subsystems[str(p, "nqn")]; !ok {
+			return nil, errf(codeInvalidParams, "Unable to find subsystem")
+		}
+		return append([]spdk.NvmfController{}, f.nvmeConns[str(p, "nqn")]...), nil
+	},
+	"iscsi_get_connections": func(f *Fake, _ map[string]any) (any, *rpcErr) {
+		return []spdk.IscsiConnection{}, nil
 	},
 	"nvmf_subsystem_remove_ns": func(f *Fake, p map[string]any) (any, *rpcErr) {
 		s, ok := f.subsystems[str(p, "nqn")]

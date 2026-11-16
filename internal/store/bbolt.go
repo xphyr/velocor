@@ -164,6 +164,33 @@ func (s *BoltStore) MutateVolume(id string, fn func(*Volume) error) (*Volume, er
 	return mutateRecord(s.db, bucketVolumes, id, fn, func(v *Volume, id string) { v.ID = id })
 }
 
+// MutateInitiatorGroup atomically applies fn to the InitiatorGroup record. Referenced hosts
+// must exist.
+func (s *BoltStore) MutateInitiatorGroup(id string, fn func(*InitiatorGroup) error) (*InitiatorGroup, error) {
+	var out InitiatorGroup
+	err := s.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketInitiatorGroups)
+		if err := getJSON(b, []byte(id), &out); err != nil {
+			return err
+		}
+		if err := fn(&out); err != nil {
+			return err
+		}
+		out.ID = id
+		hosts := tx.Bucket(bucketHosts)
+		for _, hid := range out.HostIDs {
+			if hosts.Get([]byte(hid)) == nil {
+				return fmt.Errorf("host %s: %w", hid, ErrNotFound)
+			}
+		}
+		return putJSON(b, []byte(id), &out)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
 // MutateExport atomically applies fn to the Export record.
 func (s *BoltStore) MutateExport(id string, fn func(*Export) error) (*Export, error) {
 	return mutateRecord(s.db, bucketExports, id, fn, func(e *Export, id string) { e.ID = id })

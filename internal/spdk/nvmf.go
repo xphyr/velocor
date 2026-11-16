@@ -224,3 +224,20 @@ func (c *Client) NvmfSubsystemPause(ctx context.Context, nqn string) error {
 func (c *Client) NvmfSubsystemResume(ctx context.Context, nqn string) error {
 	return c.Call(ctx, "nvmf_subsystem_resume", map[string]any{"nqn": nqn}, nil)
 }
+
+// NvmfController is a host controller connected to an NVMe-oF subsystem.
+type NvmfController struct {
+	Cntlid      uint32 `json:"cntlid"`
+	HostNQN     string `json:"hostnqn"`
+	HostID      string `json:"hostid"`
+	NumIOQpairs uint32 `json:"num_io_qpairs"`
+}
+
+// NvmfSubsystemGetControllers lists the hosts connected to a subsystem.
+func (c *Client) NvmfSubsystemGetControllers(ctx context.Context, nqn string) ([]NvmfController, error) {
+	var res []NvmfController
+	if err := c.Call(ctx, "nvmf_subsystem_get_controllers", map[string]any{"nqn": nqn}, &res); err != nil {
+		return nil, err
+	}
+	return res, nil
+}

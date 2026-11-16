@@ -111,6 +111,8 @@ type Store interface {
 	GetInitiatorGroupByName(name string) (*InitiatorGroup, error)
 	ListInitiatorGroups() ([]*InitiatorGroup, error)
 	DeleteInitiatorGroup(id string) error
+	// MutateInitiatorGroup atomically applies fn to the InitiatorGroup record.
+	MutateInitiatorGroup(id string, fn func(*InitiatorGroup) error) (*InitiatorGroup, error)
 
 	// Exports
 	CreateExport(exp *Export) error
