@@ -7,7 +7,8 @@ Wants=network-online.target
 [Container]
 Image=registry.xphyrlab.net/velocor/velocor-spdk:latest
 ContainerName=velocor-spdk
-AutoUpdate=registry
+# No AutoUpdate: restarting spdk_tgt interrupts all SAN I/O. The data plane is only updated
+# explicitly (Web UI / API with allow_disruptive=true) during a maintenance window.
 Network=host
 SecurityLabelDisable=true
 PodmanArgs=--privileged --ipc=host --pid=host

@@ -14,6 +14,9 @@ Volume=/var/lib/velocor:/var/lib/velocor:rw
 Volume=/run/velocor:/run/velocor:rw
 Volume=/sys:/sys:rw
 Volume=/dev:/dev:rslave
+# Lab VMs without a (v)IOMMU: uncomment to allow binding NVMe drives in unsafe no-IOMMU mode.
+# Never enable this on production hardware; it lets SPDK DMA anywhere in host memory.
+#Environment=VELOCOR_ALLOW_UNSAFE_NOIOMMU=true
 Exec=--listen :8443 --db /var/lib/velocor/velocor.db --spdk-socket /run/velocor/spdk.sock --hugepages-mb 1024
 
 [Service]

@@ -9,13 +9,18 @@ imagePullSecrets: []
 
 # Velocor API authentication
 auth:
-  # Name of an existing Secret containing VELOCOR_ENDPOINT, VELOCOR_TOKEN, and VELOCOR_INSECURE.
-  # If empty and endpoint/token are provided, the chart creates a Secret automatically.
+  # Name of an existing Secret containing VELOCOR_ENDPOINT, VELOCOR_TOKEN and optionally
+  # VELOCOR_CA_CERT / VELOCOR_INSECURE. If empty and endpoint/token are provided, the chart
+  # creates a Secret automatically.
   existingSecret: ""
   secretName: velocor-csi-auth
   endpoint: ""
   token: ""
-  insecure: "true"
+  # PEM certificate used to verify the Velocor API. For the appliance's self-signed
+  # certificate, paste the contents of /var/lib/velocor/tls.crt.
+  caCert: ""
+  # Skip TLS verification entirely. Exposes the API token to anyone on the path; lab use only.
+  insecure: "false"
   # Optional portal IP:port override (useful for NAT'd lab environments)
   portalOverride: ""
 
