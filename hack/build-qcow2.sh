@@ -49,7 +49,12 @@ fi
 run="$WORK/run-$$"
 mkdir -p "$run"
 cleanup() {
+  local rc=$?
   [[ -f "$run/vm.pid" ]] && kill "$(cat "$run/vm.pid")" 2>/dev/null || true
+  if [[ $rc -ne 0 && -f "$run/console.log" ]]; then
+    cp "$run/console.log" "$WORK/last-failed-console.log"
+    echo "builder console saved to $WORK/last-failed-console.log" >&2
+  fi
   rm -rf "$run"
 }
 trap cleanup EXIT
@@ -75,10 +80,12 @@ qemu-img create -q -f qcow2 "$run/target.qcow2" "$SIZE"
 port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])')
 qemu-system-x86_64 -name velocor-qcow2-builder -machine q35,accel=kvm -cpu host -m 3072 -smp 4 \
   -daemonize -pidfile "$run/vm.pid" -display none -serial "file:$run/console.log" \
-  -drive "file=$run/builder.qcow2,if=virtio,format=qcow2" \
+  -drive "file=$run/builder.qcow2,if=none,id=os,format=qcow2" \
+  -device "virtio-blk-pci,drive=os,bootindex=1" \
   -drive "file=$run/target.qcow2,if=none,id=target,format=qcow2" \
   -device "virtio-blk-pci,drive=target,serial=VELOCORTARGET" \
-  -drive "file=$run/seed.iso,if=virtio,media=cdrom,readonly=on" \
+  -drive "file=$run/seed.iso,if=none,id=seed,format=raw,readonly=on" \
+  -device "virtio-blk-pci,drive=seed" \
   -netdev "user,id=n0,hostfwd=tcp:127.0.0.1:${port}-:22" -device virtio-net-pci,netdev=n0
 
 ssh_b=(ssh -i "$run/builder" -o IdentitiesOnly=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 -o LogLevel=ERROR -p "$port" builder@127.0.0.1)

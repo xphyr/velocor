@@ -6,7 +6,8 @@ Wants=velocor-spdk.service
 [Container]
 Image=registry.xphyrlab.net/velocor/velocor-velod:latest
 ContainerName=velocor-velod
-AutoUpdate=registry
+# No AutoUpdate: an appliance changes only through `bootc upgrade`, which ships quadlets pinned
+# to the image versions built from the same commit.
 Network=host
 SecurityLabelDisable=true
 PodmanArgs=--privileged --pid=host
