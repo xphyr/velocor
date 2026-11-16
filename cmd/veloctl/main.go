@@ -588,8 +588,8 @@ func runPool(cfg *cliConfig, args []string) error {
 		for _, p := range sliceOfMaps(resp["pools"]) {
 			totGiB := uint64FromAny(p["total_bytes"]) / (1024 * 1024 * 1024)
 			freeGiB := uint64FromAny(p["free_bytes"]) / (1024 * 1024 * 1024)
-			fmt.Fprintf(tw, "%v\t%v\t%v\t%v\t%d\t%d\t%v\t%v\t%v\n",
-				p["id"], p["name"], p["raid_level"], p["cluster_size_bytes"],
+			fmt.Fprintf(tw, "%v\t%v\t%v\t%d\t%d\t%d\t%v\t%v\t%v\n",
+				p["id"], p["name"], p["raid_level"], uint64FromAny(p["cluster_size_bytes"]),
 				totGiB, freeGiB, p["lvs_name"], p["health_status"], strOrEmpty(p["status_message"]))
 		}
 		return tw.Flush()

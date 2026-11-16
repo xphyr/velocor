@@ -151,6 +151,12 @@ work still open, ranked by risk to data, how fixes are verified, and what has be
   `pdu_pool_size` 2048) with `-s 1024`, i.e. buffer starvation on large R2T/Data-Out writes.
   *Next:* reproduce on the lab host with an iSCSI initiator VM and vary pools/memory/burst sizes;
   add an iSCSI data-path scenario to the integration tests.
+- [ ] **P1-12. No ReadWriteMany: KubeVirt VMs on Velocor can't live-migrate.** The driver
+  supports only single-node access modes, so OpenShift Virtualization can't live-migrate VMs
+  whose disks are on Velocor (node drains and cluster upgrades then stop them). *Needed:*
+  multi-node block access (RWX `volumeMode: Block`): export a volume to both source and target
+  nodes during migration, with ACLs for both; NVMe-oF ANA / reservations to keep it safe.
+
 ### P2: hardening
 
 - [ ] **P2-1. CHAP and real host identities** (was S10). Any host that can spoof an allowed NQN
@@ -167,6 +173,12 @@ work still open, ranked by risk to data, how fixes are verified, and what has be
   login runs 600k PBKDF2 iterations; consider a test-only iteration override (was F7).
 - [ ] **P2-7. The CSI driver logs nothing per request.** Stage/publish failures are only
   visible as Kubernetes events; the node plugin's log shows just its start line.
+- [ ] **P2-9. CDI has no StorageProfile defaults for the Velocor classes**, so every
+  DataVolume must spell out `accessModes` and `volumeMode`. Ship or document a StorageProfile
+  (`claimPropertySets`: RWO + Block, RWO + Filesystem) and a clone strategy.
+- [ ] **P2-10. Recovery time after an unclean SPDK stop** is now ~1 min per 500 GB on emulated
+  disks (was 16 min). If it matters on real hardware, lower the lvstore metadata reservation
+  (`num_md_pages_per_cluster_ratio`) and report a "recovering" state instead of DEGRADED.
 - [ ] **P2-8. CSI sidecar images are pinned by tag** (`csi-provisioner:v5.1.0`, ...), not digest.
 - [ ] **P2-6. No health endpoint.** velod has no unauthenticated liveness/readiness route
   (found in the 2026-11-16 qcow2 boot test), so quadlets can't use `HealthCmd=` and monitoring
@@ -316,6 +328,16 @@ root and password SSH are refused. **Upgrade and rollback** (lab host): `bootc s
 dev-bddac0b to dev-04b3b31 loads the new embedded images, removes the old ones and keeps velod's
 database; `bootc rollback` returns to dev-bddac0b with its own images and the same database. Not
 yet covered: Secure Boot.
+
+**CSI on OpenShift** (NVW, OpenShift 4.22, velocor-1 appliance, NVMe/TCP, 2026-11-16, dev-194b99c):
+provision and mount; cross-node re-attach with identical data; online expansion; snapshot and
+restore (point-in-time correct); PVC clone; raw block (`volumeMode: Block`) round trip; SPDK
+`kill -9` with a pod writing: I/O stalls ~72 s and resumes, no errors, no lost acknowledged write;
+KubeVirt: Fedora VM imported onto a Velocor block volume, boots, data survives a move to
+another node, online VM snapshot (guest-agent freeze) and restore are point-in-time correct;
+everything deleted cleanly (no PVs, snapshots, volumes or exports left). **iSCSI:** login works
+on RHCOS since d60e9ec, but the data path stalls (P1-10). Not covered: RWX / live migration
+(P1-12), Kasten.
 
 **Not yet covered:** real NVMe drives (`bdev_nvme`, vfio), io_uring (needs a host where it
 works, see P0-6), iSCSI data paths (needs an iSCSI initiator in the test image), power-loss
