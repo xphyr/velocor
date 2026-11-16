@@ -1,17 +1,25 @@
 package main
 
 import (
+	"context"
+	"encoding/json"
 	"flag"
 	"log"
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/velocor/velocor/internal/csi"
 	"github.com/velocor/velocor/internal/version"
 )
 
 func main() {
+	// `velocor-csi storageprofile <class>...`: run by the Helm chart's hook Job, not a driver.
+	if len(os.Args) > 1 && os.Args[1] == "storageprofile" {
+		runStorageProfile(os.Args[2:])
+		return
+	}
 	var (
 		driverName = flag.String("driver-name", csi.DefaultDriverName, "CSI driver name")
 		endpoint   = flag.String("endpoint", "unix:///csi/csi.sock", "CSI gRPC endpoint")
@@ -73,4 +81,18 @@ func hostnameOr(fallback string) string {
 		return h
 	}
 	return fallback
+}
+
+// runStorageProfile applies the CDI StorageProfile spec in $STORAGEPROFILE_SPEC (JSON) to the
+// named StorageClasses' profiles.
+func runStorageProfile(classes []string) {
+	spec := os.Getenv("STORAGEPROFILE_SPEC")
+	if len(classes) == 0 || spec == "" {
+		log.Fatalf("usage: STORAGEPROFILE_SPEC='{...}' velocor-csi storageprofile <storageclass>...")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	if err := csi.ApplyStorageProfiles(ctx, classes, json.RawMessage(spec)); err != nil {
+		log.Fatalf("storageprofile: %v", err)
+	}
 }

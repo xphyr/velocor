@@ -211,6 +211,7 @@ func UpdateExport(ctx context.Context, c *spdk.Client, st store.Store, id string
 	next := *old
 	next.InitiatorGroupIDs = slices.Clone(old.InitiatorGroupIDs)
 	next.PortalIDs = slices.Clone(old.PortalIDs)
+	next.NodeIDs = slices.Clone(old.NodeIDs)
 	if err := mutate(&next); err != nil {
 		return nil, err
 	}
@@ -219,7 +220,7 @@ func UpdateExport(ctx context.Context, c *spdk.Client, st store.Store, id string
 		return nil, err
 	}
 	return st.MutateExport(id, func(e *store.Export) error {
-		e.InitiatorGroupIDs, e.AllowAnyHost = next.InitiatorGroupIDs, next.AllowAnyHost
+		e.InitiatorGroupIDs, e.AllowAnyHost, e.NodeIDs = next.InitiatorGroupIDs, next.AllowAnyHost, next.NodeIDs
 		return nil
 	})
 }

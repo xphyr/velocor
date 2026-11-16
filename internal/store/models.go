@@ -343,6 +343,11 @@ type Export struct {
 	AllowAnyHost      bool           `json:"allow_any_host"`
 	// NodeID is the CSI node this export was published to (empty for manually created exports).
 	NodeID string `json:"node_id,omitempty"`
+	// Shared marks a CSI export that several nodes use at once (ReadWriteMany / ReadOnlyMany raw
+	// block, e.g. a KubeVirt VM disk during live migration). One shared export per volume;
+	// NodeIDs lists the nodes it's published to, each allowed in through its initiator group.
+	Shared  bool     `json:"shared,omitempty"`
+	NodeIDs []string `json:"node_ids,omitempty"`
 	// IscsiIgTag is the SPDK iSCSI initiator group tag owned by this export (unique, allocated by the store).
 	IscsiIgTag    int          `json:"iscsi_ig_tag,omitempty"`
 	HealthStatus  HealthStatus `json:"health_status"`

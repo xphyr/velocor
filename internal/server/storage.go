@@ -17,6 +17,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"slices"
 	"strings"
 	"time"
 	"unicode"
@@ -1050,6 +1051,8 @@ func (s *Server) handleCreateExport(w http.ResponseWriter, r *http.Request) {
 		InitiatorGroupIDs []string             `json:"initiator_group_ids"`
 		AllowAnyHost      bool                 `json:"allow_any_host"`
 		NodeID            string               `json:"node_id"`
+		Shared            bool                 `json:"shared"`
+		NodeIDs           []string             `json:"node_ids"`
 	}
 	if err := decodeJSON(r, &req); err != nil {
 		writeError(w, err)
@@ -1068,9 +1071,17 @@ func (s *Server) handleCreateExport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if req.Shared && req.NodeID != "" {
+		writeError(w, fmt.Errorf("%w: a shared export lists its nodes in node_ids, not node_id", store.ErrInvalidArgument))
+		return
+	}
+	if !req.Shared && len(req.NodeIDs) > 0 {
+		writeError(w, fmt.Errorf("%w: node_ids is only for shared exports", store.ErrInvalidArgument))
+		return
+	}
 	// Idempotent by Name for Kubernetes CSI ControllerPublishVolume retries.
 	if existing, err := s.store.GetExportByName(req.Name); err == nil {
-		if existing.VolumeID == req.VolumeID && existing.NodeID == req.NodeID {
+		if existing.VolumeID == req.VolumeID && existing.NodeID == req.NodeID && existing.Shared == req.Shared {
 			writeJSON(w, http.StatusOK, map[string]any{"export": existing})
 			return
 		}
@@ -1122,6 +1133,8 @@ func (s *Server) handleCreateExport(w http.ResponseWriter, r *http.Request) {
 		InitiatorGroupIDs: req.InitiatorGroupIDs,
 		AllowAnyHost:      req.AllowAnyHost,
 		NodeID:            req.NodeID,
+		Shared:            req.Shared,
+		NodeIDs:           slices.Compact(slices.Sorted(slices.Values(req.NodeIDs))),
 		HealthStatus:      store.HealthStatusOnline,
 	}
 	acl, err := dataplane.ResolveACL(s.store, exp.InitiatorGroupIDs)

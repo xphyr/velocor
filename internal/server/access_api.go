@@ -20,12 +20,14 @@ func (s *Server) handleUpdateExport(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		InitiatorGroupIDs *[]string `json:"initiator_group_ids"`
 		AllowAnyHost      *bool     `json:"allow_any_host"`
+		// node_ids: the CSI nodes of a shared export, changed together with their groups.
+		NodeIDs *[]string `json:"node_ids"`
 	}
 	if err := decodeJSON(r, &req); err != nil {
 		writeError(w, err)
 		return
 	}
-	if req.InitiatorGroupIDs == nil && req.AllowAnyHost == nil {
+	if req.InitiatorGroupIDs == nil && req.AllowAnyHost == nil && req.NodeIDs == nil {
 		writeError(w, fmt.Errorf("%w: nothing to change; set initiator_group_ids and/or allow_any_host", store.ErrInvalidArgument))
 		return
 	}
@@ -43,7 +45,14 @@ func (s *Server) handleUpdateExport(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
+	if req.NodeIDs != nil && !exp.Shared {
+		writeError(w, fmt.Errorf("%w: node_ids can only be changed on a shared export", store.ErrInvalidArgument))
+		return
+	}
 	updated, err := dataplane.UpdateExport(r.Context(), s.spdk, s.store, id, vol, func(e *store.Export) error {
+		if req.NodeIDs != nil {
+			e.NodeIDs = slices.Compact(slices.Sorted(slices.Values(*req.NodeIDs)))
+		}
 		if req.InitiatorGroupIDs != nil {
 			e.InitiatorGroupIDs = slices.Compact(slices.Sorted(slices.Values(*req.InitiatorGroupIDs)))
 		}

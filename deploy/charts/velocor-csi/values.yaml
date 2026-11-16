@@ -96,6 +96,28 @@ snapshots:
     # "auto" enables --enable-volume-group-snapshots=true when groupsnapshot.storage.k8s.io/v1beta1 CRD exists
     groupSnapshotsEnabled: auto
 
+# KubeVirt CDI StorageProfile for each Velocor StorageClass: what CDI asks for when it makes a
+# VM disk (DataVolume). CDI creates the profiles but fills them in only for drivers it knows, so
+# a Helm hook Job patches these settings in after every install and upgrade (which also restores
+# a profile that CDI reset because its StorageClass was recreated).
+cdi:
+  storageProfile:
+    # "auto": only when CDI (cdi.kubevirt.io/v1beta1) is installed; true/false forces it.
+    enabled: auto
+    # In order of preference. ReadWriteMany raw block comes first: it's what a VM needs to
+    # live-migrate. A ReadWriteMany filesystem isn't offered (the driver refuses it).
+    claimPropertySets:
+      - accessModes: [ReadWriteMany]
+        volumeMode: Block
+      - accessModes: [ReadWriteOnce]
+        volumeMode: Block
+      - accessModes: [ReadWriteOnce]
+        volumeMode: Filesystem
+    # Clones are made by the driver (thin lvol clones); no data is copied.
+    cloneStrategy: csi-clone
+    # Golden images from DataImportCrons are kept as snapshots; VM disks are clones of them.
+    dataImportCronSourceFormat: snapshot
+
 openshift:
   scc:
     # "auto" binds the OpenShift privileged SCC to velocor-csi-node when security.openshift.io/v1 is present

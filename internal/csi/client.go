@@ -63,6 +63,14 @@ type CreateExportRequest struct {
 	InitiatorGroupIDs []string             `json:"initiator_group_ids,omitempty"`
 	AllowAnyHost      bool                 `json:"allow_any_host"`
 	NodeID            string               `json:"node_id,omitempty"`
+	Shared            bool                 `json:"shared,omitempty"`
+	NodeIDs           []string             `json:"node_ids,omitempty"`
+}
+
+// UpdateExportRequest changes who may reach a live export (PATCH /api/v1/exports/{id}).
+type UpdateExportRequest struct {
+	InitiatorGroupIDs *[]string `json:"initiator_group_ids,omitempty"`
+	NodeIDs           *[]string `json:"node_ids,omitempty"`
 }
 
 // VelocorClient defines the control-plane operations required by the CSI driver.
@@ -95,6 +103,7 @@ type VelocorClient interface {
 	ListExports(ctx context.Context) ([]*store.Export, error)
 	CreateExport(ctx context.Context, req CreateExportRequest) (*store.Export, error)
 	DeleteExport(ctx context.Context, id string) error
+	UpdateExport(ctx context.Context, id string, req UpdateExportRequest) (*store.Export, error)
 }
 
 // HTTPClient implements VelocorClient over the velod REST/JSON API.
@@ -365,6 +374,14 @@ func (c *HTTPClient) CreateExport(ctx context.Context, req CreateExportRequest) 
 		Export *store.Export `json:"export"`
 	}
 	err := c.doJSON(ctx, http.MethodPost, "/api/v1/exports", req, &resp)
+	return resp.Export, err
+}
+
+func (c *HTTPClient) UpdateExport(ctx context.Context, id string, req UpdateExportRequest) (*store.Export, error) {
+	var resp struct {
+		Export *store.Export `json:"export"`
+	}
+	err := c.doJSON(ctx, http.MethodPatch, "/api/v1/exports/"+url.PathEscape(id), req, &resp)
 	return resp.Export, err
 }
 

@@ -365,6 +365,20 @@ The Velocor CSI driver (`velocor-csi`) integrates Kubernetes clusters with a Vel
 - **Volume Cloning** (`dataSource` referencing an existing `PersistentVolumeClaim` or `VolumeSnapshot`)
 - **Volume Group Snapshots** (`VolumeGroupSnapshot` via CSI `GroupController`)
 
+#### Shared volumes and KubeVirt live migration
+
+- **ReadWriteMany (and ReadOnlyMany) are supported for raw block volumes (`volumeMode: Block`)**,
+  which is what a KubeVirt VM needs to live-migrate: during a migration the VM's disk is used by
+  the source and the target node at once. A shared volume gets one export (one NVMe-oF
+  subsystem) that each node using it is allowed into; nodes are added and removed while the
+  others stay connected. Whatever shares the device must coordinate its writes and use direct
+  I/O, as QEMU does.
+- **A ReadWriteMany filesystem is refused:** a filesystem written from two nodes is corrupted.
+- **CDI StorageProfile:** on clusters with KubeVirt CDI, the chart's hook Job fills in each
+  Velocor StorageClass's StorageProfile (`cdi.storageProfile` in `values.yaml`): ReadWriteMany
+  block first, driver clones (`csi-clone`), snapshots for golden images. DataVolumes then need no
+  access or volume mode of their own, and VMs created from them are live-migratable.
+
 #### Changed Block Tracking (CBT): not yet supported
 
 The driver does **not** implement the CSI `SnapshotMetadata` service (KEP-3314) and does not
