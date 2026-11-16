@@ -6,3 +6,13 @@ hack/vm-lab/.vms/
 *.raw
 *.iso
 *.db
+
+# Secrets and local-only files must never reach a build context (velod/csi builds COPY . .)
+*.priv
+*.token
+*.token.priv
+*.pem
+*.key
+.env
+CLAUDE.local.md
+deploy/bootc/config.local.toml
