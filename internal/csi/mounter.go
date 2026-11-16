@@ -32,6 +32,8 @@ type VolumeStats struct {
 type Mounter interface {
 	ConnectTarget(ctx context.Context, publishCtx map[string]string, hostNQN, initiatorIQN string) (string, error)
 	DisconnectTarget(ctx context.Context, publishCtx map[string]string) error
+	// FlushDevice writes out what the node still caches for a raw block device.
+	FlushDevice(ctx context.Context, devicePath string) error
 	FormatAndMount(ctx context.Context, source, target, fsType string, mountOpts []string) error
 	BindMount(ctx context.Context, source, target string, mountOpts []string, isBlock bool) error
 	Unmount(ctx context.Context, target string) error
@@ -186,18 +188,43 @@ func (m *LinuxMounter) DisconnectTarget(ctx context.Context, publishCtx map[stri
 		port := publishCtx["portal_port"]
 		if iqn != "" && ip != "" && port != "" {
 			portal := iscsiPortalAddr(ip, port)
-			_ = iscsiadm(ctx, "-m", "node", "-T", iqn, "-p", portal, "--logout").Run()
-			// Forget the target too, so the node keeps no record of volumes it no longer uses.
+			// Exit status 21: no matching session (already logged out), which is fine.
+			if out, err := iscsiadm(ctx, "-m", "node", "-T", iqn, "-p", portal, "--logout").CombinedOutput(); err != nil && exitCode(err) != 21 {
+				return fmt.Errorf("iscsiadm logout %s: %w (%s)", iqn, err, strings.TrimSpace(string(out)))
+			}
+			// Forget the target too, so the node keeps no record of volumes it no longer uses
+			// (and iscsid doesn't keep retrying a target that's gone).
 			_ = iscsiadm(ctx, "-m", "node", "-T", iqn, "-p", portal, "-o", "delete").Run()
 		}
 		return nil
 	default:
 		nqn := publishCtx["target_nqn"]
 		if nqn != "" {
-			_ = exec.CommandContext(ctx, "nvme", "disconnect", "-n", nqn).Run()
+			out, err := exec.CommandContext(ctx, "nvme", "disconnect", "-n", nqn).CombinedOutput()
+			if err != nil && !strings.Contains(string(out), "disconnected 0 controller") {
+				return fmt.Errorf("nvme disconnect %s: %w (%s)", nqn, err, strings.TrimSpace(string(out)))
+			}
 		}
 		return nil
 	}
+}
+
+// FlushDevice writes out what the kernel still holds for a raw block device. Raw block
+// volumes go through the page cache with no filesystem to flush them; tearing the connection
+// down first would race the data against the next node's reads.
+func (m *LinuxMounter) FlushDevice(ctx context.Context, devicePath string) error {
+	if out, err := exec.CommandContext(ctx, "blockdev", "--flushbufs", devicePath).CombinedOutput(); err != nil {
+		return fmt.Errorf("blockdev --flushbufs %s: %w (%s)", devicePath, err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+func exitCode(err error) int {
+	var ee *exec.ExitError
+	if errors.As(err, &ee) {
+		return ee.ExitCode()
+	}
+	return -1
 }
 
 func deterministicHostID(hostNQN string) string {

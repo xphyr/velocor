@@ -38,6 +38,10 @@ func (f *fakeMounter) DisconnectTarget(_ context.Context, _ map[string]string) e
 	return nil
 }
 
+func (f *fakeMounter) FlushDevice(_ context.Context, _ string) error {
+	return nil
+}
+
 func (f *fakeMounter) FormatAndMount(_ context.Context, _, target, _ string, _ []string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()

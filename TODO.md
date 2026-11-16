@@ -142,6 +142,15 @@ work still open, ranked by risk to data, how fixes are verified, and what has be
   *Needed:* a supported degraded start (SPDK investigation; possibly removing the absent member
   from the superblock with operator confirmation). Together with P0-1 this is "redundancy".
 
+- [ ] **P1-10. SPDK's iSCSI target stalls large writes (found on NVW, 2026-11-16).** After the
+  login fix (d60e9ec), `mkfs.ext4` on an iSCSI volume hung: 19 writes in flight (the LUN allows
+  4 MiB), never completed; the initiator aborted (`ABORT_TASK`: "abort task not supported"),
+  reset the LUN and reconnected. The writes never reach the volume's bdev, so they stall in the
+  iSCSI layer. NVMe/TCP over the same path and pool is fine. Suspects: the reduced iSCSI pools
+  in `/etc/velocor/spdk.json` (`immediate_data_pool_size`/`data_out_pool_size` 512,
+  `pdu_pool_size` 2048) with `-s 1024`, i.e. buffer starvation on large R2T/Data-Out writes.
+  *Next:* reproduce on the lab host with an iSCSI initiator VM and vary pools/memory/burst sizes;
+  add an iSCSI data-path scenario to the integration tests.
 ### P2: hardening
 
 - [ ] **P2-1. CHAP and real host identities** (was S10). Any host that can spoof an allowed NQN
@@ -156,6 +165,9 @@ work still open, ranked by risk to data, how fixes are verified, and what has be
   validated against the number of exports and connections.
 - [ ] **P2-5. Slow test suites.** Auth/server tests take ~50–100 s under `-race` because every
   login runs 600k PBKDF2 iterations; consider a test-only iteration override (was F7).
+- [ ] **P2-7. The CSI driver logs nothing per request.** Stage/publish failures are only
+  visible as Kubernetes events; the node plugin's log shows just its start line.
+- [ ] **P2-8. CSI sidecar images are pinned by tag** (`csi-provisioner:v5.1.0`, ...), not digest.
 - [ ] **P2-6. No health endpoint.** velod has no unauthenticated liveness/readiness route
   (found in the 2026-11-16 qcow2 boot test), so quadlets can't use `HealthCmd=` and monitoring
   can't tell "velod up but SPDK unreachable" from "all good". *Needed:* `/healthz` (process up)
@@ -339,6 +351,13 @@ code. Each now has a real-SPDK scenario and a matching unit test.
 ### Other second-review fixes
 
 - [x] **P0-5.** SPDK was killed 10 s into every shutdown (podman default): `StopTimeout=120`.
+- [x] **P1-11. One stuck volume blocked the whole CSI node** (NVW, 2026-11-16): the node plugin
+  serialized every stage/publish on one mutex, so a hung iSCSI format made the node's NVMe
+  volumes time out too. Now per-volume locks (a busy volume answers Aborted, which the sidecars
+  retry); `TestNodeVolumeLocksAreIndependent`. With it, from synology-csi's iSCSI handling:
+  raw block devices are flushed (`blockdev --flushbufs`) before disconnect, and logout /
+  disconnect failures are returned (the stage record is kept so kubelet retries the unstage)
+  instead of being ignored.
 - [x] **Slow operations were aborted halfway and left orphans** (velocor-1, 2026-11-16). Creating
   a pool on 2 × 500 GB took longer than the SPDK client's 15 s per-call timeout and veloctl's
   30 s: spdk_tgt finished the lvstore anyway, velod rolled back by deleting the RAID from under

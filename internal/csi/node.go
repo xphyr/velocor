@@ -27,7 +27,25 @@ type NodeServer struct {
 	mounter          Mounter
 	publishedTargets map[string]map[string]bool
 	stagingPaths     map[string]string // volume ID -> staging_target_path (for NodeExpandVolume)
-	mu               sync.Mutex
+	mu               sync.Mutex        // guards the maps only; never held across I/O
+	busy             map[string]bool   // volume IDs with an operation in progress
+}
+
+// lockVolume serializes operations per volume. Calls for other volumes proceed, so one hung
+// device (say, a format waiting on a stuck target) can't block every pod on the node. A second
+// call for a busy volume gets Aborted, which the CSI sidecars retry.
+func (s *NodeServer) lockVolume(id string) (func(), error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.busy[id] {
+		return nil, status.Errorf(codes.Aborted, "an operation on volume %s is already in progress", id)
+	}
+	s.busy[id] = true
+	return func() {
+		s.mu.Lock()
+		delete(s.busy, id)
+		s.mu.Unlock()
+	}, nil
 }
 
 // NewNodeServer creates a CSI NodeServer.
@@ -37,6 +55,7 @@ func NewNodeServer(nodeID string, mounter Mounter) *NodeServer {
 		mounter:          mounter,
 		publishedTargets: map[string]map[string]bool{},
 		stagingPaths:     map[string]string{},
+		busy:             map[string]bool{},
 	}
 }
 
@@ -72,8 +91,11 @@ func (s *NodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolu
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	unlock, err := s.lockVolume(req.GetVolumeId())
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
 
 	devPath, err := s.mounter.ConnectTarget(ctx, req.GetPublishContext(), nodeHostNQN(s.nodeID), nodeInitiatorIQN(s.nodeID))
 	if err != nil {
@@ -105,7 +127,9 @@ func (s *NodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolu
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "persist staging metadata: %v", err)
 	}
+	s.mu.Lock()
 	s.stagingPaths[req.GetVolumeId()] = req.GetStagingTargetPath()
+	s.mu.Unlock()
 	return &csi.NodeStageVolumeResponse{}, nil
 }
 
@@ -114,8 +138,11 @@ func (s *NodeServer) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstage
 		return nil, status.Error(codes.InvalidArgument, "volume_id and staging_target_path are required")
 	}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	unlock, err := s.lockVolume(req.GetVolumeId())
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
 
 	mountPath := filepath.Join(req.GetStagingTargetPath(), "mount")
 	if err := s.mounter.Unmount(ctx, mountPath); err != nil {
@@ -127,11 +154,21 @@ func (s *NodeServer) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstage
 	if raw, err := os.ReadFile(metaPath); err == nil {
 		var meta stageMetadata
 		if json.Unmarshal(raw, &meta) == nil {
-			_ = s.mounter.DisconnectTarget(ctx, meta.PublishContext)
+			if meta.IsBlock && meta.DevicePath != "" {
+				if err := s.mounter.FlushDevice(ctx, meta.DevicePath); err != nil {
+					return nil, status.Errorf(codes.Internal, "flush %s: %v", meta.DevicePath, err)
+				}
+			}
+			// On failure keep the metadata, so the retried unstage disconnects again.
+			if err := s.mounter.DisconnectTarget(ctx, meta.PublishContext); err != nil {
+				return nil, status.Errorf(codes.Internal, "disconnect: %v", err)
+			}
 		}
 		_ = os.Remove(metaPath)
 	}
+	s.mu.Lock()
 	delete(s.stagingPaths, req.GetVolumeId())
+	s.mu.Unlock()
 	return &csi.NodeUnstageVolumeResponse{}, nil
 }
 
@@ -143,15 +180,21 @@ func (s *NodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublish
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	unlock, err := s.lockVolume(req.GetVolumeId())
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
 
 	if req.GetVolumeCapability().GetAccessMode().GetMode() == csi.VolumeCapability_AccessMode_SINGLE_NODE_SINGLE_WRITER {
+		s.mu.Lock()
 		for tp := range s.publishedTargets[req.GetVolumeId()] {
 			if tp != req.GetTargetPath() {
+				s.mu.Unlock()
 				return nil, status.Errorf(codes.FailedPrecondition, "volume %s already published at %s", req.GetVolumeId(), tp)
 			}
 		}
+		s.mu.Unlock()
 	}
 
 	var meta stageMetadata
@@ -179,10 +222,12 @@ func (s *NodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublish
 	if err := s.mounter.BindMount(ctx, source, req.GetTargetPath(), opts, isBlock); err != nil {
 		return nil, status.Errorf(codes.Internal, "bind mount: %v", err)
 	}
+	s.mu.Lock()
 	if s.publishedTargets[req.GetVolumeId()] == nil {
 		s.publishedTargets[req.GetVolumeId()] = map[string]bool{}
 	}
 	s.publishedTargets[req.GetVolumeId()][req.GetTargetPath()] = true
+	s.mu.Unlock()
 	return &csi.NodePublishVolumeResponse{}, nil
 }
 
@@ -191,16 +236,21 @@ func (s *NodeServer) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpub
 		return nil, status.Error(codes.InvalidArgument, "volume_id and target_path are required")
 	}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	unlock, err := s.lockVolume(req.GetVolumeId())
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
 
 	if err := s.mounter.Unmount(ctx, req.GetTargetPath()); err != nil {
 		return nil, status.Errorf(codes.Internal, "unmount target: %v", err)
 	}
 	_ = os.RemoveAll(req.GetTargetPath())
+	s.mu.Lock()
 	if targets := s.publishedTargets[req.GetVolumeId()]; targets != nil {
 		delete(targets, req.GetTargetPath())
 	}
+	s.mu.Unlock()
 	return &csi.NodeUnpublishVolumeResponse{}, nil
 }
 
