@@ -258,16 +258,22 @@ Authenticate via `veloctl` (session token is saved to `~/.config/velocor/token`)
 
 ```bash
 export VELOCOR_ENDPOINT="https://<appliance-ip>:8443"
+# veloctl verifies TLS. Trust the appliance's self-signed certificate (copy it once):
+scp root@<appliance-ip>:/var/lib/velocor/tls.crt ~/.config/velocor/appliance.crt
+export VELOCOR_CA_CERT=~/.config/velocor/appliance.crt   # or pass --ca-cert
 
 sudo cat /var/lib/velocor/initial-admin-password   # on the appliance
-veloctl login --username admin --password '<bootstrap-password>'
+veloctl login --username admin                      # prompts for the password
 
 # Required before any other API call: replace the bootstrap password
 # (or simply sign in to the Web UI, which prompts for it)
+veloctl passwd
 
-# Check appliance health, SPDK connection, and hugepage status
+# Check appliance health, SPDK connection, hugepages, and configuration warnings
 veloctl system status
 ```
+
+`VELOCOR_INSECURE=true` (or `--insecure`) skips certificate verification entirely; use it only in a lab.
 
 ### 2. Discover & Claim Physical Disks
 
@@ -306,14 +312,26 @@ veloctl portal list
 # Create a 50 GiB thin-provisioned volume
 veloctl volume create --name app-data --pool <pool-id> --size-gib 50 --thin=true
 
-# Export the volume over NVMe-oF/TCP
+# Say which hosts may connect (NQN from /etc/nvme/hostnqn on each host)
+veloctl initiator-group create --name app-hosts --nqns nqn.2014-08.org.nvmexpress:uuid:<host-uuid>
+
+# Export the volume over NVMe-oF/TCP to that group only
 veloctl export create \
   --name exp-app-data \
   --volume <volume-id> \
   --protocol NVMEOF_TCP \
   --portals <portal-id> \
-  --allow-any-host=true
+  --initiator-groups <initiator-group-id>
+
+# Later: add a host to the group (re-applied to every export using it), see who's connected,
+# or change who may reach one export
+veloctl initiator-group update <initiator-group-id> --nqns nqn...:host-a,nqn...:host-b
+veloctl export connections <export-id>
+veloctl export access <export-id> --initiator-groups <id1>,<id2>
+veloctl volume usage <volume-id>
 ```
+
+Exports with no initiator groups are refused unless `--allow-any-host` is given explicitly, which lets anyone who can reach the portal connect.
 
 ---
 

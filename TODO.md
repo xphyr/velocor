@@ -87,7 +87,7 @@ Mark `[x]` when fixed **and** covered by a test. "HW" = needs verification on re
 - [x] **F10.** Pre-release cleanup: removed all migration/compatibility code (legacy SSD ID migration, iSCSI tag backfill, non-superblock RAID re-creation, reconciler lvstore initialisation, v1 password hashes, second-granular JWTs, legacy CSI export attribution, duplicate CBT routes, whole-record `Update*` store methods).
 
 - [x] **F11.** Web UI rewritten in the nvweaver layout (top nav, hash-routed detail pages for pools/volumes/exports, filterable paged tables, `<dialog>` forms with typed confirmation, role-aware controls, forced password change). New API: `PATCH /exports/{id}`, `GET /exports/{id}/connections`, `PATCH /initiator-groups/{id}`, `GET /volumes/{id}/usage`, `warnings` in `/system/status`.
-- [ ] **F12.** `veloctl` has no commands yet for the new export-access / initiator-group edit / connections / usage endpoints.
+- [x] **F12.** `veloctl`: `passwd`, `volume get|usage`, `export get|connections|access`, `initiator-group update`, `--cidrs`; TLS verification on by default (`--ca-cert`), password prompts without echo.
 
 ## Testing
 

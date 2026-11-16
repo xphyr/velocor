@@ -1,8 +1,10 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -17,6 +19,7 @@ import (
 	"time"
 
 	"github.com/velocor/velocor/internal/version"
+	"golang.org/x/sys/unix"
 )
 
 type cliConfig struct {
@@ -31,7 +34,8 @@ func main() {
 	var (
 		endpoint    = flag.String("endpoint", envOrDefault("VELOCOR_ENDPOINT", "https://127.0.0.1:8443"), "Velocor API endpoint URL")
 		token       = flag.String("token", os.Getenv("VELOCOR_TOKEN"), "Bearer token (JWT or velo_pat_...); reads ~/.config/velocor/token if unset")
-		insecure    = flag.Bool("insecure", os.Getenv("VELOCOR_INSECURE") != "false", "Skip TLS certificate verification for self-signed appliance certs")
+		insecure    = flag.Bool("insecure", os.Getenv("VELOCOR_INSECURE") == "true", "Skip TLS certificate verification (exposes your session to anyone on the network path; lab use only)")
+		caCert      = flag.String("ca-cert", os.Getenv("VELOCOR_CA_CERT"), "Certificate to trust for the appliance: a PEM file path, or PEM text (e.g. a copy of /var/lib/velocor/tls.crt)")
 		jsonOut     = flag.Bool("json", false, "Print raw JSON responses")
 		showVersion = flag.Bool("version", false, "Print veloctl version and exit")
 	)
@@ -54,16 +58,19 @@ func main() {
 		tok = loadSavedToken()
 	}
 
+	tlsCfg, err := tlsConfig(*insecure, *caCert)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
 	cfg := &cliConfig{
 		endpoint:   strings.TrimRight(*endpoint, "/"),
 		token:      tok,
 		insecure:   *insecure,
 		jsonOutput: *jsonOut,
 		httpClient: &http.Client{
-			Timeout: 30 * time.Second,
-			Transport: &http.Transport{
-				TLSClientConfig: &tls.Config{InsecureSkipVerify: *insecure}, //nolint:gosec
-			},
+			Timeout:   30 * time.Second,
+			Transport: &http.Transport{TLSClientConfig: tlsCfg},
 		},
 	}
 
@@ -83,6 +90,8 @@ func dispatch(cfg *cliConfig, args []string) error {
 		return nil
 	case "login":
 		return runLogin(cfg, sub)
+	case "passwd", "password":
+		return runPasswd(cfg, sub)
 	case "user":
 		return runUser(cfg, sub)
 	case "token":
@@ -114,12 +123,16 @@ func dispatch(cfg *cliConfig, args []string) error {
 
 func runLogin(cfg *cliConfig, args []string) error {
 	fs := flag.NewFlagSet("login", flag.ExitOnError)
-	username := fs.String("username", "admin", "Administrator username")
-	password := fs.String("password", "", "Administrator password")
+	username := fs.String("username", "admin", "Username")
+	password := fs.String("password", "", "Password (prompted for, without echo, if omitted)")
 	_ = fs.Parse(args)
 
 	if *password == "" {
-		return fmt.Errorf("--password is required")
+		p, err := promptSecret("Password for " + *username + ": ")
+		if err != nil {
+			return err
+		}
+		*password = p
 	}
 
 	resp, err := cfg.request("POST", "/api/v1/auth/login", map[string]any{
@@ -137,6 +150,47 @@ func runLogin(cfg *cliConfig, args []string) error {
 		return fmt.Errorf("save token: %w", err)
 	}
 	fmt.Printf("Logged in as %s (role: %v). Session token saved to %s\n", *username, resp["role"], tokenFilePath())
+	if mc, _ := resp["must_change_password"].(bool); mc {
+		fmt.Println("This account must choose a new password before anything else: run 'veloctl passwd'.")
+	}
+	return nil
+}
+
+// runPasswd changes the signed-in user's own password. The server revokes every earlier
+// session, so the fresh token it returns replaces the saved one.
+func runPasswd(cfg *cliConfig, args []string) error {
+	fs := flag.NewFlagSet("passwd", flag.ExitOnError)
+	current := fs.String("current", "", "Current password (prompted for if omitted)")
+	next := fs.String("new", "", "New password, at least 8 characters (prompted for if omitted)")
+	_ = fs.Parse(args)
+	var err error
+	if *current == "" {
+		if *current, err = promptSecret("Current password: "); err != nil {
+			return err
+		}
+	}
+	if *next == "" {
+		if *next, err = promptSecret("New password: "); err != nil {
+			return err
+		}
+		again, err := promptSecret("New password again: ")
+		if err != nil {
+			return err
+		}
+		if again != *next {
+			return fmt.Errorf("the new passwords don't match")
+		}
+	}
+	resp, err := cfg.request("POST", "/api/v1/auth/password", map[string]any{"current_password": *current, "new_password": *next})
+	if err != nil {
+		return err
+	}
+	if tok, _ := resp["access_token"].(string); tok != "" {
+		if err := saveToken(tok); err != nil {
+			return fmt.Errorf("password changed, but saving the new session failed: %w", err)
+		}
+	}
+	fmt.Println("Password changed. Your other sessions have ended.")
 	return nil
 }
 
@@ -306,6 +360,12 @@ func runSystem(cfg *cliConfig, args []string) error {
 		fmt.Printf("SPDK Connected:     %v (version %v, socket %v)\n", spdkSt["connected"], node["spdk_version"], spdkSt["socket_path"])
 		fmt.Printf("Hugepages (MiB):    %v total / %v free\n", spdkSt["hugepages_total_mb"], spdkSt["hugepages_free_mb"])
 		fmt.Printf("Drift Repaired:     %v\n", recSt["drift_repaired_count"])
+		if degraded, _ := recSt["degraded_resources"].([]any); len(degraded) > 0 {
+			fmt.Printf("Needing Attention:  %v\n", degraded)
+		}
+		for _, w := range sliceOfAny(resp["warnings"]) {
+			fmt.Printf("WARNING: %v\n", w)
+		}
 		return nil
 
 	case "reconcile":
@@ -538,9 +598,38 @@ func runPool(cfg *cliConfig, args []string) error {
 
 func runVolume(cfg *cliConfig, args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("subcommand required: list | create | resize | qos | delete")
+		return fmt.Errorf("subcommand required: list | get | usage | create | resize | qos | delete")
 	}
 	switch args[0] {
+	case "get":
+		if len(args) < 2 {
+			return fmt.Errorf("usage: veloctl volume get <volume-id>")
+		}
+		resp, err := cfg.request("GET", "/api/v1/volumes/"+url.PathEscape(args[1]), nil)
+		if err != nil {
+			return err
+		}
+		return printJSON(resp)
+
+	case "usage":
+		if len(args) < 2 {
+			return fmt.Errorf("usage: veloctl volume usage <volume-id>")
+		}
+		resp, err := cfg.request("GET", "/api/v1/volumes/"+url.PathEscape(args[1])+"/usage", nil)
+		if err != nil {
+			return err
+		}
+		if cfg.jsonOutput {
+			return printJSON(resp)
+		}
+		size, alloc := uint64FromAny(resp["size_bytes"]), uint64FromAny(resp["allocated_bytes"])
+		pct := 0.0
+		if size > 0 {
+			pct = 100 * float64(alloc) / float64(size)
+		}
+		fmt.Printf("Allocated: %s of %s (%.1f%%), thin=%v\n", humanBytes(alloc), humanBytes(size), pct, resp["thin_provision"])
+		return nil
+
 	case "list":
 		resp, err := cfg.request("GET", "/api/v1/volumes", nil)
 		if err != nil {
@@ -901,9 +990,37 @@ func runHost(cfg *cliConfig, args []string) error {
 
 func runInitiatorGroup(cfg *cliConfig, args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("subcommand required: list | create | delete")
+		return fmt.Errorf("subcommand required: list | create | update | delete")
 	}
 	switch args[0] {
+	case "update":
+		fs := flag.NewFlagSet("initiator-group update", flag.ExitOnError)
+		hostIDs := fs.String("host-ids", "", "Comma-separated Host IDs (replaces the current list)")
+		nqns := fs.String("nqns", "", "Comma-separated NVMe-oF host NQNs (replaces the current list)")
+		iqns := fs.String("iqns", "", "Comma-separated iSCSI initiator IQNs (replaces the current list)")
+		cidrs := fs.String("cidrs", "", "Comma-separated iSCSI source CIDRs (replaces the current list)")
+		id, err := parseWithID(fs, args[1:])
+		if err != nil {
+			return fmt.Errorf("usage: veloctl initiator-group update <id> [--host-ids ...] [--nqns ...] [--iqns ...] [--cidrs ...]")
+		}
+		// Only lists that were given are sent, so the others are left as they are.
+		body := map[string]any{}
+		fields := map[string]string{"host-ids": "host_ids", "nqns": "host_nqns", "iqns": "initiator_iqns", "cidrs": "allowed_cidrs"}
+		values := map[string]*string{"host-ids": hostIDs, "nqns": nqns, "iqns": iqns, "cidrs": cidrs}
+		fs.Visit(func(f *flag.Flag) { body[fields[f.Name]] = splitList(*values[f.Name]) })
+		if len(body) == 0 {
+			return fmt.Errorf("nothing to change: give at least one of --host-ids, --nqns, --iqns, --cidrs")
+		}
+		resp, err := cfg.request("PATCH", "/api/v1/initiator-groups/"+url.PathEscape(id), body)
+		if err != nil {
+			return err
+		}
+		if cfg.jsonOutput {
+			return printJSON(resp)
+		}
+		fmt.Printf("Updated initiator group %s; re-applied to %v export(s)\n", id, resp["exports_updated"])
+		return nil
+
 	case "list":
 		resp, err := cfg.request("GET", "/api/v1/initiator-groups", nil)
 		if err != nil {
@@ -917,6 +1034,7 @@ func runInitiatorGroup(cfg *cliConfig, args []string) error {
 		hostIDs := fs.String("host-ids", "", "Comma-separated Host IDs")
 		nqns := fs.String("nqns", "", "Comma-separated NVMe-oF Host NQNs")
 		iqns := fs.String("iqns", "", "Comma-separated iSCSI Initiator IQNs")
+		cidrs := fs.String("cidrs", "", "Comma-separated iSCSI source CIDRs")
 		_ = fs.Parse(args[1:])
 		if *name == "" {
 			return fmt.Errorf("--name is required")
@@ -936,6 +1054,7 @@ func runInitiatorGroup(cfg *cliConfig, args []string) error {
 			"host_ids":       hostIDList,
 			"host_nqns":      nqnList,
 			"initiator_iqns": iqnList,
+			"allowed_cidrs":  splitList(*cidrs),
 		})
 		if err != nil {
 			return err
@@ -960,9 +1079,77 @@ func runInitiatorGroup(cfg *cliConfig, args []string) error {
 
 func runExport(cfg *cliConfig, args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("subcommand required: list | create | delete")
+		return fmt.Errorf("subcommand required: list | get | connections | access | create | delete")
 	}
 	switch args[0] {
+	case "get":
+		if len(args) < 2 {
+			return fmt.Errorf("usage: veloctl export get <export-id>")
+		}
+		resp, err := cfg.request("GET", "/api/v1/exports/"+url.PathEscape(args[1]), nil)
+		if err != nil {
+			return err
+		}
+		return printJSON(resp)
+
+	case "connections":
+		if len(args) < 2 {
+			return fmt.Errorf("usage: veloctl export connections <export-id>")
+		}
+		resp, err := cfg.request("GET", "/api/v1/exports/"+url.PathEscape(args[1])+"/connections", nil)
+		if err != nil {
+			return err
+		}
+		if cfg.jsonOutput {
+			return printJSON(resp)
+		}
+		conns := sliceOfMaps(resp["connections"])
+		if len(conns) == 0 {
+			fmt.Println("Nothing is connected.")
+			return nil
+		}
+		tw := newTabWriter()
+		fmt.Fprintln(tw, "HOST\tADDRESS\tQUEUES")
+		for _, c := range conns {
+			fmt.Fprintf(tw, "%s\t%s\t%v\n", strOrDash(c["host"]), strOrDash(c["address"]), c["queues"])
+		}
+		return tw.Flush()
+
+	case "access":
+		fs := flag.NewFlagSet("export access", flag.ExitOnError)
+		igs := fs.String("initiator-groups", "", "Comma-separated InitiatorGroup IDs allowed to connect (replaces the current list; empty for none)")
+		allowAny := fs.Bool("allow-any-host", false, "Let any host connect, with no access control (--allow-any-host=false to require a list again)")
+		id, err := parseWithID(fs, args[1:])
+		if err != nil {
+			return fmt.Errorf("usage: veloctl export access <export-id> [--initiator-groups a,b] [--allow-any-host=true|false]")
+		}
+		body := map[string]any{}
+		fs.Visit(func(f *flag.Flag) {
+			switch f.Name {
+			case "initiator-groups":
+				body["initiator_group_ids"] = splitList(*igs)
+			case "allow-any-host":
+				body["allow_any_host"] = *allowAny
+			}
+		})
+		if len(body) == 0 {
+			return fmt.Errorf("nothing to change: give --initiator-groups and/or --allow-any-host")
+		}
+		resp, err := cfg.request("PATCH", "/api/v1/exports/"+url.PathEscape(id), body)
+		if err != nil {
+			return err
+		}
+		if cfg.jsonOutput {
+			return printJSON(resp)
+		}
+		exp, _ := resp["export"].(map[string]any)
+		if open, _ := exp["allow_any_host"].(bool); open {
+			fmt.Printf("Export %s now lets ANY host connect.\n", id)
+		} else {
+			fmt.Printf("Export %s is limited to initiator groups %v.\n", id, exp["initiator_group_ids"])
+		}
+		return nil
+
 	case "list":
 		resp, err := cfg.request("GET", "/api/v1/exports", nil)
 		if err != nil {
@@ -1063,6 +1250,9 @@ func (c *cliConfig) request(method, path string, body any) (map[string]any, erro
 	}
 	if resp.StatusCode >= 400 {
 		if errMsg, ok := out["error"].(string); ok {
+			if strings.Contains(errMsg, "initial password must be changed") {
+				errMsg += " (run 'veloctl passwd')"
+			}
 			return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, errMsg)
 		}
 		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(raw)))
@@ -1077,17 +1267,20 @@ Usage:
   veloctl [global-flags] <command> <subcommand> [flags]
 
 Commands:
-  login             Authenticate admin session and cache JWT
+  login             Sign in and cache the session token
+  passwd            Change your own password
+  user              Manage local users (list, create, update, delete)
   token             Manage scoped service tokens (list, create, revoke)
   system            Appliance status, OS/container updates, bootc upgrade/rollback
   disk              List, scan, claim, or release NVMe and SSD drives
   pool              Create, list, or delete SPDK RAID + lvol_store pools
-  volume            Create, list, resize, set QoS, or delete logical volumes
+  volume            Create, list, get, show usage, resize, set QoS, or delete volumes
   snapshot          Create, list, clone, delete snapshots & query CBT blocks
   group-snapshot    Create, list, get, or delete consistency group snapshots
   portal            Manage NVMe-oF and iSCSI network portals
-  initiator-group   Manage host NQN/IQN ACL initiator groups
-  export            Create, list, or delete NVMe-oF and iSCSI volume exports
+  host              Register NVMe-oF / iSCSI initiator hosts
+  initiator-group   Manage host NQN/IQN ACL initiator groups (create, update, delete)
+  export            Create, inspect, change access to, or delete volume exports
   version           Print version information
 
 Global Flags:
@@ -1164,4 +1357,107 @@ func envOrDefault(key, def string) string {
 		return v
 	}
 	return def
+}
+
+// tlsConfig verifies the appliance against the system roots plus caCert (a PEM file path or
+// PEM text). insecure disables verification entirely and is only for labs.
+func tlsConfig(insecure bool, caCert string) (*tls.Config, error) {
+	cfg := &tls.Config{MinVersion: tls.VersionTLS12, InsecureSkipVerify: insecure} //nolint:gosec // explicit opt-in only
+	caCert = strings.TrimSpace(caCert)
+	if caCert == "" {
+		return cfg, nil
+	}
+	pemData := []byte(caCert)
+	if !strings.HasPrefix(caCert, "-----BEGIN") {
+		b, err := os.ReadFile(caCert)
+		if err != nil {
+			return nil, fmt.Errorf("read --ca-cert: %w", err)
+		}
+		pemData = b
+	}
+	pool, err := x509.SystemCertPool()
+	if err != nil || pool == nil {
+		pool = x509.NewCertPool()
+	}
+	if !pool.AppendCertsFromPEM(pemData) {
+		return nil, fmt.Errorf("--ca-cert does not contain a PEM certificate")
+	}
+	cfg.RootCAs = pool
+	return cfg, nil
+}
+
+// promptSecret reads a line from the terminal without echoing it. When stdin isn't a
+// terminal (a pipe in a script), it reads the line as is.
+func promptSecret(prompt string) (string, error) {
+	fd := int(os.Stdin.Fd())
+	old, err := unix.IoctlGetTermios(fd, unix.TCGETS)
+	if err == nil {
+		noEcho := *old
+		noEcho.Lflag &^= unix.ECHO
+		if err := unix.IoctlSetTermios(fd, unix.TCSETS, &noEcho); err == nil {
+			defer func() {
+				_ = unix.IoctlSetTermios(fd, unix.TCSETS, old)
+				fmt.Fprintln(os.Stderr)
+			}()
+		}
+	}
+	fmt.Fprint(os.Stderr, prompt)
+	line, err := bufio.NewReader(os.Stdin).ReadString('\n')
+	if err != nil && line == "" {
+		return "", fmt.Errorf("read password: %w", err)
+	}
+	return strings.TrimRight(line, "\r\n"), nil
+}
+
+// parseWithID accepts "<id> [flags]" as well as "[flags] <id>".
+func parseWithID(fs *flag.FlagSet, args []string) (string, error) {
+	var id string
+	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
+		id, args = args[0], args[1:]
+	}
+	if err := fs.Parse(args); err != nil {
+		return "", err
+	}
+	if id == "" {
+		id = fs.Arg(0)
+	}
+	if id == "" {
+		return "", fmt.Errorf("an ID is required")
+	}
+	return id, nil
+}
+
+func splitList(s string) []string {
+	out := []string{}
+	for _, v := range strings.Split(s, ",") {
+		if v = strings.TrimSpace(v); v != "" {
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
+func sliceOfAny(v any) []any {
+	s, _ := v.([]any)
+	return s
+}
+
+func strOrDash(v any) string {
+	if s := strOrEmpty(v); s != "" {
+		return s
+	}
+	return "-"
+}
+
+func humanBytes(b uint64) string {
+	const unit = 1024
+	if b < unit {
+		return fmt.Sprintf("%d B", b)
+	}
+	div, exp := uint64(unit), 0
+	for n := b / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %ciB", float64(b)/float64(div), "KMGTPE"[exp])
 }
