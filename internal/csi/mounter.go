@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -59,6 +60,37 @@ func (m *LinuxMounter) sys(parts ...string) string {
 	return filepath.Join(append([]string{root}, parts...)...)
 }
 
+// hostMountNS is the host's mount namespace: the node plugin runs with hostPID, so PID 1 is the
+// host's init.
+const hostMountNS = "/proc/1/ns/mnt"
+
+var (
+	hostISCSIAdmOnce sync.Once
+	hostISCSIAdm     bool
+)
+
+// iscsiadm runs open-iscsi's iscsiadm. iscsiadm passes node records to iscsid as raw C structs,
+// so it must be the same build as the host's iscsid: a container's iscsiadm talking to a
+// different host build fails logins with "iSCSI driver not found" (error 12) although
+// everything is set up (seen on OpenShift/RHCOS with a Fedora-based image). So it runs the
+// host's own iscsiadm, in the host's mount namespace, whenever the plugin runs beside a host;
+// VELOCOR_ISCSIADM=container forces the bundled one.
+func iscsiadm(ctx context.Context, args ...string) *exec.Cmd {
+	hostISCSIAdmOnce.Do(func() {
+		if os.Getenv("VELOCOR_ISCSIADM") == "container" {
+			return
+		}
+		host, err1 := os.Readlink(hostMountNS)
+		self, err2 := os.Readlink("/proc/self/ns/mnt")
+		hostISCSIAdm = err1 == nil && err2 == nil && host != self
+	})
+	if !hostISCSIAdm {
+		return exec.CommandContext(ctx, "iscsiadm", args...)
+	}
+	full := append([]string{"--mount=" + hostMountNS, "--", "/usr/bin/env", "PATH=/usr/sbin:/usr/bin:/sbin:/bin", "iscsiadm"}, args...)
+	return exec.CommandContext(ctx, "nsenter", full...)
+}
+
 // iscsiIface returns the dedicated open-iscsi interface used for an initiator IQN, creating
 // it on first use. Logging in through our own iface avoids rewriting the host's global
 // /etc/iscsi/initiatorname.iscsi, which other iSCSI users on the node depend on.
@@ -68,11 +100,11 @@ func iscsiIface(ctx context.Context, initiatorIQN string) (string, error) {
 	}
 	sum := sha256.Sum256([]byte(initiatorIQN))
 	name := "velocor-" + hex.EncodeToString(sum[:4])
-	if out, err := exec.CommandContext(ctx, "iscsiadm", "-m", "iface", "-I", name, "-o", "new").CombinedOutput(); err != nil &&
+	if out, err := iscsiadm(ctx, "-m", "iface", "-I", name, "-o", "new").CombinedOutput(); err != nil &&
 		!strings.Contains(strings.ToLower(string(out)), "exists") {
 		return "", fmt.Errorf("iscsiadm iface new %s: %w (%s)", name, err, strings.TrimSpace(string(out)))
 	}
-	if out, err := exec.CommandContext(ctx, "iscsiadm", "-m", "iface", "-I", name, "-o", "update",
+	if out, err := iscsiadm(ctx, "-m", "iface", "-I", name, "-o", "update",
 		"-n", "iface.initiatorname", "-v", initiatorIQN).CombinedOutput(); err != nil {
 		return "", fmt.Errorf("iscsiadm iface update %s: %w (%s)", name, err, strings.TrimSpace(string(out)))
 	}
@@ -107,11 +139,17 @@ func (m *LinuxMounter) ConnectTarget(ctx context.Context, publishCtx map[string]
 			return "", err
 		}
 		portal := iscsiPortalAddr(ip, port)
-		if out, err := exec.CommandContext(ctx, "iscsiadm", "-m", "discovery", "-t", "sendtargets", "-p", portal, "-I", iface).CombinedOutput(); err != nil {
+		if out, err := iscsiadm(ctx, "-m", "discovery", "-t", "sendtargets", "-p", portal, "-I", iface).CombinedOutput(); err != nil {
 			return "", fmt.Errorf("iscsiadm discovery %s: %w (%s)", portal, err, strings.TrimSpace(string(out)))
 		}
+		// Kubernetes decides when this node uses the volume: iscsid must never log in on its own
+		// at boot (node.startup defaults to automatic for discovered records).
+		if out, err := iscsiadm(ctx, "-m", "node", "-T", iqn, "-p", portal, "-I", iface, "-o", "update",
+			"-n", "node.startup", "-v", "manual").CombinedOutput(); err != nil {
+			return "", fmt.Errorf("iscsiadm set node.startup for %s: %w (%s)", iqn, err, strings.TrimSpace(string(out)))
+		}
 		// Ignore error if already logged in (exit code 15).
-		out, err := exec.CommandContext(ctx, "iscsiadm", "-m", "node", "-T", iqn, "-p", portal, "-I", iface, "--login").CombinedOutput()
+		out, err := iscsiadm(ctx, "-m", "node", "-T", iqn, "-p", portal, "-I", iface, "--login").CombinedOutput()
 		if err != nil && !strings.Contains(string(out), "already present") {
 			return "", fmt.Errorf("iscsiadm login %s: %w (%s)", iqn, err, strings.TrimSpace(string(out)))
 		}
@@ -147,7 +185,10 @@ func (m *LinuxMounter) DisconnectTarget(ctx context.Context, publishCtx map[stri
 		ip := publishCtx["portal_ip"]
 		port := publishCtx["portal_port"]
 		if iqn != "" && ip != "" && port != "" {
-			_ = exec.CommandContext(ctx, "iscsiadm", "-m", "node", "-T", iqn, "-p", iscsiPortalAddr(ip, port), "--logout").Run()
+			portal := iscsiPortalAddr(ip, port)
+			_ = iscsiadm(ctx, "-m", "node", "-T", iqn, "-p", portal, "--logout").Run()
+			// Forget the target too, so the node keeps no record of volumes it no longer uses.
+			_ = iscsiadm(ctx, "-m", "node", "-T", iqn, "-p", portal, "-o", "delete").Run()
 		}
 		return nil
 	default:
@@ -360,7 +401,7 @@ func (m *LinuxMounter) RescanTarget(ctx context.Context, publishCtx map[string]s
 		if iqn == "" {
 			return fmt.Errorf("missing target_iqn in publish_context")
 		}
-		if out, err := exec.CommandContext(ctx, "iscsiadm", "-m", "node", "-T", iqn, "-R").CombinedOutput(); err != nil {
+		if out, err := iscsiadm(ctx, "-m", "node", "-T", iqn, "-R").CombinedOutput(); err != nil {
 			return fmt.Errorf("iscsiadm rescan %s: %w (%s)", iqn, err, strings.TrimSpace(string(out)))
 		}
 	default:

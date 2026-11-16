@@ -613,7 +613,7 @@ func (s *ControllerServer) selectPool(ctx context.Context, poolParam string, req
 			return p.ID, nil
 		}
 	}
-	return pools[0].ID, nil
+	return "", status.Errorf(codes.ResourceExhausted, "no storage pool has %d bytes free", requiredBytes)
 }
 
 func (s *ControllerServer) ensureNodeInitiatorGroup(ctx context.Context, nodeID string) (string, error) {

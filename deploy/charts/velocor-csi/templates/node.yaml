@@ -68,6 +68,11 @@ spec:
               mountPath: /dev
             - name: etc-iscsi
               mountPath: /etc/iscsi
+            # iscsiadm keeps ifaces and node records here (Fedora/RHEL/RHCOS); the host's iscsid
+            # performs the login and must see the same files, or it fails with "transport not
+            # found" (error 12) for the driver's own iface.
+            - name: var-lib-iscsi
+              mountPath: /var/lib/iscsi
             - name: etc-nvme
               mountPath: /etc/nvme
           {{- with .Values.node.resources }}
@@ -108,6 +113,10 @@ spec:
         - name: etc-iscsi
           hostPath:
             path: /etc/iscsi
+            type: DirectoryOrCreate
+        - name: var-lib-iscsi
+          hostPath:
+            path: /var/lib/iscsi
             type: DirectoryOrCreate
         - name: etc-nvme
           hostPath:
