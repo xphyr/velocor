@@ -181,6 +181,10 @@ Everything here was written by Gemini and is in scope to rewrite.
   registry, overridden for lab builds.
 - [ ] **B10. Inconsistent SPDK settings**: the image's default `CMD` uses `-s 512` while the
   quadlet uses `-s 1024`; the quadlet should be the only source.
+- [x] **B13.** Outdated dev builds piled up in the registry: `hack/build-dev-images.sh` builds
+  and pushes `dev-<sha>` from a clean tree (labelled `quay.expires-after`), and
+  `hack/prune-dev-tags.sh` removes superseded builds by tag (consecutive builds share digests,
+  so deleting by digest would remove the newer build too).
 - [x] **B11.** Secrets could enter build contexts (`COPY . .` with a name-based ignore list):
   `.containerignore` now excludes them by pattern.
 - [x] **B12.** The lab disk builder copied the host's registry credentials into disk images:

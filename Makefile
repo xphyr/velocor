@@ -23,6 +23,9 @@ QCOW2_OUTPUT_DIR ?= output
 QCOW2_ROOTFS ?= xfs
 BIB_CONFIG ?= $(if $(wildcard deploy/bootc/config.local.toml),deploy/bootc/config.local.toml,deploy/bootc/config.toml)
 PODMAN ?= podman
+# Extra image labels, e.g. BUILD_LABELS="quay.expires-after=14d" so dev builds expire on Quay.
+BUILD_LABELS ?=
+LABEL_ARGS := $(addprefix --label ,$(BUILD_LABELS))
 SKOPEO ?= skopeo
 
 .PHONY: all build build-velod build-veloctl build-csi proto proto-lint test lint clean spdk-test-image test-integration \
@@ -48,24 +51,24 @@ build-csi:
 containers: container-spdk container-velod container-csi container-bootc
 
 container-spdk:
-	$(PODMAN) build -t $(SPDK_IMAGE) -f deploy/containers/Containerfile.spdk .
+	$(PODMAN) build $(LABEL_ARGS) -t $(SPDK_IMAGE) -f deploy/containers/Containerfile.spdk .
 
 container-velod:
-	$(PODMAN) build \
+	$(PODMAN) build $(LABEL_ARGS) \
 		--build-arg VERSION=$(VERSION) \
 		--build-arg COMMIT=$(COMMIT) \
 		--build-arg BUILD_TIME=$(BUILD_TIME) \
 		-t $(VELOD_IMAGE) -f deploy/containers/Containerfile.velod .
 
 container-csi:
-	$(PODMAN) build \
+	$(PODMAN) build $(LABEL_ARGS) \
 		--build-arg VERSION=$(VERSION) \
 		--build-arg COMMIT=$(COMMIT) \
 		--build-arg BUILD_TIME=$(BUILD_TIME) \
 		-t $(CSI_IMAGE) -f deploy/containers/Containerfile.csi .
 
 container-bootc:
-	$(PODMAN) build \
+	$(PODMAN) build $(LABEL_ARGS) \
 		--build-arg VELOD_IMAGE=$(VELOD_IMAGE) \
 		--build-arg SPDK_IMAGE=$(SPDK_IMAGE) \
 		-t $(BOOTC_IMAGE) -f deploy/bootc/Containerfile .
