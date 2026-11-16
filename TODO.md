@@ -52,17 +52,29 @@ work still open, ranked by risk to data, how fixes are verified, and what has be
   but the member drives (NVMe without power-loss protection, nearly all SATA SSDs) do cache
   writes, so **a power cut can lose acknowledged writes**. Reproduced by
   `TestWriteCacheAndFlushAdvertised` (reported as a known issue until this is decided).
-  *Options:*
-  1. **Patch SPDK** (lvol: support FLUSH and pass it to the blobstore device; RAID: report
-     `write_cache` if any member has one). The correct fix, worth upstreaming; nvweaver already
-     carries an SPDK durability patch.
-  2. **Turn the drives' volatile write caches off** at claim (NVMe Set Features VWC=0 via admin
-     passthrough; `hdparm -W0` for SATA), trading write speed for safety.
-  3. **Require power-loss-protected drives**: detect the volatile write cache at claim and
-     refuse or loudly warn.
+  **Decision (2026-11-16): interim handling, no SPDK patch for now.** The proper fix (patching
+  SPDK so FLUSH reaches the drives) is deferred to a later phase: see
+  [L-1](#long-term). Until then, Velocor makes the risk visible and safe by default per disk:
+  1. **Detect the volatile write cache at claim.** Read it before the disk goes to SPDK: NVMe
+     Identify Controller `VWC` (and Get Features 06h for whether it's on), the ATA IDENTIFY
+     write-cache bits for SATA, the caching mode page `WCE` / Extended INQUIRY `NV_SUP` for SAS;
+     the kernel's `/sys/block/*/queue/write_cache` reflects the same signal. Record it on the
+     disk and show it in the UI, CLI and API.
+  2. **`VWC = 0`: durable, nothing to do.** The drive has no volatile cache, so a completed
+     write is on durable media.
+  3. **`VWC = 1`: treated as unprotected** unless an operator marks the disk "power-loss
+     protected" (or its model is on a known-PLP list). There is no standard field for power-loss
+     protection, and many PLP drives still report `VWC = 1`, so this has to be declared.
+  4. **For unprotected disks, offer to turn the write cache off** (NVMe Set Features VWC=0
+     through SPDK's admin passthrough; `hdparm -W0` for SATA; `WCE=0` for SAS) and keep it off
+     across restarts. This is safe but can cut write speed and endurance sharply on consumer
+     drives, so the trade-off is shown per disk; pools containing unprotected disks with the
+     cache on are flagged.
+  5. **Validate with a power-pull test** on real hardware (write with fsync under load, cut
+     power, verify) before calling this done.
 
-  *Recommendation:* 2 + 3 now (safe by default, trade-off visible per disk), then 1.
-  **Decision needed.**
+  This item stays open until steps 1–5 are implemented and tested, and P0-4 as a whole is not
+  closed until L-1 is done.
 
 - [ ] **P0-6. A failed io_uring setup crashes `spdk_tgt`. (Verified)**
   Claiming an SSD with the io_uring backend where io_uring can't be set up (locked-memory
@@ -130,9 +142,21 @@ work still open, ranked by risk to data, how fixes are verified, and what has be
 - [ ] **P2-5. Slow test suites.** Auth/server tests take ~50–100 s under `-race` because every
   login runs 600k PBKDF2 iterations; consider a test-only iteration override (was F7).
 
+### Long-term
+
+- [ ] **L-1. Patch SPDK so flushes reach the drives (the real fix for P0-4).** Make the lvol
+  module support FLUSH and pass it through to its blobstore's device, and have the RAID module
+  report `write_cache` when any member has one, so NVMe-oF advertises a volatile write cache and
+  hosts send FLUSH/FUA. Every drive then behaves correctly with its cache on, and PLP drives pay
+  almost nothing for it. Deferred by decision on 2026-11-16 (see P0-4); **still required in a
+  future phase**. Aim to upstream it rather than carry it; nvweaver's SPDK durability patch is
+  prior art. Once it ships, the interim handling in P0-4 can relax (caches left on, the PLP flag
+  kept as information).
+
 ### Suggested order of work
 
-1. **P0-4 durability**: disable volatile write caches / require PLP (decision needed).
+1. **P0-4 durability, interim handling**: detect the write cache per disk, PLP declaration,
+   optional cache disable, power-pull test (decided 2026-11-16; SPDK patch is L-1).
 2. **P0-1 + P1-8 redundancy**: replace-disk with rebuild, and a supported degraded start.
 3. **P0-2 capacity**: overcommit limits, reserve, thresholds.
 4. **P0-3 metadata**: on-pool metadata copy, backups, recovery from disks.
