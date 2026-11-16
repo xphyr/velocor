@@ -382,3 +382,36 @@ func TestPoolVolumeSnapshotAndExportReferentialIntegrity(t *testing.T) {
 		}
 	}
 }
+
+func TestSyncMigratesLegacySSDIDAndPoolMembership(t *testing.T) {
+	st, err := OpenBoltStore(t.TempDir() + "/m.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+	legacy := &Disk{ID: "ssd-sdb", Name: "sdb", Type: DiskTypeSSD, SerialNumber: "S123", DevicePath: "/dev/sdb", SizeBytes: 1 << 30}
+	if err := st.UpsertDisk(legacy); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.ClaimDisk("ssd-sdb", DiskDriverStateUringClaimed, "uring_sdb"); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CreatePool(&Pool{ID: "p1", Name: "p1", DiskIDs: []string{"ssd-sdb"}}); err != nil {
+		t.Fatal(err)
+	}
+	// After a reboot the same physical disk is now sdc, discovered under its stable ID.
+	if err := st.SyncDiscoveredDisk(&Disk{ID: "ssd-S123", Name: "sdc", Type: DiskTypeSSD, SerialNumber: "S123", DevicePath: "/dev/disk/by-id/wwn-x"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.GetDisk("ssd-sdb"); err == nil {
+		t.Fatalf("legacy record should be removed")
+	}
+	d, err := st.GetDisk("ssd-S123")
+	if err != nil || !d.Claimed || d.SPDKBdevName != "uring_sdb" || d.PoolID != "p1" || d.DevicePath != "/dev/disk/by-id/wwn-x" {
+		t.Fatalf("migrated disk wrong: %+v, %v", d, err)
+	}
+	p, _ := st.GetPool("p1")
+	if len(p.DiskIDs) != 1 || p.DiskIDs[0] != "ssd-S123" {
+		t.Fatalf("pool membership not migrated: %v", p.DiskIDs)
+	}
+}

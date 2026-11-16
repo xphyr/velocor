@@ -2,7 +2,9 @@ package store
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"regexp"
 	"slices"
 	"sort"
 	"strings"
@@ -12,18 +14,18 @@ import (
 )
 
 var (
-	bucketSystem          = []byte("system")
-	bucketUsers           = []byte("users")
-	bucketTokens          = []byte("tokens")
-	bucketDisks           = []byte("disks")
-	bucketPools           = []byte("pools")
+	bucketSystem               = []byte("system")
+	bucketUsers                = []byte("users")
+	bucketTokens               = []byte("tokens")
+	bucketDisks                = []byte("disks")
+	bucketPools                = []byte("pools")
 	bucketVolumes              = []byte("volumes")
 	bucketSnapshots            = []byte("snapshots")
 	bucketVolumeGroupSnapshots = []byte("volume_group_snapshots")
 	bucketPortals              = []byte("portals")
-	bucketHosts           = []byte("hosts")
-	bucketInitiatorGroups = []byte("initiator_groups")
-	bucketExports         = []byte("exports")
+	bucketHosts                = []byte("hosts")
+	bucketInitiatorGroups      = []byte("initiator_groups")
+	bucketExports              = []byte("exports")
 
 	keySystemConfig = []byte("config")
 )
@@ -42,6 +44,8 @@ var allBuckets = [][]byte{
 	bucketInitiatorGroups,
 	bucketExports,
 }
+
+var _ Store = (*BoltStore)(nil)
 
 // BoltStore implements Store backed by an embedded bbolt key-value database.
 type BoltStore struct {
@@ -68,7 +72,164 @@ func OpenBoltStore(path string) (*BoltStore, error) {
 		return nil, err
 	}
 
+	if err := db.Update(backfillIscsiTags); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("migrate iscsi tags: %w", err)
+	}
+
 	return &BoltStore{db: db}, nil
+}
+
+// iscsiTagBase is the first SPDK iSCSI portal/initiator group tag the store hands out.
+// Tags below it are left free so they never collide with groups created by older
+// releases (which hard-coded tag 1) that may still be live in a running spdk_tgt.
+const iscsiTagBase = 1000
+
+func nextPortalPgTag(b *bolt.Bucket) (int, error) {
+	maxTag := iscsiTagBase - 1
+	err := b.ForEach(func(_, v []byte) error {
+		var p Portal
+		if err := json.Unmarshal(v, &p); err != nil {
+			return err
+		}
+		maxTag = max(maxTag, p.IscsiPgTag)
+		return nil
+	})
+	return maxTag + 1, err
+}
+
+func nextExportIgTag(b *bolt.Bucket) (int, error) {
+	maxTag := iscsiTagBase - 1
+	err := b.ForEach(func(_, v []byte) error {
+		var e Export
+		if err := json.Unmarshal(v, &e); err != nil {
+			return err
+		}
+		maxTag = max(maxTag, e.IscsiIgTag)
+		return nil
+	})
+	return maxTag + 1, err
+}
+
+// backfillIscsiTags assigns unique SPDK tags to iSCSI portals and exports created
+// before tags were tracked.
+func backfillIscsiTags(tx *bolt.Tx) error {
+	portalsB := tx.Bucket(bucketPortals)
+	var portals []Portal
+	if err := portalsB.ForEach(func(_, v []byte) error {
+		var p Portal
+		if err := json.Unmarshal(v, &p); err != nil {
+			return err
+		}
+		if p.Protocol == ExportProtocolISCSI && p.IscsiPgTag == 0 {
+			portals = append(portals, p)
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+	for _, p := range portals {
+		tag, err := nextPortalPgTag(portalsB)
+		if err != nil {
+			return err
+		}
+		p.IscsiPgTag = tag
+		if err := putJSON(portalsB, []byte(p.ID), &p); err != nil {
+			return err
+		}
+	}
+
+	expsB := tx.Bucket(bucketExports)
+	var exps []Export
+	if err := expsB.ForEach(func(_, v []byte) error {
+		var e Export
+		if err := json.Unmarshal(v, &e); err != nil {
+			return err
+		}
+		if e.Protocol == ExportProtocolISCSI && e.IscsiIgTag == 0 {
+			exps = append(exps, e)
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+	for _, e := range exps {
+		tag, err := nextExportIgTag(expsB)
+		if err != nil {
+			return err
+		}
+		e.IscsiIgTag = tag
+		if err := putJSON(expsB, []byte(e.ID), &e); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// mutateRecord atomically loads the JSON record id from bucket, applies fn and stores
+// the result, all inside a single bbolt write transaction. fn may return ErrSkipWrite
+// to leave the record untouched. The record's identity is preserved via keepID.
+func mutateRecord[T any](db *bolt.DB, bucket []byte, id string, fn func(*T) error, keepID func(*T, string)) (*T, error) {
+	if id == "" {
+		return nil, fmt.Errorf("%w: id is required", ErrInvalidArgument)
+	}
+	var rec T
+	err := db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucket)
+		if err := getJSON(b, []byte(id), &rec); err != nil {
+			return err
+		}
+		if err := fn(&rec); err != nil {
+			return err
+		}
+		keepID(&rec, id)
+		return putJSON(b, []byte(id), &rec)
+	})
+	if errors.Is(err, ErrSkipWrite) {
+		err = db.View(func(tx *bolt.Tx) error {
+			var cur T
+			if err := getJSON(tx.Bucket(bucket), []byte(id), &cur); err != nil {
+				return err
+			}
+			rec = cur
+			return nil
+		})
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &rec, nil
+}
+
+// MutateDisk atomically applies fn to the Disk record.
+func (s *BoltStore) MutateDisk(id string, fn func(*Disk) error) (*Disk, error) {
+	return mutateRecord(s.db, bucketDisks, id, func(d *Disk) error {
+		wasBoot := d.IsBootDevice
+		if err := fn(d); err != nil {
+			return err
+		}
+		d.IsBootDevice = wasBoot // boot classification is owned by hardware sync only
+		if d.IsBootDevice && d.Claimed {
+			return ErrBootDeviceProtected
+		}
+		d.UpdatedAt = time.Now().UTC()
+		return nil
+	}, func(d *Disk, id string) { d.ID = id })
+}
+
+// MutatePool atomically applies fn to the Pool record.
+func (s *BoltStore) MutatePool(id string, fn func(*Pool) error) (*Pool, error) {
+	return mutateRecord(s.db, bucketPools, id, fn, func(p *Pool, id string) { p.ID = id })
+}
+
+// MutateVolume atomically applies fn to the Volume record.
+func (s *BoltStore) MutateVolume(id string, fn func(*Volume) error) (*Volume, error) {
+	return mutateRecord(s.db, bucketVolumes, id, fn, func(v *Volume, id string) { v.ID = id })
+}
+
+// MutateExport atomically applies fn to the Export record.
+func (s *BoltStore) MutateExport(id string, fn func(*Export) error) (*Export, error) {
+	return mutateRecord(s.db, bucketExports, id, fn, func(e *Export, id string) { e.ID = id })
 }
 
 // Close closes the underlying bbolt database.
@@ -283,6 +444,22 @@ func (s *BoltStore) upsertDisk(disk *Disk, syncBoot bool) error {
 			if !syncBoot && existing.IsBootDevice {
 				cp.IsBootDevice = true
 			}
+			if syncBoot && existing.Claimed {
+				// A hardware scan only refreshes identity/capacity. Claim and SPDK binding state
+				// are owned by the claim/release API and the reconciler, and are preserved here
+				// inside the same transaction so a concurrent claim can never be lost.
+				cp.Claimed = true
+				cp.DriverState = existing.DriverState
+				cp.SPDKBdevName = existing.SPDKBdevName
+				cp.HealthStatus = existing.HealthStatus
+				cp.Smart = existing.Smart
+				if cp.IsBootDevice {
+					// Should be impossible (claiming refuses boot/in-use disks); never silently
+					// drop a pool member, but flag it loudly.
+					cp.IsBootDevice = false
+					cp.HealthStatus = HealthStatusFaulted
+				}
+			}
 			if cp.IsBootDevice && cp.Claimed {
 				return ErrBootDeviceProtected
 			}
@@ -312,10 +489,63 @@ func (s *BoltStore) upsertDisk(disk *Disk, syncBoot bool) error {
 			}
 		} else if cp.IsBootDevice && cp.Claimed {
 			return ErrBootDeviceProtected
+		} else if syncBoot {
+			if err := migrateLegacySSDID(tx, &cp); err != nil {
+				return err
+			}
 		}
 		return putJSON(b, []byte(cp.ID), &cp)
 	})
 }
+
+// migrateLegacySSDID re-keys a disk record created by older releases under its unstable
+// kernel name ("ssd-sdb") to the hardware-derived ID now reported by discovery, carrying
+// over claim/pool state and rewriting pool membership. Matching is by serial number only:
+// kernel names are exactly what cannot be trusted across reboots.
+func migrateLegacySSDID(tx *bolt.Tx, cp *Disk) error {
+	if cp.Type != DiskTypeSSD || cp.SerialNumber == "" {
+		return nil
+	}
+	b := tx.Bucket(bucketDisks)
+	var legacy *Disk
+	err := b.ForEach(func(_, v []byte) error {
+		var d Disk
+		if err := json.Unmarshal(v, &d); err != nil {
+			return err
+		}
+		if d.Type == DiskTypeSSD && d.ID != cp.ID && legacySSDID.MatchString(d.ID) && d.SerialNumber == cp.SerialNumber {
+			legacy = &d
+		}
+		return nil
+	})
+	if err != nil || legacy == nil {
+		return err
+	}
+	if legacy.Claimed && !cp.IsBootDevice {
+		cp.Claimed = true
+		cp.DriverState = legacy.DriverState
+		cp.SPDKBdevName = legacy.SPDKBdevName
+		cp.HealthStatus = legacy.HealthStatus
+	}
+	cp.PoolID = legacy.PoolID
+	if legacy.PoolID != "" {
+		pb := tx.Bucket(bucketPools)
+		var pool Pool
+		if err := getJSON(pb, []byte(legacy.PoolID), &pool); err == nil {
+			for i, id := range pool.DiskIDs {
+				if id == legacy.ID {
+					pool.DiskIDs[i] = cp.ID
+				}
+			}
+			if err := putJSON(pb, []byte(pool.ID), &pool); err != nil {
+				return err
+			}
+		}
+	}
+	return b.Delete([]byte(legacy.ID))
+}
+
+var legacySSDID = regexp.MustCompile(`^ssd-(sd|vd|xvd)[a-z]+$`)
 
 // GetDisk retrieves a Disk by ID.
 func (s *BoltStore) GetDisk(id string) (*Disk, error) {
@@ -578,15 +808,20 @@ func (s *BoltStore) ListPools() ([]*Pool, error) {
 	return pools, nil
 }
 
-// DeletePool deletes a Pool if it has no Volumes or Snapshots, and clears PoolID on its member Disks.
-func (s *BoltStore) DeletePool(id string) error {
-	return s.db.Update(func(tx *bolt.Tx) error {
-		poolsB := tx.Bucket(bucketPools)
-		var pool Pool
-		if err := getJSON(poolsB, []byte(id), &pool); err != nil {
-			return err
-		}
+// CheckPoolDeletable returns nil if DeletePool(id) would currently succeed.
+func (s *BoltStore) CheckPoolDeletable(id string) error {
+	return s.db.View(func(tx *bolt.Tx) error {
+		_, err := checkPoolDeletableTx(tx, id)
+		return err
+	})
+}
 
+func checkPoolDeletableTx(tx *bolt.Tx, id string) (*Pool, error) {
+	var pool Pool
+	if err := getJSON(tx.Bucket(bucketPools), []byte(id), &pool); err != nil {
+		return nil, err
+	}
+	err := func() error {
 		// Ensure no volumes exist in this pool.
 		volsB := tx.Bucket(bucketVolumes)
 		err := volsB.ForEach(func(_, v []byte) error {
@@ -615,6 +850,19 @@ func (s *BoltStore) DeletePool(id string) error {
 			}
 			return nil
 		})
+		return err
+	}()
+	if err != nil {
+		return nil, err
+	}
+	return &pool, nil
+}
+
+// DeletePool deletes a Pool if it has no Volumes or Snapshots, and clears PoolID on its member Disks.
+func (s *BoltStore) DeletePool(id string) error {
+	return s.db.Update(func(tx *bolt.Tx) error {
+		poolsB := tx.Bucket(bucketPools)
+		pool, err := checkPoolDeletableTx(tx, id)
 		if err != nil {
 			return err
 		}
@@ -802,51 +1050,49 @@ func (s *BoltStore) ListVolumes(poolID string) ([]*Volume, error) {
 	return vols, nil
 }
 
-// DeleteVolume deletes a Volume if it is unattached, has no active Exports, and has no Snapshots.
+// CheckVolumeDeletable returns nil if DeleteVolume(id) would currently succeed.
+func (s *BoltStore) CheckVolumeDeletable(id string) error {
+	return s.db.View(func(tx *bolt.Tx) error {
+		return checkVolumeDeletableTx(tx, id)
+	})
+}
+
+// checkVolumeDeletableTx validates that a Volume is unattached and unexported.
+// Snapshots deliberately do NOT block deletion: CSI requires VolumeSnapshots to
+// outlive their source PVC, and SPDK snapshots are independent of the deleted clone.
+func checkVolumeDeletableTx(tx *bolt.Tx, id string) error {
+	volsB := tx.Bucket(bucketVolumes)
+	var vol Volume
+	if err := getJSON(volsB, []byte(id), &vol); err != nil {
+		return err
+	}
+	if vol.AttachmentState != AttachmentStateUnattached && vol.AttachmentState != "" {
+		return fmt.Errorf("%w: volume %s has active attachment state %s", ErrInUse, id, vol.AttachmentState)
+	}
+
+	// Ensure no exports reference this volume.
+	expsB := tx.Bucket(bucketExports)
+	err := expsB.ForEach(func(_, v []byte) error {
+		var exp Export
+		if err := json.Unmarshal(v, &exp); err != nil {
+			return err
+		}
+		if exp.VolumeID == id {
+			return fmt.Errorf("%w: volume %s is exported by %s", ErrInUse, id, exp.ID)
+		}
+		return nil
+	})
+	return err
+}
+
+// DeleteVolume deletes a Volume if it is unattached and has no active Exports.
+// Its Snapshots are retained.
 func (s *BoltStore) DeleteVolume(id string) error {
 	return s.db.Update(func(tx *bolt.Tx) error {
-		volsB := tx.Bucket(bucketVolumes)
-		var vol Volume
-		if err := getJSON(volsB, []byte(id), &vol); err != nil {
+		if err := checkVolumeDeletableTx(tx, id); err != nil {
 			return err
 		}
-		if vol.AttachmentState != AttachmentStateUnattached && vol.AttachmentState != "" {
-			return fmt.Errorf("%w: volume %s has active attachment state %s", ErrInUse, id, vol.AttachmentState)
-		}
-
-		// Ensure no exports reference this volume.
-		expsB := tx.Bucket(bucketExports)
-		err := expsB.ForEach(func(_, v []byte) error {
-			var exp Export
-			if err := json.Unmarshal(v, &exp); err != nil {
-				return err
-			}
-			if exp.VolumeID == id {
-				return fmt.Errorf("%w: volume %s is exported by %s", ErrInUse, id, exp.ID)
-			}
-			return nil
-		})
-		if err != nil {
-			return err
-		}
-
-		// Ensure no snapshots reference this volume.
-		snapsB := tx.Bucket(bucketSnapshots)
-		err = snapsB.ForEach(func(_, v []byte) error {
-			var snap Snapshot
-			if err := json.Unmarshal(v, &snap); err != nil {
-				return err
-			}
-			if snap.VolumeID == id {
-				return fmt.Errorf("%w: volume %s has snapshot %s", ErrInUse, id, snap.ID)
-			}
-			return nil
-		})
-		if err != nil {
-			return err
-		}
-
-		return volsB.Delete([]byte(id))
+		return tx.Bucket(bucketVolumes).Delete([]byte(id))
 	})
 }
 
@@ -988,28 +1234,42 @@ func (s *BoltStore) ListSnapshots(poolID, volumeID string) ([]*Snapshot, error) 
 	return snaps, nil
 }
 
+// CheckSnapshotDeletable returns nil if DeleteSnapshot(id) would currently succeed.
+func (s *BoltStore) CheckSnapshotDeletable(id string) error {
+	return s.db.View(func(tx *bolt.Tx) error {
+		_, err := checkSnapshotDeletableTx(tx, id)
+		return err
+	})
+}
+
+func checkSnapshotDeletableTx(tx *bolt.Tx, id string) (*Snapshot, error) {
+	var snap Snapshot
+	if err := getJSON(tx.Bucket(bucketSnapshots), []byte(id), &snap); err != nil {
+		return nil, err
+	}
+	// Ensure no cloned volume depends on this snapshot.
+	err := tx.Bucket(bucketVolumes).ForEach(func(_, v []byte) error {
+		var vol Volume
+		if err := json.Unmarshal(v, &vol); err != nil {
+			return err
+		}
+		if vol.ParentSnapshotID == id {
+			return fmt.Errorf("%w: snapshot %s is parent of cloned volume %s", ErrInUse, id, vol.ID)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &snap, nil
+}
+
 // DeleteSnapshot deletes a Snapshot if no cloned Volume depends on it, and stitches
 // any child Snapshot's ParentSnapshotID to preserve CBT lineage continuity.
 func (s *BoltStore) DeleteSnapshot(id string) error {
 	return s.db.Update(func(tx *bolt.Tx) error {
 		snapsB := tx.Bucket(bucketSnapshots)
-		var snap Snapshot
-		if err := getJSON(snapsB, []byte(id), &snap); err != nil {
-			return err
-		}
-
-		// Ensure no cloned volume depends on this snapshot.
-		volsB := tx.Bucket(bucketVolumes)
-		err := volsB.ForEach(func(_, v []byte) error {
-			var vol Volume
-			if err := json.Unmarshal(v, &vol); err != nil {
-				return err
-			}
-			if vol.ParentSnapshotID == id {
-				return fmt.Errorf("%w: snapshot %s is parent of cloned volume %s", ErrInUse, id, vol.ID)
-			}
-			return nil
-		})
+		snap, err := checkSnapshotDeletableTx(tx, id)
 		if err != nil {
 			return err
 		}
@@ -1188,6 +1448,13 @@ func (s *BoltStore) CreatePortal(portal *Portal) error {
 		})
 		if err != nil {
 			return err
+		}
+		if cp.Protocol == ExportProtocolISCSI && cp.IscsiPgTag == 0 {
+			tag, err := nextPortalPgTag(b)
+			if err != nil {
+				return err
+			}
+			cp.IscsiPgTag = tag
 		}
 		if err := putJSON(b, []byte(cp.ID), &cp); err != nil {
 			return err
@@ -1598,6 +1865,14 @@ func (s *BoltStore) CreateExport(exp *Export) error {
 		})
 		if err != nil {
 			return err
+		}
+
+		if cp.Protocol == ExportProtocolISCSI && cp.IscsiIgTag == 0 {
+			tag, err := nextExportIgTag(expsB)
+			if err != nil {
+				return err
+			}
+			cp.IscsiIgTag = tag
 		}
 
 		// Transition volume attachment state to BLOCK_EXPORT.

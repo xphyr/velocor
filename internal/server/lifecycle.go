@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -282,15 +283,37 @@ func queryContainerUpdates(ctx context.Context) ContainerUpdatesStatus {
 	return res
 }
 
+// containerUnitRe restricts container updates to Velocor's own quadlet units. The unit name
+// reaches systemctl/podman on the host, so it must never be free-form.
+var containerUnitRe = regexp.MustCompile(`^velocor-[a-z0-9][a-z0-9-]{0,62}\.service$`)
+
+// dataPlaneUnit is restarted only with explicit consent: it interrupts all SAN I/O.
+const dataPlaneUnit = "velocor-spdk.service"
+
+// updateScript pulls the image of container $1 and restarts unit $2. Values are passed as
+// positional parameters, never interpolated into the script text.
+const updateScript = `img="$(podman inspect --format '{{.ImageName}}' "$1" 2>/dev/null || true)"; if [ -n "$img" ]; then podman pull "$img"; fi; systemctl restart "$2"`
+
 func (s *Server) handleApplyContainerUpdates(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Unit string `json:"unit"`
+		Unit            string `json:"unit"`
+		AllowDisruptive bool   `json:"allow_disruptive"`
 	}
-	_ = json.NewDecoder(r.Body).Decode(&req)
+	if r.ContentLength != 0 {
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeError(w, fmt.Errorf("%w: invalid json body", store.ErrInvalidArgument))
+			return
+		}
+	}
 	unit := strings.TrimSpace(req.Unit)
 
-	if unit != "" && !strings.HasSuffix(unit, ".service") {
-		writeError(w, fmt.Errorf("%w: unit must end with .service", store.ErrInvalidArgument))
+	if unit != "" && !containerUnitRe.MatchString(unit) {
+		writeError(w, fmt.Errorf("%w: unit must be a velocor-*.service container unit", store.ErrInvalidArgument))
+		return
+	}
+	if unit == dataPlaneUnit && !req.AllowDisruptive {
+		writeError(w, fmt.Errorf("%w: updating %s restarts spdk_tgt and interrupts all SAN I/O; resend with allow_disruptive=true during a maintenance window",
+			store.ErrInvalidArgument, dataPlaneUnit))
 		return
 	}
 
@@ -326,15 +349,11 @@ func (s *Server) handleApplyContainerUpdates(w http.ResponseWriter, r *http.Requ
 			}
 		} else {
 			containerName := strings.TrimSuffix(unit, ".service")
-			script := fmt.Sprintf(
-				`img="$(podman inspect --format '{{.ImageName}}' %q 2>/dev/null || true)"; if [ -n "$img" ]; then podman pull "$img"; fi; systemctl restart %q`,
-				containerName, unit,
-			)
 			out, err = hostCommand(ctx, "systemd-run", "--no-block", "--collect",
 				"--unit=velocor-container-update",
-				"/bin/sh", "-c", script).CombinedOutput()
+				"/bin/sh", "-c", updateScript, "velocor-update", containerName, unit).CombinedOutput()
 			if err != nil {
-				out, err = hostCommand(ctx, "/bin/sh", "-c", script).CombinedOutput()
+				out, err = hostCommand(ctx, "/bin/sh", "-c", updateScript, "velocor-update", containerName, unit).CombinedOutput()
 			}
 		}
 

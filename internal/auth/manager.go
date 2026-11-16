@@ -2,6 +2,7 @@ package auth
 
 import (
 	"crypto/hmac"
+	"crypto/pbkdf2"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -10,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -21,13 +23,35 @@ const (
 	TokenPrefix = "velo_pat_"
 	// DefaultAdminUsername is the initial administrator username created on first boot.
 	DefaultAdminUsername = "admin"
-	// DefaultAdminPassword is the initial bootstrap password if VELOCOR_INIT_PASSWORD is unset.
-	DefaultAdminPassword = "velocor-admin-changeme"
 	// DefaultSessionTTL is the default validity window for human JWT sessions.
 	DefaultSessionTTL = 12 * time.Hour
 
-	pbkdfIterations = 10000
+	// pbkdf2Iterations follows the OWASP recommendation for PBKDF2-HMAC-SHA256.
+	pbkdf2Iterations = 600_000
+	// patLastUsedResolution bounds how often a PAT's last-used timestamp is persisted, so an
+	// API client does not cost a bbolt fsync on every request.
+	patLastUsedResolution = 5 * time.Minute
 )
+
+// ErrPasswordChangeRequired is returned for any operation other than changing the password
+// while an account is flagged MustChangePassword.
+var ErrPasswordChangeRequired = errors.New("forbidden: the initial password must be changed before using the API")
+
+// Principal is an authenticated caller.
+type Principal struct {
+	Subject            string
+	Role               store.Role
+	IsToken            bool
+	MustChangePassword bool
+}
+
+// Session is the result of a successful password login.
+type Session struct {
+	Token              string
+	ExpiresAt          time.Time
+	Role               store.Role
+	MustChangePassword bool
+}
 
 var (
 	// ErrUnauthorized is returned when credentials or bearer tokens are missing, invalid, or expired.
@@ -42,6 +66,9 @@ type Claims struct {
 	Role      store.Role `json:"role"`
 	IssuedAt  int64      `json:"iat"`
 	ExpiresAt int64      `json:"exp"`
+	// IssuedAtNs gives revocation (SessionsValidAfter) nanosecond precision, so a session
+	// issued moments before a password/role change cannot survive it.
+	IssuedAtNs int64 `json:"iat_ns,omitempty"`
 }
 
 // Manager manages system cryptographic secrets, local admin credentials,
@@ -83,8 +110,10 @@ func NewManager(st store.Store, initPassword string) (*Manager, error) {
 	}
 
 	if _, err := st.GetAdminUser(DefaultAdminUsername); errors.Is(err, store.ErrNotFound) {
-		if initPassword == "" {
-			initPassword = DefaultAdminPassword
+		if len(initPassword) < 8 {
+			// There is deliberately no built-in default: every appliance would otherwise ship
+			// with the same credentials. Callers generate a random one (see BootstrapPassword).
+			return nil, fmt.Errorf("%w: a bootstrap admin password of at least 8 characters is required on first start", store.ErrInvalidArgument)
 		}
 		hash, err := HashPassword(initPassword)
 		if err != nil {
@@ -92,11 +121,12 @@ func NewManager(st store.Store, initPassword string) (*Manager, error) {
 		}
 		now := time.Now().UTC()
 		if err := st.SaveAdminUser(&store.AdminUser{
-			Username:     DefaultAdminUsername,
-			PasswordHash: hash,
-			Role:         store.RoleAdmin,
-			CreatedAt:    now,
-			UpdatedAt:    now,
+			Username:           DefaultAdminUsername,
+			PasswordHash:       hash,
+			Role:               store.RoleAdmin,
+			MustChangePassword: true,
+			CreatedAt:          now,
+			UpdatedAt:          now,
 		}); err != nil {
 			return nil, fmt.Errorf("save bootstrap admin user: %w", err)
 		}
@@ -111,55 +141,94 @@ func NewManager(st store.Store, initPassword string) (*Manager, error) {
 	}, nil
 }
 
+// GenerateBootstrapPassword returns a random password for the first-boot admin account.
+func GenerateBootstrapPassword() (string, error) {
+	b, err := randomBytes(18)
+	if err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(b), nil
+}
+
 // Login verifies username/password credentials and issues a signed HS256 JWT token.
 func (m *Manager) Login(username, password string) (string, time.Time, store.Role, error) {
+	sess, err := m.LoginSession(username, password)
+	if err != nil {
+		return "", time.Time{}, "", err
+	}
+	return sess.Token, sess.ExpiresAt, sess.Role, nil
+}
+
+// LoginSession verifies credentials and issues a session. Legacy password hashes are
+// transparently upgraded to the current KDF.
+func (m *Manager) LoginSession(username, password string) (*Session, error) {
 	user, err := m.store.GetAdminUser(username)
 	if err != nil {
-		return "", time.Time{}, "", ErrUnauthorized
+		// Burn comparable time so unknown usernames are not distinguishable by latency.
+		_ = VerifyPassword(password, dummyHash)
+		return nil, ErrUnauthorized
 	}
 	if !VerifyPassword(password, user.PasswordHash) {
-		return "", time.Time{}, "", ErrUnauthorized
+		return nil, ErrUnauthorized
 	}
+	if needsRehash(user.PasswordHash) {
+		if hash, err := HashPassword(password); err == nil {
+			user.PasswordHash = hash
+			_ = m.store.SaveAdminUser(user)
+		}
+	}
+	return m.issueSession(user)
+}
 
+func (m *Manager) issueSession(user *store.AdminUser) (*Session, error) {
 	role := user.Role
 	if role == "" {
 		role = store.RoleAdmin
 	}
-
 	now := time.Now().UTC()
 	expiresAt := now.Add(m.sessionTTL)
-	claims := Claims{
-		Subject:   user.Username,
-		Role:      role,
-		IssuedAt:  now.Unix(),
-		ExpiresAt: expiresAt.Unix(),
-	}
-	token, err := m.signJWT(claims)
+	token, err := m.signJWT(Claims{
+		Subject:    user.Username,
+		Role:       role,
+		IssuedAt:   now.Unix(),
+		IssuedAtNs: now.UnixNano(),
+		ExpiresAt:  expiresAt.Unix(),
+	})
 	if err != nil {
-		return "", time.Time{}, "", err
+		return nil, err
 	}
-	return token, expiresAt, role, nil
+	return &Session{Token: token, ExpiresAt: expiresAt, Role: role, MustChangePassword: user.MustChangePassword}, nil
 }
 
-// ChangePassword updates an admin user's password after verifying the current password.
-func (m *Manager) ChangePassword(username, currentPassword, newPassword string) error {
+// ChangePassword updates a user's password after verifying the current one. All existing
+// sessions of the user are revoked; a fresh session is returned for the caller.
+func (m *Manager) ChangePassword(username, currentPassword, newPassword string) (*Session, error) {
 	if len(newPassword) < 8 {
-		return fmt.Errorf("%w: new password must be at least 8 characters", store.ErrInvalidArgument)
+		return nil, fmt.Errorf("%w: new password must be at least 8 characters", store.ErrInvalidArgument)
+	}
+	if newPassword == currentPassword {
+		return nil, fmt.Errorf("%w: new password must differ from the current one", store.ErrInvalidArgument)
 	}
 	user, err := m.store.GetAdminUser(username)
 	if err != nil {
-		return ErrUnauthorized
+		return nil, ErrUnauthorized
 	}
 	if !VerifyPassword(currentPassword, user.PasswordHash) {
-		return ErrUnauthorized
+		return nil, ErrUnauthorized
 	}
 	hash, err := HashPassword(newPassword)
 	if err != nil {
-		return err
+		return nil, err
 	}
+	now := time.Now().UTC()
 	user.PasswordHash = hash
-	user.UpdatedAt = time.Now().UTC()
-	return m.store.SaveAdminUser(user)
+	user.MustChangePassword = false
+	user.SessionsValidAfter = now
+	user.UpdatedAt = now
+	if err := m.store.SaveAdminUser(user); err != nil {
+		return nil, err
+	}
+	return m.issueSession(user)
 }
 
 // ValidateRole verifies that role is a supported RBAC role.
@@ -201,8 +270,10 @@ func (m *Manager) CreateUser(username, password string, role store.Role) (*store
 		Username:     username,
 		PasswordHash: hash,
 		Role:         role,
-		CreatedAt:    now,
-		UpdatedAt:    now,
+		// Tokens minted for a previously deleted account with the same name stay invalid.
+		SessionsValidAfter: now,
+		CreatedAt:          now,
+		UpdatedAt:          now,
 	}
 	if err := m.store.SaveAdminUser(user); err != nil {
 		return nil, err
@@ -236,8 +307,12 @@ func (m *Manager) UpdateUser(username string, role *store.Role, newPassword *str
 			return nil, err
 		}
 		user.PasswordHash = hash
+		// An administrator reset forces the user to choose their own password.
+		user.MustChangePassword = true
 	}
-	user.UpdatedAt = time.Now().UTC()
+	now := time.Now().UTC()
+	user.SessionsValidAfter = now
+	user.UpdatedAt = now
 	if err := m.store.SaveAdminUser(user); err != nil {
 		return nil, err
 	}
@@ -323,15 +398,48 @@ func (m *Manager) CreateApiToken(name string, role store.Role, ttl time.Duration
 // AuthenticateBearer validates either a Personal/Service Access Token (velo_pat_...)
 // or an HS256 session JWT, returning the authenticated principal subject and RBAC Role.
 func (m *Manager) AuthenticateBearer(rawToken string) (string, store.Role, error) {
+	p, err := m.Authenticate(rawToken)
+	if err != nil {
+		return "", "", err
+	}
+	return p.Subject, p.Role, nil
+}
+
+// Authenticate validates a bearer credential and returns the caller. Session JWTs are
+// checked against the live user record, so deleting a user, changing their role or
+// password takes effect immediately rather than when the token expires.
+func (m *Manager) Authenticate(rawToken string) (*Principal, error) {
 	rawToken = strings.TrimSpace(rawToken)
 	if rawToken == "" {
-		return "", "", ErrUnauthorized
+		return nil, ErrUnauthorized
 	}
-
 	if strings.HasPrefix(rawToken, TokenPrefix) {
-		return m.authenticatePAT(rawToken)
+		sub, role, err := m.authenticatePAT(rawToken)
+		if err != nil {
+			return nil, err
+		}
+		return &Principal{Subject: sub, Role: role, IsToken: true}, nil
 	}
-	return m.authenticateJWT(rawToken)
+	claims, err := m.verifyJWT(rawToken)
+	if err != nil {
+		return nil, err
+	}
+	user, err := m.store.GetAdminUser(claims.Subject)
+	if err != nil {
+		return nil, ErrUnauthorized
+	}
+	issuedNs := claims.IssuedAtNs
+	if issuedNs == 0 {
+		issuedNs = claims.IssuedAt * int64(time.Second)
+	}
+	if !user.SessionsValidAfter.IsZero() && issuedNs < user.SessionsValidAfter.UnixNano() {
+		return nil, ErrUnauthorized
+	}
+	role := user.Role
+	if role == "" {
+		role = store.RoleAdmin
+	}
+	return &Principal{Subject: user.Username, Role: role, MustChangePassword: user.MustChangePassword}, nil
 }
 
 // Authorize checks whether the granted role satisfies the minimum required role tier.
@@ -377,7 +485,9 @@ func (m *Manager) authenticatePAT(rawToken string) (string, store.Role, error) {
 		return "", "", ErrUnauthorized
 	}
 
-	_ = m.store.UpdateApiTokenLastUsed(id, time.Now().UTC())
+	if now := time.Now().UTC(); tok.LastUsedAt == nil || now.Sub(*tok.LastUsedAt) > patLastUsedResolution {
+		_ = m.store.UpdateApiTokenLastUsed(id, now)
+	}
 	return "token:" + tok.Name, tok.Role, nil
 }
 
@@ -397,10 +507,10 @@ func (m *Manager) signJWT(claims Claims) (string, error) {
 	return signingInput + "." + sig, nil
 }
 
-func (m *Manager) authenticateJWT(tokenStr string) (string, store.Role, error) {
+func (m *Manager) verifyJWT(tokenStr string) (*Claims, error) {
 	parts := strings.Split(tokenStr, ".")
 	if len(parts) != 3 {
-		return "", "", ErrUnauthorized
+		return nil, ErrUnauthorized
 	}
 	signingInput := parts[0] + "." + parts[1]
 	mac := hmac.New(sha256.New, m.jwtSecret)
@@ -409,42 +519,53 @@ func (m *Manager) authenticateJWT(tokenStr string) (string, store.Role, error) {
 
 	gotSig, err := base64.RawURLEncoding.DecodeString(parts[2])
 	if err != nil || !hmac.Equal(gotSig, expectedSig) {
-		return "", "", ErrUnauthorized
+		return nil, ErrUnauthorized
 	}
 
 	claimsBytes, err := base64.RawURLEncoding.DecodeString(parts[1])
 	if err != nil {
-		return "", "", ErrUnauthorized
+		return nil, ErrUnauthorized
 	}
 	var claims Claims
 	if err := json.Unmarshal(claimsBytes, &claims); err != nil {
-		return "", "", ErrUnauthorized
+		return nil, ErrUnauthorized
 	}
 
-	if time.Now().UTC().Unix() > claims.ExpiresAt {
-		return "", "", ErrUnauthorized
+	if claims.Subject == "" || time.Now().UTC().Unix() > claims.ExpiresAt {
+		return nil, ErrUnauthorized
 	}
-	return claims.Subject, claims.Role, nil
+	return &claims, nil
 }
 
-// HashPassword computes a salted iterative SHA-256 password hash.
+// HashPassword derives a PBKDF2-HMAC-SHA256 hash (OWASP-recommended iteration count).
+// Format: v2$<iterations>$<hex salt>$<hex key>.
 func HashPassword(password string) (string, error) {
 	salt, err := randomBytes(16)
 	if err != nil {
 		return "", err
 	}
-	derived := derivePasswordKey(password, salt, pbkdfIterations)
-	return fmt.Sprintf("v1$%d$%s$%s", pbkdfIterations, hex.EncodeToString(salt), hex.EncodeToString(derived)), nil
+	key, err := pbkdf2.Key(sha256.New, password, salt, pbkdf2Iterations, 32)
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("v2$%d$%s$%s", pbkdf2Iterations, hex.EncodeToString(salt), hex.EncodeToString(key)), nil
 }
 
-// VerifyPassword verifies a plaintext password against a stored HashPassword string.
+// dummyHash is verified against for unknown usernames to equalise login latency.
+var dummyHash = func() string {
+	h, _ := HashPassword("velocor-timing-equaliser")
+	return h
+}()
+
+// VerifyPassword verifies a plaintext password against a stored hash (v2 PBKDF2, or the
+// legacy v1 iterated-SHA-256 scheme, which is only accepted so it can be upgraded).
 func VerifyPassword(password, encodedHash string) bool {
 	parts := strings.Split(encodedHash, "$")
-	if len(parts) != 4 || parts[0] != "v1" {
+	if len(parts) != 4 {
 		return false
 	}
-	var iterations int
-	if _, err := fmt.Sscanf(parts[1], "%d", &iterations); err != nil || iterations <= 0 {
+	iterations, err := strconv.Atoi(parts[1])
+	if err != nil || iterations <= 0 || iterations > 10_000_000 {
 		return false
 	}
 	salt, err := hex.DecodeString(parts[2])
@@ -455,11 +576,27 @@ func VerifyPassword(password, encodedHash string) bool {
 	if err != nil {
 		return false
 	}
-	derived := derivePasswordKey(password, salt, iterations)
+	var derived []byte
+	switch parts[0] {
+	case "v2":
+		derived, err = pbkdf2.Key(sha256.New, password, salt, iterations, len(expected))
+		if err != nil {
+			return false
+		}
+	case "v1":
+		derived = legacyDerivePasswordKey(password, salt, iterations)
+	default:
+		return false
+	}
 	return subtle.ConstantTimeCompare(derived, expected) == 1
 }
 
-func derivePasswordKey(password string, salt []byte, iterations int) []byte {
+func needsRehash(encodedHash string) bool {
+	return !strings.HasPrefix(encodedHash, fmt.Sprintf("v2$%d$", pbkdf2Iterations))
+}
+
+// legacyDerivePasswordKey is the pre-v2 scheme, retained only to verify-and-upgrade.
+func legacyDerivePasswordKey(password string, salt []byte, iterations int) []byte {
 	mac := hmac.New(sha256.New, salt)
 	_, _ = mac.Write([]byte(password))
 	acc := mac.Sum(nil)

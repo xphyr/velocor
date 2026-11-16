@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -75,6 +76,7 @@ type CreateExportRequest struct {
 	PortalIDs         []string             `json:"portal_ids"`
 	InitiatorGroupIDs []string             `json:"initiator_group_ids,omitempty"`
 	AllowAnyHost      bool                 `json:"allow_any_host"`
+	NodeID            string               `json:"node_id,omitempty"`
 }
 
 // VelocorClient defines the control-plane operations required by the CSI driver.
@@ -120,10 +122,26 @@ type HTTPClient struct {
 
 // NewHTTPClient creates a Velocor REST API client.
 func NewHTTPClient(endpoint, token string, insecureSkipVerify bool) *HTTPClient {
+	c, _ := NewHTTPClientWithCA(endpoint, token, insecureSkipVerify, "")
+	return c
+}
+
+// NewHTTPClientWithCA creates a client that verifies the Velocor API certificate against
+// caPEM (e.g. velod's self-signed /var/lib/velocor/tls.crt) in addition to the system roots.
+func NewHTTPClientWithCA(endpoint, token string, insecureSkipVerify bool, caPEM string) (*HTTPClient, error) {
 	endpoint = strings.TrimRight(strings.TrimSpace(endpoint), "/")
-	tr := &http.Transport{
-		TLSClientConfig: &tls.Config{InsecureSkipVerify: insecureSkipVerify}, // #nosec G402 - lab/self-signed certs
+	tlsCfg := &tls.Config{MinVersion: tls.VersionTLS12, InsecureSkipVerify: insecureSkipVerify} // #nosec G402 - explicit opt-in only
+	if strings.TrimSpace(caPEM) != "" {
+		pool, err := x509.SystemCertPool()
+		if err != nil || pool == nil {
+			pool = x509.NewCertPool()
+		}
+		if !pool.AppendCertsFromPEM([]byte(caPEM)) {
+			return nil, fmt.Errorf("VELOCOR_CA_CERT does not contain a valid PEM certificate")
+		}
+		tlsCfg.RootCAs = pool
 	}
+	tr := &http.Transport{TLSClientConfig: tlsCfg}
 	return &HTTPClient{
 		baseURL: endpoint,
 		token:   strings.TrimSpace(token),
@@ -131,7 +149,7 @@ func NewHTTPClient(endpoint, token string, insecureSkipVerify bool) *HTTPClient 
 			Timeout:   30 * time.Second,
 			Transport: tr,
 		},
-	}
+	}, nil
 }
 
 func (c *HTTPClient) doJSON(ctx context.Context, method, path string, reqBody, out any) error {

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"strings"
 	"sync/atomic"
 	"time"
 )
@@ -145,4 +146,54 @@ func (c *Client) GetVersion(ctx context.Context) (string, error) {
 		return "", err
 	}
 	return res.Version, nil
+}
+
+// BdevWaitForExamine blocks until SPDK has finished examining all registered bdevs
+// (RAID superblock assembly, lvstore load, ...). It must be called before deciding that
+// on-disk metadata is "missing" after bdevs were (re)created.
+func (c *Client) BdevWaitForExamine(ctx context.Context) error {
+	return c.Call(ctx, "bdev_wait_for_examine", nil, nil)
+}
+
+// IsNotFound reports whether err is an SPDK JSON-RPC error indicating that the
+// referenced object (bdev, lvol, subsystem, target node, ...) does not exist.
+// Delete paths use it to stay idempotent.
+func IsNotFound(err error) bool {
+	var rpcErr *RPCError
+	if !errors.As(err, &rpcErr) {
+		return false
+	}
+	switch rpcErr.Code {
+	case -19, -2: // -ENODEV, -ENOENT
+		return true
+	}
+	msg := strings.ToLower(rpcErr.Message + " " + string(rpcErr.Data))
+	for _, needle := range []string{"no such device", "no such file", "not found", "does not exist", "unable to find", "could not find"} {
+		if strings.Contains(msg, needle) {
+			return true
+		}
+	}
+	return false
+}
+
+// MaxLvolNameLen is the longest lvol / lvstore name SPDK accepts (SPDK_LVOL_NAME_MAX - 1).
+const MaxLvolNameLen = 63
+
+// ValidateObjectName checks that name is safe to embed in SPDK bdev, lvstore, lvol,
+// NQN and IQN identifiers: 1..MaxLvolNameLen characters from [A-Za-z0-9._-].
+func ValidateObjectName(name string) error {
+	if name == "" {
+		return errors.New("name must not be empty")
+	}
+	if len(name) > MaxLvolNameLen {
+		return fmt.Errorf("name %q is longer than %d characters", name, MaxLvolNameLen)
+	}
+	for _, r := range name {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '_', r == '.':
+		default:
+			return fmt.Errorf("name %q contains invalid character %q (allowed: A-Z a-z 0-9 . _ -)", name, r)
+		}
+	}
+	return nil
 }

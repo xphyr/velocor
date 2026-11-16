@@ -26,6 +26,7 @@ type NodeServer struct {
 	nodeID           string
 	mounter          Mounter
 	publishedTargets map[string]map[string]bool
+	stagingPaths     map[string]string // volume ID -> staging_target_path (for NodeExpandVolume)
 	mu               sync.Mutex
 }
 
@@ -35,6 +36,7 @@ func NewNodeServer(nodeID string, mounter Mounter) *NodeServer {
 		nodeID:           nodeID,
 		mounter:          mounter,
 		publishedTargets: map[string]map[string]bool{},
+		stagingPaths:     map[string]string{},
 	}
 }
 
@@ -96,9 +98,14 @@ func (s *NodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolu
 		PublishContext: req.GetPublishContext(),
 		IsBlock:        isBlock,
 	}
-	if b, err := json.Marshal(meta); err == nil {
-		_ = os.WriteFile(filepath.Join(req.GetStagingTargetPath(), stageMetaFilename), b, 0600)
+	b, err := json.Marshal(meta)
+	if err == nil {
+		err = os.WriteFile(filepath.Join(req.GetStagingTargetPath(), stageMetaFilename), b, 0600)
 	}
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "persist staging metadata: %v", err)
+	}
+	s.stagingPaths[req.GetVolumeId()] = req.GetStagingTargetPath()
 	return &csi.NodeStageVolumeResponse{}, nil
 }
 
@@ -124,6 +131,7 @@ func (s *NodeServer) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstage
 		}
 		_ = os.Remove(metaPath)
 	}
+	delete(s.stagingPaths, req.GetVolumeId())
 	return &csi.NodeUnstageVolumeResponse{}, nil
 }
 
@@ -236,17 +244,29 @@ func (s *NodeServer) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandVo
 		return nil, status.Errorf(codes.NotFound, "volume_path %q does not exist", req.GetVolumePath())
 	}
 
-	var devPath string
-	if req.GetStagingTargetPath() != "" {
-		if raw, err := os.ReadFile(filepath.Join(req.GetStagingTargetPath(), stageMetaFilename)); err == nil {
-			var meta stageMetadata
-			if json.Unmarshal(raw, &meta) == nil {
-				devPath = meta.DevicePath
-			}
+	var meta stageMetadata
+	stagingPath := req.GetStagingTargetPath() // optional in the CSI spec
+	if stagingPath == "" {
+		s.mu.Lock()
+		stagingPath = s.stagingPaths[req.GetVolumeId()]
+		s.mu.Unlock()
+	}
+	if stagingPath != "" {
+		if raw, err := os.ReadFile(filepath.Join(stagingPath, stageMetaFilename)); err == nil {
+			_ = json.Unmarshal(raw, &meta)
 		}
 	}
-
-	if err := s.mounter.ResizeFilesystem(ctx, devPath, req.GetVolumePath()); err != nil {
+	if meta.DevicePath == "" {
+		return nil, status.Error(codes.FailedPrecondition, "staged device for volume is unknown; staging_target_path is required")
+	}
+	// The host must observe the new LUN/namespace size before the filesystem can grow.
+	if err := s.mounter.RescanTarget(ctx, meta.PublishContext); err != nil {
+		return nil, status.Errorf(codes.Internal, "rescan target: %v", err)
+	}
+	if meta.IsBlock {
+		return &csi.NodeExpandVolumeResponse{CapacityBytes: req.GetCapacityRange().GetRequiredBytes()}, nil
+	}
+	if err := s.mounter.ResizeFilesystem(ctx, meta.DevicePath, req.GetVolumePath()); err != nil {
 		return nil, status.Errorf(codes.Internal, "resize filesystem: %v", err)
 	}
 

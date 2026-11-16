@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/velocor/velocor/internal/auth"
@@ -28,6 +29,7 @@ func TestLifecycleEndpointsAndRBAC(t *testing.T) {
 	if err != nil {
 		t.Fatalf("auth.NewManager failed: %v", err)
 	}
+	clearMustChange(t, st)
 	rec := reconciler.New(st, spdkClient, nil, nil)
 	srv := New(st, spdkClient, nil, authMgr, rec, nil)
 	ts := httptest.NewServer(srv.Handler())
@@ -159,5 +161,23 @@ func TestLoadOrGenerateSelfSignedTLSConfigPersists(t *testing.T) {
 	}
 	if !bytes.Equal(cfg1.Certificates[0].Certificate[0], cfg2.Certificates[0].Certificate[0]) {
 		t.Fatalf("expected persisted TLS certificate to be reused across reloads")
+	}
+}
+
+func TestContainerUpdateRejectsUnsafeUnits(t *testing.T) {
+	h := newHarness(t)
+	for _, unit := range []string{
+		`velocor-velod.service"; rm -rf / #`,
+		"velocor-$(id).service",
+		"sshd.service",
+		"../velocor-velod.service",
+	} {
+		if code, resp := h.do("POST", "/api/v1/system/containers/update", h.admin, map[string]any{"unit": unit}); code != http.StatusBadRequest {
+			t.Fatalf("unit %q accepted (%d %v)", unit, code, resp)
+		}
+	}
+	code, resp := h.do("POST", "/api/v1/system/containers/update", h.admin, map[string]any{"unit": "velocor-spdk.service"})
+	if code != http.StatusBadRequest || !strings.Contains(resp["error"].(string), "allow_disruptive") {
+		t.Fatalf("data-plane restart without consent: %d %v", code, resp)
 	}
 }

@@ -2,6 +2,8 @@ package csi
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"strconv"
 	"strings"
@@ -265,51 +267,39 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 	if err != nil {
 		return nil, mapAPIError(err)
 	}
-
-	// Check if already exported (idempotent publish).
-	var existingExport *store.Export
-	for _, exp := range exports {
-		if exp.VolumeID == vol.ID {
-			existingExport = exp
-			break
-		}
-	}
-
 	portals, err := s.client.ListPortals(ctx)
 	if err != nil {
 		return nil, mapAPIError(err)
 	}
-
-	var portal *store.Portal
-	if existingExport != nil {
-		for _, p := range portals {
-			for _, pid := range existingExport.PortalIDs {
-				if p.ID == pid {
-					portal = p
-					break
-				}
-			}
-			if portal != nil {
-				break
-			}
-		}
-		return &csi.ControllerPublishVolumeResponse{
-			PublishContext: buildPublishContext(existingExport, portal),
-		}, nil
+	igs, err := s.client.ListInitiatorGroups(ctx)
+	if err != nil {
+		return nil, mapAPIError(err)
 	}
 
+	// Exports are per (volume, node). Every access mode we support is single-node, so a
+	// volume already published to a different node must not be handed to this one.
+	for _, exp := range exports {
+		if exp.VolumeID != vol.ID {
+			continue
+		}
+		owner := exportNodeID(exp, igs)
+		if owner == req.GetNodeId() || (exp.NodeID == "" && owner == sanitizeName(req.GetNodeId())) {
+			return &csi.ControllerPublishVolumeResponse{
+				PublishContext: buildPublishContext(exp, exportPortal(exp, portals), vol),
+			}, nil
+		}
+		return nil, status.Errorf(codes.FailedPrecondition, "volume %s is already published to node %q", vol.ID, owner)
+	}
+
+	var portal *store.Portal
 	for _, p := range portals {
 		if p.Protocol == proto {
 			portal = p
 			break
 		}
 	}
-	if portal == nil && len(portals) > 0 {
-		portal = portals[0]
-		proto = portal.Protocol
-	}
 	if portal == nil {
-		return nil, status.Error(codes.FailedPrecondition, "no storage portal configured in Velocor")
+		return nil, status.Errorf(codes.FailedPrecondition, "no %s storage portal configured in Velocor", proto)
 	}
 
 	igID, err := s.ensureNodeInitiatorGroup(ctx, req.GetNodeId())
@@ -318,20 +308,55 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 	}
 
 	exp, err := s.client.CreateExport(ctx, CreateExportRequest{
-		Name:              "csi-" + vol.Name,
+		Name:              exportNameFor(vol.ID, req.GetNodeId()),
 		VolumeID:          vol.ID,
 		Protocol:          proto,
 		PortalIDs:         []string{portal.ID},
 		InitiatorGroupIDs: []string{igID},
 		AllowAnyHost:      false,
+		NodeID:            req.GetNodeId(),
 	})
 	if err != nil {
 		return nil, mapAPIError(err)
 	}
 
 	return &csi.ControllerPublishVolumeResponse{
-		PublishContext: buildPublishContext(exp, portal),
+		PublishContext: buildPublishContext(exp, portal, vol),
 	}, nil
+}
+
+// exportNameFor derives a short, deterministic export name for a (volume, node) pair that
+// is valid inside NQNs/IQNs regardless of how long or exotic the Kubernetes node name is.
+func exportNameFor(volID, nodeID string) string {
+	sum := sha256.Sum256([]byte(nodeID))
+	return "csi-" + volID + "-" + hex.EncodeToString(sum[:6])
+}
+
+// exportNodeID returns the CSI node an export belongs to. Exports created by older releases
+// carry no NodeID; they are attributed via their per-node "csi-node-<node>" initiator group.
+func exportNodeID(exp *store.Export, igs []*store.InitiatorGroup) string {
+	if exp.NodeID != "" {
+		return exp.NodeID
+	}
+	for _, gid := range exp.InitiatorGroupIDs {
+		for _, g := range igs {
+			if g.ID == gid && strings.HasPrefix(g.Name, "csi-node-") {
+				return strings.TrimPrefix(g.Name, "csi-node-")
+			}
+		}
+	}
+	return ""
+}
+
+func exportPortal(exp *store.Export, portals []*store.Portal) *store.Portal {
+	for _, pid := range exp.PortalIDs {
+		for _, p := range portals {
+			if p.ID == pid {
+				return p
+			}
+		}
+	}
+	return nil
 }
 
 func (s *ControllerServer) ControllerUnpublishVolume(ctx context.Context, req *csi.ControllerUnpublishVolumeRequest) (*csi.ControllerUnpublishVolumeResponse, error) {
@@ -346,11 +371,22 @@ func (s *ControllerServer) ControllerUnpublishVolume(ctx context.Context, req *c
 	if err != nil {
 		return nil, mapAPIError(err)
 	}
+	igs, err := s.client.ListInitiatorGroups(ctx)
+	if err != nil {
+		return nil, mapAPIError(err)
+	}
+	legacyNode := sanitizeName(req.GetNodeId())
 	for _, exp := range exports {
-		if exp.VolumeID == req.GetVolumeId() {
-			if err := s.client.DeleteExport(ctx, exp.ID); err != nil && !IsNotFound(err) {
-				return nil, mapAPIError(err)
-			}
+		if exp.VolumeID != req.GetVolumeId() {
+			continue
+		}
+		// An empty node_id means "unpublish from all nodes" per the CSI spec.
+		owner := exportNodeID(exp, igs)
+		if req.GetNodeId() != "" && owner != req.GetNodeId() && !(exp.NodeID == "" && owner == legacyNode) {
+			continue
+		}
+		if err := s.client.DeleteExport(ctx, exp.ID); err != nil && !IsNotFound(err) {
+			return nil, mapAPIError(err)
 		}
 	}
 	return &csi.ControllerUnpublishVolumeResponse{}, nil
@@ -385,14 +421,9 @@ func (s *ControllerServer) ListVolumes(ctx context.Context, req *csi.ListVolumes
 	if err != nil {
 		return nil, mapAPIError(err)
 	}
-	exports, _ := s.client.ListExports(ctx)
-	pubByVol := map[string][]string{}
-	for _, exp := range exports {
-		if len(exp.InitiatorGroupIDs) > 0 {
-			pubByVol[exp.VolumeID] = append(pubByVol[exp.VolumeID], exp.InitiatorGroupIDs...)
-		} else {
-			pubByVol[exp.VolumeID] = append(pubByVol[exp.VolumeID], "exported")
-		}
+	pubByVol, err := s.publishedNodes(ctx)
+	if err != nil {
+		return nil, err
 	}
 
 	start, end, nextToken, err := paginate(len(vols), req.GetStartingToken(), req.GetMaxEntries())
@@ -558,19 +589,35 @@ func (s *ControllerServer) ControllerGetVolume(ctx context.Context, req *csi.Con
 	if err != nil {
 		return nil, mapAPIError(err)
 	}
-	exports, _ := s.client.ListExports(ctx)
-	var pubNodes []string
-	for _, exp := range exports {
-		if exp.VolumeID == vol.ID {
-			pubNodes = append(pubNodes, exp.InitiatorGroupIDs...)
-		}
+	pubByVol, err := s.publishedNodes(ctx)
+	if err != nil {
+		return nil, err
 	}
 	return &csi.ControllerGetVolumeResponse{
 		Volume: toCSIVolume(vol, nil, nil),
 		Status: &csi.ControllerGetVolumeResponse_VolumeStatus{
-			PublishedNodeIds: pubNodes,
+			PublishedNodeIds: pubByVol[vol.ID],
 		},
 	}, nil
+}
+
+// publishedNodes maps volume IDs to the CSI node IDs they are published to.
+func (s *ControllerServer) publishedNodes(ctx context.Context) (map[string][]string, error) {
+	exports, err := s.client.ListExports(ctx)
+	if err != nil {
+		return nil, mapAPIError(err)
+	}
+	igs, err := s.client.ListInitiatorGroups(ctx)
+	if err != nil {
+		return nil, mapAPIError(err)
+	}
+	out := map[string][]string{}
+	for _, exp := range exports {
+		if node := exportNodeID(exp, igs); node != "" {
+			out[exp.VolumeID] = append(out[exp.VolumeID], node)
+		}
+	}
+	return out, nil
 }
 
 func (s *ControllerServer) selectPool(ctx context.Context, poolParam string, requiredBytes uint64) (string, error) {
@@ -669,10 +716,14 @@ func normalizeProtocol(p string) store.ExportProtocol {
 	}
 }
 
-func buildPublishContext(exp *store.Export, portal *store.Portal) map[string]string {
+func buildPublishContext(exp *store.Export, portal *store.Portal, vol *store.Volume) map[string]string {
 	ctx := map[string]string{
 		"export_id": exp.ID,
 		"protocol":  string(exp.Protocol),
+	}
+	if vol != nil && vol.UUID != "" {
+		// The node verifies the attached namespace carries this UUID before formatting/mounting.
+		ctx["volume_uuid"] = vol.UUID
 	}
 	if portal != nil {
 		ctx["portal_ip"] = portal.IPAddress

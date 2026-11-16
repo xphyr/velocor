@@ -395,8 +395,9 @@ func runSystem(cfg *cliConfig, args []string) error {
 	case "update-containers":
 		fs := flag.NewFlagSet("system update-containers", flag.ExitOnError)
 		unit := fs.String("unit", "", "Optional systemd unit name (e.g. velocor-velod.service)")
+		disruptive := fs.Bool("allow-disruptive", false, "Allow restarting the SPDK data plane (interrupts all SAN I/O)")
 		_ = fs.Parse(args[1:])
-		resp, err := cfg.request("POST", "/api/v1/system/containers/update", map[string]any{"unit": *unit})
+		resp, err := cfg.request("POST", "/api/v1/system/containers/update", map[string]any{"unit": *unit, "allow_disruptive": *disruptive})
 		if err != nil {
 			return err
 		}
@@ -443,10 +444,17 @@ func runDisk(cfg *cliConfig, args []string) error {
 		return nil
 
 	case "claim":
-		if len(args) < 2 {
-			return fmt.Errorf("usage: veloctl disk claim <disk-id>")
+		fs := flag.NewFlagSet("disk claim", flag.ExitOnError)
+		force := fs.Bool("force", false, "Claim even if the disk has partitions or filesystem signatures (DESTROYS its data)")
+		_ = fs.Parse(args[1:])
+		if fs.NArg() < 1 {
+			return fmt.Errorf("usage: veloctl disk claim [--force] <disk-id>")
 		}
-		resp, err := cfg.request("POST", "/api/v1/disks/"+args[1]+":claim", map[string]any{})
+		path := "/api/v1/disks/" + url.PathEscape(fs.Arg(0)) + ":claim"
+		if *force {
+			path += "?force=true"
+		}
+		resp, err := cfg.request("POST", path, map[string]any{})
 		if err != nil {
 			return err
 		}

@@ -374,7 +374,7 @@
           <td><span class="badge ${v.thin_provision ? "badge-info" : "badge-muted"}">${v.thin_provision ? "THIN" : "THICK"}</span></td>
           <td><span class="badge badge-muted">${escapeHtml(v.attachment_state)}</span></td>
           <td class="mono">${qosText}</td>
-          <td>${healthBadge(v.health_status)}</td>
+          <td>${healthBadge(v.health_status)}${v.status_message ? `<div class="muted" style="font-size:0.75rem;margin-top:0.2rem">${escapeHtml(v.status_message)}</div>` : ""}</td>
           <td><div class="actions-cell">
             <button class="btn btn-sm" data-vol-snap="${escapeHtml(v.id)}">Snapshot</button>
             <button class="btn btn-sm" data-vol-resize="${escapeHtml(v.id)}">Resize</button>
@@ -569,7 +569,7 @@
           <td class="mono">${escapeHtml(volName)}</td>
           <td class="mono">${escapeHtml(target)}</td>
           <td><span class="badge badge-muted">${escapeHtml(access)}</span></td>
-          <td>${healthBadge(e.health_status)}</td>
+          <td>${healthBadge(e.health_status)}${e.status_message ? `<div class="muted" style="font-size:0.75rem;margin-top:0.2rem">${escapeHtml(e.status_message)}</div>` : ""}</td>
           <td><div class="actions-cell">
             <button class="btn btn-sm" data-export-connect="${escapeHtml(e.id)}">Connect CLI</button>
             <button class="btn btn-danger btn-sm" data-export-delete="${escapeHtml(e.id)}">Delete</button>
@@ -722,6 +722,10 @@
       if (!res.ok) throw new Error(data.error || "Login failed");
       setToken(data.access_token);
       hideLogin();
+      if (data.must_change_password) {
+        promptInitialPasswordChange(fd.get("password"));
+        return;
+      }
       toast("Signed in to Velocor");
       await refreshAll();
     } catch (err) {
@@ -729,6 +733,36 @@
       $("login-error").classList.remove("hidden");
     }
   });
+
+  function promptInitialPasswordChange(currentPassword) {
+    openModal("Set a new administrator password", `
+      <form id="form-initial-password" style="display:flex;flex-direction:column;gap:0.85rem">
+        <p class="muted">This account is using its initial password. Choose a new one (at least 8 characters) to continue.</p>
+        <div class="field"><label>New password</label><input type="password" name="new_password" minlength="8" required autocomplete="new-password" /></div>
+        <div class="field"><label>Confirm new password</label><input type="password" name="confirm_password" minlength="8" required autocomplete="new-password" /></div>
+        <div class="modal-footer"><button type="submit" class="btn btn-primary">Set password</button></div>
+      </form>
+    `, () => {
+      $("form-initial-password").addEventListener("submit", async (e) => {
+        e.preventDefault();
+        const fd = new FormData(e.target);
+        if (fd.get("new_password") !== fd.get("confirm_password")) {
+          toast("Passwords do not match", "err");
+          return;
+        }
+        try {
+          const res = await api("POST", "/api/v1/auth/password", {
+            current_password: currentPassword,
+            new_password: fd.get("new_password"),
+          });
+          if (res.access_token) setToken(res.access_token);
+          closeModal();
+          toast("Password updated");
+          await refreshAll();
+        } catch (err) { toast(err.message, "err"); }
+      });
+    });
+  }
 
   $("btn-logout").addEventListener("click", () => {
     setToken("");
@@ -759,7 +793,14 @@
     if (!(t instanceof HTMLElement)) return;
     try {
       if (t.dataset.diskClaim) {
-        await api("POST", `/api/v1/disks/${encodeURIComponent(t.dataset.diskClaim)}:claim`);
+        const claimPath = `/api/v1/disks/${encodeURIComponent(t.dataset.diskClaim)}:claim`;
+        try {
+          await api("POST", claimPath);
+        } catch (err) {
+          if (!/force=true/.test(err.message)) throw err;
+          if (!confirm(`${err.message}\n\nClaiming this disk will DESTROY all data on it. Continue?`)) return;
+          await api("POST", `${claimPath}?force=true`);
+        }
         toast("Disk claimed for SPDK");
         await refreshAll();
       } else if (t.dataset.diskRelease) {
@@ -1200,8 +1241,8 @@
           </div>
         </div>
         <div class="field"><label>Portals</label><div id="export-portals-wrap"></div></div>
-        <label class="checkbox-row"><input type="checkbox" name="allow_any_host" id="chk-allow-any-host" checked /> Allow Any Host</label>
-        <div class="field hidden" id="export-igs-wrap"><label>Allowed Initiator Groups</label>${igBoxes}</div>
+        <label class="checkbox-row"><input type="checkbox" name="allow_any_host" id="chk-allow-any-host" /> Allow Any Host <span class="muted">(no access control: any initiator that can reach the portal may connect)</span></label>
+        <div class="field" id="export-igs-wrap"><label>Allowed Initiator Groups</label>${igBoxes}</div>
         <div class="modal-footer"><button type="submit" class="btn btn-primary">Create Export</button></div>
       </form>
     `, () => {
@@ -1360,10 +1401,11 @@
     e.preventDefault();
     const fd = new FormData(e.target);
     try {
-      await api("POST", "/api/v1/auth/password", {
+      const res = await api("POST", "/api/v1/auth/password", {
         current_password: fd.get("current_password"),
         new_password: fd.get("new_password"),
       });
+      if (res.access_token) setToken(res.access_token);
       e.target.reset();
       toast("Password updated");
     } catch (err) { toast(err.message, "err"); }
@@ -1431,9 +1473,13 @@
 
   async function triggerContainerUpdate(unit) {
     const label = unit ? `unit ${unit}` : "all AutoUpdate containers";
-    if (!confirm(`Apply container updates for ${label}? Running services may briefly restart.`)) return;
+    const dataPlane = unit === "velocor-spdk.service";
+    const warning = dataPlane
+      ? `Updating ${unit} RESTARTS spdk_tgt and interrupts ALL SAN I/O on this appliance. Only do this in a maintenance window. Continue?`
+      : `Apply container updates for ${label}? Running services may briefly restart.`;
+    if (!confirm(warning)) return;
     try {
-      const res = await api("POST", "/api/v1/system/containers/update", { unit: unit || "" });
+      const res = await api("POST", "/api/v1/system/containers/update", { unit: unit || "", allow_disruptive: dataPlane });
       toast(res.message || "Container update scheduled");
       setTimeout(() => refreshAll(), 1500);
     } catch (err) { toast(err.message, "err"); }

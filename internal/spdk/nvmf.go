@@ -207,3 +207,20 @@ func (c *Client) NvmfSubsystemListenerSetANAState(ctx context.Context, nqn, trty
 	}
 	return c.Call(ctx, "nvmf_subsystem_listener_set_ana_state", params, nil)
 }
+
+// NvmfSubsystemAllowAnyHost toggles whether any host NQN may connect to the subsystem.
+func (c *Client) NvmfSubsystemAllowAnyHost(ctx context.Context, nqn string, allow bool) error {
+	params := map[string]any{"nqn": nqn, "allow_any_host": allow}
+	return c.Call(ctx, "nvmf_subsystem_allow_any_host", params, nil)
+}
+
+// NvmfSubsystemPause quiesces I/O on a subsystem: outstanding commands complete and new
+// ones are queued until NvmfSubsystemResume. Used to take crash-consistent group snapshots.
+func (c *Client) NvmfSubsystemPause(ctx context.Context, nqn string) error {
+	return c.Call(ctx, "nvmf_subsystem_pause", map[string]any{"nqn": nqn}, nil)
+}
+
+// NvmfSubsystemResume resumes I/O on a subsystem paused with NvmfSubsystemPause.
+func (c *Client) NvmfSubsystemResume(ctx context.Context, nqn string) error {
+	return c.Call(ctx, "nvmf_subsystem_resume", map[string]any{"nqn": nqn}, nil)
+}

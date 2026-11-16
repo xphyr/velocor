@@ -42,6 +42,18 @@ type Server struct {
 	logger     *slog.Logger
 	startedAt  time.Time
 	mux        *http.ServeMux
+
+	loginLimiter  *loginLimiter
+	metricsPublic bool
+}
+
+// Option customises a Server.
+type Option func(*Server)
+
+// WithPublicMetrics serves /metrics without authentication (for scrapers that cannot send
+// a bearer token). By default /metrics requires a READONLY token.
+func WithPublicMetrics(public bool) Option {
+	return func(s *Server) { s.metricsPublic = public }
 }
 
 // New constructs a new control-plane Server and registers all routes.
@@ -52,6 +64,7 @@ func New(
 	authMgr *auth.Manager,
 	rec *reconciler.Reconciler,
 	logger *slog.Logger,
+	opts ...Option,
 ) *Server {
 	if logger == nil {
 		logger = slog.Default()
@@ -65,14 +78,25 @@ func New(
 		logger:     logger,
 		startedAt:  time.Now().UTC(),
 		mux:        http.NewServeMux(),
+
+		loginLimiter: newLoginLimiter(),
+	}
+	for _, o := range opts {
+		o(s)
 	}
 	s.registerRoutes()
 	return s
 }
 
+// maxRequestBodyBytes bounds every request body; no API payload legitimately exceeds it.
+const maxRequestBodyBytes = 1 << 20
+
 // Handler returns the root http.Handler for the server.
 func (s *Server) Handler() http.Handler {
-	return s.mux
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
+		s.mux.ServeHTTP(w, r)
+	})
 }
 
 func (s *Server) registerRoutes() {
@@ -80,7 +104,11 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /{$}", s.handleDashboard)
 	s.mux.Handle("GET /assets/", s.handleWebAssets())
 	s.mux.HandleFunc("GET /api/v1/openapi.json", s.handleOpenAPI)
-	s.mux.HandleFunc("GET /metrics", s.handleMetrics)
+	if s.metricsPublic {
+		s.mux.HandleFunc("GET /metrics", s.handleMetrics)
+	} else {
+		s.mux.HandleFunc("GET /metrics", s.withAuth(store.RoleReadOnly, s.handleMetrics))
+	}
 	s.mux.HandleFunc("POST /api/v1/auth/login", s.handleLogin)
 
 	// Auth, User & Token management
@@ -163,8 +191,9 @@ func (s *Server) registerRoutes() {
 type contextKey string
 
 const (
-	subjectContextKey contextKey = "subject"
-	roleContextKey    contextKey = "role"
+	subjectContextKey    contextKey = "subject"
+	roleContextKey       contextKey = "role"
+	mustChangeContextKey contextKey = "must_change_password"
 )
 
 func subjectFromContext(ctx context.Context) string {
@@ -185,17 +214,22 @@ func (s *Server) withAuth(requiredRole store.Role, next http.HandlerFunc) http.H
 			return
 		}
 		rawToken := strings.TrimPrefix(hdr, "Bearer ")
-		sub, role, err := s.auth.AuthenticateBearer(rawToken)
+		p, err := s.auth.Authenticate(rawToken)
 		if err != nil {
 			writeError(w, err)
 			return
 		}
-		if err := auth.Authorize(role, requiredRole); err != nil {
+		if p.MustChangePassword && r.URL.Path != "/api/v1/auth/password" && r.URL.Path != "/api/v1/auth/me" {
+			writeError(w, auth.ErrPasswordChangeRequired)
+			return
+		}
+		if err := auth.Authorize(p.Role, requiredRole); err != nil {
 			writeError(w, err)
 			return
 		}
-		ctx := context.WithValue(r.Context(), subjectContextKey, sub)
-		ctx = context.WithValue(ctx, roleContextKey, role)
+		ctx := context.WithValue(r.Context(), subjectContextKey, p.Subject)
+		ctx = context.WithValue(ctx, roleContextKey, p.Role)
+		ctx = context.WithValue(ctx, mustChangeContextKey, p.MustChangePassword)
 		next(w, r.WithContext(ctx))
 	}
 }
@@ -216,23 +250,35 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		writeError(w, fmt.Errorf("%w: invalid json body", store.ErrInvalidArgument))
 		return
 	}
-	tok, exp, role, err := s.auth.Login(req.Username, req.Password)
+	ip := clientIP(r)
+	if wait := s.loginLimiter.blocked(ip, req.Username); wait > 0 {
+		w.Header().Set("Retry-After", strconv.Itoa(int(wait.Seconds())+1))
+		writeJSON(w, http.StatusTooManyRequests, map[string]any{"error": "too many failed login attempts; try again later"})
+		return
+	}
+	sess, err := s.auth.LoginSession(req.Username, req.Password)
 	if err != nil {
+		s.loginLimiter.fail(ip, req.Username)
+		s.logger.Warn("failed login", "username", req.Username, "remote", ip)
 		writeError(w, err)
 		return
 	}
+	s.loginLimiter.succeed(ip, req.Username)
 	writeJSON(w, http.StatusOK, map[string]any{
-		"access_token": tok,
-		"expires_at":   exp,
-		"username":     req.Username,
-		"role":         role,
+		"access_token":         sess.Token,
+		"expires_at":           sess.ExpiresAt,
+		"username":             req.Username,
+		"role":                 sess.Role,
+		"must_change_password": sess.MustChangePassword,
 	})
 }
 
 func (s *Server) handleAuthMe(w http.ResponseWriter, r *http.Request) {
+	mustChange, _ := r.Context().Value(mustChangeContextKey).(bool)
 	writeJSON(w, http.StatusOK, map[string]any{
-		"username": subjectFromContext(r.Context()),
-		"role":     roleFromContext(r.Context()),
+		"username":             subjectFromContext(r.Context()),
+		"role":                 roleFromContext(r.Context()),
+		"must_change_password": mustChange,
 	})
 }
 
@@ -250,11 +296,16 @@ func (s *Server) handleChangePassword(w http.ResponseWriter, r *http.Request) {
 		writeError(w, fmt.Errorf("%w: invalid json body", store.ErrInvalidArgument))
 		return
 	}
-	if err := s.auth.ChangePassword(sub, req.CurrentPassword, req.NewPassword); err != nil {
+	sess, err := s.auth.ChangePassword(sub, req.CurrentPassword, req.NewPassword)
+	if err != nil {
 		writeError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{})
+	// All earlier sessions (including the caller's) were revoked; hand back a fresh one.
+	writeJSON(w, http.StatusOK, map[string]any{
+		"access_token": sess.Token,
+		"expires_at":   sess.ExpiresAt,
+	})
 }
 
 type userView struct {
@@ -411,37 +462,6 @@ func (s *Server) handleGetDisk(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"disk": disk})
 }
 
-func (s *Server) handleScanDisks(w http.ResponseWriter, _ *http.Request) {
-	if s.hw != nil {
-		_ = s.hw.RefreshBootGuard()
-		discovered, err := s.hw.DiscoverDisks()
-		if err != nil {
-			writeError(w, err)
-			return
-		}
-		for _, d := range discovered {
-			if existing, err := s.store.GetDisk(d.ID); err == nil {
-				if existing.Claimed && !d.IsBootDevice {
-					d.Claimed = true
-					d.DriverState = existing.DriverState
-					d.SPDKBdevName = existing.SPDKBdevName
-					d.PoolID = existing.PoolID
-				}
-			}
-			if err := s.store.SyncDiscoveredDisk(d); err != nil {
-				writeError(w, err)
-				return
-			}
-		}
-	}
-	disks, err := s.store.ListDisks()
-	if err != nil {
-		writeError(w, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"disks": disks})
-}
-
 func (s *Server) handleDiskAction(w http.ResponseWriter, r *http.Request) {
 	// Matches POST /api/v1/disks/{id}:claim or POST /api/v1/disks/{id}:release
 	tail := strings.TrimPrefix(r.URL.Path, "/api/v1/disks/")
@@ -455,88 +475,6 @@ func (s *Server) handleDiskAction(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.NotFound(w, r)
 	}
-}
-
-func (s *Server) claimDisk(w http.ResponseWriter, r *http.Request, id string) {
-	d, err := s.store.GetDisk(id)
-	if err != nil {
-		writeError(w, err)
-		return
-	}
-	if d.IsBootDevice {
-		writeError(w, store.ErrBootDeviceProtected)
-		return
-	}
-
-	drvState := d.DriverState
-	bdevName := d.SPDKBdevName
-	switch d.Type {
-	case store.DiskTypeNVMe:
-		if s.hw != nil && d.PCIAddress != "" {
-			boundState, err := s.hw.BindNVMeToUserspace(d.PCIAddress, "")
-			if err != nil {
-				writeError(w, err)
-				return
-			}
-			drvState = boundState
-		} else {
-			drvState = store.DiskDriverStateVfioPCI
-		}
-		if s.spdk != nil {
-			ctrlName := "Nvme_" + strings.ReplaceAll(strings.ReplaceAll(d.PCIAddress, ":", "_"), ".", "_")
-			if attached, err := s.spdk.BdevNvmeAttachController(r.Context(), ctrlName, "PCIe", d.PCIAddress); err == nil && len(attached) > 0 {
-				bdevName = attached[0]
-			}
-		}
-		if bdevName == "" {
-			bdevName = "Nvme_" + d.ID + "n1"
-		}
-	case store.DiskTypeSSD:
-		drvState = store.DiskDriverStateUringClaimed
-		bdevName = "uring_" + d.Name
-		if s.spdk != nil && d.DevicePath != "" {
-			if created, err := s.spdk.BdevUringCreate(r.Context(), bdevName, d.DevicePath, d.BlockSize); err == nil {
-				bdevName = created
-			}
-		}
-	}
-
-	updated, err := s.store.ClaimDisk(id, drvState, bdevName)
-	if err != nil {
-		writeError(w, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"disk": updated})
-}
-
-func (s *Server) releaseDisk(w http.ResponseWriter, r *http.Request, id string) {
-	d, err := s.store.GetDisk(id)
-	if err != nil {
-		writeError(w, err)
-		return
-	}
-	if d.PoolID != "" {
-		writeError(w, fmt.Errorf("%w: disk %s belongs to pool %s", store.ErrInUse, id, d.PoolID))
-		return
-	}
-	if s.spdk != nil && d.SPDKBdevName != "" {
-		switch d.Type {
-		case store.DiskTypeNVMe:
-			ctrlName := strings.TrimSuffix(d.SPDKBdevName, "n1")
-			_ = s.spdk.BdevNvmeDetachController(r.Context(), ctrlName)
-		case store.DiskTypeSSD:
-			_ = s.spdk.BdevUringDelete(r.Context(), d.SPDKBdevName)
-		}
-	}
-	if d.Type == store.DiskTypeNVMe && s.hw != nil && d.PCIAddress != "" {
-		_ = s.hw.BindNVMeToKernel(d.PCIAddress)
-	}
-	updated, err := s.store.ReleaseDisk(id)
-	if err != nil {
-		writeError(w, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"disk": updated})
 }
 
 // --- Pool Handlers ---
@@ -557,94 +495,6 @@ func (s *Server) handleGetPool(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"pool": pool})
-}
-
-func (s *Server) handleCreatePool(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		Name             string             `json:"name"`
-		RaidLevel        store.RaidLevel    `json:"raid_level"`
-		DiskIDs          []string           `json:"disk_ids"`
-		StripSizeKB      uint32             `json:"strip_size_kb"`
-		ClusterSizeBytes uint32             `json:"cluster_size_bytes"`
-		FilterPolicy     store.FilterPolicy `json:"filter_policy"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, fmt.Errorf("%w: invalid json body", store.ErrInvalidArgument))
-		return
-	}
-	if req.RaidLevel == "" {
-		req.RaidLevel = store.RaidLevel0
-	}
-	if req.StripSizeKB == 0 {
-		req.StripSizeKB = 64
-	}
-	if req.ClusterSizeBytes == 0 {
-		req.ClusterSizeBytes = store.DefaultClusterSizeBytes
-	}
-
-	var totalRaw uint64
-	var baseBdevs []string
-	for _, diskID := range req.DiskIDs {
-		d, err := s.store.GetDisk(diskID)
-		if err != nil {
-			writeError(w, fmt.Errorf("disk %s: %w", diskID, err))
-			return
-		}
-		totalRaw += d.SizeBytes
-		if d.SPDKBdevName != "" {
-			baseBdevs = append(baseBdevs, d.SPDKBdevName)
-		}
-	}
-
-	pool := &store.Pool{
-		ID:                newResourceID("pool"),
-		Name:              req.Name,
-		RaidLevel:         req.RaidLevel,
-		DiskIDs:           req.DiskIDs,
-		StripSizeKB:       req.StripSizeKB,
-		ClusterSizeBytes:  req.ClusterSizeBytes,
-		BaseBdevName:      "raid_" + req.Name,
-		EffectiveBdevName: "raid_" + req.Name,
-		LVSName:           "lvs_" + req.Name,
-		TotalBytes:        totalRaw,
-		FreeBytes:         totalRaw,
-		FilterPolicy:      req.FilterPolicy,
-		HealthStatus:      store.HealthStatusOnline,
-	}
-
-	if err := s.store.CreatePool(pool); err != nil {
-		writeError(w, err)
-		return
-	}
-
-	if s.spdk != nil && len(baseBdevs) == len(req.DiskIDs) {
-		if err := s.spdk.BdevRaidCreate(r.Context(), pool.BaseBdevName, string(pool.RaidLevel), pool.StripSizeKB, baseBdevs, false); err == nil {
-			if lvsUUID, err := s.spdk.BdevLvolCreateLvstore(r.Context(), pool.EffectiveBdevName, pool.LVSName, pool.ClusterSizeBytes, ""); err == nil {
-				pool.LVSUUID = lvsUUID
-				_ = s.store.UpdatePool(pool)
-			}
-		}
-	}
-
-	writeJSON(w, http.StatusCreated, map[string]any{"pool": pool})
-}
-
-func (s *Server) handleDeletePool(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
-	pool, err := s.store.GetPool(id)
-	if err != nil {
-		writeError(w, err)
-		return
-	}
-	if err := s.store.DeletePool(id); err != nil {
-		writeError(w, err)
-		return
-	}
-	if s.spdk != nil {
-		_ = s.spdk.BdevLvolDeleteLvstore(r.Context(), pool.LVSUUID, pool.LVSName)
-		_ = s.spdk.BdevRaidDelete(r.Context(), pool.BaseBdevName)
-	}
-	writeJSON(w, http.StatusOK, map[string]any{})
 }
 
 // --- Volume & Snapshot Handlers ---
@@ -668,208 +518,6 @@ func (s *Server) handleGetVolume(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"volume": vol})
 }
 
-func (s *Server) handleCreateVolume(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		Name          string             `json:"name"`
-		PoolID        string             `json:"pool_id"`
-		SizeBytes     uint64             `json:"size_bytes"`
-		ThinProvision bool               `json:"thin_provision"`
-		FilterPolicy  store.FilterPolicy `json:"filter_policy"`
-		QosPolicy     store.QosPolicy    `json:"qos_policy"`
-		Labels        map[string]string  `json:"labels"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, fmt.Errorf("%w: invalid json body", store.ErrInvalidArgument))
-		return
-	}
-
-	// Idempotency check by (PoolID, Name) for Kubernetes CSI CreateVolume retry semantics.
-	if existing, err := s.store.GetVolumeByName(req.PoolID, req.Name); err == nil {
-		if existing.SizeBytes == req.SizeBytes {
-			writeJSON(w, http.StatusOK, map[string]any{"volume": existing})
-			return
-		}
-		writeError(w, fmt.Errorf("%w: volume %s already exists with size %d", store.ErrAlreadyExists, req.Name, existing.SizeBytes))
-		return
-	}
-
-	pool, err := s.store.GetPool(req.PoolID)
-	if err != nil {
-		writeError(w, err)
-		return
-	}
-
-	lvolAlias := fmt.Sprintf("%s/%s", pool.LVSName, req.Name)
-	vol := &store.Volume{
-		ID:                newResourceID("vol"),
-		Name:              req.Name,
-		PoolID:            req.PoolID,
-		LvolBdevName:      lvolAlias,
-		EffectiveBdevName: lvolAlias,
-		SizeBytes:         req.SizeBytes,
-		ThinProvision:     req.ThinProvision,
-		FilterPolicy:      req.FilterPolicy,
-		QosPolicy:         req.QosPolicy,
-		AttachmentState:   store.AttachmentStateUnattached,
-		HealthStatus:      store.HealthStatusOnline,
-		Labels:            req.Labels,
-	}
-
-	if err := s.store.CreateVolume(vol); err != nil {
-		writeError(w, err)
-		return
-	}
-
-	if s.spdk != nil {
-		if uuid, err := s.spdk.BdevLvolCreate(r.Context(), pool.LVSName, vol.Name, vol.SizeBytes, vol.ThinProvision, ""); err == nil {
-			vol.UUID = uuid
-			_ = s.store.UpdateVolume(vol)
-		}
-		if vol.QosPolicy.RwIosPerSec > 0 || vol.QosPolicy.RwMbytesPerSec > 0 {
-			_ = s.spdk.BdevSetQoSLimit(r.Context(), vol.EffectiveBdevName,
-				vol.QosPolicy.RwIosPerSec,
-				vol.QosPolicy.RwMbytesPerSec,
-				vol.QosPolicy.RMbytesPerSec,
-				vol.QosPolicy.WMbytesPerSec,
-			)
-		}
-	}
-
-	writeJSON(w, http.StatusCreated, map[string]any{"volume": vol})
-}
-
-func (s *Server) handleVolumeAction(w http.ResponseWriter, r *http.Request) {
-	tail := strings.TrimPrefix(r.URL.Path, "/api/v1/volumes/")
-	if strings.HasSuffix(tail, ":resize") {
-		id := strings.TrimSuffix(tail, ":resize")
-		s.resizeVolume(w, r, id)
-		return
-	}
-	http.NotFound(w, r)
-}
-
-func (s *Server) resizeVolume(w http.ResponseWriter, r *http.Request, id string) {
-	var req struct {
-		NewSizeBytes uint64 `json:"new_size_bytes"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, fmt.Errorf("%w: invalid json body", store.ErrInvalidArgument))
-		return
-	}
-	vol, err := s.store.GetVolume(id)
-	if err != nil {
-		writeError(w, err)
-		return
-	}
-	if req.NewSizeBytes < vol.SizeBytes {
-		writeError(w, fmt.Errorf("%w: new_size_bytes (%d) must be >= current size (%d)", store.ErrInvalidArgument, req.NewSizeBytes, vol.SizeBytes))
-		return
-	}
-	if s.spdk != nil {
-		_ = s.spdk.BdevLvolResize(r.Context(), vol.LvolBdevName, req.NewSizeBytes)
-	}
-	vol.SizeBytes = req.NewSizeBytes
-	if err := s.store.UpdateVolume(vol); err != nil {
-		writeError(w, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"volume": vol})
-}
-
-func (s *Server) handleSetVolumeQoS(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
-	var req struct {
-		QosPolicy store.QosPolicy `json:"qos_policy"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, fmt.Errorf("%w: invalid json body", store.ErrInvalidArgument))
-		return
-	}
-	vol, err := s.store.GetVolume(id)
-	if err != nil {
-		writeError(w, err)
-		return
-	}
-	if s.spdk != nil {
-		_ = s.spdk.BdevSetQoSLimit(r.Context(), vol.EffectiveBdevName,
-			req.QosPolicy.RwIosPerSec,
-			req.QosPolicy.RwMbytesPerSec,
-			req.QosPolicy.RMbytesPerSec,
-			req.QosPolicy.WMbytesPerSec,
-		)
-	}
-	vol.QosPolicy = req.QosPolicy
-	if err := s.store.UpdateVolume(vol); err != nil {
-		writeError(w, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"volume": vol})
-}
-
-func (s *Server) handleDeleteVolume(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
-	vol, err := s.store.GetVolume(id)
-	if err != nil {
-		writeError(w, err)
-		return
-	}
-	if err := s.store.DeleteVolume(id); err != nil {
-		writeError(w, err)
-		return
-	}
-	if s.spdk != nil {
-		_ = s.spdk.BdevLvolDelete(r.Context(), vol.LvolBdevName)
-	}
-	writeJSON(w, http.StatusOK, map[string]any{})
-}
-
-func (s *Server) handleCreateSnapshot(w http.ResponseWriter, r *http.Request) {
-	volID := r.PathValue("volume_id")
-	var req struct {
-		Name string `json:"name"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, fmt.Errorf("%w: invalid json body", store.ErrInvalidArgument))
-		return
-	}
-
-	// Idempotent by (VolumeID, Name) for Kubernetes CSI CreateSnapshot retries.
-	if existing, err := s.store.GetSnapshotByName(volID, req.Name); err == nil {
-		writeJSON(w, http.StatusOK, map[string]any{"snapshot": existing})
-		return
-	}
-
-	vol, err := s.store.GetVolume(volID)
-	if err != nil {
-		writeError(w, err)
-		return
-	}
-	pool, err := s.store.GetPool(vol.PoolID)
-	if err != nil {
-		writeError(w, err)
-		return
-	}
-
-	snap := &store.Snapshot{
-		ID:           newResourceID("snap"),
-		Name:         req.Name,
-		VolumeID:     vol.ID,
-		PoolID:       pool.ID,
-		LvolBdevName: fmt.Sprintf("%s/%s", pool.LVSName, req.Name),
-		SizeBytes:    vol.SizeBytes,
-	}
-	if s.spdk != nil {
-		if uuid, err := s.spdk.BdevLvolSnapshot(r.Context(), vol.LvolBdevName, req.Name); err == nil {
-			snap.UUID = uuid
-		}
-	}
-	if err := s.store.CreateSnapshot(snap); err != nil {
-		writeError(w, err)
-		return
-	}
-	writeJSON(w, http.StatusCreated, map[string]any{"snapshot": snap})
-}
-
 func (s *Server) handleListSnapshots(w http.ResponseWriter, r *http.Request) {
 	poolID := r.URL.Query().Get("pool_id")
 	volID := r.URL.Query().Get("volume_id")
@@ -879,187 +527,6 @@ func (s *Server) handleListSnapshots(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"snapshots": snaps})
-}
-
-func (s *Server) handleSnapshotGetOrBlocks(w http.ResponseWriter, r *http.Request) {
-	tail := strings.TrimPrefix(r.URL.Path, "/api/v1/snapshots/")
-	switch {
-	case strings.HasSuffix(tail, "/blocks:allocated"):
-		snapID := strings.TrimSuffix(tail, "/blocks:allocated")
-		s.handleGetSnapshotAllocatedBlocks(w, r, snapID)
-	case strings.HasSuffix(tail, "/blocks:changed"):
-		targetSnapID := strings.TrimSuffix(tail, "/blocks:changed")
-		s.handleGetSnapshotChangedBlocks(w, r, targetSnapID)
-	default:
-		snap, err := s.store.GetSnapshot(tail)
-		if err != nil {
-			writeError(w, err)
-			return
-		}
-		writeJSON(w, http.StatusOK, map[string]any{"snapshot": snap})
-	}
-}
-
-func (s *Server) handleSnapshotAction(w http.ResponseWriter, r *http.Request) {
-	tail := strings.TrimPrefix(r.URL.Path, "/api/v1/snapshots/")
-	if strings.HasSuffix(tail, ":clone") {
-		snapID := strings.TrimSuffix(tail, ":clone")
-		s.cloneSnapshot(w, r, snapID)
-		return
-	}
-	http.NotFound(w, r)
-}
-
-func (s *Server) cloneSnapshot(w http.ResponseWriter, r *http.Request, snapID string) {
-	var req struct {
-		CloneName    string             `json:"clone_name"`
-		FilterPolicy store.FilterPolicy `json:"filter_policy"`
-		QosPolicy    store.QosPolicy    `json:"qos_policy"`
-		Labels       map[string]string  `json:"labels"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, fmt.Errorf("%w: invalid json body", store.ErrInvalidArgument))
-		return
-	}
-	snap, err := s.store.GetSnapshot(snapID)
-	if err != nil {
-		writeError(w, err)
-		return
-	}
-	pool, err := s.store.GetPool(snap.PoolID)
-	if err != nil {
-		writeError(w, err)
-		return
-	}
-
-	lvolAlias := fmt.Sprintf("%s/%s", pool.LVSName, req.CloneName)
-	clone := &store.Volume{
-		ID:                newResourceID("vol"),
-		Name:              req.CloneName,
-		PoolID:            pool.ID,
-		LvolBdevName:      lvolAlias,
-		EffectiveBdevName: lvolAlias,
-		SizeBytes:         snap.SizeBytes,
-		ThinProvision:     true,
-		ParentSnapshotID:  snap.ID,
-		FilterPolicy:      req.FilterPolicy,
-		QosPolicy:         req.QosPolicy,
-		AttachmentState:   store.AttachmentStateUnattached,
-		HealthStatus:      store.HealthStatusOnline,
-		Labels:            req.Labels,
-	}
-	if s.spdk != nil {
-		if uuid, err := s.spdk.BdevLvolClone(r.Context(), snap.LvolBdevName, req.CloneName); err == nil {
-			clone.UUID = uuid
-		}
-	}
-	if err := s.store.CreateVolume(clone); err != nil {
-		writeError(w, err)
-		return
-	}
-	writeJSON(w, http.StatusCreated, map[string]any{"volume": clone})
-}
-
-func (s *Server) handleGetSnapshotAllocatedBlocks(w http.ResponseWriter, r *http.Request, snapID string) {
-	snap, err := s.store.GetSnapshot(snapID)
-	if err != nil {
-		writeError(w, err)
-		return
-	}
-	pool, err := s.store.GetPool(snap.PoolID)
-	if err != nil {
-		writeError(w, err)
-		return
-	}
-
-	// Walk ancestor lineage to union all allocated clusters up to snapID.
-	lineage, err := s.collectSnapshotLineage(snap, "")
-	if err != nil {
-		writeError(w, err)
-		return
-	}
-
-	var extentSets [][]spdk.BlockExtent
-	if s.spdk != nil {
-		for _, layer := range lineage {
-			frag, err := s.spdk.BdevLvolGetFragmap(r.Context(), layer.LvolBdevName, 0, layer.SizeBytes)
-			if err != nil {
-				writeError(w, err)
-				return
-			}
-			ext, err := spdk.DecodeFragmapExtents(frag)
-			if err != nil {
-				writeError(w, err)
-				return
-			}
-			extentSets = append(extentSets, ext)
-		}
-	}
-	merged := spdk.MergeBlockExtents(extentSets...)
-	writeJSON(w, http.StatusOK, map[string]any{
-		"snapshot_id":        snap.ID,
-		"volume_size_bytes":  snap.SizeBytes,
-		"cluster_size_bytes": pool.ClusterSizeBytes,
-		"extents":            formatBlockExtents(merged),
-	})
-}
-
-func (s *Server) handleGetSnapshotChangedBlocks(w http.ResponseWriter, r *http.Request, targetSnapID string) {
-	baseSnapID := r.URL.Query().Get("base_snapshot_id")
-	if baseSnapID == "" {
-		writeError(w, fmt.Errorf("%w: base_snapshot_id query parameter is required", store.ErrInvalidArgument))
-		return
-	}
-	targetSnap, err := s.store.GetSnapshot(targetSnapID)
-	if err != nil {
-		writeError(w, err)
-		return
-	}
-	baseSnap, err := s.store.GetSnapshot(baseSnapID)
-	if err != nil {
-		writeError(w, err)
-		return
-	}
-	if targetSnap.VolumeID != baseSnap.VolumeID {
-		writeError(w, fmt.Errorf("%w: snapshots %s and %s belong to different volumes", store.ErrInvalidArgument, baseSnapID, targetSnapID))
-		return
-	}
-	pool, err := s.store.GetPool(targetSnap.PoolID)
-	if err != nil {
-		writeError(w, err)
-		return
-	}
-
-	lineage, err := s.collectSnapshotLineage(targetSnap, baseSnap.ID)
-	if err != nil {
-		writeError(w, err)
-		return
-	}
-
-	var extentSets [][]spdk.BlockExtent
-	if s.spdk != nil {
-		for _, layer := range lineage {
-			frag, err := s.spdk.BdevLvolGetFragmap(r.Context(), layer.LvolBdevName, 0, layer.SizeBytes)
-			if err != nil {
-				writeError(w, err)
-				return
-			}
-			ext, err := spdk.DecodeFragmapExtents(frag)
-			if err != nil {
-				writeError(w, err)
-				return
-			}
-			extentSets = append(extentSets, ext)
-		}
-	}
-	merged := spdk.MergeBlockExtents(extentSets...)
-	writeJSON(w, http.StatusOK, map[string]any{
-		"base_snapshot_id":   baseSnap.ID,
-		"target_snapshot_id": targetSnap.ID,
-		"volume_size_bytes":  targetSnap.SizeBytes,
-		"cluster_size_bytes": pool.ClusterSizeBytes,
-		"extents":            formatBlockExtents(merged),
-	})
 }
 
 func (s *Server) collectSnapshotLineage(target *store.Snapshot, stopAtParentID string) ([]*store.Snapshot, error) {
@@ -1087,143 +554,11 @@ func formatBlockExtents(extents []spdk.BlockExtent) []map[string]uint64 {
 	for _, e := range extents {
 		out = append(out, map[string]uint64{
 			"offset_bytes": e.OffsetBytes,
-			"size_bytes":   e.SizeBytes,
+			"length_bytes": e.SizeBytes,
+			"size_bytes":   e.SizeBytes, // deprecated alias kept for older clients
 		})
 	}
 	return out
-}
-
-func (s *Server) handleDeleteSnapshot(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
-	snap, err := s.store.GetSnapshot(id)
-	if err != nil {
-		writeError(w, err)
-		return
-	}
-	if err := s.store.DeleteSnapshot(id); err != nil {
-		writeError(w, err)
-		return
-	}
-	if s.spdk != nil {
-		_ = s.spdk.BdevLvolDelete(r.Context(), snap.LvolBdevName)
-	}
-	writeJSON(w, http.StatusOK, map[string]any{})
-}
-
-func (s *Server) handleCreateVolumeGroupSnapshot(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		Name      string   `json:"name"`
-		VolumeIDs []string `json:"volume_ids"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, fmt.Errorf("%w: invalid json body", store.ErrInvalidArgument))
-		return
-	}
-	if req.Name == "" || len(req.VolumeIDs) == 0 {
-		writeError(w, fmt.Errorf("%w: name and non-empty volume_ids are required", store.ErrInvalidArgument))
-		return
-	}
-
-	seen := make(map[string]struct{}, len(req.VolumeIDs))
-	dedupVolIDs := make([]string, 0, len(req.VolumeIDs))
-	for _, id := range req.VolumeIDs {
-		if id == "" {
-			writeError(w, fmt.Errorf("%w: volume_ids must not contain empty values", store.ErrInvalidArgument))
-			return
-		}
-		if _, dup := seen[id]; dup {
-			continue
-		}
-		seen[id] = struct{}{}
-		dedupVolIDs = append(dedupVolIDs, id)
-	}
-
-	// Idempotent by Name when volume sets match; AlreadyExists on mismatch.
-	if existing, err := s.store.GetVolumeGroupSnapshotByName(req.Name); err == nil {
-		if !equalStringSets(existing.VolumeIDs, dedupVolIDs) {
-			writeError(w, fmt.Errorf("%w: volume group snapshot %s already exists with different volumes", store.ErrAlreadyExists, req.Name))
-			return
-		}
-		snaps := s.resolveGroupSnapshots(existing.SnapshotIDs)
-		writeJSON(w, http.StatusOK, map[string]any{
-			"volume_group_snapshot": existing,
-			"snapshots":             snaps,
-		})
-		return
-	}
-
-	// Pre-validate all volumes and pools exist before creating any snapshots.
-	type volPool struct {
-		vol  *store.Volume
-		pool *store.Pool
-	}
-	targets := make([]volPool, 0, len(dedupVolIDs))
-	for _, volID := range dedupVolIDs {
-		vol, err := s.store.GetVolume(volID)
-		if err != nil {
-			writeError(w, err)
-			return
-		}
-		pool, err := s.store.GetPool(vol.PoolID)
-		if err != nil {
-			writeError(w, err)
-			return
-		}
-		targets = append(targets, volPool{vol: vol, pool: pool})
-	}
-
-	// Take snapshots across all member volumes in a tight coordinated loop.
-	createdSnaps := make([]*store.Snapshot, 0, len(targets))
-	snapIDs := make([]string, 0, len(targets))
-	rollback := func() {
-		for _, cs := range createdSnaps {
-			_ = s.store.DeleteSnapshot(cs.ID)
-			if s.spdk != nil {
-				_ = s.spdk.BdevLvolDelete(r.Context(), cs.LvolBdevName)
-			}
-		}
-	}
-
-	for _, t := range targets {
-		snapName := fmt.Sprintf("%s-%s", req.Name, t.vol.ID)
-		snap := &store.Snapshot{
-			ID:           newResourceID("snap"),
-			Name:         snapName,
-			VolumeID:     t.vol.ID,
-			PoolID:       t.pool.ID,
-			LvolBdevName: fmt.Sprintf("%s/%s", t.pool.LVSName, snapName),
-			SizeBytes:    t.vol.SizeBytes,
-		}
-		if s.spdk != nil {
-			if uuid, err := s.spdk.BdevLvolSnapshot(r.Context(), t.vol.LvolBdevName, snapName); err == nil {
-				snap.UUID = uuid
-			}
-		}
-		if err := s.store.CreateSnapshot(snap); err != nil {
-			rollback()
-			writeError(w, err)
-			return
-		}
-		createdSnaps = append(createdSnaps, snap)
-		snapIDs = append(snapIDs, snap.ID)
-	}
-
-	vgs := &store.VolumeGroupSnapshot{
-		ID:          newResourceID("vgs"),
-		Name:        req.Name,
-		VolumeIDs:   dedupVolIDs,
-		SnapshotIDs: snapIDs,
-		ReadyToUse:  true,
-	}
-	if err := s.store.CreateVolumeGroupSnapshot(vgs); err != nil {
-		rollback()
-		writeError(w, err)
-		return
-	}
-	writeJSON(w, http.StatusCreated, map[string]any{
-		"volume_group_snapshot": vgs,
-		"snapshots":             createdSnaps,
-	})
 }
 
 func (s *Server) handleListVolumeGroupSnapshots(w http.ResponseWriter, r *http.Request) {
@@ -1246,29 +581,6 @@ func (s *Server) handleGetVolumeGroupSnapshot(w http.ResponseWriter, r *http.Req
 		"volume_group_snapshot": vgs,
 		"snapshots":             s.resolveGroupSnapshots(vgs.SnapshotIDs),
 	})
-}
-
-func (s *Server) handleDeleteVolumeGroupSnapshot(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
-	vgs, err := s.store.GetVolumeGroupSnapshot(id)
-	if err != nil {
-		writeError(w, err)
-		return
-	}
-	if err := s.store.DeleteVolumeGroupSnapshot(id); err != nil {
-		writeError(w, err)
-		return
-	}
-	for _, snapID := range vgs.SnapshotIDs {
-		snap, err := s.store.GetSnapshot(snapID)
-		if err != nil {
-			continue
-		}
-		if err := s.store.DeleteSnapshot(snapID); err == nil && s.spdk != nil {
-			_ = s.spdk.BdevLvolDelete(r.Context(), snap.LvolBdevName)
-		}
-	}
-	writeJSON(w, http.StatusOK, map[string]any{})
 }
 
 func (s *Server) resolveGroupSnapshots(snapIDs []string) []*store.Snapshot {
@@ -1434,6 +746,11 @@ func (s *Server) handleCreateInitiatorGroup(w http.ResponseWriter, r *http.Reque
 		writeError(w, fmt.Errorf("%w: invalid json body", store.ErrInvalidArgument))
 		return
 	}
+	if strings.TrimSpace(req.CHAPUser) != "" {
+		// Accepting CHAP settings without enforcing them would be a false sense of security.
+		writeError(w, fmt.Errorf("%w: CHAP authentication is not implemented yet", store.ErrInvalidArgument))
+		return
+	}
 	group := &store.InitiatorGroup{
 		ID:            newResourceID("ig"),
 		Name:          req.Name,
@@ -1458,58 +775,6 @@ func (s *Server) handleDeleteInitiatorGroup(w http.ResponseWriter, r *http.Reque
 	writeJSON(w, http.StatusOK, map[string]any{})
 }
 
-func (s *Server) resolveInitiatorGroupACLs(ig *store.InitiatorGroup) (hostNQNs, initiatorIQNs, cidrs []string) {
-	seenNQN := make(map[string]bool)
-	seenIQN := make(map[string]bool)
-	seenCIDR := make(map[string]bool)
-
-	addNQN := func(v string) {
-		v = strings.TrimSpace(v)
-		if v != "" && !seenNQN[v] {
-			seenNQN[v] = true
-			hostNQNs = append(hostNQNs, v)
-		}
-	}
-	addIQN := func(v string) {
-		v = strings.TrimSpace(v)
-		if v != "" && !seenIQN[v] {
-			seenIQN[v] = true
-			initiatorIQNs = append(initiatorIQNs, v)
-		}
-	}
-	addCIDR := func(v string) {
-		v = strings.TrimSpace(v)
-		if v != "" && !seenCIDR[v] {
-			seenCIDR[v] = true
-			cidrs = append(cidrs, v)
-		}
-	}
-
-	for _, hid := range ig.HostIDs {
-		if h, err := s.store.GetHost(hid); err == nil {
-			addNQN(h.HostNQN)
-			addIQN(h.InitiatorIQN)
-			if h.IPAddress != "" {
-				if strings.Contains(h.IPAddress, "/") {
-					addCIDR(h.IPAddress)
-				} else {
-					addCIDR(h.IPAddress + "/32")
-				}
-			}
-		}
-	}
-	for _, nqn := range ig.HostNQNs {
-		addNQN(nqn)
-	}
-	for _, iqn := range ig.InitiatorIQNs {
-		addIQN(iqn)
-	}
-	for _, cidr := range ig.AllowedCIDRs {
-		addCIDR(cidr)
-	}
-	return hostNQNs, initiatorIQNs, cidrs
-}
-
 func (s *Server) handleListExports(w http.ResponseWriter, r *http.Request) {
 	volID := r.URL.Query().Get("volume_id")
 	protoFilter := store.ExportProtocol(strings.ToUpper(r.URL.Query().Get("protocol_filter")))
@@ -1528,169 +793,6 @@ func (s *Server) handleGetExport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"export": exp})
-}
-
-func (s *Server) handleCreateExport(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		Name              string               `json:"name"`
-		VolumeID          string               `json:"volume_id"`
-		Protocol          store.ExportProtocol `json:"protocol"`
-		SubsystemNQN      string               `json:"subsystem_nqn"`
-		NamespaceID       uint32               `json:"namespace_id"`
-		TargetIQN         string               `json:"target_iqn"`
-		LUNID             uint32               `json:"lun_id"`
-		PortalIDs         []string             `json:"portal_ids"`
-		InitiatorGroupIDs []string             `json:"initiator_group_ids"`
-		AllowAnyHost      bool                 `json:"allow_any_host"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, fmt.Errorf("%w: invalid json body", store.ErrInvalidArgument))
-		return
-	}
-	if req.Protocol == "" {
-		req.Protocol = store.ExportProtocolNVMeoFTCP
-	}
-
-	// Idempotent by Name for Kubernetes CSI ControllerPublishVolume retries.
-	if existing, err := s.store.GetExportByName(req.Name); err == nil {
-		if existing.VolumeID == req.VolumeID {
-			writeJSON(w, http.StatusOK, map[string]any{"export": existing})
-			return
-		}
-		writeError(w, fmt.Errorf("%w: export %s already exists for volume %s", store.ErrAlreadyExists, req.Name, existing.VolumeID))
-		return
-	}
-
-	vol, err := s.store.GetVolume(req.VolumeID)
-	if err != nil {
-		writeError(w, err)
-		return
-	}
-
-	if (req.Protocol == store.ExportProtocolNVMeoFTCP || req.Protocol == store.ExportProtocolNVMeoFRDMA) && req.SubsystemNQN == "" {
-		req.SubsystemNQN = "nqn.2026-11.io.velocor:" + req.Name
-	}
-	if req.NamespaceID == 0 {
-		req.NamespaceID = 1
-	}
-	if req.Protocol == store.ExportProtocolISCSI && req.TargetIQN == "" {
-		req.TargetIQN = "iqn.2026-11.io.velocor:" + req.Name
-	}
-
-	exp := &store.Export{
-		ID:                newResourceID("exp"),
-		Name:              req.Name,
-		VolumeID:          req.VolumeID,
-		Protocol:          req.Protocol,
-		SubsystemNQN:      req.SubsystemNQN,
-		NamespaceID:       req.NamespaceID,
-		TargetIQN:         req.TargetIQN,
-		LUNID:             req.LUNID,
-		PortalIDs:         req.PortalIDs,
-		InitiatorGroupIDs: req.InitiatorGroupIDs,
-		AllowAnyHost:      req.AllowAnyHost,
-		HealthStatus:      store.HealthStatusOnline,
-	}
-
-	if err := s.store.CreateExport(exp); err != nil {
-		writeError(w, err)
-		return
-	}
-
-	if s.spdk != nil && (exp.Protocol == store.ExportProtocolNVMeoFTCP || exp.Protocol == store.ExportProtocolNVMeoFRDMA) {
-		trtype := "TCP"
-		if exp.Protocol == store.ExportProtocolNVMeoFRDMA {
-			trtype = "RDMA"
-		}
-		_ = s.spdk.NvmfCreateTransport(r.Context(), trtype)
-		serial := "VELO" + strings.ToUpper(strings.ReplaceAll(exp.ID, "-", ""))
-		if len(serial) > 20 {
-			serial = serial[:20]
-		}
-		if err := s.spdk.NvmfCreateSubsystem(r.Context(), exp.SubsystemNQN, serial, "", exp.AllowAnyHost, 32); err == nil {
-			_, _ = s.spdk.NvmfSubsystemAddNs(r.Context(), exp.SubsystemNQN, vol.EffectiveBdevName, exp.NamespaceID, "")
-			for _, gid := range exp.InitiatorGroupIDs {
-				if ig, err := s.store.GetInitiatorGroup(gid); err == nil {
-					nqns, _, _ := s.resolveInitiatorGroupACLs(ig)
-					for _, nqn := range nqns {
-						_ = s.spdk.NvmfSubsystemAddHost(r.Context(), exp.SubsystemNQN, nqn)
-					}
-				}
-			}
-			for _, pid := range exp.PortalIDs {
-				if p, err := s.store.GetPortal(pid); err == nil {
-					_ = s.spdk.NvmfSubsystemAddListener(r.Context(), exp.SubsystemNQN, trtype, "IPv4", p.IPAddress, strconv.Itoa(int(p.Port)))
-				}
-			}
-		}
-	} else if s.spdk != nil && exp.Protocol == store.ExportProtocolISCSI {
-		pgTag := 1
-		igTag := 1
-		var spdkPortals []spdk.IscsiPortal
-		for _, pid := range exp.PortalIDs {
-			if p, err := s.store.GetPortal(pid); err == nil {
-				spdkPortals = append(spdkPortals, spdk.IscsiPortal{
-					Host: p.IPAddress,
-					Port: strconv.Itoa(int(p.Port)),
-				})
-			}
-		}
-		if len(spdkPortals) > 0 {
-			_ = s.spdk.IscsiCreatePortalGroup(r.Context(), pgTag, spdkPortals)
-		}
-		iqns := []string{"ANY"}
-		netmasks := []string{"0.0.0.0/1", "128.0.0.0/1"}
-		if !exp.AllowAnyHost && len(exp.InitiatorGroupIDs) > 0 {
-			var resolvedIQNs, resolvedCIDRs []string
-			for _, gid := range exp.InitiatorGroupIDs {
-				if ig, err := s.store.GetInitiatorGroup(gid); err == nil {
-					_, gIQNs, gCIDRs := s.resolveInitiatorGroupACLs(ig)
-					resolvedIQNs = append(resolvedIQNs, gIQNs...)
-					resolvedCIDRs = append(resolvedCIDRs, gCIDRs...)
-				}
-			}
-			if len(resolvedIQNs) > 0 {
-				iqns = resolvedIQNs
-			}
-			if len(resolvedCIDRs) > 0 {
-				netmasks = resolvedCIDRs
-			}
-		}
-		_ = s.spdk.IscsiCreateInitiatorGroup(r.Context(), igTag, iqns, netmasks)
-		_ = s.spdk.IscsiCreateTargetNode(
-			r.Context(),
-			exp.TargetIQN,
-			exp.Name,
-			[]spdk.IscsiLun{{BdevName: vol.EffectiveBdevName, LunID: int(exp.LUNID)}},
-			[]spdk.IscsiPgIgMap{{PgTag: pgTag, IgTag: igTag}},
-			64,
-			true, false, false, 0,
-		)
-	}
-
-	writeJSON(w, http.StatusCreated, map[string]any{"export": exp})
-}
-
-func (s *Server) handleDeleteExport(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
-	exp, err := s.store.GetExport(id)
-	if err != nil {
-		writeError(w, err)
-		return
-	}
-	if err := s.store.DeleteExport(id); err != nil {
-		writeError(w, err)
-		return
-	}
-	if s.spdk != nil {
-		switch exp.Protocol {
-		case store.ExportProtocolNVMeoFTCP, store.ExportProtocolNVMeoFRDMA:
-			_ = s.spdk.NvmfDeleteSubsystem(r.Context(), exp.SubsystemNQN)
-		case store.ExportProtocolISCSI:
-			_ = s.spdk.IscsiDeleteTargetNode(r.Context(), exp.TargetIQN)
-		}
-	}
-	writeJSON(w, http.StatusOK, map[string]any{})
 }
 
 // --- System & Metrics Handlers ---
@@ -1955,7 +1057,7 @@ func writeError(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, auth.ErrUnauthorized):
 		status = http.StatusUnauthorized
-	case errors.Is(err, auth.ErrForbidden):
+	case errors.Is(err, auth.ErrForbidden), errors.Is(err, auth.ErrPasswordChangeRequired):
 		status = http.StatusForbidden
 	case errors.Is(err, store.ErrNotFound):
 		status = http.StatusNotFound
@@ -1965,6 +1067,10 @@ func writeError(w http.ResponseWriter, err error) {
 		status = http.StatusConflict
 	case errors.Is(err, store.ErrInvalidArgument):
 		status = http.StatusBadRequest
+	case errors.Is(err, errDataPlaneUnavailable):
+		status = http.StatusServiceUnavailable
+	case errors.Is(err, spdk.ErrCBTUnsupported):
+		status = http.StatusNotImplemented
 	}
 	writeJSON(w, status, map[string]any{
 		"error": err.Error(),

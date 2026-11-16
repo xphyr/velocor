@@ -154,23 +154,28 @@ type Disk struct {
 
 // Pool aggregates one or more claimed Disks into an SPDK RAID bdev + lvol_store.
 type Pool struct {
-	ID                string       `json:"id"`
-	Name              string       `json:"name"`
-	RaidLevel         RaidLevel    `json:"raid_level"`
-	DiskIDs           []string     `json:"disk_ids"`
-	StripSizeKB       uint32       `json:"strip_size_kb"`
-	ClusterSizeBytes  uint32       `json:"cluster_size_bytes"`
-	BaseBdevName      string       `json:"base_bdev_name"`
-	EffectiveBdevName string       `json:"effective_bdev_name"`
-	LVSUUID           string       `json:"lvs_uuid"`
-	LVSName           string       `json:"lvs_name"`
-	TotalBytes        uint64       `json:"total_bytes"`
-	FreeBytes         uint64       `json:"free_bytes"`
-	AllocatedBytes    uint64       `json:"allocated_bytes"`
-	FilterPolicy      FilterPolicy `json:"filter_policy"`
-	HealthStatus      HealthStatus `json:"health_status"`
-	StatusMessage     string       `json:"status_message,omitempty"`
-	CreatedAt         time.Time    `json:"created_at"`
+	ID                string    `json:"id"`
+	Name              string    `json:"name"`
+	RaidLevel         RaidLevel `json:"raid_level"`
+	DiskIDs           []string  `json:"disk_ids"`
+	StripSizeKB       uint32    `json:"strip_size_kb"`
+	ClusterSizeBytes  uint32    `json:"cluster_size_bytes"`
+	BaseBdevName      string    `json:"base_bdev_name"`
+	EffectiveBdevName string    `json:"effective_bdev_name"`
+	// RaidSuperblock records whether the RAID bdev was created with an on-disk SPDK
+	// superblock. Superblock arrays are re-assembled by SPDK examine and must never be
+	// re-created by the reconciler; legacy arrays (false) must never be re-created
+	// with a superblock because that would shift the data offset.
+	RaidSuperblock bool         `json:"raid_superblock,omitempty"`
+	LVSUUID        string       `json:"lvs_uuid"`
+	LVSName        string       `json:"lvs_name"`
+	TotalBytes     uint64       `json:"total_bytes"`
+	FreeBytes      uint64       `json:"free_bytes"`
+	AllocatedBytes uint64       `json:"allocated_bytes"`
+	FilterPolicy   FilterPolicy `json:"filter_policy"`
+	HealthStatus   HealthStatus `json:"health_status"`
+	StatusMessage  string       `json:"status_message,omitempty"`
+	CreatedAt      time.Time    `json:"created_at"`
 }
 
 // Volume represents a logical volume (SPDK bdev_lvol) inside a Pool.
@@ -190,6 +195,7 @@ type Volume struct {
 	QosPolicy         QosPolicy         `json:"qos_policy"`
 	AttachmentState   AttachmentState   `json:"attachment_state"`
 	HealthStatus      HealthStatus      `json:"health_status"`
+	StatusMessage     string            `json:"status_message,omitempty"`
 	Labels            map[string]string `json:"labels,omitempty"`
 	CreatedAt         time.Time         `json:"created_at"`
 }
@@ -226,7 +232,9 @@ type Portal struct {
 	Protocol  ExportProtocol `json:"protocol"`
 	IPAddress string         `json:"ip_address"`
 	Port      uint32         `json:"port"`
-	CreatedAt time.Time      `json:"created_at"`
+	// IscsiPgTag is the SPDK iSCSI portal group tag for ISCSI portals (unique, allocated by the store).
+	IscsiPgTag int       `json:"iscsi_pg_tag,omitempty"`
+	CreatedAt  time.Time `json:"created_at"`
 }
 
 // Host represents a registered SAN initiator host (ESXi, Linux, Kubernetes worker)
@@ -269,17 +277,27 @@ type Export struct {
 	PortalIDs         []string       `json:"portal_ids"`
 	InitiatorGroupIDs []string       `json:"initiator_group_ids,omitempty"`
 	AllowAnyHost      bool           `json:"allow_any_host"`
-	HealthStatus      HealthStatus   `json:"health_status"`
-	CreatedAt         time.Time      `json:"created_at"`
+	// NodeID is the CSI node this export was published to (empty for manually created exports).
+	NodeID string `json:"node_id,omitempty"`
+	// IscsiIgTag is the SPDK iSCSI initiator group tag owned by this export (unique, allocated by the store).
+	IscsiIgTag    int          `json:"iscsi_ig_tag,omitempty"`
+	HealthStatus  HealthStatus `json:"health_status"`
+	StatusMessage string       `json:"status_message,omitempty"`
+	CreatedAt     time.Time    `json:"created_at"`
 }
 
 // AdminUser stores local user credentials and RBAC role.
 type AdminUser struct {
-	Username     string    `json:"username"`
-	PasswordHash string    `json:"password_hash"`
-	Role         Role      `json:"role,omitempty"`
-	CreatedAt    time.Time `json:"created_at,omitempty"`
-	UpdatedAt    time.Time `json:"updated_at"`
+	Username     string `json:"username"`
+	PasswordHash string `json:"password_hash"`
+	Role         Role   `json:"role,omitempty"`
+	// SessionsValidAfter revokes every session JWT issued before it (password change,
+	// role change, user deletion and re-creation).
+	SessionsValidAfter time.Time `json:"sessions_valid_after,omitempty"`
+	// MustChangePassword restricts the account to changing its password (bootstrap admin).
+	MustChangePassword bool      `json:"must_change_password,omitempty"`
+	CreatedAt          time.Time `json:"created_at,omitempty"`
+	UpdatedAt          time.Time `json:"updated_at"`
 }
 
 // ApiToken represents a scoped Personal/Service Access Token (velo_pat_...).

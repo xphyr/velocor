@@ -114,9 +114,10 @@ func TestHardwareDiscoveryBootGuardAndVFIOBinding(t *testing.T) {
 	mustWriteFile(t, filepath.Join(hpDir, "free_hugepages"), "0\n")
 
 	mgr, err := NewManager(Config{
-		SysfsRoot: sysfs,
-		ProcRoot:  procfs,
-		DevRoot:   devfs,
+		SysfsRoot:          sysfs,
+		ProcRoot:           procfs,
+		DevRoot:            devfs,
+		AllowUnsafeNoIOMMU: true,
 	})
 	if err != nil {
 		t.Fatalf("NewManager failed: %v", err)
@@ -136,7 +137,7 @@ func TestHardwareDiscoveryBootGuardAndVFIOBinding(t *testing.T) {
 	if err != nil {
 		t.Fatalf("DiscoverDisks failed: %v", err)
 	}
-	// Expect 5 disks: nvme-0000-00-04-0 (boot), nvme-0000-01-00-0 (data), ssd-sda (boot), ssd-sdb (data), ssd-sdd (virtual data).
+	// Expect 5 disks: nvme-0000-00-04-0 (boot), nvme-0000-01-00-0 (data), ssd-sda (boot), ssd-SSD-SDB-01 (data, serial-based ID), ssd-sdd (virtual data).
 	// Bare rotational HDD sdc must be ignored.
 	if len(disks) != 5 {
 		t.Fatalf("expected 5 disks, got %d: %+v", len(disks), disks)
@@ -156,8 +157,8 @@ func TestHardwareDiscoveryBootGuardAndVFIOBinding(t *testing.T) {
 	if !byID["ssd-sda"].IsBootDevice {
 		t.Fatalf("expected ssd-sda IsBootDevice=true")
 	}
-	if byID["ssd-sdb"].IsBootDevice || byID["ssd-sdb"].BlockSize != 4096 {
-		t.Fatalf("unexpected data SSD disk: %+v", byID["ssd-sdb"])
+	if byID["ssd-SSD-SDB-01"].IsBootDevice || byID["ssd-SSD-SDB-01"].BlockSize != 4096 {
+		t.Fatalf("unexpected data SSD disk: %+v", byID["ssd-SSD-SDB-01"])
 	}
 	if byID["ssd-sdd"] == nil || byID["ssd-sdd"].IsBootDevice {
 		t.Fatalf("expected virtual QEMU HARDDISK sdd to be discovered as non-boot: %+v", byID["ssd-sdd"])
