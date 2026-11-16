@@ -2,7 +2,7 @@
 
 **Velocor** is an open-source, API-first, all-flash SAN/NAS storage appliance distribution built on **SPDK** (Storage Performance Development Kit) and **Fedora Image Mode (`bootc`)**, written in Go.
 
-Velocor decouples the user-space block data plane (`spdk_tgt`) from the control plane (`velod`) using Podman Quadlet containers on a thin, immutable `fedora-bootc:45` host OS—enabling sub-second, zero-disruption control-plane upgrades while sustaining low-latency NVMe-oF and iSCSI I/O.
+Velocor decouples the user-space block data plane (`spdk_tgt`) from the control plane (`velod`) using Podman Quadlet containers on a thin, immutable `fedora-bootc:45` host OS—so the control plane can be upgraded or restarted without interrupting low-latency NVMe-oF and iSCSI I/O. (Updating the `spdk_tgt` data-plane container itself *does* interrupt I/O and is therefore never automatic.)
 
 ---
 
@@ -29,7 +29,7 @@ Velocor decouples the user-space block data plane (`spdk_tgt`) from the control 
 
 ## Core Components & Features
 
-- **`velod` (`cmd/velod`)**: Node control-plane daemon, hardware manager (`vfio-pci` & hugepages), transactional desired-state store (`bbolt`), background drift reconciler, and single-port (`:8443`) gRPC + REST/OpenAPI server, Prometheus `/metrics` endpoint, and embedded Web UI console.
+- **`velod` (`cmd/velod`)**: Node control-plane daemon, hardware manager (`vfio-pci` & hugepages), transactional desired-state store (`bbolt`), background drift reconciler, and single-port (`:8443`) REST/JSON + OpenAPI server, authenticated Prometheus `/metrics` endpoint, and embedded Web UI console.
 - **`veloctl` (`cmd/veloctl`)**: Operator CLI for managing users, tokens, disks, pools, volumes, snapshots, Changed Block Tracking (CBT), network portals, initiator groups, and exports.
 - **`velocor-spdk` (`spdk_tgt`)**: User-space, polled-mode SPDK `v26.09` data plane managing PCIe NVMe (`vfio-pci` / `bdev_nvme`) and SATA/SAS SSD (`io_uring` / `bdev_uring`) devices directly.
 - **`velocor-csi` (`cmd/velocor-csi`)**: Kubernetes CSI driver (`csi.velocor.io`) supporting dynamic NVMe-oF/TCP and iSCSI provisioning, online volume expansion, CoW snapshots, cloning, `VolumeGroupSnapshot`, and CSI `SnapshotMetadata` (KEP-3314 CBT).
@@ -46,7 +46,7 @@ Velocor decouples the user-space block data plane (`spdk_tgt`) from the control 
 |  +-------------------------------------+   +-----------------------------------+  |
 |  | velocor-velod.service (Quadlet)     |   | velocor-spdk.service (Quadlet)    |  |
 |  | - velod Control Plane (:8443 TLS)   |   | - spdk_tgt (User-Space Polled IO) |  |
-|  | - gRPC + REST + Embedded Web UI     |-->| - bdev_nvme (vfio-pci)            |  |
+|  | - REST + Embedded Web UI            |-->| - bdev_nvme (vfio-pci)            |  |
 |  | - bbolt DB (/var/lib/velocor/*.db)  |   | - bdev_uring (Linux io_uring)     |  |
 |  | - Reconciler & Hardware Manager     |   | - bdev_raid + lvol_store + lvol   |  |
 |  +-------------------------------------+   | - NVMe-oF/TCP (:4420) & iSCSI     |  |
@@ -194,8 +194,9 @@ You can run Velocor on an existing **Fedora 45+**, **RHEL / CentOS Stream 9/10**
    ublk_drv
    EOF
 
-   # Enable noiommu fallback only if running inside a VM without vIOMMU
-   echo "options vfio enable_unsafe_noiommu_mode=1" | sudo tee /etc/modprobe.d/velocor-vfio.conf
+   # Lab VMs without a vIOMMU only: velod refuses to bind NVMe drives without an IOMMU
+   # unless VELOCOR_ALLOW_UNSAFE_NOIOMMU=true is set in velocor-velod.container. Never
+   # enable this on production hardware: it lets SPDK DMA anywhere in host memory.
 
    # Allocate at least 1024 MiB of 2 MiB hugepages for SPDK
    echo "vm.nr_hugepages = 512" | sudo tee /etc/sysctl.d/90-velocor.conf
@@ -248,19 +249,21 @@ See [hack/vm-lab/README.md](hack/vm-lab/README.md) for environment overrides and
 ### 1. Access the Web UI or Authenticate `veloctl`
 
 - **Web UI Console**: Open `https://<appliance-ip>:8443` in your browser.
-- **Default Bootstrap Credentials**:
+- **Bootstrap Credentials**:
   - **Username**: `admin`
-  - **Password**: `velocor-admin-changeme` (unless overridden via `VELOCOR_INIT_PASSWORD` on first boot)
+  - **Password**: generated randomly on first boot and written to `/var/lib/velocor/initial-admin-password` (root-only), unless `VELOCOR_INIT_PASSWORD` is set on first boot. There is no shared default password.
+  - The bootstrap password must be changed at first login; until then the API only allows changing it. Delete the file afterwards.
 
 Authenticate via `veloctl` (session token is saved to `~/.config/velocor/token`):
 
 ```bash
 export VELOCOR_ENDPOINT="https://<appliance-ip>:8443"
 
-veloctl login --username admin --password velocor-admin-changeme
+sudo cat /var/lib/velocor/initial-admin-password   # on the appliance
+veloctl login --username admin --password '<bootstrap-password>'
 
-# Recommended: change the default admin password immediately
-veloctl user update --username admin --password "<new-strong-password>"
+# Required before any other API call: replace the bootstrap password
+# (or simply sign in to the Web UI, which prompts for it)
 
 # Check appliance health, SPDK connection, and hugepage status
 veloctl system status
@@ -378,14 +381,15 @@ kubectl create namespace velocor-csi
 kubectl -n velocor-csi create secret generic velocor-csi-auth \
   --from-literal=VELOCOR_ENDPOINT="https://<velocor-appliance-ip>:8443" \
   --from-literal=VELOCOR_TOKEN="velo_pat_<your-token>" \
-  --from-literal=VELOCOR_INSECURE="true"
+  --from-file=VELOCOR_CA_CERT=./velocor-tls.crt   # copy of /var/lib/velocor/tls.crt from the appliance
 ```
 
 | Environment Key | Description |
 | :--- | :--- |
 | `VELOCOR_ENDPOINT` | Base HTTPS URL of the `velod` API on the Velocor appliance (e.g., `https://10.0.2.15:8443`). |
 | `VELOCOR_TOKEN` | Personal/Service Access Token (`velo_pat_...`) with role `CSI_PROVISIONER` or `ADMIN`. |
-| `VELOCOR_INSECURE` | Set to `"true"` when using the appliance's auto-generated self-signed TLS certificate, or `"false"` if using a trusted CA certificate. |
+| `VELOCOR_CA_CERT` | PEM certificate used to verify the appliance. For the auto-generated self-signed certificate, use the contents of `/var/lib/velocor/tls.crt`. Not needed when the appliance uses a certificate from a CA the cluster already trusts. |
+| `VELOCOR_INSECURE` | Optional. `"true"` disables TLS verification entirely, exposing the API token to anyone on the network path. Lab use only. |
 
 ---
 
