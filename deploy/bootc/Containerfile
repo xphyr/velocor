@@ -71,6 +71,16 @@ RUN chmod 0440 /etc/sudoers.d/velocor-admin && \
     sshd -t -f /etc/ssh/sshd_config -h /tmp/check-hostkey && \
     rm -f /tmp/check-hostkey /tmp/check-hostkey.pub
 
+# ostree owns /boot (a bind mount of the root filesystem's /boot). On UEFI machines
+# systemd-gpt-auto-generator would also put an automount for the EFI System Partition on /boot;
+# it shadows ostree's mount and expires, so at shutdown ostree-finalize-staged cannot remount
+# /boot read-write and every staged upgrade is silently dropped. Turn the generator off: by
+# kernel argument (bootc applies kargs.d on install and upgrade) and by masking it, which also
+# covers the first boot after upgrading from an image without the argument.
+RUN mkdir -p /usr/lib/bootc/kargs.d /etc/systemd/system-generators && \
+    printf 'kargs = ["systemd.gpt_auto=0"]\n' > /usr/lib/bootc/kargs.d/10-velocor.toml && \
+    ln -sf /dev/null /etc/systemd/system-generators/systemd-gpt-auto-generator
+
 # Install ESXi-style appliance console splash banner (/etc/issue)
 COPY deploy/bootc/velocor-console-banner.sh /usr/libexec/velocor-console-banner
 COPY deploy/bootc/velocor-console.service /usr/lib/systemd/system/velocor-console.service

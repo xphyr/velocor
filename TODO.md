@@ -130,7 +130,10 @@ work still open, ranked by risk to data, how fixes are verified, and what has be
 
 - [ ] **P1-7. OS lifecycle.** `bootc upgrade` runs inside the HTTP request (minutes) and should
   be a tracked background job. Reboot doesn't stop exports or SPDK cleanly first, and doesn't
-  warn about connected hosts.
+  warn about connected hosts. **A failed upgrade is silent:** if the staged deployment isn't
+  finalized at shutdown, the appliance simply boots the old version. velod should remember the
+  image it staged and, after the reboot, warn when the booted image differs (seen on velocor-1,
+  see the UEFI `/boot` fix below).
 
 - [ ] **P1-8. A RAID1 missing a member at startup is not served. (Verified)** SPDK keeps a
   superblock RAID1 in `configuring` until every member is present; it does not start degraded.
@@ -318,6 +321,11 @@ code. Each now has a real-SPDK scenario and a matching unit test.
 ### Other second-review fixes
 
 - [x] **P0-5.** SPDK was killed 10 s into every shutdown (podman default): `StopTimeout=120`.
+- [x] **Upgrades silently failed on UEFI appliances.** systemd-gpt-auto-generator put an
+  automount for the EFI System Partition on `/boot`, shadowing ostree's bind mount; at shutdown
+  `ostree-finalize-staged` failed with "Remounting /boot read-write: Invalid argument" and the
+  appliance rebooted into the old version (velocor-1, 2026-11-16; BIOS installs unaffected).
+  The OS image now sets `systemd.gpt_auto=0` (bootc kargs.d) and masks the generator.
 - [x] **P1-2.** A failed resume after a group snapshot left I/O paused forever: resume is now
   retried with backoff. (A velod crash between pause and resume can still leave a subsystem
   paused; SPDK doesn't expose pause state.)
