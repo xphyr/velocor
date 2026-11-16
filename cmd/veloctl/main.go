@@ -599,7 +599,7 @@ func runPool(cfg *cliConfig, args []string) error {
 		name := fs.String("name", "", "Pool name")
 		raid := fs.String("raid", "RAID0", "RAID level: RAID0 | RAID1 (RAID10 is not supported yet)")
 		disksCSV := fs.String("disks", "", "Comma-separated disk IDs")
-		clusterSz := fs.Uint("cluster-size", 65536, "SPDK lvol_store cluster size in bytes (default 64 KiB)")
+		clusterSz := fs.Uint("cluster-size", 1<<20, "SPDK lvol_store cluster size in bytes (default 1 MiB; smaller clusters mean much more metadata and slower recovery)")
 		_ = fs.Parse(args[1:])
 		if *name == "" || *disksCSV == "" {
 			return fmt.Errorf("--name and --disks are required")

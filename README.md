@@ -306,12 +306,12 @@ veloctl disk claim nvme-0000-00-04-0
 ### 3. Create a Storage Pool & Network Portal
 
 ```bash
-# Create an SPDK RAID1 pool with a 64 KiB cluster size
+# Create an SPDK RAID1 pool (1 MiB clusters, the default)
 veloctl pool create \
   --name flash-pool-0 \
   --raid RAID1 \
   --disks nvme-0000-00-03-0,nvme-0000-00-04-0 \
-  --cluster-size 65536
+  --cluster-size 1048576
 
 veloctl pool list
 

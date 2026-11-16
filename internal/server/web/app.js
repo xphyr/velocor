@@ -446,7 +446,7 @@ async function createPoolDialog() {
       { name: "level", kind: "radio", label: "RAID level", value: "RAID1", options: RAID_LEVELS },
       { name: "disks", kind: "checks", label: "Disks", options: free.map((d) => ({ value: d.id, label: `${d.name || d.id} (${d.type}, ${humanSize(d.size_bytes)})` })), empty: "No claimed disks are free. Claim some on the Disks screen first." },
       { name: "strip", label: "Strip size", when: (v) => v.level !== "RAID1", value: "64", options: ["16", "32", "64", "128", "256"].map((k) => ({ value: k, label: `${k} KiB` })) },
-      { name: "cluster", label: "Cluster size", value: String(64 * 1024), hint: "The unit of thin allocation.",
+      { name: "cluster", label: "Cluster size", value: String(1 << 20), hint: "The unit of thin allocation. Smaller clusters cost much more metadata and make recovery after a crash slower.",
         options: [[64 * 1024, "64 KiB"], [1 << 20, "1 MiB"], [4 << 20, "4 MiB"]].map(([v, l]) => ({ value: String(v), label: l })) },
     ],
     action: (v) => send("POST", "/pools", { name: v.name, raid_level: v.level, disk_ids: v.disks, strip_size_kb: Number(v.strip), cluster_size_bytes: Number(v.cluster) }),

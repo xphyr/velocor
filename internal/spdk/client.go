@@ -34,6 +34,8 @@ var longRunningMethods = map[string]bool{
 	"bdev_lvol_resize":          true,
 	"bdev_raid_create":          true,
 	"bdev_raid_delete":          true,
+	// Loading a volume store after an unclean stop replays its whole metadata area.
+	"bdev_wait_for_examine": true,
 }
 
 // RPCError represents a JSON-RPC 2.0 error returned by spdk_tgt.

@@ -167,7 +167,10 @@ func (m *LinuxMounter) ConnectTarget(ctx context.Context, publishCtx map[string]
 		if proto == "NVMEOF_RDMA" {
 			trtype = "rdma"
 		}
-		args := []string{"connect", "-t", trtype, "-a", ip, "-s", port, "-n", nqn}
+		// Keep reconnecting for as long as it takes: an appliance or data-plane restart (which
+		// can include volume-store recovery) must stall I/O, not fail it. With the kernel's
+		// default ctrl_loss_tmo (600 s) pods got I/O errors during a 16-minute recovery.
+		args := []string{"connect", "-t", trtype, "-a", ip, "-s", port, "-n", nqn, "--ctrl-loss-tmo=-1", "--reconnect-delay=5"}
 		if hostNQN != "" {
 			args = append(args, "-q", hostNQN, "-I", deterministicHostID(hostNQN))
 		}

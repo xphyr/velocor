@@ -99,9 +99,13 @@ const (
 	RoleReadOnly       Role = "READONLY"
 )
 
-// DefaultClusterSizeBytes is the default SPDK lvol_store cluster size (64 KiB)
-// used to optimize thin provisioning and Changed Block Tracking (CBT).
-const DefaultClusterSizeBytes uint32 = 64 * 1024
+// DefaultClusterSizeBytes is the default SPDK lvol_store cluster size (1 MiB).
+//
+// SPDK reserves one metadata page (4 KiB) per cluster, and after an unclean stop recovery reads
+// all of them: with 64 KiB clusters a 500 GB pool carried ~30 GiB of metadata (6% of the pool)
+// and took 16 minutes to recover on velocor-1, long enough for hosts to give up. 1 MiB keeps
+// that to ~0.4% and about a minute, while thin allocation stays fine-grained.
+const DefaultClusterSizeBytes uint32 = 1 << 20
 
 // FilterPolicy defines stackable SPDK filter bdev layers (crypto / compression).
 type FilterPolicy struct {

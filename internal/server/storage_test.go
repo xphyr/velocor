@@ -124,7 +124,11 @@ func TestStorageEndToEndAndCBT(t *testing.T) {
 	if code, _ := h.do("POST", "/api/v1/disks/nvme-boot:claim", h.admin, nil); code != http.StatusConflict {
 		t.Fatalf("claiming the boot disk must fail with 409, got %d", code)
 	}
-	poolID := h.pool("pool0", "RAID0", "nvme-data1")
+	// 64 KiB clusters: the extents below are checked at that granularity.
+	h.expect(h.do("POST", "/api/v1/disks/nvme-data1:claim", h.admin, nil))(http.StatusOK)
+	poolID := field(h.expect(h.do("POST", "/api/v1/pools", h.admin, map[string]any{
+		"name": "pool0", "raid_level": "RAID0", "disk_ids": []string{"nvme-data1"}, "cluster_size_bytes": 65536,
+	}))(http.StatusCreated), "pool", "id").(string)
 	pool, _ := h.st.GetPool(poolID)
 	if pool.LVSUUID == "" || pool.HealthStatus != store.HealthStatusOnline {
 		t.Fatalf("pool not fully initialised: %+v", pool)

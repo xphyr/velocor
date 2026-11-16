@@ -351,6 +351,16 @@ code. Each now has a real-SPDK scenario and a matching unit test.
 ### Other second-review fixes
 
 - [x] **P0-5.** SPDK was killed 10 s into every shutdown (podman default): `StopTimeout=120`.
+- [x] **A data-plane restart failed I/O on every host** (NVW, 2026-11-16). SPDK was killed
+  (its stop hung on the wedged iSCSI target, P1-10), and recovering the three volume stores
+  took 16 minutes, because 64 KiB clusters mean one 4 KiB metadata page per 64 KiB of pool:
+  ~30 GiB of metadata per 500 GB, all read during recovery (and 6% of capacity lost). Hosts
+  connected with the kernel's default `ctrl_loss_tmo` (600 s) gave up and pods got EIO. Data
+  was intact afterwards (both test volumes verified by checksum after remount). Fixed: default
+  cluster size 1 MiB (~0.4% metadata); the CSI driver connects with `--ctrl-loss-tmo=-1
+  --reconnect-delay=5` so I/O stalls instead of failing; `bdev_wait_for_examine` gets the long
+  RPC timeout. Still open: iSCSI's `replacement_timeout` (120 s default) has the same effect for
+  iSCSI hosts, and velod should report "recovering" rather than DEGRADED while volume stores load.
 - [x] **P1-11. One stuck volume blocked the whole CSI node** (NVW, 2026-11-16): the node plugin
   serialized every stage/publish on one mutex, so a hung iSCSI format made the node's NVMe
   volumes time out too. Now per-volume locks (a busy volume answers Aborted, which the sidecars
