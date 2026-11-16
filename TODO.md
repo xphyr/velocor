@@ -54,7 +54,7 @@ Mark `[x]` when fixed **and** covered by a test. "HW" = needs verification on re
 - [x] **S2. JWT not revocable** — re-check user existence/role/password-change epoch per request
 - [x] **S3. Default admin password** `velocor-admin-changeme` — generate random first-boot password / force change
 - [x] **S4. Login rate limiting**
-- [x] **S5. Password hashing** — replace iterated SHA-256 with argon2id/bcrypt (migrate on login)
+- [x] **S5. Password hashing** — replace iterated SHA-256 with PBKDF2-SHA256 (600k iterations, stdlib)
 - [x] **S6. `/metrics` unauthenticated**
 - [x] **S7. Helm chart defaults `insecure: "true"`**
 - [x] **S8. Request body limits + HTTP server Read/Write/Idle timeouts**
@@ -78,14 +78,13 @@ Mark `[x]` when fixed **and** covered by a test. "HW" = needs verification on re
 
 - [ ] **F1.** HW: confirm `bdev_raid_delete` on a superblock RAID wipes member superblocks; otherwise released disks auto-assemble an orphan array on next attach.
 - [ ] **F2.** HW: confirm SPDK assembles a superblock RAID1/5F *degraded* when a member is missing at boot (pool currently reported DEGRADED, never re-created).
-- [ ] **F3.** Legacy SSD records without a serial number cannot be migrated to stable IDs automatically (still use `/dev/sdX`); needs a manual re-claim.
-- [ ] **F4.** Legacy iSCSI exports created by older releases share portal group tag 1; first reconcile after upgrade reports DEGRADED until spdk_tgt is restarted once.
 - [ ] **F5.** Reconciler `EnsureExport` lists subsystems/target nodes per export (O(n²) RPCs); prefetch once per pass if export counts grow.
 - [x] **F6.** Web UI / veloctl: surface `force=true` for disk claim, `allow_any_host` for exports, `status_message`, forced initial password change, data-plane update consent.
 
 - [ ] **F7.** Auth/server test suites are slow (~50-100 s under `-race`) because every login runs 600k PBKDF2 iterations; consider a test-only iteration override.
-- [ ] **F8.** Upgrade note: legacy pools keep `RaidSuperblock=false` (re-created by the reconciler as before, never converted). Migrating them to superblock arrays requires a data migration, not an in-place flag flip.
 - [x] **F9.** Session revocation precision: `iat` was second- (then millisecond-) granular, so a token issued just before a password/role change survived it. Now nanosecond `iat_ns`.
+
+- [x] **F10.** Pre-release cleanup: removed all migration/compatibility code (legacy SSD ID migration, iSCSI tag backfill, non-superblock RAID re-creation, reconciler lvstore initialisation, v1 password hashes, second-granular JWTs, legacy CSI export attribution, duplicate CBT routes, whole-record `Update*` store methods).
 
 ## Testing
 

@@ -126,7 +126,7 @@ func TestStorageEndToEndAndCBT(t *testing.T) {
 	}
 	poolID := h.pool("pool0", "RAID0", "nvme-data1")
 	pool, _ := h.st.GetPool(poolID)
-	if !pool.RaidSuperblock || pool.LVSUUID == "" || pool.HealthStatus != store.HealthStatusOnline {
+	if pool.LVSUUID == "" || pool.HealthStatus != store.HealthStatusOnline {
 		t.Fatalf("pool not fully initialised: %+v", pool)
 	}
 
@@ -151,10 +151,8 @@ func TestStorageEndToEndAndCBT(t *testing.T) {
 		snaps = append(snaps, field(resp, "snapshot", "id").(string))
 	}
 
-	// Both the legacy route and the one the CSI client uses must work, with length_bytes.
 	for _, path := range []string{
 		"/api/v1/snapshots/" + snaps[2] + "/blocks:changed?base_snapshot_id=" + snaps[0],
-		"/api/v1/snapshots/" + snaps[2] + ":changed-blocks?base_snapshot_id=" + snaps[0],
 	} {
 		resp := h.expect(h.do("GET", path, csi, nil))(http.StatusOK)
 		ext := resp["extents"].([]any)
@@ -166,7 +164,7 @@ func TestStorageEndToEndAndCBT(t *testing.T) {
 			t.Fatalf("%s: want offset 64KiB length 128KiB, got %v", path, e)
 		}
 	}
-	resp := h.expect(h.do("GET", "/api/v1/snapshots/"+snaps[0]+":allocated-blocks", csi, nil))(http.StatusOK)
+	resp := h.expect(h.do("GET", "/api/v1/snapshots/"+snaps[0]+"/blocks:allocated", csi, nil))(http.StatusOK)
 	if ext := resp["extents"].([]any); len(ext) != 1 || ext[0].(map[string]any)["length_bytes"].(float64) != 65536 {
 		t.Fatalf("allocated blocks of s1 wrong: %v", resp)
 	}

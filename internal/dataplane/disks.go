@@ -64,11 +64,7 @@ func AttachDisk(ctx context.Context, c *spdk.Client, hw *hardware.Manager, d *st
 		if d.DevicePath == "" {
 			return "", "", fmt.Errorf("%w: disk %s has no device path", store.ErrInvalidArgument, d.ID)
 		}
-		name := d.SPDKBdevName // keep a previously assigned name stable across restarts
-		if name == "" {
-			name = UringBdevName(d)
-		}
-		name, err := c.BdevUringCreate(ctx, name, d.DevicePath, d.BlockSize)
+		name, err := c.BdevUringCreate(ctx, UringBdevName(d), d.DevicePath, d.BlockSize)
 		if err != nil {
 			return "", "", fmt.Errorf("create io_uring bdev for %s: %w", d.DevicePath, err)
 		}

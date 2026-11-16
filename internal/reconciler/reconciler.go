@@ -29,10 +29,10 @@ type State struct {
 // toward the desired state persisted in bbolt.
 //
 // Safety rules (see TODO C1):
-//   - It never initialises an lvstore for a pool that has ever had one (LVSUUID set).
-//   - It never creates an lvol for a volume record; a missing lvol is reported FAULTED,
-//     because re-creating it would hand hosts a blank disk under the old identity.
-//   - It never re-creates a superblock RAID; SPDK examine assembles those itself.
+//   - It never creates RAID bdevs, lvstores or lvols. Pools are created atomically by the
+//     API with an on-disk RAID superblock, so after a restart SPDK examine re-assembles the
+//     array and loads its lvstore; anything still missing is reported, never re-created,
+//     because re-creating it would hand hosts blank storage under the old identity.
 //   - It only writes store records whose observed status actually changed, and only the
 //     status fields it owns, via atomic Mutate* calls.
 type Reconciler struct {
@@ -292,7 +292,7 @@ func (r *Reconciler) reconcilePools(ctx context.Context, p *pass, examined bool)
 			p.degrade(res, reason)
 		}
 
-		// 1. RAID bdev.
+		// 1. RAID bdev (assembled by SPDK examine from its on-disk superblock).
 		ri := slices.IndexFunc(raids, func(rb spdk.RaidBdevInfo) bool { return rb.Name == pool.BaseBdevName })
 		raidOnline := false
 		switch {
@@ -301,82 +301,33 @@ func (r *Reconciler) reconcilePools(ctx context.Context, p *pass, examined bool)
 		case ri >= 0:
 			fail(store.HealthStatusDegraded, fmt.Sprintf("RAID %s is %s (%d/%d members present)",
 				pool.BaseBdevName, raids[ri].State, raids[ri].NumBaseBdevsDiscovered, raids[ri].NumBaseBdevs))
-		case pool.RaidSuperblock:
+		default:
 			fail(store.HealthStatusDegraded, fmt.Sprintf("RAID %s not assembled by SPDK examine (%d/%d member bdevs present)",
 				pool.BaseBdevName, r.presentMembers(pool, bdevs), len(pool.DiskIDs)))
-		default:
-			// Legacy array without superblock: SPDK cannot assemble it, so re-create it with the
-			// exact original geometry and member order. superblock=false is mandatory here.
-			members, ok := r.memberBdevs(pool, bdevs)
-			if !ok {
-				fail(store.HealthStatusDegraded, fmt.Sprintf("waiting for member disk SPDK bdevs (%d/%d ready)", len(members), len(pool.DiskIDs)))
-				break
-			}
-			if err := r.spdk.BdevRaidCreate(ctx, pool.BaseBdevName, string(pool.RaidLevel), pool.StripSizeKB, members, false); err != nil {
-				fail(store.HealthStatusDegraded, fmt.Sprintf("re-create legacy RAID %s: %v", pool.BaseBdevName, err))
-				break
-			}
-			p.repaired++
-			raidOnline = true
-			// The re-created RAID must be examined before we look for its lvstore.
-			if err := r.spdk.BdevWaitForExamine(ctx); err != nil {
-				examined = false
-			}
-			if fresh, err := r.spdk.BdevLvolGetLvstores(ctx, "", ""); err == nil {
-				lvstores = fresh
-			} else {
-				examined = false
-			}
-			if fresh, err := r.bdevSet(ctx); err == nil {
-				bdevs = fresh
-			}
-		}
-		if raidOnline && pool.EffectiveBdevName != pool.BaseBdevName {
-			if _, ok := bdevs[pool.EffectiveBdevName]; !ok {
-				raidOnline = false
-				fail(store.HealthStatusDegraded, fmt.Sprintf("filter bdev %s is not present", pool.EffectiveBdevName))
-			}
 		}
 
 		// 2. lvstore.
 		var lvs *spdk.LvolStoreInfo
 		for i := range lvstores {
-			if (pool.LVSUUID != "" && lvstores[i].UUID == pool.LVSUUID) || (pool.LVSUUID == "" && lvstores[i].Name == pool.LVSName) {
+			if lvstores[i].UUID == pool.LVSUUID {
 				lvs = &lvstores[i]
 			}
 		}
-		newLVSUUID := pool.LVSUUID
 		switch {
-		case lvs != nil:
-		case !raidOnline:
-			// Already reported; never touch lvstores on an incomplete array.
-		case pool.LVSUUID != "":
-			if slices.ContainsFunc(lvstores, func(l spdk.LvolStoreInfo) bool { return l.Name == pool.LVSName }) {
-				fail(store.HealthStatusFaulted, fmt.Sprintf("lvstore %s has a different UUID than recorded (%s); it may have been re-initialised", pool.LVSName, pool.LVSUUID))
-			} else {
-				fail(store.HealthStatusFaulted, fmt.Sprintf("lvstore %s (%s) not found on %s; refusing to re-initialise it because that would destroy all volumes",
-					pool.LVSName, pool.LVSUUID, pool.EffectiveBdevName))
-			}
+		case lvs != nil || !raidOnline:
+			// Missing RAID already reported; never inspect lvstores on an incomplete array.
+		case pool.LVSUUID == "":
+			fail(store.HealthStatusFaulted, "pool has no lvstore UUID; its creation never completed")
 		case !examined:
-			fail(store.HealthStatusDegraded, "waiting for SPDK examine to complete before initialising lvstore")
+			fail(store.HealthStatusDegraded, "waiting for SPDK examine to load lvstore "+pool.LVSName)
+		case slices.ContainsFunc(lvstores, func(l spdk.LvolStoreInfo) bool { return l.Name == pool.LVSName }):
+			fail(store.HealthStatusFaulted, fmt.Sprintf("lvstore %s has a different UUID than recorded (%s); it may have been re-initialised", pool.LVSName, pool.LVSUUID))
 		default:
-			// The pool was never successfully initialised (no lvstore UUID ever recorded) and
-			// examine found nothing on the bdev: initialising is safe.
-			uuid, err := r.spdk.BdevLvolCreateLvstore(ctx, pool.EffectiveBdevName, pool.LVSName, pool.ClusterSizeBytes, "")
-			if err != nil {
-				fail(store.HealthStatusDegraded, fmt.Sprintf("initialise lvstore %s: %v", pool.LVSName, err))
-				break
-			}
-			p.repaired++
-			newLVSUUID = uuid
-			if fresh, err := r.spdk.BdevLvolGetLvstores(ctx, "", uuid); err == nil && len(fresh) > 0 {
-				lvs = &fresh[0]
-			}
+			fail(store.HealthStatusFaulted, fmt.Sprintf("lvstore %s (%s) not found on %s", pool.LVSName, pool.LVSUUID, pool.BaseBdevName))
 		}
 
 		var total, free uint64
 		if lvs != nil {
-			newLVSUUID = lvs.UUID
 			cs := uint64(lvs.ClusterSize)
 			if cs == 0 {
 				cs = uint64(pool.ClusterSizeBytes)
@@ -388,7 +339,7 @@ func (r *Reconciler) reconcilePools(ctx context.Context, p *pass, examined bool)
 		}
 		msg := strings.Join(reasons, "; ")
 		_, err := r.store.MutatePool(pool.ID, func(cur *store.Pool) error {
-			changed := cur.HealthStatus != health || cur.StatusMessage != msg || cur.LVSUUID != newLVSUUID
+			changed := cur.HealthStatus != health || cur.StatusMessage != msg
 			if lvs != nil && (cur.TotalBytes != total || cur.FreeBytes != free) {
 				changed = true
 				cur.TotalBytes, cur.FreeBytes = total, free
@@ -400,7 +351,7 @@ func (r *Reconciler) reconcilePools(ctx context.Context, p *pass, examined bool)
 			if !changed {
 				return store.ErrSkipWrite
 			}
-			cur.HealthStatus, cur.StatusMessage, cur.LVSUUID = health, msg, newLVSUUID
+			cur.HealthStatus, cur.StatusMessage = health, msg
 			return nil
 		})
 		if err != nil {
@@ -449,14 +400,7 @@ func (r *Reconciler) reconcileVolumes(ctx context.Context, p *pass, poolOnline m
 	for _, vol := range volumes {
 		res := "volume:" + vol.ID
 		health, msg := store.HealthStatusOnline, ""
-		uuid := vol.UUID
-		var info spdk.BdevInfo
-		found := false
-		if vol.UUID != "" {
-			info, found = bdevs[vol.UUID]
-		} else {
-			info, found = bdevs[vol.LvolBdevName]
-		}
+		info, found := bdevs[vol.UUID]
 
 		switch {
 		case !poolOnline[vol.PoolID]:
@@ -467,9 +411,6 @@ func (r *Reconciler) reconcileVolumes(ctx context.Context, p *pass, poolOnline m
 			msg = fmt.Sprintf("lvol %s (%s) is missing from its lvstore; not re-creating it because that would present an empty disk", vol.LvolBdevName, vol.UUID)
 			p.degrade(res, msg)
 		default:
-			if uuid == "" {
-				uuid = info.UUID // backfill records created before UUIDs were tracked
-			}
 			if vol.EffectiveBdevName != vol.LvolBdevName {
 				if _, ok := bdevs[vol.EffectiveBdevName]; !ok {
 					health, msg = store.HealthStatusDegraded, fmt.Sprintf("filter bdev %s is not present", vol.EffectiveBdevName)
@@ -495,10 +436,10 @@ func (r *Reconciler) reconcileVolumes(ctx context.Context, p *pass, poolOnline m
 		}
 
 		if _, err := r.store.MutateVolume(vol.ID, func(cur *store.Volume) error {
-			if cur.HealthStatus == health && cur.StatusMessage == msg && cur.UUID == uuid {
+			if cur.HealthStatus == health && cur.StatusMessage == msg {
 				return store.ErrSkipWrite
 			}
-			cur.HealthStatus, cur.StatusMessage, cur.UUID = health, msg, uuid
+			cur.HealthStatus, cur.StatusMessage = health, msg
 			return nil
 		}); err != nil && !errors.Is(err, store.ErrNotFound) {
 			p.errs = append(p.errs, fmt.Sprintf("update volume %s: %v", vol.ID, err))

@@ -317,7 +317,7 @@ func (c *HTTPClient) CloneSnapshot(ctx context.Context, snapID, cloneName string
 
 func (c *HTTPClient) GetSnapshotAllocatedBlocks(ctx context.Context, snapID string) (*BlockMetadataResult, error) {
 	var resp BlockMetadataResult
-	err := c.doJSON(ctx, http.MethodGet, "/api/v1/snapshots/"+url.PathEscape(snapID)+":allocated-blocks", nil, &resp)
+	err := c.doJSON(ctx, http.MethodGet, "/api/v1/snapshots/"+url.PathEscape(snapID)+"/blocks:allocated", nil, &resp)
 	return &resp, err
 }
 
@@ -325,7 +325,7 @@ func (c *HTTPClient) GetSnapshotChangedBlocks(ctx context.Context, targetSnapID,
 	var resp BlockMetadataResult
 	q := url.Values{}
 	q.Set("base_snapshot_id", baseSnapID)
-	err := c.doJSON(ctx, http.MethodGet, "/api/v1/snapshots/"+url.PathEscape(targetSnapID)+":changed-blocks?"+q.Encode(), nil, &resp)
+	err := c.doJSON(ctx, http.MethodGet, "/api/v1/snapshots/"+url.PathEscape(targetSnapID)+"/blocks:changed?"+q.Encode(), nil, &resp)
 	return &resp, err
 }
 

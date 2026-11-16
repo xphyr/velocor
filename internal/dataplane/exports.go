@@ -21,8 +21,7 @@ import (
 	"github.com/velocor/velocor/internal/store"
 )
 
-// ErrNoInitiators is returned when an export would be reachable by nobody (or, for
-// iSCSI in older releases, silently by everybody). Callers must either supply
+// ErrNoInitiators is returned when an export would be reachable by nobody. Callers must either supply
 // initiator groups that resolve to at least one initiator, or set AllowAnyHost.
 var ErrNoInitiators = errors.New("export has no initiators; add an initiator group or set allow_any_host explicitly")
 
@@ -326,7 +325,7 @@ func ensureIscsi(ctx context.Context, c *spdk.Client, exp *store.Export, vol *st
 				return fmt.Errorf("iscsi portal group %d does not contain %s:%s", p.IscsiPgTag, want.Host, want.Port)
 			}
 		} else if err := c.IscsiCreatePortalGroup(ctx, p.IscsiPgTag, []spdk.IscsiPortal{want}); err != nil {
-			return fmt.Errorf("create iscsi portal group %d for %s:%s (if an older release created this portal under another tag, restart spdk_tgt once to migrate): %w",
+			return fmt.Errorf("create iscsi portal group %d for %s:%s: %w",
 				p.IscsiPgTag, want.Host, want.Port, err)
 		} else {
 			pgs = append(pgs, spdk.IscsiPortalGroup{Tag: p.IscsiPgTag, Portals: []spdk.IscsiPortal{want}})

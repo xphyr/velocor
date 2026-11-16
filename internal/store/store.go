@@ -56,7 +56,6 @@ type Store interface {
 	CreatePool(pool *Pool) error
 	GetPool(id string) (*Pool, error)
 	GetPoolByName(name string) (*Pool, error)
-	UpdatePool(pool *Pool) error
 	// MutatePool atomically applies fn to the current Pool record inside one transaction.
 	MutatePool(id string, fn func(*Pool) error) (*Pool, error)
 	// CheckPoolDeletable returns nil if DeletePool(id) would currently succeed.
@@ -68,7 +67,6 @@ type Store interface {
 	CreateVolume(vol *Volume) error
 	GetVolume(id string) (*Volume, error)
 	GetVolumeByName(poolID, name string) (*Volume, error)
-	UpdateVolume(vol *Volume) error
 	// MutateVolume atomically applies fn to the current Volume record inside one transaction.
 	MutateVolume(id string, fn func(*Volume) error) (*Volume, error)
 	// CheckVolumeDeletable returns nil if DeleteVolume(id) would currently succeed.
@@ -118,7 +116,6 @@ type Store interface {
 	CreateExport(exp *Export) error
 	GetExport(id string) (*Export, error)
 	GetExportByName(name string) (*Export, error)
-	UpdateExport(exp *Export) error
 	// MutateExport atomically applies fn to the current Export record inside one transaction.
 	MutateExport(id string, fn func(*Export) error) (*Export, error)
 	ListExports(volumeID string, protocolFilter ExportProtocol) ([]*Export, error)

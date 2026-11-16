@@ -271,24 +271,21 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 	if err != nil {
 		return nil, mapAPIError(err)
 	}
-	igs, err := s.client.ListInitiatorGroups(ctx)
-	if err != nil {
-		return nil, mapAPIError(err)
-	}
-
 	// Exports are per (volume, node). Every access mode we support is single-node, so a
 	// volume already published to a different node must not be handed to this one.
 	for _, exp := range exports {
 		if exp.VolumeID != vol.ID {
 			continue
 		}
-		owner := exportNodeID(exp, igs)
-		if owner == req.GetNodeId() || (exp.NodeID == "" && owner == sanitizeName(req.GetNodeId())) {
+		if exp.NodeID == req.GetNodeId() {
 			return &csi.ControllerPublishVolumeResponse{
 				PublishContext: buildPublishContext(exp, exportPortal(exp, portals), vol),
 			}, nil
 		}
-		return nil, status.Errorf(codes.FailedPrecondition, "volume %s is already published to node %q", vol.ID, owner)
+		if exp.NodeID == "" {
+			return nil, status.Errorf(codes.FailedPrecondition, "volume %s has a non-CSI export %s", vol.ID, exp.ID)
+		}
+		return nil, status.Errorf(codes.FailedPrecondition, "volume %s is already published to node %q", vol.ID, exp.NodeID)
 	}
 
 	var portal *store.Portal
@@ -332,22 +329,6 @@ func exportNameFor(volID, nodeID string) string {
 	return "csi-" + volID + "-" + hex.EncodeToString(sum[:6])
 }
 
-// exportNodeID returns the CSI node an export belongs to. Exports created by older releases
-// carry no NodeID; they are attributed via their per-node "csi-node-<node>" initiator group.
-func exportNodeID(exp *store.Export, igs []*store.InitiatorGroup) string {
-	if exp.NodeID != "" {
-		return exp.NodeID
-	}
-	for _, gid := range exp.InitiatorGroupIDs {
-		for _, g := range igs {
-			if g.ID == gid && strings.HasPrefix(g.Name, "csi-node-") {
-				return strings.TrimPrefix(g.Name, "csi-node-")
-			}
-		}
-	}
-	return ""
-}
-
 func exportPortal(exp *store.Export, portals []*store.Portal) *store.Portal {
 	for _, pid := range exp.PortalIDs {
 		for _, p := range portals {
@@ -371,18 +352,13 @@ func (s *ControllerServer) ControllerUnpublishVolume(ctx context.Context, req *c
 	if err != nil {
 		return nil, mapAPIError(err)
 	}
-	igs, err := s.client.ListInitiatorGroups(ctx)
-	if err != nil {
-		return nil, mapAPIError(err)
-	}
-	legacyNode := sanitizeName(req.GetNodeId())
 	for _, exp := range exports {
-		if exp.VolumeID != req.GetVolumeId() {
+		// Only CSI-managed exports (NodeID set) are touched. An empty node_id means
+		// "unpublish from all nodes" per the CSI spec.
+		if exp.VolumeID != req.GetVolumeId() || exp.NodeID == "" {
 			continue
 		}
-		// An empty node_id means "unpublish from all nodes" per the CSI spec.
-		owner := exportNodeID(exp, igs)
-		if req.GetNodeId() != "" && owner != req.GetNodeId() && !(exp.NodeID == "" && owner == legacyNode) {
+		if req.GetNodeId() != "" && exp.NodeID != req.GetNodeId() {
 			continue
 		}
 		if err := s.client.DeleteExport(ctx, exp.ID); err != nil && !IsNotFound(err) {
@@ -607,14 +583,10 @@ func (s *ControllerServer) publishedNodes(ctx context.Context) (map[string][]str
 	if err != nil {
 		return nil, mapAPIError(err)
 	}
-	igs, err := s.client.ListInitiatorGroups(ctx)
-	if err != nil {
-		return nil, mapAPIError(err)
-	}
 	out := map[string][]string{}
 	for _, exp := range exports {
-		if node := exportNodeID(exp, igs); node != "" {
-			out[exp.VolumeID] = append(out[exp.VolumeID], node)
+		if exp.NodeID != "" {
+			out[exp.VolumeID] = append(out[exp.VolumeID], exp.NodeID)
 		}
 	}
 	return out, nil

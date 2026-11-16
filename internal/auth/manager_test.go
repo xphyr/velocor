@@ -2,7 +2,6 @@ package auth
 
 import (
 	"errors"
-	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -165,24 +164,5 @@ func TestSessionsAreRevokedOnPasswordChangeDemotionAndDeletion(t *testing.T) {
 	}
 	if _, err := mgr.Authenticate(tok2); !errors.Is(err, ErrUnauthorized) {
 		t.Fatalf("re-created user must not accept the old account's session, got %v", err)
-	}
-}
-
-func TestLegacyHashIsUpgradedOnLogin(t *testing.T) {
-	mgr, st := newTestManager(t)
-	salt := []byte("0123456789abcdef")
-	legacy := fmt.Sprintf("v1$10000$%x$%x", salt, legacyDerivePasswordKey("legacy-pass-1", salt, 10000))
-	if err := st.SaveAdminUser(&store.AdminUser{Username: "old", PasswordHash: legacy, Role: store.RoleReadOnly}); err != nil {
-		t.Fatal(err)
-	}
-	if _, _, _, err := mgr.Login("old", "legacy-pass-1"); err != nil {
-		t.Fatalf("legacy hash must still verify: %v", err)
-	}
-	u, _ := st.GetAdminUser("old")
-	if !strings.HasPrefix(u.PasswordHash, "v2$") {
-		t.Fatalf("hash not upgraded: %s", u.PasswordHash)
-	}
-	if _, _, _, err := mgr.Login("old", "legacy-pass-1"); err != nil {
-		t.Fatalf("upgraded hash must verify: %v", err)
 	}
 }

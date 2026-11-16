@@ -159,8 +159,7 @@ func (m *Manager) Login(username, password string) (string, time.Time, store.Rol
 	return sess.Token, sess.ExpiresAt, sess.Role, nil
 }
 
-// LoginSession verifies credentials and issues a session. Legacy password hashes are
-// transparently upgraded to the current KDF.
+// LoginSession verifies credentials and issues a session.
 func (m *Manager) LoginSession(username, password string) (*Session, error) {
 	user, err := m.store.GetAdminUser(username)
 	if err != nil {
@@ -170,12 +169,6 @@ func (m *Manager) LoginSession(username, password string) (*Session, error) {
 	}
 	if !VerifyPassword(password, user.PasswordHash) {
 		return nil, ErrUnauthorized
-	}
-	if needsRehash(user.PasswordHash) {
-		if hash, err := HashPassword(password); err == nil {
-			user.PasswordHash = hash
-			_ = m.store.SaveAdminUser(user)
-		}
 	}
 	return m.issueSession(user)
 }
@@ -428,11 +421,7 @@ func (m *Manager) Authenticate(rawToken string) (*Principal, error) {
 	if err != nil {
 		return nil, ErrUnauthorized
 	}
-	issuedNs := claims.IssuedAtNs
-	if issuedNs == 0 {
-		issuedNs = claims.IssuedAt * int64(time.Second)
-	}
-	if !user.SessionsValidAfter.IsZero() && issuedNs < user.SessionsValidAfter.UnixNano() {
+	if claims.IssuedAtNs == 0 || claims.IssuedAtNs < user.SessionsValidAfter.UnixNano() {
 		return nil, ErrUnauthorized
 	}
 	role := user.Role
@@ -557,11 +546,10 @@ var dummyHash = func() string {
 	return h
 }()
 
-// VerifyPassword verifies a plaintext password against a stored hash (v2 PBKDF2, or the
-// legacy v1 iterated-SHA-256 scheme, which is only accepted so it can be upgraded).
+// VerifyPassword verifies a plaintext password against a stored HashPassword string.
 func VerifyPassword(password, encodedHash string) bool {
 	parts := strings.Split(encodedHash, "$")
-	if len(parts) != 4 {
+	if len(parts) != 4 || parts[0] != "v2" {
 		return false
 	}
 	iterations, err := strconv.Atoi(parts[1])
@@ -576,37 +564,11 @@ func VerifyPassword(password, encodedHash string) bool {
 	if err != nil {
 		return false
 	}
-	var derived []byte
-	switch parts[0] {
-	case "v2":
-		derived, err = pbkdf2.Key(sha256.New, password, salt, iterations, len(expected))
-		if err != nil {
-			return false
-		}
-	case "v1":
-		derived = legacyDerivePasswordKey(password, salt, iterations)
-	default:
+	derived, err := pbkdf2.Key(sha256.New, password, salt, iterations, len(expected))
+	if err != nil {
 		return false
 	}
 	return subtle.ConstantTimeCompare(derived, expected) == 1
-}
-
-func needsRehash(encodedHash string) bool {
-	return !strings.HasPrefix(encodedHash, fmt.Sprintf("v2$%d$", pbkdf2Iterations))
-}
-
-// legacyDerivePasswordKey is the pre-v2 scheme, retained only to verify-and-upgrade.
-func legacyDerivePasswordKey(password string, salt []byte, iterations int) []byte {
-	mac := hmac.New(sha256.New, salt)
-	_, _ = mac.Write([]byte(password))
-	acc := mac.Sum(nil)
-	for i := 1; i < iterations; i++ {
-		h := sha256.New()
-		_, _ = h.Write(acc)
-		_, _ = h.Write(salt)
-		acc = h.Sum(nil)
-	}
-	return acc
 }
 
 func hashTokenString(raw string) string {

@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"regexp"
 	"slices"
 	"sort"
 	"strings"
@@ -72,18 +71,11 @@ func OpenBoltStore(path string) (*BoltStore, error) {
 		return nil, err
 	}
 
-	if err := db.Update(backfillIscsiTags); err != nil {
-		_ = db.Close()
-		return nil, fmt.Errorf("migrate iscsi tags: %w", err)
-	}
-
 	return &BoltStore{db: db}, nil
 }
 
 // iscsiTagBase is the first SPDK iSCSI portal/initiator group tag the store hands out.
-// Tags below it are left free so they never collide with groups created by older
-// releases (which hard-coded tag 1) that may still be live in a running spdk_tgt.
-const iscsiTagBase = 1000
+const iscsiTagBase = 1
 
 func nextPortalPgTag(b *bolt.Bucket) (int, error) {
 	maxTag := iscsiTagBase - 1
@@ -109,61 +101,6 @@ func nextExportIgTag(b *bolt.Bucket) (int, error) {
 		return nil
 	})
 	return maxTag + 1, err
-}
-
-// backfillIscsiTags assigns unique SPDK tags to iSCSI portals and exports created
-// before tags were tracked.
-func backfillIscsiTags(tx *bolt.Tx) error {
-	portalsB := tx.Bucket(bucketPortals)
-	var portals []Portal
-	if err := portalsB.ForEach(func(_, v []byte) error {
-		var p Portal
-		if err := json.Unmarshal(v, &p); err != nil {
-			return err
-		}
-		if p.Protocol == ExportProtocolISCSI && p.IscsiPgTag == 0 {
-			portals = append(portals, p)
-		}
-		return nil
-	}); err != nil {
-		return err
-	}
-	for _, p := range portals {
-		tag, err := nextPortalPgTag(portalsB)
-		if err != nil {
-			return err
-		}
-		p.IscsiPgTag = tag
-		if err := putJSON(portalsB, []byte(p.ID), &p); err != nil {
-			return err
-		}
-	}
-
-	expsB := tx.Bucket(bucketExports)
-	var exps []Export
-	if err := expsB.ForEach(func(_, v []byte) error {
-		var e Export
-		if err := json.Unmarshal(v, &e); err != nil {
-			return err
-		}
-		if e.Protocol == ExportProtocolISCSI && e.IscsiIgTag == 0 {
-			exps = append(exps, e)
-		}
-		return nil
-	}); err != nil {
-		return err
-	}
-	for _, e := range exps {
-		tag, err := nextExportIgTag(expsB)
-		if err != nil {
-			return err
-		}
-		e.IscsiIgTag = tag
-		if err := putJSON(expsB, []byte(e.ID), &e); err != nil {
-			return err
-		}
-	}
-	return nil
 }
 
 // mutateRecord atomically loads the JSON record id from bucket, applies fn and stores
@@ -489,63 +426,10 @@ func (s *BoltStore) upsertDisk(disk *Disk, syncBoot bool) error {
 			}
 		} else if cp.IsBootDevice && cp.Claimed {
 			return ErrBootDeviceProtected
-		} else if syncBoot {
-			if err := migrateLegacySSDID(tx, &cp); err != nil {
-				return err
-			}
 		}
 		return putJSON(b, []byte(cp.ID), &cp)
 	})
 }
-
-// migrateLegacySSDID re-keys a disk record created by older releases under its unstable
-// kernel name ("ssd-sdb") to the hardware-derived ID now reported by discovery, carrying
-// over claim/pool state and rewriting pool membership. Matching is by serial number only:
-// kernel names are exactly what cannot be trusted across reboots.
-func migrateLegacySSDID(tx *bolt.Tx, cp *Disk) error {
-	if cp.Type != DiskTypeSSD || cp.SerialNumber == "" {
-		return nil
-	}
-	b := tx.Bucket(bucketDisks)
-	var legacy *Disk
-	err := b.ForEach(func(_, v []byte) error {
-		var d Disk
-		if err := json.Unmarshal(v, &d); err != nil {
-			return err
-		}
-		if d.Type == DiskTypeSSD && d.ID != cp.ID && legacySSDID.MatchString(d.ID) && d.SerialNumber == cp.SerialNumber {
-			legacy = &d
-		}
-		return nil
-	})
-	if err != nil || legacy == nil {
-		return err
-	}
-	if legacy.Claimed && !cp.IsBootDevice {
-		cp.Claimed = true
-		cp.DriverState = legacy.DriverState
-		cp.SPDKBdevName = legacy.SPDKBdevName
-		cp.HealthStatus = legacy.HealthStatus
-	}
-	cp.PoolID = legacy.PoolID
-	if legacy.PoolID != "" {
-		pb := tx.Bucket(bucketPools)
-		var pool Pool
-		if err := getJSON(pb, []byte(legacy.PoolID), &pool); err == nil {
-			for i, id := range pool.DiskIDs {
-				if id == legacy.ID {
-					pool.DiskIDs[i] = cp.ID
-				}
-			}
-			if err := putJSON(pb, []byte(pool.ID), &pool); err != nil {
-				return err
-			}
-		}
-	}
-	return b.Delete([]byte(legacy.ID))
-}
-
-var legacySSDID = regexp.MustCompile(`^ssd-(sd|vd|xvd)[a-z]+$`)
 
 // GetDisk retrieves a Disk by ID.
 func (s *BoltStore) GetDisk(id string) (*Disk, error) {
@@ -770,21 +654,6 @@ func (s *BoltStore) GetPoolByName(name string) (*Pool, error) {
 	return found, nil
 }
 
-// UpdatePool updates mutable fields of an existing Pool (capacity, health, UUIDs, effective bdev).
-func (s *BoltStore) UpdatePool(pool *Pool) error {
-	if pool == nil || pool.ID == "" {
-		return fmt.Errorf("%w: pool id is required", ErrInvalidArgument)
-	}
-	return s.db.Update(func(tx *bolt.Tx) error {
-		b := tx.Bucket(bucketPools)
-		var existing Pool
-		if err := getJSON(b, []byte(pool.ID), &existing); err != nil {
-			return err
-		}
-		return putJSON(b, []byte(pool.ID), pool)
-	})
-}
-
 // ListPools returns all Pools ordered by CreatedAt.
 func (s *BoltStore) ListPools() ([]*Pool, error) {
 	var pools []*Pool
@@ -985,21 +854,6 @@ func (s *BoltStore) GetVolumeByName(poolID, name string) (*Volume, error) {
 		return nil, ErrNotFound
 	}
 	return found, nil
-}
-
-// UpdateVolume updates an existing Volume.
-func (s *BoltStore) UpdateVolume(vol *Volume) error {
-	if vol == nil || vol.ID == "" {
-		return fmt.Errorf("%w: volume id is required", ErrInvalidArgument)
-	}
-	return s.db.Update(func(tx *bolt.Tx) error {
-		b := tx.Bucket(bucketVolumes)
-		var existing Volume
-		if err := getJSON(b, []byte(vol.ID), &existing); err != nil {
-			return err
-		}
-		return putJSON(b, []byte(vol.ID), vol)
-	})
 }
 
 // SetVolumeAttachmentState transitions a Volume's AttachmentState while preventing conflicting attachments.
@@ -1926,21 +1780,6 @@ func (s *BoltStore) GetExportByName(name string) (*Export, error) {
 		return nil, ErrNotFound
 	}
 	return found, nil
-}
-
-// UpdateExport updates an existing Export.
-func (s *BoltStore) UpdateExport(exp *Export) error {
-	if exp == nil || exp.ID == "" {
-		return fmt.Errorf("%w: export id is required", ErrInvalidArgument)
-	}
-	return s.db.Update(func(tx *bolt.Tx) error {
-		b := tx.Bucket(bucketExports)
-		var existing Export
-		if err := getJSON(b, []byte(exp.ID), &existing); err != nil {
-			return err
-		}
-		return putJSON(b, []byte(exp.ID), exp)
-	})
 }
 
 // ListExports returns all Exports, optionally filtered by VolumeID and/or ExportProtocol.

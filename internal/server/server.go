@@ -555,7 +555,6 @@ func formatBlockExtents(extents []spdk.BlockExtent) []map[string]uint64 {
 		out = append(out, map[string]uint64{
 			"offset_bytes": e.OffsetBytes,
 			"length_bytes": e.SizeBytes,
-			"size_bytes":   e.SizeBytes, // deprecated alias kept for older clients
 		})
 	}
 	return out

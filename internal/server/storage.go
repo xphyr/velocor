@@ -47,14 +47,6 @@ func validateDisplayName(kind, name string) error {
 	return nil
 }
 
-// lvolRef returns the most precise SPDK reference for an lvol: its UUID when known.
-func lvolRef(uuid, alias string) string {
-	if uuid != "" {
-		return uuid
-	}
-	return alias
-}
-
 func decodeJSON(r *http.Request, dst any) error {
 	if err := json.NewDecoder(r.Body).Decode(dst); err != nil {
 		return fmt.Errorf("%w: invalid json body: %v", store.ErrInvalidArgument, err)
@@ -257,7 +249,6 @@ func (s *Server) handleCreatePool(w http.ResponseWriter, r *http.Request) {
 		BaseBdevName:      "raid_" + id,
 		EffectiveBdevName: "raid_" + id,
 		LVSName:           "lvs_" + id,
-		RaidSuperblock:    true,
 		TotalBytes:        totalRaw,
 		FreeBytes:         totalRaw,
 		FilterPolicy:      req.FilterPolicy,
@@ -484,7 +475,7 @@ func (s *Server) resizeVolume(w http.ResponseWriter, r *http.Request, id string)
 		writeError(w, err)
 		return
 	}
-	if err := s.spdk.BdevLvolResize(r.Context(), lvolRef(vol.UUID, vol.LvolBdevName), req.NewSizeBytes); err != nil {
+	if err := s.spdk.BdevLvolResize(r.Context(), vol.UUID, req.NewSizeBytes); err != nil {
 		writeError(w, fmt.Errorf("resize lvol: %w", err))
 		return
 	}
@@ -548,7 +539,7 @@ func (s *Server) handleDeleteVolume(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
-	if err := s.spdk.BdevLvolDelete(r.Context(), lvolRef(vol.UUID, vol.LvolBdevName)); err != nil && !spdk.IsNotFound(err) {
+	if err := s.spdk.BdevLvolDelete(r.Context(), vol.UUID); err != nil && !spdk.IsNotFound(err) {
 		writeError(w, fmt.Errorf("delete lvol: %w", err))
 		return
 	}
@@ -612,7 +603,7 @@ func (s *Server) handleCreateSnapshot(w http.ResponseWriter, r *http.Request) {
 // returns an unsaved Snapshot record for it.
 func (s *Server) takeSnapshot(ctx context.Context, vol *store.Volume, pool *store.Pool, name string) (*store.Snapshot, error) {
 	id := newResourceID("snap")
-	uuid, err := s.spdk.BdevLvolSnapshot(ctx, lvolRef(vol.UUID, vol.LvolBdevName), id)
+	uuid, err := s.spdk.BdevLvolSnapshot(ctx, vol.UUID, id)
 	if err != nil {
 		return nil, fmt.Errorf("snapshot volume %s: %w", vol.ID, err)
 	}
@@ -684,7 +675,7 @@ func (s *Server) cloneSnapshot(w http.ResponseWriter, r *http.Request, snapID st
 
 	id := newResourceID("vol")
 	alias := pool.LVSName + "/" + id
-	uuid, err := s.spdk.BdevLvolClone(r.Context(), lvolRef(snap.UUID, snap.LvolBdevName), id)
+	uuid, err := s.spdk.BdevLvolClone(r.Context(), snap.UUID, id)
 	if err != nil {
 		writeError(w, fmt.Errorf("clone snapshot %s: %w", snap.ID, err))
 		return
@@ -710,17 +701,13 @@ func (s *Server) cloneSnapshot(w http.ResponseWriter, r *http.Request, snapID st
 
 func (s *Server) handleSnapshotGetOrBlocks(w http.ResponseWriter, r *http.Request) {
 	tail := strings.TrimPrefix(r.URL.Path, "/api/v1/snapshots/")
-	for _, suffix := range []string{"/blocks:allocated", ":allocated-blocks"} {
-		if id, ok := strings.CutSuffix(tail, suffix); ok {
-			s.handleSnapshotBlocks(w, r, id, false)
-			return
-		}
+	if id, ok := strings.CutSuffix(tail, "/blocks:allocated"); ok {
+		s.handleSnapshotBlocks(w, r, id, false)
+		return
 	}
-	for _, suffix := range []string{"/blocks:changed", ":changed-blocks"} {
-		if id, ok := strings.CutSuffix(tail, suffix); ok {
-			s.handleSnapshotBlocks(w, r, id, true)
-			return
-		}
+	if id, ok := strings.CutSuffix(tail, "/blocks:changed"); ok {
+		s.handleSnapshotBlocks(w, r, id, true)
+		return
 	}
 	snap, err := s.store.GetSnapshot(tail)
 	if err != nil {
@@ -770,7 +757,7 @@ func (s *Server) handleSnapshotBlocks(w http.ResponseWriter, r *http.Request, ta
 	}
 	var extentSets [][]spdk.BlockExtent
 	for _, layer := range lineage {
-		frag, err := s.spdk.BdevLvolGetFragmap(r.Context(), lvolRef(layer.UUID, layer.LvolBdevName), 0, layer.SizeBytes)
+		frag, err := s.spdk.BdevLvolGetFragmap(r.Context(), layer.UUID, 0, layer.SizeBytes)
 		if err != nil {
 			writeError(w, err)
 			return
@@ -810,7 +797,7 @@ func (s *Server) handleDeleteSnapshot(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
-	if err := s.spdk.BdevLvolDelete(r.Context(), lvolRef(snap.UUID, snap.LvolBdevName)); err != nil && !spdk.IsNotFound(err) {
+	if err := s.spdk.BdevLvolDelete(r.Context(), snap.UUID); err != nil && !spdk.IsNotFound(err) {
 		writeError(w, fmt.Errorf("delete snapshot lvol: %w", err))
 		return
 	}
@@ -1011,7 +998,7 @@ func (s *Server) handleDeleteVolumeGroupSnapshot(w http.ResponseWriter, r *http.
 		return
 	}
 	for _, snap := range snaps {
-		if err := s.spdk.BdevLvolDelete(r.Context(), lvolRef(snap.UUID, snap.LvolBdevName)); err != nil && !spdk.IsNotFound(err) {
+		if err := s.spdk.BdevLvolDelete(r.Context(), snap.UUID); err != nil && !spdk.IsNotFound(err) {
 			writeError(w, fmt.Errorf("delete snapshot %s: %w", snap.ID, err))
 			return
 		}

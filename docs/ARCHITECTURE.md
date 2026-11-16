@@ -36,7 +36,7 @@
 These rules are enforced in code and covered by tests against a stateful fake `spdk_tgt`
 (`internal/spdk/spdktest`), which models restarts, asynchronous examine and error injection.
 
-1. **The reconciler never creates storage that might replace existing data.** It never initialises an lvstore for a pool that has ever recorded one (`LVSUUID`), never creates an lvol for a volume record (a missing lvol is reported `FAULTED`), and never re-creates a superblock RAID (SPDK examine assembles those). It always calls `bdev_wait_for_examine` before concluding that on-disk metadata is absent.
+1. **The reconciler never creates storage.** Pools are created atomically by the API with an on-disk RAID superblock, so after a restart SPDK examine re-assembles each array and loads its lvstore. The reconciler only re-attaches disks and re-applies QoS and exports; a missing RAID, lvstore or lvol is reported `DEGRADED`/`FAULTED`, never re-created. It always calls `bdev_wait_for_examine` before concluding that on-disk metadata is absent.
 2. **SPDK first, store second.** API handlers only persist a resource after SPDK succeeded and roll back partially created SPDK objects on failure. Deletes check store preconditions, delete in SPDK (missing objects are fine), then delete the record.
 3. **SPDK names come from resource IDs**, never user-supplied names, so snapshot/volume lvols can never collide and always fit SPDK's 63-character limit.
 4. **Exports default to deny.** Every iSCSI export owns a unique initiator group (tag allocated by the store); a portal group exists per Velocor portal. An export with no resolvable initiators is rejected unless `allow_any_host` is set explicitly.

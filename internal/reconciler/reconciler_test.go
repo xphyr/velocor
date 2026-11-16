@@ -32,7 +32,7 @@ func newEnv(t *testing.T) *env {
 
 // provision builds a pool + volume through the real SPDK client calls, exactly the way the
 // API does, and records them in the store. It returns the pool and volume.
-func (e *env) provision(level store.RaidLevel, superblock bool, pcis ...string) (*store.Pool, *store.Volume) {
+func (e *env) provision(level store.RaidLevel, pcis ...string) (*store.Pool, *store.Volume) {
 	e.t.Helper()
 	c := e.fake.Client()
 	var diskIDs, bdevs []string
@@ -52,11 +52,11 @@ func (e *env) provision(level store.RaidLevel, superblock bool, pcis ...string) 
 		diskIDs = append(diskIDs, d.ID)
 		bdevs = append(bdevs, bdev)
 	}
-	pool := &store.Pool{ID: "pool-1", Name: "p1", RaidLevel: level, DiskIDs: diskIDs, StripSizeKB: 64, RaidSuperblock: superblock}
+	pool := &store.Pool{ID: "pool-1", Name: "p1", RaidLevel: level, DiskIDs: diskIDs, StripSizeKB: 64}
 	if err := e.st.CreatePool(pool); err != nil {
 		e.t.Fatal(err)
 	}
-	if err := c.BdevRaidCreate(e.ctx, pool.BaseBdevName, string(level), 64, bdevs, superblock); err != nil {
+	if err := c.BdevRaidCreate(e.ctx, pool.BaseBdevName, string(level), 64, bdevs, true); err != nil {
 		e.t.Fatal(err)
 	}
 	lvsUUID, err := c.BdevLvolCreateLvstore(e.ctx, pool.EffectiveBdevName, pool.LVSName, 0, "")
@@ -89,45 +89,35 @@ func (e *env) reconcile() State {
 }
 
 func TestRestartWithLazyExamineNeverWipesLvstore(t *testing.T) {
-	for _, tc := range []struct {
-		name       string
-		superblock bool
-	}{{"superblock", true}, {"legacy-no-superblock", false}} {
-		t.Run(tc.name, func(t *testing.T) {
-			e := newEnv(t)
-			pool, vol := e.provision(store.RaidLevel1, tc.superblock, "0000:01:00.0", "0000:02:00.0")
+	e := newEnv(t)
+	pool, vol := e.provision(store.RaidLevel1, "0000:01:00.0", "0000:02:00.0")
 
-			e.fake.LazyExamine = true
-			e.fake.Restart()
-			st := e.reconcile()
+	e.fake.LazyExamine = true
+	e.fake.Restart()
+	st := e.reconcile()
 
-			if gen := e.fake.LvstoreGeneration(pool.LVSName); gen != 1 {
-				t.Fatalf("lvstore was re-initialised (generation %d): pool data destroyed", gen)
-			}
-			if n := e.fake.CallCount("bdev_lvol_create_lvstore"); n != 1 { // only the provisioning call
-				t.Fatalf("bdev_lvol_create_lvstore called %d times", n)
-			}
-			if tc.superblock && e.fake.CallCount("bdev_raid_create") != 1 {
-				t.Fatalf("superblock RAID must be assembled by examine, not re-created")
-			}
-			if !e.fake.LvolExists(vol.LvolBdevName) {
-				t.Fatalf("volume lvol lost")
-			}
-			p, _ := e.st.GetPool(pool.ID)
-			v, _ := e.st.GetVolume(vol.ID)
-			if p.HealthStatus != store.HealthStatusOnline || v.HealthStatus != store.HealthStatusOnline {
-				t.Fatalf("pool=%s (%s) vol=%s (%s); reconciler state %+v", p.HealthStatus, p.StatusMessage, v.HealthStatus, v.StatusMessage, st)
-			}
-			if got := e.fake.QoS(vol.UUID).RwIosPerSec; got != 5000 {
-				t.Fatalf("QoS not restored: %d", got)
-			}
-		})
+	if gen := e.fake.LvstoreGeneration(pool.LVSName); gen != 1 {
+		t.Fatalf("lvstore was re-initialised (generation %d): pool data destroyed", gen)
+	}
+	if e.fake.CallCount("bdev_lvol_create_lvstore") != 1 || e.fake.CallCount("bdev_raid_create") != 1 {
+		t.Fatalf("reconciler created storage instead of letting examine assemble it: %v", e.fake.Calls())
+	}
+	if !e.fake.LvolExists(vol.LvolBdevName) {
+		t.Fatalf("volume lvol lost")
+	}
+	p, _ := e.st.GetPool(pool.ID)
+	v, _ := e.st.GetVolume(vol.ID)
+	if p.HealthStatus != store.HealthStatusOnline || v.HealthStatus != store.HealthStatusOnline {
+		t.Fatalf("pool=%s (%s) vol=%s (%s); reconciler state %+v", p.HealthStatus, p.StatusMessage, v.HealthStatus, v.StatusMessage, st)
+	}
+	if got := e.fake.QoS(vol.UUID).RwIosPerSec; got != 5000 {
+		t.Fatalf("QoS not restored: %d", got)
 	}
 }
 
 func TestMissingLvstoreIsFaultedNotReinitialised(t *testing.T) {
 	e := newEnv(t)
-	pool, _ := e.provision(store.RaidLevel0, true, "0000:01:00.0")
+	pool, _ := e.provision(store.RaidLevel0, "0000:01:00.0")
 	// Simulate the lvstore being unreadable: pretend the recorded UUID belongs to something else.
 	if _, err := e.st.MutatePool(pool.ID, func(p *store.Pool) error { p.LVSUUID = "deadbeef"; return nil }); err != nil {
 		t.Fatal(err)
@@ -145,7 +135,7 @@ func TestMissingLvstoreIsFaultedNotReinitialised(t *testing.T) {
 
 func TestMissingLvolIsFaultedNotRecreated(t *testing.T) {
 	e := newEnv(t)
-	_, vol := e.provision(store.RaidLevel0, true, "0000:01:00.0")
+	_, vol := e.provision(store.RaidLevel0, "0000:01:00.0")
 	if err := e.fake.Client().BdevLvolDelete(e.ctx, vol.UUID); err != nil {
 		t.Fatal(err)
 	}
@@ -161,7 +151,7 @@ func TestMissingLvolIsFaultedNotRecreated(t *testing.T) {
 
 func TestDegradedRaidStaysUntouched(t *testing.T) {
 	e := newEnv(t)
-	pool, _ := e.provision(store.RaidLevel1, true, "0000:01:00.0", "0000:02:00.0")
+	pool, _ := e.provision(store.RaidLevel1, "0000:01:00.0", "0000:02:00.0")
 	e.fake.RemoveMedia("0000:02:00.0")
 	e.fake.Restart()
 	e.reconcile()
@@ -176,7 +166,7 @@ func TestDegradedRaidStaysUntouched(t *testing.T) {
 
 func TestExportsRestoredWithACLsAfterRestart(t *testing.T) {
 	e := newEnv(t)
-	_, vol := e.provision(store.RaidLevel0, true, "0000:01:00.0")
+	_, vol := e.provision(store.RaidLevel0, "0000:01:00.0")
 	const hostNQN = "nqn.2014-08.org.nvmexpress:uuid:host-a"
 	const hostIQN = "iqn.1994-05.com.redhat:host-a"
 	must := func(err error) {
@@ -238,7 +228,7 @@ func TestExportsRestoredWithACLsAfterRestart(t *testing.T) {
 
 func TestIscsiExportRefusesImplicitAnyAccess(t *testing.T) {
 	e := newEnv(t)
-	_, vol := e.provision(store.RaidLevel0, true, "0000:01:00.0")
+	_, vol := e.provision(store.RaidLevel0, "0000:01:00.0")
 	if err := e.st.CreatePortal(&store.Portal{ID: "pt-i", Name: "i", Protocol: store.ExportProtocolISCSI, IPAddress: "10.0.0.10", Port: 3260}); err != nil {
 		t.Fatal(err)
 	}

@@ -459,7 +459,7 @@ func seedBackend(t *testing.T, st *store.BoltStore, poolID string) *spdktest.Fak
 		t.Fatal(err)
 	}
 	pool := &store.Pool{ID: poolID, Name: poolID, DiskIDs: []string{"disk-1"}, RaidLevel: store.RaidLevel0,
-		TotalBytes: 100 << 30, FreeBytes: 100 << 30, RaidSuperblock: true, HealthStatus: store.HealthStatusOnline}
+		TotalBytes: 100 << 30, FreeBytes: 100 << 30, HealthStatus: store.HealthStatusOnline}
 	if err := st.CreatePool(pool); err != nil {
 		t.Fatal(err)
 	}
