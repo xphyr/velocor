@@ -460,7 +460,7 @@ func runSystem(cfg *cliConfig, args []string) error {
 
 func runDisk(cfg *cliConfig, args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("subcommand required: list | scan | claim | release")
+		return fmt.Errorf("subcommand required: list | scan | claim | release | set")
 	}
 	switch args[0] {
 	case "list":
@@ -472,16 +472,27 @@ func runDisk(cfg *cliConfig, args []string) error {
 			return printJSON(resp)
 		}
 		tw := newTabWriter()
-		fmt.Fprintln(tw, "ID\tNAME\tTYPE\tPCI/DEV\tSIZE(GiB)\tDRIVER\tBOOT\tCLAIMED\tPOOL\tBDEV")
+		fmt.Fprintln(tw, "ID\tNAME\tTYPE\tPCI/DEV\tSIZE(GiB)\tDRIVER\tBOOT\tCLAIMED\tPOOL\tWRITE CACHE\tDURABILITY")
 		for _, d := range sliceOfMaps(resp["disks"]) {
 			loc := fmt.Sprintf("%v", d["pci_address"])
 			if loc == "" || loc == "<nil>" {
 				loc = fmt.Sprintf("%v", d["device_path"])
 			}
 			szGiB := uint64FromAny(d["size_bytes"]) / (1024 * 1024 * 1024)
-			fmt.Fprintf(tw, "%v\t%v\t%v\t%s\t%d\t%v\t%v\t%v\t%v\t%v\n",
+			cache := strOrEmpty(d["write_cache"])
+			if cache == "" {
+				cache = "UNKNOWN"
+			}
+			if d["write_cache_policy"] == "DISABLED" {
+				cache += " (kept off)"
+			}
+			durability := strOrEmpty(d["durability"])
+			if d["power_loss_protected"] == true {
+				durability += " (PLP declared)"
+			}
+			fmt.Fprintf(tw, "%v\t%v\t%v\t%s\t%d\t%v\t%v\t%v\t%v\t%s\t%s\n",
 				d["id"], d["name"], d["type"], loc, szGiB, d["driver_state"],
-				d["is_boot_device"], d["claimed"], strOrEmpty(d["pool_id"]), strOrEmpty(d["spdk_bdev_name"]))
+				d["is_boot_device"], d["claimed"], strOrEmpty(d["pool_id"]), cache, durability)
 		}
 		return tw.Flush()
 
@@ -515,6 +526,37 @@ func runDisk(cfg *cliConfig, args []string) error {
 			return fmt.Errorf("usage: veloctl disk release <disk-id>")
 		}
 		resp, err := cfg.request("POST", "/api/v1/disks/"+args[1]+":release", map[string]any{})
+		if err != nil {
+			return err
+		}
+		return printJSON(resp)
+
+	case "set":
+		fs := flag.NewFlagSet("disk set", flag.ExitOnError)
+		plp := fs.String("power-loss-protected", "", "true|false: declare that the disk protects its write cache against power loss")
+		cache := fs.String("write-cache", "", "disabled|leave: turn the disk's volatile write cache off and keep it off, or leave it to the drive (switches it back on)")
+		_ = fs.Parse(args[1:])
+		if fs.NArg() < 1 || (*plp == "" && *cache == "") {
+			return fmt.Errorf("usage: veloctl disk set <disk-id> [--power-loss-protected=true|false] [--write-cache=disabled|leave]")
+		}
+		body := map[string]any{}
+		switch *plp {
+		case "":
+		case "true", "false":
+			body["power_loss_protected"] = *plp == "true"
+		default:
+			return fmt.Errorf("--power-loss-protected must be true or false")
+		}
+		switch *cache {
+		case "":
+		case "disabled":
+			body["write_cache_policy"] = "DISABLED"
+		case "leave":
+			body["write_cache_policy"] = ""
+		default:
+			return fmt.Errorf("--write-cache must be disabled or leave")
+		}
+		resp, err := cfg.request("PATCH", "/api/v1/disks/"+url.PathEscape(fs.Arg(0)), body)
 		if err != nil {
 			return err
 		}
@@ -1236,7 +1278,7 @@ Commands:
   user              Manage local users (list, create, update, delete)
   token             Manage scoped service tokens (list, create, revoke)
   system            Appliance status, containers, bootc upgrade/rollback
-  disk              List, scan, claim, or release NVMe and SSD drives
+  disk              List, scan, claim, release drives; set write cache / power-loss protection
   pool              Create, list, or delete SPDK RAID + lvol_store pools
   volume            Create, list, get, show usage, resize, set QoS, or delete volumes
   snapshot          Create, list, clone and delete snapshots

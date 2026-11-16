@@ -1,6 +1,9 @@
 package store
 
-import "time"
+import (
+	"encoding/json"
+	"time"
+)
 
 // HealthStatus represents the operational health of a resource.
 type HealthStatus string
@@ -150,7 +153,68 @@ type Disk struct {
 	SPDKBdevName     string          `json:"spdk_bdev_name,omitempty"`
 	HealthStatus     HealthStatus    `json:"health_status"`
 	Smart            SmartHealth     `json:"smart"`
-	UpdatedAt        time.Time       `json:"updated_at"`
+	// WriteCache is what the hardware reports (refreshed by every scan; the last known value is
+	// kept while SPDK owns the device and the kernel can't see it).
+	WriteCache WriteCacheState `json:"write_cache"`
+	// PowerLossProtected is declared by an operator: there is no standard field for it, and
+	// drives with power-loss protection usually still report a volatile write cache.
+	PowerLossProtected bool `json:"power_loss_protected"`
+	// WriteCachePolicy is the operator's choice; DISABLED makes velod switch the drive's
+	// volatile write cache off and keep it off.
+	WriteCachePolicy WriteCachePolicy `json:"write_cache_policy,omitempty"`
+	UpdatedAt        time.Time        `json:"updated_at"`
+}
+
+// WriteCacheState is a disk's volatile write cache as reported by the hardware.
+type WriteCacheState string
+
+const (
+	WriteCacheUnknown      WriteCacheState = ""              // not determined (yet)
+	WriteCacheWriteBack    WriteCacheState = "WRITE_BACK"    // volatile cache present and in use
+	WriteCacheWriteThrough WriteCacheState = "WRITE_THROUGH" // no volatile cache in use
+)
+
+// WriteCachePolicy is what Velocor does with a disk's volatile write cache.
+type WriteCachePolicy string
+
+const (
+	WriteCachePolicyLeave    WriteCachePolicy = ""         // leave the drive's setting alone
+	WriteCachePolicyDisabled WriteCachePolicy = "DISABLED" // turn it off and keep it off
+)
+
+// Durability says whether a write the drive has acknowledged survives a power cut.
+type Durability string
+
+const (
+	DurabilityDurable Durability = "DURABLE"
+	// DurabilityAtRisk: the drive caches writes in volatile memory and isn't declared
+	// power-loss protected. SPDK v26.09 never passes FLUSH through lvols and RAID (TODO P0-4,
+	// L-1), so acknowledged writes can be lost on power failure.
+	DurabilityAtRisk  Durability = "AT_RISK"
+	DurabilityUnknown Durability = "UNKNOWN"
+)
+
+// Durability derives the disk's durability from its write cache and the operator's
+// power-loss-protection declaration.
+func (d *Disk) Durability() Durability {
+	switch {
+	case d.PowerLossProtected, d.WriteCache == WriteCacheWriteThrough:
+		return DurabilityDurable
+	case d.WriteCache == WriteCacheWriteBack:
+		return DurabilityAtRisk
+	default:
+		return DurabilityUnknown
+	}
+}
+
+// MarshalJSON adds the derived "durability" to every JSON form of a Disk (API responses);
+// it's recomputed on output, so a stored copy is never trusted.
+func (d Disk) MarshalJSON() ([]byte, error) {
+	type plain Disk
+	return json.Marshal(struct {
+		plain
+		Durability Durability `json:"durability"`
+	}{plain(d), d.Durability()})
 }
 
 // Pool aggregates one or more claimed Disks into an SPDK RAID bdev + lvol_store.

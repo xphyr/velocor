@@ -117,6 +117,12 @@ func (s *Server) claimDisk(w http.ResponseWriter, r *http.Request, id string) {
 			return
 		}
 	}
+	if d.WriteCachePolicy == store.WriteCachePolicyDisabled && s.hw != nil {
+		if _, err := s.applyWriteCachePolicy(d); err != nil {
+			writeError(w, err)
+			return
+		}
+	}
 	bdev, drv, err := dataplane.AttachDisk(r.Context(), s.spdk, s.hw, d)
 	if err != nil {
 		writeError(w, err)

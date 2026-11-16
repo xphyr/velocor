@@ -216,6 +216,7 @@ func (m *Manager) DiscoverDisks() ([]*store.Disk, error) {
 				IsBootDevice:     isBoot,
 				Claimed:          claimed,
 				HealthStatus:     store.HealthStatusOnline,
+				WriteCache:       m.writeCacheState(blockName),
 				UpdatedAt:        time.Now().UTC(),
 			})
 		}
@@ -280,6 +281,7 @@ func (m *Manager) DiscoverDisks() ([]*store.Disk, error) {
 				IsBootDevice:     isBoot,
 				Claimed:          false,
 				HealthStatus:     store.HealthStatusOnline,
+				WriteCache:       m.writeCacheState(devName),
 				UpdatedAt:        time.Now().UTC(),
 			})
 		}

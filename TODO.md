@@ -76,6 +76,23 @@ work still open, ranked by risk to data, how fixes are verified, and what has be
   This item stays open until steps 1–5 are implemented and tested, and P0-4 as a whole is not
   closed until L-1 is done.
 
+  **Progress (2026-11-16):**
+  - [x] Step 1 (detection) via the kernel (`queue/write_cache`) in every hardware scan; the last
+    known state is kept while SPDK owns a device. Shown per disk (`write_cache`, derived
+    `durability` = DURABLE / AT_RISK / UNKNOWN) in the API, `veloctl disk list` and the UI;
+    `/system/status` warns about at-risk pool disks.
+  - [x] Step 3: `PATCH /disks/{id}` `power_loss_protected` (operator declaration; scans never
+    change it). No known-PLP model list yet.
+  - [x] Step 4 for SATA/SAS/virtio SSDs: `write_cache_policy: DISABLED` switches the drive's
+    own cache off through `scsi_disk/*/cache_type` (MODE SELECT; never the "temporary" values,
+    which only change the kernel's view), at claim and on every reconciler pass (drives can
+    re-enable it after a power cycle). Verified on velocor-1's emulated SATA disks (kernel logs
+    "Write cache: disabled" from the drive).
+  - [ ] Step 1 + 4 for NVMe owned by SPDK: Get/Set Features 06h through `bdev_nvme_send_cmd`
+    (admin passthrough); until then the policy is refused for NVMe.
+  - [ ] Pool-level flag in the pool API/UI (today: per-disk durability plus the status warning).
+  - [ ] Step 5: power-pull test on real hardware.
+
 - [ ] **P0-6. A failed io_uring setup crashes `spdk_tgt`. (Verified)**
   Claiming an SSD with the io_uring backend where io_uring can't be set up (locked-memory
   limits, seccomp, `kernel.io_uring_disabled`) makes `spdk_tgt` segfault instead of returning an
@@ -258,6 +275,14 @@ root, hugepages or NVMe hardware needed.
 | `TestRAID5FRefused` | API refuses RAID5F; SPDK still can't put a volume store on raid5f (R3) |
 
 All pass except the write-cache check, which is reported as the known issue P0-4.
+
+**Appliance image** (`hack/build-qcow2.sh` disks, dev-04b3b31, 2026-11-16): boots with **BIOS**
+(QEMU SeaBIOS on the lab host) and **UEFI** (velocor-1, Secure Boot off); first boot with no
+network at all brings up SPDK and velod from the embedded images; `velocor-admin` key login works,
+root and password SSH are refused. **Upgrade and rollback** (lab host): `bootc switch` from
+dev-bddac0b to dev-04b3b31 loads the new embedded images, removes the old ones and keeps velod's
+database; `bootc rollback` returns to dev-bddac0b with its own images and the same database. Not
+yet covered: Secure Boot.
 
 **Not yet covered:** real NVMe drives (`bdev_nvme`, vfio), io_uring (needs a host where it
 works, see P0-6), iSCSI data paths (needs an iSCSI initiator in the test image), power-loss

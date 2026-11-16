@@ -374,6 +374,32 @@ function smartCell(d) {
     s.critical_warning && pill("Critical warning", "bad")];
 }
 
+// Write cache and durability (TODO.md P0-4): SPDK doesn't pass flushes through volumes, so a
+// drive caching writes in volatile memory can lose acknowledged writes on power failure.
+function durabilityCell(d) {
+  const notes = [d.write_cache_policy === "DISABLED" && "kept off by Velocor", d.power_loss_protected && "declared power-loss protected"].filter(Boolean).join(", ");
+  const cache = { WRITE_BACK: "Cache on", WRITE_THROUGH: "No volatile cache" }[d.write_cache] || "Cache unknown";
+  const p = { DURABLE: pill("Durable", "ok"), AT_RISK: pill("At risk", "warn"), UNKNOWN: pill("Unknown", "quiet") }[d.durability] || "-";
+  return [p, el("span", { class: "sub" }, notes ? `${cache}; ${notes}` : cache)];
+}
+
+function writeCacheDialog(d) {
+  openDialog({
+    title: `Write cache of ${d.name || d.id}`,
+    intro: "Velocor's volumes don't pass flushes down to the drives yet, so a drive that keeps writes in a volatile cache can lose writes the host was told are safe if power fails. Either turn the cache off (safe, but writes can get much slower and wear consumer drives faster) or, if the drive has power-loss protection, declare it.",
+    submit: "Save",
+    fields: [
+      { name: "policy", kind: "radio", label: "Write cache", value: d.write_cache_policy || "", options: [
+        { value: "", label: "Leave it to the drive" + (d.write_cache === "WRITE_BACK" ? " (currently on)" : "") },
+        { value: "DISABLED", label: "Turn it off and keep it off" },
+      ] },
+      { name: "plp", kind: "tick", value: !!d.power_loss_protected, text: "This drive has power-loss protection (capacitors that flush its cache on power failure)" },
+    ],
+    action: (x) => send("PATCH", `/disks/${encodeURIComponent(d.id)}`, { write_cache_policy: x.policy, power_loss_protected: x.plp }),
+    done: () => { notify(`Updated ${d.name || d.id}.`); rerender(); },
+  });
+}
+
 async function disks() {
   const [items, poolList] = await Promise.all([list("/disks", "disks"), list("/pools", "pools")]);
   const poolsById = byId(poolList);
@@ -393,7 +419,9 @@ async function disks() {
       { title: "State", cell: (d) => diskState(d, poolsById), text: (d) => (d.is_boot_device ? "protected" : d.claimed ? "claimed" : "available") },
       { title: "Health", cell: (d) => (d.claimed ? health(d) : "-") },
       { title: "SMART", cell: smartCell },
+      { title: "Durability", cell: (d) => (d.is_boot_device ? "-" : durabilityCell(d)), text: (d) => d.durability || "" },
       { title: "", cell: (d) => el("div", { class: "row-actions" },
+        can.admin && !d.is_boot_device && el("button", { onclick: () => writeCacheDialog(d) }, "Write cache"),
         can.admin && !d.claimed && !d.is_boot_device && el("button", { onclick: () => claimDialog(d) }, "Claim"),
         can.admin && d.claimed && !d.pool_id && el("button", { class: "danger-quiet", onclick: () => releaseDialog(d) }, "Release")) },
     ], items, { empty: "No disks found. Scan for disks.", state: stateOf("disks") }),

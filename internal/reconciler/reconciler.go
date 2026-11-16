@@ -112,6 +112,7 @@ func (r *Reconciler) ReconcileOnce(ctx context.Context) (State, error) {
 
 	p := &pass{}
 	r.syncHardware(p)
+	r.enforceWriteCache(p)
 
 	if _, err := r.spdk.GetVersion(ctx); err != nil {
 		r.finishPass(0, []string{"spdk_tgt"}, fmt.Sprintf("spdk_tgt unreachable: %v", err))
@@ -155,6 +156,38 @@ func (r *Reconciler) syncHardware(p *pass) {
 	for _, d := range discovered {
 		if err := r.store.SyncDiscoveredDisk(d); err != nil {
 			p.errs = append(p.errs, fmt.Sprintf("sync disk %s: %v", d.ID, err))
+		}
+	}
+}
+
+// enforceWriteCache keeps the volatile write cache off on disks whose policy says so (TODO.md
+// P0-4): drives can turn it back on after a power cycle or reset.
+func (r *Reconciler) enforceWriteCache(p *pass) {
+	if r.hw == nil {
+		return
+	}
+	disks, err := r.store.ListDisks()
+	if err != nil {
+		p.errs = append(p.errs, fmt.Sprintf("list disks: %v", err))
+		return
+	}
+	for _, d := range disks {
+		if d.WriteCachePolicy != store.WriteCachePolicyDisabled || d.IsBootDevice || d.WriteCache == store.WriteCacheWriteThrough {
+			continue
+		}
+		state, err := r.hw.SetWriteCache(d, false)
+		if err != nil {
+			p.degrade("disk:"+d.ID, "cannot disable the write cache: "+err.Error())
+		} else {
+			p.repaired++
+		}
+		if state != d.WriteCache {
+			if _, err := r.store.MutateDisk(d.ID, func(cur *store.Disk) error {
+				cur.WriteCache = state
+				return nil
+			}); err != nil {
+				p.errs = append(p.errs, fmt.Sprintf("record write cache of %s: %v", d.ID, err))
+			}
 		}
 	}
 }

@@ -451,6 +451,13 @@ func (s *BoltStore) upsertDisk(disk *Disk, syncBoot bool) error {
 			if (cp.Name == "" || strings.HasPrefix(cp.Name, "nvme_")) && existing.Name != "" && !strings.HasPrefix(existing.Name, "nvme_") {
 				cp.Name = existing.Name
 			}
+			// Operator declarations are never touched by a hardware scan, and the last known
+			// write-cache state survives while SPDK owns the device and the kernel can't see it.
+			cp.PowerLossProtected = existing.PowerLossProtected
+			cp.WriteCachePolicy = existing.WriteCachePolicy
+			if cp.WriteCache == WriteCacheUnknown {
+				cp.WriteCache = existing.WriteCache
+			}
 		} else if cp.IsBootDevice && cp.Claimed {
 			return ErrBootDeviceProtected
 		}

@@ -74,6 +74,7 @@ func (s *Server) warnings() []string {
 	if s.metricsPublic {
 		out = append(out, "/metrics is served without authentication.")
 	}
+	out = append(out, s.durabilityWarnings()...)
 	if s.hw != nil && s.hw.UnsafeNoIOMMUAllowed() {
 		out = append(out, "Unsafe no-IOMMU mode is allowed: SPDK can DMA anywhere in host memory. Use this only in lab VMs.")
 	}
@@ -159,6 +160,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /api/v1/disks", s.withAuth(store.RoleReadOnly, s.handleListDisks))
 	s.mux.HandleFunc("POST /api/v1/disks:scan", s.withAuth(store.RoleAdmin, s.handleScanDisks))
 	s.mux.HandleFunc("POST /api/v1/disks/", s.withAuth(store.RoleAdmin, s.handleDiskAction))
+	s.mux.HandleFunc("PATCH /api/v1/disks/{id}", s.withAuth(store.RoleAdmin, s.handleUpdateDisk))
 	s.mux.HandleFunc("GET /api/v1/disks/{id}", s.withAuth(store.RoleReadOnly, s.handleGetDisk))
 
 	// Pools
