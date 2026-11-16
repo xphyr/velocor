@@ -1,21 +1,23 @@
-# Thin Immutable Appliance Host OS on Fedora Image Mode (bootc) 45
-# Runs spdk_tgt and velod as decoupled Podman Quadlet containers.
-ARG VELOD_IMAGE=registry.xphyrlab.net/velocor/velocor-velod:latest
-ARG VELOCTL_FROM=${VELOD_IMAGE}
-ARG PRELOAD_IMAGES_FROM=preload-empty
+# Thin immutable appliance OS on Fedora image mode (bootc) 45.
+# Runs spdk_tgt and velod as Podman quadlet containers.
+#
+# VELOD_IMAGE and SPDK_IMAGE are required and must be pinned by digest (repo:tag@sha256:...):
+# `make image-os` resolves them from the images pushed for the same commit. Both images
+# are embedded in this OS image and the quadlets reference them by digest, so an appliance runs
+# exactly the containers it was built and tested with, without a registry at boot, and only
+# `bootc upgrade` changes them.
+ARG VELOD_IMAGE
+ARG SPDK_IMAGE
 
-FROM ${VELOCTL_FROM} AS velod-bin
+# veloctl for the host comes from the same velod image the appliance runs.
+FROM ${VELOD_IMAGE} AS velod-bin
 
-FROM quay.io/fedora/fedora-bootc:45 AS preload-empty
-RUN mkdir -p /preload-images
+FROM quay.io/fedora/fedora-bootc:45@sha256:1989dd9223dc2ef03e3be158165be13e55b5571c62e9f3c88992950cf355416d
 
-FROM ${PRELOAD_IMAGES_FROM} AS preload-images
-
-FROM quay.io/fedora/fedora-bootc:45
-
-ARG VELOD_IMAGE=registry.xphyrlab.net/velocor/velocor-velod:latest
-ARG SPDK_IMAGE=registry.xphyrlab.net/velocor/velocor-spdk:latest
-ARG PRELOAD_IMAGES=true
+ARG VELOD_IMAGE
+ARG SPDK_IMAGE
+# Only for CI builds of pull requests, whose images live in a throwaway local registry.
+ARG INSECURE_REGISTRY=false
 
 RUN dnf install -y \
       podman \
@@ -72,27 +74,28 @@ COPY deploy/bootc/velocor-console-banner.sh /usr/libexec/velocor-console-banner
 COPY deploy/bootc/velocor-console.service /usr/lib/systemd/system/velocor-console.service
 COPY deploy/bootc/90-velocor-banner /usr/lib/NetworkManager/dispatcher.d/90-velocor-banner
 
-# Preload velocor-spdk and velocor-velod images so first boot works without pulling
+# Embed both container images (oci-archive keeps the registry manifest digest, so podman finds
+# them by digest after loading) and pin the quadlets to exactly what was embedded.
 COPY deploy/bootc/velocor-preload-images.sh /usr/libexec/velocor-preload-images
 COPY deploy/bootc/velocor-preload-images.service /usr/lib/systemd/system/velocor-preload-images.service
-COPY --from=preload-images /preload-images /tmp/preload-images
+RUN set -eu; \
+    tls=""; [ "${INSECURE_REGISTRY}" = "true" ] && tls="--src-tls-verify=false"; \
+    mkdir -p /usr/share/velocor/images; \
+    embed() { \
+      ref="$1" name="$2"; \
+      case "$ref" in *@sha256:*) ;; *) echo "$name image '$ref' must be pinned by digest (repo:tag@sha256:...)" >&2; exit 1 ;; esac; \
+      repo_tag="${ref%@*}"; \
+      archive="/usr/share/velocor/images/$name.oci.tar"; \
+      skopeo copy -q $tls "docker://$ref" "oci-archive:$archive:$repo_tag"; \
+      digest="$(skopeo inspect --format '{{.Digest}}' "oci-archive:$archive")"; \
+      sed -i "s|^Image=.*|Image=${repo_tag}@${digest}|" "/usr/share/containers/systemd/$name.container"; \
+      echo "$name: Image=${repo_tag}@${digest}"; \
+    }; \
+    embed "${SPDK_IMAGE}" velocor-spdk; \
+    embed "${VELOD_IMAGE}" velocor-velod; \
+    ! grep -q '@VELOCOR_' /usr/share/containers/systemd/velocor-*.container
 
-RUN sed -i "s|^Image=.*|Image=${SPDK_IMAGE}|" /usr/share/containers/systemd/velocor-spdk.container && \
-    sed -i "s|^Image=.*|Image=${VELOD_IMAGE}|" /usr/share/containers/systemd/velocor-velod.container && \
-    ARCH="$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')" && \
-    mkdir -p /usr/share/velocor/images && \
-    if [ -f /tmp/preload-images/velocor-spdk.tar ]; then \
-      mv /tmp/preload-images/velocor-spdk.tar /usr/share/velocor/images/velocor-spdk.tar; \
-    elif [ "${PRELOAD_IMAGES}" = "true" ]; then \
-      skopeo copy --override-arch "${ARCH}" "docker://${SPDK_IMAGE}" "docker-archive:/usr/share/velocor/images/velocor-spdk.tar:${SPDK_IMAGE}"; \
-    fi && \
-    if [ -f /tmp/preload-images/velocor-velod.tar ]; then \
-      mv /tmp/preload-images/velocor-velod.tar /usr/share/velocor/images/velocor-velod.tar; \
-    elif [ "${PRELOAD_IMAGES}" = "true" ]; then \
-      skopeo copy --override-arch "${ARCH}" "docker://${VELOD_IMAGE}" "docker-archive:/usr/share/velocor/images/velocor-velod.tar:${VELOD_IMAGE}"; \
-    fi && \
-    rm -rf /tmp/preload-images && \
-    chmod 0755 /usr/libexec/velocor-console-banner /usr/libexec/velocor-preload-images /usr/lib/NetworkManager/dispatcher.d/90-velocor-banner && \
+RUN chmod 0755 /usr/libexec/velocor-console-banner /usr/libexec/velocor-preload-images /usr/lib/NetworkManager/dispatcher.d/90-velocor-banner && \
     systemctl disable bootc-fetch-apply-updates.timer && \
     systemctl enable velocor-console.service velocor-preload-images.service vmtoolsd.service qemu-guest-agent.service && \
     /usr/lib/systemd/system-generators/podman-system-generator --dryrun >/dev/null && \

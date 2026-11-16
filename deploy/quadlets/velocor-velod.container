@@ -4,7 +4,8 @@ After=network-online.target velocor-spdk.service
 Wants=velocor-spdk.service
 
 [Container]
-Image=registry.xphyrlab.net/velocor/velocor-velod:latest
+# Filled in by the OS image build with the embedded image, pinned by digest.
+Image=@VELOCOR_VELOD_IMAGE@
 ContainerName=velocor-velod
 # No AutoUpdate: an appliance changes only through `bootc upgrade`, which ships quadlets pinned
 # to the image versions built from the same commit.

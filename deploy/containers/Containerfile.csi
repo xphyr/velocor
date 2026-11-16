@@ -1,7 +1,8 @@
-FROM --platform=$BUILDPLATFORM quay.io/fedora/fedora:45 AS builder
+# Kubernetes CSI driver. Multi-arch: the Go build runs natively on the build platform and
+# cross-compiles; only the small runtime stage runs under emulation.
+FROM --platform=$BUILDPLATFORM docker.io/library/golang:1.26.11@sha256:f6946db66567acc1497655237e58f06ec3a57478a5e0d67fca29d2ffcf2ea136 AS builder
 
-RUN dnf install -y golang git && dnf clean all
-
+ENV CGO_ENABLED=0 GOTOOLCHAIN=local
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
@@ -9,14 +10,14 @@ RUN go mod download
 COPY . .
 ARG TARGETOS=linux
 ARG TARGETARCH=amd64
-ARG VERSION=v0.1.0
+ARG VERSION=unknown
 ARG COMMIT=unknown
 ARG BUILD_TIME=unknown
-RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
-    go build -ldflags="-s -w -X github.com/velocor/velocor/internal/version.Version=${VERSION} -X github.com/velocor/velocor/internal/version.Commit=${COMMIT} -X github.com/velocor/velocor/internal/version.BuildTime=${BUILD_TIME}" \
+RUN GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
+    go build -trimpath -ldflags="-s -w -X github.com/velocor/velocor/internal/version.Version=${VERSION} -X github.com/velocor/velocor/internal/version.Commit=${COMMIT} -X github.com/velocor/velocor/internal/version.BuildTime=${BUILD_TIME}" \
     -o /out/velocor-csi ./cmd/velocor-csi
 
-FROM quay.io/fedora/fedora-minimal:45
+FROM quay.io/fedora/fedora-minimal:45@sha256:68173f6dc68d25b73ef343e098d8d3df7aaa1096b565012a143d536c52180227
 
 RUN microdnf install -y nvme-cli iscsi-initiator-utils e2fsprogs xfsprogs util-linux && microdnf clean all
 RUN mkdir -p /csi /var/lib/kubelet

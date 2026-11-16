@@ -1,0 +1,11 @@
+version: "2"
+
+linters:
+  settings:
+    errcheck:
+      # fmt.Fprint* here writes to tabwriters (errors surface at Flush, which is checked) or to
+      # strings.Builder (cannot fail).
+      exclude-functions:
+        - fmt.Fprint
+        - fmt.Fprintf
+        - fmt.Fprintln

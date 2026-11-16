@@ -63,7 +63,7 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for a detailed breakdown of the
 
 ### Prerequisites
 
-- **Go** `1.23+`
+- **Go**: the version in `go.mod`'s `toolchain` line (container builds use exactly that version)
 - **Podman** (for building workload and `bootc` OS container images)
 - **QEMU/KVM**, `qemu-img`, `genisoimage`, and `jq` (optional, for the local 2-node VM lab)
 
@@ -79,15 +79,25 @@ make test
 
 ### Build & Push Container Images
 
-By default, images use `IMAGE_PREFIX=registry.xphyrlab.net/velocor`. Override `IMAGE_PREFIX` to push to your own container registry:
+Images are named `$(IMAGE_PREFIX)/<name>:$(TAG)`. `IMAGE_PREFIX` defaults to `ghcr.io/xphyr`;
+`TAG` defaults to `dev-<short sha>`, so a local build never overwrites a shared tag (`latest`
+and version tags are pushed only by CI's release job).
 
 ```bash
-# Build all container images (velocor-spdk, velocor-velod, velocor-csi, velocor-os)
-make containers IMAGE_PREFIX=registry.example.com/velocor
+# Build velocor-spdk, velocor-velod and velocor-csi locally
+make images IMAGE_PREFIX=registry.example.com/velocor
 
-# Push all container images to your registry
-make push-containers IMAGE_PREFIX=registry.example.com/velocor
+# Push them, then build and push velocor-os (refuses a dirty tree: commit first)
+make push IMAGE_PREFIX=registry.example.com/velocor
 ```
+
+The OS image (`velocor-os`) embeds the `velocor-spdk` and `velocor-velod` images of the same
+build, pinned by digest, so `make push` pushes those first and the OS image build resolves their
+digests from the registry. An appliance therefore runs exactly the containers it was built and
+tested with, needs no registry at boot, and changes them only through an OS upgrade.
+
+All base images, the Go toolchain and the SPDK source commit are pinned (`make check-pins`
+verifies it; Renovate proposes bumps).
 
 ### Build a Local `qcow2` VM Image
 
@@ -97,7 +107,7 @@ onto a second virtual disk. Nothing from the build host goes into the image.
 
 ```bash
 hack/build-qcow2.sh \
-  --image registry.xphyrlab.net/velocor/velocor-os:dev-<sha> \
+  --image registry.example.com/velocor/velocor-os:dev-<sha> \
   --output velocor-os.qcow2 --size 32G \
   --authorized-keys ~/.ssh/id_ed25519.pub   # repeatable
 ```
@@ -115,9 +125,8 @@ the repository contains keys or passwords; give `velocor-admin` keys in one of t
 - After installing with `bootc install to-disk` (below), add the file
   `/etc/ssh/authorized_keys.d/velocor-admin` (mode 0644, owned by root) to the installed system.
 
-`make qcow2` (bootc-image-builder, needs sudo) still works; to add keys with it, put a
-`[[customizations.user]]` block with `name = "velocor-admin"` and your `key` in
-`deploy/bootc/config.local.toml` (git-ignored).
+`make qcow2 IMAGE_PREFIX=... QCOW2_KEYS="a.pub b.pub"` runs the same script for the OS image of
+the current commit.
 
 ---
 
@@ -131,7 +140,7 @@ The recommended production deployment installs the immutable `velocor-os` image 
 2. **Install `velocor-os` to the target boot drive** (e.g., `/dev/sda` or `/dev/nvme0n1`):
 
    ```bash
-   export BOOTC_IMAGE="registry.xphyrlab.net/velocor/velocor-os:<tag>"
+   export BOOTC_IMAGE="ghcr.io/xphyr/velocor-os:<version>"
    export TARGET_DISK="/dev/sda"
 
    sudo podman pull "${BOOTC_IMAGE}"
@@ -169,8 +178,9 @@ The recommended production deployment installs the immutable `velocor-os` image 
 5. **Atomic OS Upgrades & Rollbacks:**
 
    ```bash
-   # Upgrade the appliance OS image via veloctl (or `bootc upgrade` on the host)
-   veloctl system upgrade registry.xphyrlab.net/velocor/velocor-os:v0.2.0
+   # Upgrade the appliance OS image via veloctl (or `bootc upgrade` on the host). The OS image
+   # carries velod and spdk_tgt, so this is also how the containers are updated.
+   veloctl system upgrade ghcr.io/xphyr/velocor-os:v0.2.0
 
    # Roll back to the previous OS deployment if needed
    veloctl system rollback
@@ -432,7 +442,7 @@ kubectl -n velocor-csi create secret generic velocor-csi-auth \
 
 ### 4. Deploy the CSI Driver & Snapshot Classes
 
-> **Custom Registry & Release Manifests:** If you pushed `velocor-csi` to a custom registry, update the `image:` field in [deploy/k8s/csi/velocor-csi.yaml](deploy/k8s/csi/velocor-csi.yaml) (default: `registry.xphyrlab.net/velocor/velocor-csi:latest`). For tagged GitHub Releases, a pre-configured `velocor-csi.yaml` pointing to `ghcr.io/<owner>/velocor-csi:<tag>` is attached directly to the release assets.
+> **Custom Registry & Release Manifests:** If you pushed `velocor-csi` to a custom registry, update the `image:` field in [deploy/k8s/csi/velocor-csi.yaml](deploy/k8s/csi/velocor-csi.yaml) (default: `ghcr.io/xphyr/velocor-csi:latest`). For tagged GitHub Releases, a `velocor-csi.yaml` pinned to that release's image digest is attached to the release; the Helm chart from a release pins the digest too (`image.digest`).
 
 Apply the CSI driver manifest (creates the `CSIDriver`, RBAC roles, `velocor-csi-controller` Deployment, `velocor-csi-node` DaemonSet, and the `velocor-nvme-tcp` and `velocor-iscsi` StorageClasses):
 

@@ -5,7 +5,8 @@ After=network-online.target local-fs.target
 Wants=network-online.target
 
 [Container]
-Image=registry.xphyrlab.net/velocor/velocor-spdk:latest
+# Filled in by the OS image build with the embedded image, pinned by digest.
+Image=@VELOCOR_SPDK_IMAGE@
 ContainerName=velocor-spdk
 # No AutoUpdate: restarting spdk_tgt interrupts all SAN I/O. The data plane is only updated
 # explicitly (Web UI / API with allow_disruptive=true) during a maintenance window.

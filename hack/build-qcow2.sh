@@ -3,13 +3,12 @@
 #
 # A throwaway Fedora Cloud VM runs `bootc install to-disk` against a second virtual disk,
 # which becomes the qcow2. Only KVM access is needed (no sudo, no rootful podman), so this runs
-# on an unprivileged lab host. Unlike `make qcow2` (bootc-image-builder), nothing from the
-# build host ends up in the image: no registry credentials, and no SSH key unless one is
-# passed explicitly. The appliance's login is `velocor-admin` (root can't log in over SSH): give
+# on an unprivileged lab host. Nothing from the build host ends up in the image: no registry
+# credentials, and no SSH key unless one is passed explicitly. The appliance's login is `velocor-admin` (root can't log in over SSH): give
 # it keys with --authorized-keys (repeatable; written to /etc/ssh/authorized_keys.d/velocor-admin
 # in the installed system), or provision them at boot with cloud-init.
 #
-# Usage: hack/build-qcow2.sh --image registry.xphyrlab.net/velocor/velocor-os:dev-<sha> \
+# Usage: hack/build-qcow2.sh --image <registry>/<org>/velocor-os:dev-<sha>[@sha256:...] \
 #          --output velocor-os.qcow2 [--size 32G] [--authorized-keys keys.pub ...] [--work DIR]
 set -euo pipefail
 

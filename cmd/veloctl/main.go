@@ -340,7 +340,7 @@ func runToken(cfg *cliConfig, args []string) error {
 
 func runSystem(cfg *cliConfig, args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("subcommand required: status | os | reconcile | iostats | upgrade | rollback | reboot | check-updates | update-containers")
+		return fmt.Errorf("subcommand required: status | os | reconcile | iostats | upgrade | rollback | reboot | containers")
 	}
 	switch args[0] {
 	case "status":
@@ -435,33 +435,23 @@ func runSystem(cfg *cliConfig, args []string) error {
 		}
 		return printJSON(resp)
 
-	case "check-updates", "containers":
-		resp, err := cfg.request("GET", "/api/v1/system/containers/updates", nil)
+	case "containers":
+		resp, err := cfg.request("GET", "/api/v1/system/containers", nil)
 		if err != nil {
 			return err
 		}
 		if cfg.jsonOutput {
 			return printJSON(resp)
 		}
-		fmt.Printf("Updates Available: %v (checked %v)\n", resp["updates_available"], resp["checked_at"])
+		if msg, _ := resp["message"].(string); msg != "" {
+			fmt.Println(msg)
+		}
 		tw := newTabWriter()
-		fmt.Fprintln(tw, "UNIT\tCONTAINER\tIMAGE\tUPDATE STATUS\tRUNNING")
+		fmt.Fprintln(tw, "UNIT\tIMAGE\tSTATUS")
 		for _, c := range sliceOfMaps(resp["containers"]) {
-			fmt.Fprintf(tw, "%v\t%v\t%v\t%v\t%v\n",
-				c["unit"], c["container_name"], c["image"], c["update_status"], c["running_status"])
+			fmt.Fprintf(tw, "%v\t%v\t%v\n", c["unit"], c["image"], c["running_status"])
 		}
 		return tw.Flush()
-
-	case "update-containers":
-		fs := flag.NewFlagSet("system update-containers", flag.ExitOnError)
-		unit := fs.String("unit", "", "Optional systemd unit name (e.g. velocor-velod.service)")
-		disruptive := fs.Bool("allow-disruptive", false, "Allow restarting the SPDK data plane (interrupts all SAN I/O)")
-		_ = fs.Parse(args[1:])
-		resp, err := cfg.request("POST", "/api/v1/system/containers/update", map[string]any{"unit": *unit, "allow_disruptive": *disruptive})
-		if err != nil {
-			return err
-		}
-		return printJSON(resp)
 
 	default:
 		return fmt.Errorf("unknown system subcommand %q", args[0])
@@ -1245,7 +1235,7 @@ Commands:
   passwd            Change your own password
   user              Manage local users (list, create, update, delete)
   token             Manage scoped service tokens (list, create, revoke)
-  system            Appliance status, OS/container updates, bootc upgrade/rollback
+  system            Appliance status, containers, bootc upgrade/rollback
   disk              List, scan, claim, or release NVMe and SSD drives
   pool              Create, list, or delete SPDK RAID + lvol_store pools
   volume            Create, list, get, show usage, resize, set QoS, or delete volumes

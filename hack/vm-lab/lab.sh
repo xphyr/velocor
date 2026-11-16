@@ -22,7 +22,7 @@ INIT_SSH_PORT="${INIT_SSH_PORT:-12222}"
 FEDORA_RELEASE="${FEDORA_RELEASE:-45}"
 BASE_IMAGE="${BASE_IMAGE:-${LAB_DIR}/fedora-cloud-base.qcow2}"
 BOOTC_DISK="${BOOTC_DISK:-${LAB_DIR}/velocor-bootc.qcow2}"
-BOOTC_IMAGE="${BOOTC_IMAGE:-registry.xphyrlab.net/velocor/velocor-os:latest}"
+BOOTC_IMAGE="${BOOTC_IMAGE:-}"  # required for build-bootc-disk: <registry>/<org>/velocor-os:dev-<sha>
 
 usage() {
   cat <<EOF
@@ -133,6 +133,7 @@ build_bootc_disk() {
     echo "Fedora bootc disk already exists at ${BOOTC_DISK}"
     return 0
   fi
+  [[ -n "${BOOTC_IMAGE}" ]] || { echo "set BOOTC_IMAGE to the OS image to install (<registry>/<org>/velocor-os:dev-<sha>)" >&2; exit 1; }
   ensure_ssh_key
   "${REPO_ROOT}/hack/build-qcow2.sh" --image "${BOOTC_IMAGE}" --output "${BOOTC_DISK}" \
     --size 20G --authorized-keys "${LAB_DIR}/id_ed25519.pub" --work "${LAB_DIR}/qcow2-build"
@@ -323,7 +324,7 @@ EOF
 
   echo ""
   echo "=== Creating SPDK RAID1 Pool & Thin-Provisioned Volumes ==="
-  local pool_id vol_nvmf_id vol_iscsi_id portal_nvmf_id portal_iscsi_id snap1_id snap2_id
+  local pool_id vol_nvmf_id vol_iscsi_id portal_nvmf_id portal_iscsi_id
   pool_id="$("${REPO_ROOT}/bin/veloctl" --endpoint "https://127.0.0.1:${SAN_API_PORT}" --insecure pool create --name nvme-pool --raid RAID1 --disks nvme-0000-00-03-0,nvme-0000-00-04-0 | jq -r '.pool.id')"
   vol_nvmf_id="$("${REPO_ROOT}/bin/veloctl" --endpoint "https://127.0.0.1:${SAN_API_PORT}" --insecure volume create --name vol-nvmf --pool "${pool_id}" --size-gib 2 --thin=true | jq -r '.volume.id')"
   vol_iscsi_id="$("${REPO_ROOT}/bin/veloctl" --endpoint "https://127.0.0.1:${SAN_API_PORT}" --insecure volume create --name vol-iscsi --pool "${pool_id}" --size-gib 2 --thin=true | jq -r '.volume.id')"
@@ -354,9 +355,9 @@ EOF
 
   echo ""
   echo "=== Testing CoW Snapshots on NVMe-oF/TCP Volume ==="
-  snap1_id="$("${REPO_ROOT}/bin/veloctl" --endpoint "https://127.0.0.1:${SAN_API_PORT}" --insecure snapshot create --volume "${vol_nvmf_id}" --name snap-1 | jq -r '.snapshot.id')"
+  "${REPO_ROOT}/bin/veloctl" --endpoint "https://127.0.0.1:${SAN_API_PORT}" --insecure snapshot create --volume "${vol_nvmf_id}" --name snap-1 | jq -e '.snapshot.id' >/dev/null
   ssh "${ssh_opts[@]}" -p "${SAN_SSH_PORT}" velocor-admin@127.0.0.1 "sudo dd if=/dev/urandom of=/dev/nvme0n1 bs=64k count=2 seek=16 oflag=direct status=none && sync && sudo nvme disconnect -n nqn.2026-11.io.velocor:exp-nvmf"
-  snap2_id="$("${REPO_ROOT}/bin/veloctl" --endpoint "https://127.0.0.1:${SAN_API_PORT}" --insecure snapshot create --volume "${vol_nvmf_id}" --name snap-2 | jq -r '.snapshot.id')"
+  "${REPO_ROOT}/bin/veloctl" --endpoint "https://127.0.0.1:${SAN_API_PORT}" --insecure snapshot create --volume "${vol_nvmf_id}" --name snap-2 | jq -e '.snapshot.id' >/dev/null
   "${REPO_ROOT}/bin/veloctl" --endpoint "https://127.0.0.1:${SAN_API_PORT}" --insecure snapshot list
 
   echo ""

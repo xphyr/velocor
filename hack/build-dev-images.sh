@@ -1,34 +1,24 @@
 #!/usr/bin/env bash
-# Build all Velocor images from the current commit and push them as dev-<sha>.
+# Build all Velocor images from the current commit and push them as dev-<sha> to a dev registry.
 #
-# Usage: hack/build-dev-images.sh <authfile>
+# Usage: IMAGE_PREFIX=<registry>/<org> hack/build-dev-images.sh <authfile>
 #   <authfile>  podman authfile with push rights (a robot account, not a personal login)
 #
-# Dev builds carry quay.expires-after so Quay removes them on its own after DEV_EXPIRY (a
-# backstop); remove superseded builds right away with hack/prune-dev-tags.sh. Refuses to run on
-# a dirty tree, so a dev-<sha> tag always matches the commit it names, and never pushes latest
-# or release tags.
+# A thin wrapper around `make push` (which refuses dirty trees and release tags). Dev builds
+# carry quay.expires-after so Quay removes them after DEV_EXPIRY as a backstop; remove superseded
+# builds right away with hack/prune-dev-tags.sh.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-AUTH=${1:?usage: $0 <authfile>}
-[[ -z "$(git status --porcelain --untracked-files=no)" ]] || { echo "working tree has uncommitted changes; commit first" >&2; exit 1; }
-SHA=$(git rev-parse --short HEAD)
-TAG=dev-$SHA
-P=${IMAGE_PREFIX:-registry.xphyrlab.net/velocor}
-LABELS="quay.expires-after=${DEV_EXPIRY:-30d}"
-log() { echo "=== $(date +%T) $*"; }
+AUTH=${1:?usage: IMAGE_PREFIX=<registry>/<org> $0 <authfile>}
+: "${IMAGE_PREFIX:?set IMAGE_PREFIX to the dev registry and org, e.g. quay.example.com/velocor}"
+TAG=dev-$(git rev-parse --short=7 HEAD)
+export REGISTRY_AUTH_FILE=$AUTH
 
-log "build spdk";  make container-spdk  BUILD_LABELS="$LABELS" SPDK_IMAGE="$P/velocor-spdk:$TAG"
-log "build velod"; make container-velod BUILD_LABELS="$LABELS" VELOD_IMAGE="$P/velocor-velod:$TAG"
-log "build csi";   make container-csi   BUILD_LABELS="$LABELS" CSI_IMAGE="$P/velocor-csi:$TAG"
-for img in velocor-spdk velocor-velod velocor-csi; do
-  log "push $img:$TAG"; podman push --authfile "$AUTH" "$P/$img:$TAG"
-done
-log "build os (bootc), pinned to $TAG"
-make container-bootc BUILD_LABELS="$LABELS" SPDK_IMAGE="$P/velocor-spdk:$TAG" \
-  VELOD_IMAGE="$P/velocor-velod:$TAG" BOOTC_IMAGE="$P/velocor-os:$TAG"
-log "push velocor-os:$TAG"; podman push --authfile "$AUTH" "$P/velocor-os:$TAG"
-log "verify the OS image's quadlets are pinned to $TAG"
-podman run --rm --entrypoint grep "$P/velocor-os:$TAG" -h '^Image=' \
-  /usr/share/containers/systemd/velocor-spdk.container /usr/share/containers/systemd/velocor-velod.container
-log "DONE $TAG"
+make push IMAGE_PREFIX="$IMAGE_PREFIX" TAG="$TAG" BUILD_LABELS="quay.expires-after=${DEV_EXPIRY:-30d}"
+
+echo "=== quadlets in $IMAGE_PREFIX/velocor-os:$TAG"
+podman run --rm --entrypoint grep "$IMAGE_PREFIX/velocor-os:$TAG" -h '^Image=' \
+  /usr/share/containers/systemd/velocor-spdk.container /usr/share/containers/systemd/velocor-velod.container |
+  tee /dev/stderr | grep -q "^Image=$IMAGE_PREFIX/velocor-velod:$TAG@sha256:" ||
+  { echo "OS image is not pinned to velod $TAG by digest" >&2; exit 1; }
+echo "=== DONE $TAG"

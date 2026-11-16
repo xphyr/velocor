@@ -84,7 +84,7 @@ spec:
       serviceAccountName: velocor-csi-controller
       containers:
         - name: velocor-csi
-          image: registry.xphyrlab.net/velocor/velocor-csi:latest
+          image: ghcr.io/xphyr/velocor-csi:latest
           imagePullPolicy: IfNotPresent
           args:
             - --mode=controller
@@ -158,7 +158,7 @@ spec:
       dnsPolicy: ClusterFirstWithHostNet
       containers:
         - name: velocor-csi
-          image: registry.xphyrlab.net/velocor/velocor-csi:latest
+          image: ghcr.io/xphyr/velocor-csi:latest
           imagePullPolicy: IfNotPresent
           securityContext:
             privileged: true

@@ -56,8 +56,7 @@ This file tracks implementation progress directly inside the Git repository so a
 ## Phase 7: Operator Parity & Appliance Lifecycle Management (`veloctl` & Web UI)
 - [x] `veloctl` CLI and Web UI support for Volume Group Snapshots (Consistency Groups)
 - [x] Web UI & `veloctl` parity for `velocor-os` (`bootc`) status, upgrades, and rollbacks
-- [x] Container update checker for running Quadlet services (`velocor-velod`, `velocor-spdk`) against registry digests (`podman auto-update --dry-run` / OCI manifest check)
-- [x] Web UI & `veloctl` trigger to apply container updates safely with status reporting
+- [x] Containers ship inside the OS image, pinned by digest; they change only with `bootc upgrade` (the separate container-update path was removed)
 
 ## Phase 8: Hardening & Storage Failure-Mode Testing
 - [ ] Control-plane & API hardening (audit logging, rate limiting, TLS/auth hardening, input validation, least-privilege container/host posture)

@@ -2,6 +2,8 @@ module github.com/velocor/velocor
 
 go 1.26.0
 
+toolchain go1.26.11
+
 require (
 	github.com/container-storage-interface/spec v1.13.0
 	github.com/kubernetes-csi/csi-test/v5 v5.6.0

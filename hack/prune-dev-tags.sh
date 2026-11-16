@@ -12,12 +12,14 @@
 # Usage: hack/prune-dev-tags.sh [--keep-last N] [--keep dev-<sha> ...] [--apply]
 #   --keep-last N   newest builds to keep (default 1)
 #   --keep TAG      also keep this build (repeatable), e.g. one an appliance is running
-#   env REGISTRY_USER / REGISTRY_TOKEN_FILE  credentials with push rights (defaults: the
-#        robot account velocor+claude and registry.token.priv at the repo root)
+#   env IMAGE_PREFIX (required)  <registry>/<org> the dev builds were pushed to
+#   env REGISTRY_USER / REGISTRY_TOKEN_FILE (required for --apply)  a robot account with push
+#        rights and a file holding its token
 set -euo pipefail
 
-REGISTRY=${REGISTRY:-registry.xphyrlab.net}
-ORG=${ORG:-velocor}
+: "${IMAGE_PREFIX:?set IMAGE_PREFIX to <registry>/<org>}"
+REGISTRY=${IMAGE_PREFIX%%/*}
+ORG=${IMAGE_PREFIX#*/}
 REPOS=(velocor-spdk velocor-velod velocor-csi velocor-os)
 KEEP_LAST=1 APPLY=false KEEP=()
 while [[ $# -gt 0 ]]; do
@@ -25,12 +27,12 @@ while [[ $# -gt 0 ]]; do
     --keep-last) KEEP_LAST="$2"; shift 2 ;;
     --keep) KEEP+=("$2"); shift 2 ;;
     --apply) APPLY=true; shift ;;
-    *) sed -n 2,19p "$0"; exit 2 ;;
+    *) sed -n 2,17p "$0"; exit 2 ;;
   esac
 done
 cd "$(dirname "$0")/.."
-USER_NAME=${REGISTRY_USER:-velocor+claude}
-TOKEN_FILE=${REGISTRY_TOKEN_FILE:-registry.token.priv}
+USER_NAME=${REGISTRY_USER:-}
+TOKEN_FILE=${REGISTRY_TOKEN_FILE:-}
 
 # Every dev tag in any repository.
 declare -A present
@@ -71,7 +73,7 @@ done
 [[ ${#delete[@]} -gt 0 ]] || { echo "nothing to delete"; exit 0; }
 if ! $APPLY; then echo "(dry run: pass --apply to delete)"; exit 0; fi
 
-[[ -f "$TOKEN_FILE" ]] || { echo "token file $TOKEN_FILE not found" >&2; exit 1; }
+[[ -n "$USER_NAME" && -f "$TOKEN_FILE" ]] || { echo "--apply needs REGISTRY_USER and REGISTRY_TOKEN_FILE" >&2; exit 1; }
 for tag in "${delete[@]}"; do
   for repo in ${present[$tag]}; do
     token=$(curl -fsS -u "$USER_NAME:$(tr -d '\n\r' < "$TOKEN_FILE")" \

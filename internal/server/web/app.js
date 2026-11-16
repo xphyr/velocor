@@ -1143,26 +1143,11 @@ function rebootDialog(hostname) {
   });
 }
 
-function containerUpdateDialog(unit) {
-  const dataPlane = unit === "velocor-spdk.service";
-  openDialog({
-    title: unit ? `Update ${unit}` : "Apply container updates",
-    intro: dataPlane
-      ? "This restarts spdk_tgt, which stops ALL SAN I/O on this appliance until it's back. Do it in a maintenance window."
-      : unit ? "The container restarts with its newest image. The data plane keeps serving I/O meanwhile."
-        : "Every container with automatic updates restarts with its newest image. The SPDK data plane is never included: update it on its own.",
-    submit: dataPlane ? "Restart the data plane" : "Update",
-    danger: dataPlane,
-    confirmText: dataPlane ? "velocor-spdk" : undefined,
-    action: () => send("POST", "/system/containers/update", { unit: unit || "", allow_disruptive: dataPlane }),
-    done: (r) => { notify(r.message || "Update started."); setTimeout(rerender, 1500); },
-  });
-}
-
-let containerCheck = null;
 
 async function system() {
-  const [st, os] = await Promise.all([api("/system/status"), api("/system/os").catch((err) => { if (err instanceof Unauthorized) throw err; return null; })]);
+  const soft = (err) => { if (err instanceof Unauthorized) throw err; return null; };
+  const [st, os, containers] = await Promise.all([api("/system/status"), api("/system/os").catch(soft), api("/system/containers").catch(soft)]);
+  const ctr = containers || { available: false };
   const rec = st.reconciler || {};
   const dep = (d) => (d ? [mono(d.image || "-"), el("span", { class: "sub" }, [d.version, d.timestamp && humanTime(d.timestamp)].filter(Boolean).join(", "))] : "-");
   return [
@@ -1187,24 +1172,14 @@ async function system() {
         os && os.available
           ? el("dl", { class: "facts" }, fact("Booted", dep(os.booted)), fact("Staged", dep(os.staged)), fact("Rollback", dep(os.rollback)))
           : el("div", { class: "panel-notice" }, (os && os.message) || "bootc isn't available on this host."))),
-    el("div", { class: "section-head" }, el("h2", {}, "Containers"),
-      el("div", { class: "row-actions" },
-        el("button", { id: "check-updates", onclick: async () => {
-          try { containerCheck = await api("/system/containers/updates"); rerender(); } catch (err) { notify(err.message); }
-        } }, containerCheck ? "Check again" : "Check for updates"),
-        can.admin && containerCheck && containerCheck.updates_available && el("button", { class: "primary", onclick: () => containerUpdateDialog("") }, "Apply updates"))),
-    containerCheck
-      ? [
-        containerCheck.message && el("div", { class: "panel-notice warn" }, containerCheck.message),
-        containerCheck.last_update_state && el("div", { class: "panel-notice" }, `Last update: ${containerCheck.last_update_state}. ${containerCheck.last_update_message || ""}`),
-        table([
-          { title: "Unit", cell: (c) => [el("strong", {}, c.unit), el("span", { class: "sub mono" }, c.image)] },
-          { title: "Running", cell: (c) => c.running_status || "-" },
-          { title: "Update", cell: (c) => (c.update_available ? pill("Available", "warn") : pill(c.update_status || "Current", "quiet")) },
-          { title: "", cell: (c) => el("div", { class: "row-actions" }, can.admin && el("button", { class: c.unit === "velocor-spdk.service" ? "danger-quiet" : "", onclick: () => containerUpdateDialog(c.unit) }, "Update")) },
-        ], containerCheck.containers || [], { filter: false, empty: "No containers found." }),
-      ]
-      : el("p", { class: "muted" }, "Checking asks the registry for newer images, so it's only done when you ask."),
+    el("div", { class: "section-head" }, el("h2", {}, "Containers")),
+    el("p", { class: "muted" }, "The containers are part of the operating system image, pinned to exact versions. They change only when you upgrade the operating system."),
+    !ctr.available
+      ? el("div", { class: "panel-notice warn" }, ctr.message || "podman isn't available on this host.")
+      : table([
+        { title: "Unit", cell: (c) => [el("strong", {}, c.unit), el("span", { class: "sub mono" }, c.image)] },
+        { title: "Running", cell: (c) => c.running_status || "-" },
+      ], ctr.containers || [], { filter: false, empty: "No containers found." }),
   ];
 }
 

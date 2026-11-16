@@ -146,7 +146,7 @@ func ValidateNQN(nqn string) error {
 	}
 	for _, r := range nqn[4:8] + nqn[9:11] {
 		if r < '0' || r > '9' {
-			return fmt.Errorf("NQN %q must start with nqn.yyyy-mm.", nqn)
+			return fmt.Errorf("NQN %q must start with nqn.yyyy-mm.<reverse domain>", nqn)
 		}
 	}
 	return nil

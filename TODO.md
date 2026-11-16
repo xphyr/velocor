@@ -146,41 +146,42 @@ work still open, ranked by risk to data, how fixes are verified, and what has be
 
 Everything here was written by Gemini and is in scope to rewrite.
 
-- [ ] **B1. The OS image is not built from the same commit as the containers it runs.** On
-  non-release CI runs `build-os` pins the quadlets to `velocor-velod:latest` /
-  `velocor-spdk:latest` and pre-loads whatever `latest` is at that moment, not the images built
-  earlier in the same run. An appliance image for commit X can contain velod from commit Y (or
-  from a concurrent run). *Fix:* pass the digests produced by `build-containers` to `build-os`
-  and pin quadlets by digest (`image@sha256:…`).
-- [ ] **B2. Appliances reference images by mutable tags**, even for releases, so what an
-  appliance runs can change under it. *Fix:* pin by digest in the bootc image; keep tags only for
-  humans.
-- [ ] **B3. Unpinned base images**: `fedora:45`, `fedora-minimal:45`, `fedora-bootc:45`,
-  `bootc-image-builder:latest`. Builds aren't reproducible and a base-image change can land
-  silently. *Fix:* pin by digest; let a bot (Renovate/Dependabot) propose bumps.
-- [ ] **B4. Images compile with Fedora's `golang` package, not the Go version in `go.mod`**,
-  while CI tests with `setup-go` from `go.mod`, so the binaries shipped aren't built by the
-  toolchain that was tested. *Fix:* build stages from a digest-pinned `golang:<go.mod version>`
-  image (or `GOTOOLCHAIN` from `go.mod`).
-- [ ] **B5. CI never runs the integration tests, `golangci-lint`, or `bash -n`/shellcheck.**
-  *Fix:* add jobs; GitHub runners have passwordless sudo, so the real-SPDK suite can run rootful
-  there and also cover io_uring (P0-6).
-- [ ] **B6. Least privilege in CI.** `packages: write`, `id-token: write` and
-  `attestations: write` are granted workflow-wide, including to the test job. Third-party
-  actions are pinned to moving tags (`@v6`, `anchore/sbom-action@v0`) rather than commit SHAs.
-  *Fix:* per-job permissions; pin actions by SHA.
-- [ ] **B7. Makefile defaults push `latest`.** `push-*` and `container-*` default to `:latest`,
-  so a casual `make push-containers` overwrites the shared tag. *Fix:* default to
-  `dev-<sha>`; require an explicit release target for `latest`/version tags.
-- [ ] **B8. `make qcow2` needs sudo and `bootc-image-builder:latest`.** `hack/build-qcow2.sh`
-  (rootless, no credentials or keys baked in) replaces it for lab use; decide whether releases
-  should publish a qcow2 built in CI.
-- [ ] **B9. The internal registry name leaks into public artifacts.** `deploy/k8s/csi/*.yaml`
-  and the bootc Containerfile default to `registry.xphyrlab.net`, and the release job relies on
-  `sed` to rewrite one manifest. *Fix:* one image-reference setting, defaulting to the public
-  registry, overridden for lab builds.
-- [ ] **B10. Inconsistent SPDK settings**: the image's default `CMD` uses `-s 512` while the
-  quadlet uses `-s 1024`; the quadlet should be the only source.
+- [ ] **B8 (rest). Publish a qcow2 with releases?** `make qcow2` now runs `hack/build-qcow2.sh`
+  (rootless, KVM only; bootc-image-builder and its sudo are gone). Undecided whether CI should
+  attach a qcow2 to releases (GitHub runners have KVM).
+- [ ] **B14. RPM packages in image builds are not pinned.** Base images are pinned by digest, but
+  `dnf install` takes whatever the Fedora mirrors have, so rebuilding a commit can produce
+  different packages. *Option:* RPM lockfiles (e.g. rpm-lockfile-prototype) for the SPDK builder
+  and the OS image.
+- [ ] **B15. CI compiles SPDK on every run** (one compile per run, shared by the integration
+  tests and the image). *Option:* reuse the previous `velocor-spdk` image when
+  `Containerfile.spdk` hasn't changed.
+- [ ] **B16. The new CI workflow has not run yet.** It passes actionlint and every step uses
+  `make` targets verified locally, but the GitHub-side pieces (ghcr login, cosign, attestations,
+  rootless podman with arm64 emulation on the runner, the PR local registry) are only proven by
+  a first run. Also enable Renovate on the repository (`renovate.json`).
+- [x] **B1/B2.** The OS image now embeds the velod/spdk images built and pushed in the same run
+  (`make push`; one CI job) as `oci-archive` and its quadlets reference them by digest, so an
+  appliance runs exactly what it was built with, needs no registry at boot, and changes only via
+  `bootc upgrade`. Repo quadlets carry placeholders; the build fails without digest-pinned refs.
+  velod's separate container-update path (pull the tag again and restart) was removed with it;
+  `GET /api/v1/system/containers` lists the containers read-only.
+- [x] **B3.** All base images pinned by digest, SPDK pinned by commit (tag checked against it);
+  `hack/check-pins.sh` (in `make lint` and CI) rejects unpinned FROMs and actions;
+  `renovate.json` proposes bumps.
+- [x] **B4.** Images build with the official golang image matching go.mod's new `toolchain`
+  line (`GOTOOLCHAIN=local`, `-trimpath`, commit time as build time); check-pins enforces it.
+- [x] **B5.** CI runs check-pins, go vet (incl. integration tag), golangci-lint v2.15.0 (clean;
+  `.golangci.yml`), shellcheck, helm lint, and the real-SPDK integration tests.
+- [x] **B6.** No workflow-level permissions; each job declares its own. Every action pinned to a
+  commit SHA.
+- [x] **B7.** Makefile rewritten: `TAG` defaults to `dev-<sha>`; `latest`/version tags need
+  `RELEASE=true`, a clean tree and a commit tagged `VERSION`; pushes record digests.
+- [x] **B9.** No internal registry names in the repo's artifacts: default prefix
+  `ghcr.io/xphyr`; hack scripts take `IMAGE_PREFIX`; release manifests and the Helm chart pin the
+  CSI image by digest (`image.digest`).
+- [x] **B10.** spdk_tgt and velod images have no default arguments; the quadlets are the only
+  source.
 - [x] **B13.** Outdated dev builds piled up in the registry: `hack/build-dev-images.sh` builds
   and pushes `dev-<sha>` from a clean tree (labelled `quay.expires-after`), and
   `hack/prune-dev-tags.sh` removes superseded builds by tag (consecutive builds share digests,

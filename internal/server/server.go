@@ -219,8 +219,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("POST /api/v1/system/upgrade", s.withAuth(store.RoleAdmin, s.handleStageUpgrade))
 	s.mux.HandleFunc("POST /api/v1/system/rollback", s.withAuth(store.RoleAdmin, s.handleRollbackUpgrade))
 	s.mux.HandleFunc("POST /api/v1/system/reboot", s.withAuth(store.RoleAdmin, s.handleRebootSystem))
-	s.mux.HandleFunc("GET /api/v1/system/containers/updates", s.withAuth(store.RoleReadOnly, s.handleCheckContainerUpdates))
-	s.mux.HandleFunc("POST /api/v1/system/containers/update", s.withAuth(store.RoleAdmin, s.handleApplyContainerUpdates))
+	s.mux.HandleFunc("GET /api/v1/system/containers", s.withAuth(store.RoleReadOnly, s.handleListContainers))
 	s.mux.HandleFunc("GET /api/v1/system/network", s.withAuth(store.RoleReadOnly, s.handleGetNetwork))
 	s.mux.HandleFunc("PUT /api/v1/system/network/interfaces/{name}", s.withAuth(store.RoleAdmin, s.handleUpdateNetworkInterface))
 }
@@ -941,10 +940,10 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		st := s.reconciler.State()
 		sb.WriteString("# HELP velocor_reconciler_drift_repaired_total Total resources repaired by reconciler.\n")
 		sb.WriteString("# TYPE velocor_reconciler_drift_repaired_total counter\n")
-		sb.WriteString(fmt.Sprintf("velocor_reconciler_drift_repaired_total %d\n", st.DriftRepairedCount))
+		fmt.Fprintf(&sb, "velocor_reconciler_drift_repaired_total %d\n", st.DriftRepairedCount)
 		sb.WriteString("# HELP velocor_reconciler_degraded_resources Number of currently degraded resources.\n")
 		sb.WriteString("# TYPE velocor_reconciler_degraded_resources gauge\n")
-		sb.WriteString(fmt.Sprintf("velocor_reconciler_degraded_resources %d\n", len(st.DegradedResources)))
+		fmt.Fprintf(&sb, "velocor_reconciler_degraded_resources %d\n", len(st.DegradedResources))
 	}
 
 	if pools, err := s.store.ListPools(); err == nil {
@@ -953,8 +952,8 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		sb.WriteString("# HELP velocor_pool_free_bytes Free capacity of storage pool in bytes.\n")
 		sb.WriteString("# TYPE velocor_pool_free_bytes gauge\n")
 		for _, p := range pools {
-			sb.WriteString(fmt.Sprintf("velocor_pool_total_bytes{pool=%q,raid=%q} %d\n", p.Name, p.RaidLevel, p.TotalBytes))
-			sb.WriteString(fmt.Sprintf("velocor_pool_free_bytes{pool=%q,raid=%q} %d\n", p.Name, p.RaidLevel, p.FreeBytes))
+			fmt.Fprintf(&sb, "velocor_pool_total_bytes{pool=%q,raid=%q} %d\n", p.Name, p.RaidLevel, p.TotalBytes)
+			fmt.Fprintf(&sb, "velocor_pool_free_bytes{pool=%q,raid=%q} %d\n", p.Name, p.RaidLevel, p.FreeBytes)
 		}
 	}
 
@@ -962,7 +961,7 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		sb.WriteString("# HELP velocor_disk_temperature_celsius NVMe/SSD SMART temperature in Celsius.\n")
 		sb.WriteString("# TYPE velocor_disk_temperature_celsius gauge\n")
 		for _, d := range disks {
-			sb.WriteString(fmt.Sprintf("velocor_disk_temperature_celsius{disk=%q,type=%q} %d\n", d.ID, d.Type, d.Smart.TemperatureCelsius))
+			fmt.Fprintf(&sb, "velocor_disk_temperature_celsius{disk=%q,type=%q} %d\n", d.ID, d.Type, d.Smart.TemperatureCelsius)
 		}
 	}
 
@@ -973,8 +972,8 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 			sb.WriteString("# HELP velocor_bdev_write_ops_total Total write operations on SPDK bdev.\n")
 			sb.WriteString("# TYPE velocor_bdev_write_ops_total counter\n")
 			for _, b := range iostat.Bdevs {
-				sb.WriteString(fmt.Sprintf("velocor_bdev_read_ops_total{bdev=%q} %d\n", b.Name, b.NumReadOps))
-				sb.WriteString(fmt.Sprintf("velocor_bdev_write_ops_total{bdev=%q} %d\n", b.Name, b.NumWriteOps))
+				fmt.Fprintf(&sb, "velocor_bdev_read_ops_total{bdev=%q} %d\n", b.Name, b.NumReadOps)
+				fmt.Fprintf(&sb, "velocor_bdev_write_ops_total{bdev=%q} %d\n", b.Name, b.NumWriteOps)
 			}
 		}
 	}
