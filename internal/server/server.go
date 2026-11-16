@@ -129,6 +129,12 @@ const maxRequestBodyBytes = 1 << 20
 func (s *Server) Handler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			// A client that disconnects or times out must not abort a change halfway: SPDK
+			// finishes what it was asked to do regardless, and a rollback based on a cancelled
+			// call acts on a state it no longer knows. SPDK calls carry their own timeouts.
+			r = r.WithContext(context.WithoutCancel(r.Context()))
+		}
 		s.mux.ServeHTTP(w, r)
 	})
 }

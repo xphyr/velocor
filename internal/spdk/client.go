@@ -18,7 +18,23 @@ const (
 	DefaultSocketPath = "/run/velocor/spdk.sock"
 	// DefaultTimeout is the default per-RPC timeout when context has no deadline.
 	DefaultTimeout = 15 * time.Second
+	// LongTimeout applies to methods whose duration grows with the device size (creating a
+	// volume store unmaps the whole device; thick volumes and inflation write every cluster).
+	// Giving up early is worse than waiting: spdk_tgt completes the request anyway, and the
+	// caller would act on a state it no longer knows.
+	LongTimeout = 30 * time.Minute
 )
+
+var longRunningMethods = map[string]bool{
+	"bdev_lvol_create_lvstore":  true,
+	"bdev_lvol_delete_lvstore":  true,
+	"bdev_lvol_create":          true,
+	"bdev_lvol_inflate":         true,
+	"bdev_lvol_decouple_parent": true,
+	"bdev_lvol_resize":          true,
+	"bdev_raid_create":          true,
+	"bdev_raid_delete":          true,
+}
 
 // RPCError represents a JSON-RPC 2.0 error returned by spdk_tgt.
 type RPCError struct {
@@ -79,8 +95,12 @@ func (c *Client) Call(ctx context.Context, method string, params any, result any
 	}
 
 	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
+		timeout := c.timeout
+		if longRunningMethods[method] && timeout < LongTimeout {
+			timeout = LongTimeout
+		}
 		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, c.timeout)
+		ctx, cancel = context.WithTimeout(ctx, timeout)
 		defer cancel()
 	}
 

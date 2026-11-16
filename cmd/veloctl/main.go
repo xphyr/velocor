@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
@@ -68,10 +69,9 @@ func main() {
 		token:      tok,
 		insecure:   *insecure,
 		jsonOutput: *jsonOut,
-		httpClient: &http.Client{
-			Timeout:   30 * time.Second,
-			Transport: &http.Transport{TLSClientConfig: tlsCfg},
-		},
+		// Per-request timeouts (see request): reads are quick, changes can take as long as
+		// SPDK needs (a new pool unmaps whole disks).
+		httpClient: &http.Client{Transport: &http.Transport{TLSClientConfig: tlsCfg}},
 	}
 
 	if err := dispatch(cfg, args); err != nil {
@@ -490,6 +490,9 @@ func runDisk(cfg *cliConfig, args []string) error {
 			if d["power_loss_protected"] == true {
 				durability += " (PLP declared)"
 			}
+			if d["is_boot_device"] == true {
+				cache, durability = "-", "-" // the OS disk is the operating system's business
+			}
 			fmt.Fprintf(tw, "%v\t%v\t%v\t%s\t%d\t%v\t%v\t%v\t%v\t%s\t%s\n",
 				d["id"], d["name"], d["type"], loc, szGiB, d["driver_state"],
 				d["is_boot_device"], d["claimed"], strOrEmpty(d["pool_id"]), cache, durability)
@@ -535,7 +538,7 @@ func runDisk(cfg *cliConfig, args []string) error {
 		fs := flag.NewFlagSet("disk set", flag.ExitOnError)
 		plp := fs.String("power-loss-protected", "", "true|false: declare that the disk protects its write cache against power loss")
 		cache := fs.String("write-cache", "", "disabled|leave: turn the disk's volatile write cache off and keep it off, or leave it to the drive (switches it back on)")
-		_ = fs.Parse(args[1:])
+		_ = fs.Parse(idLast(args[1:]))
 		if fs.NArg() < 1 || (*plp == "" && *cache == "") {
 			return fmt.Errorf("usage: veloctl disk set <disk-id> [--power-loss-protected=true|false] [--write-cache=disabled|leave]")
 		}
@@ -594,7 +597,7 @@ func runPool(cfg *cliConfig, args []string) error {
 	case "create":
 		fs := flag.NewFlagSet("pool create", flag.ExitOnError)
 		name := fs.String("name", "", "Pool name")
-		raid := fs.String("raid", "RAID0", "RAID level: RAID0 | RAID1 | RAID10")
+		raid := fs.String("raid", "RAID0", "RAID level: RAID0 | RAID1 (RAID10 is not supported yet)")
 		disksCSV := fs.String("disks", "", "Comma-separated disk IDs")
 		clusterSz := fs.Uint("cluster-size", 65536, "SPDK lvol_store cluster size in bytes (default 64 KiB)")
 		_ = fs.Parse(args[1:])
@@ -1233,7 +1236,13 @@ func (c *cliConfig) request(method, path string, body any) (map[string]any, erro
 		}
 		rdr = bytes.NewReader(b)
 	}
-	req, err := http.NewRequest(method, c.endpoint+path, rdr)
+	timeout := 30 * time.Second
+	if method != http.MethodGet {
+		timeout = 30 * time.Minute
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, method, c.endpoint+path, rdr)
 	if err != nil {
 		return nil, err
 	}
@@ -1466,4 +1475,14 @@ func humanBytes(b uint64) string {
 		exp++
 	}
 	return fmt.Sprintf("%.1f %ciB", float64(b)/float64(div), "KMGTPE"[exp])
+}
+
+// idLast moves a leading positional argument behind the flags, so both
+// "veloctl disk set <id> --flag" and "veloctl disk set --flag <id>" parse (Go's flag package
+// stops at the first non-flag argument).
+func idLast(args []string) []string {
+	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
+		return append(append([]string{}, args[1:]...), args[0])
+	}
+	return args
 }

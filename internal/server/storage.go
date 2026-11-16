@@ -186,16 +186,18 @@ func validRaidLevel(l store.RaidLevel, disks int) error {
 		// ones, so a volume store can't even be created on it (verified against SPDK v26.09).
 		return fmt.Errorf("%w: RAID5F is not supported: SPDK raid5f cannot hold a volume store", store.ErrInvalidArgument)
 	}
-	minDisks := map[store.RaidLevel]int{store.RaidLevel0: 1, store.RaidLevel1: 2, store.RaidLevel10: 4}
+	if l == store.RaidLevel10 {
+		// SPDK v26.09's bdev_raid has raid0, raid1, raid5f and concat: no raid10. It has to be
+		// built as raid0 over raid1 pairs (TODO.md L-4).
+		return fmt.Errorf("%w: RAID10 is not supported yet: SPDK has no raid10 level (use RAID1)", store.ErrInvalidArgument)
+	}
+	minDisks := map[store.RaidLevel]int{store.RaidLevel0: 1, store.RaidLevel1: 2}
 	n, ok := minDisks[l]
 	if !ok {
 		return fmt.Errorf("%w: unsupported raid_level %q", store.ErrInvalidArgument, l)
 	}
 	if disks < n {
 		return fmt.Errorf("%w: %s requires at least %d disks", store.ErrInvalidArgument, l, n)
-	}
-	if l == store.RaidLevel10 && disks%2 != 0 {
-		return fmt.Errorf("%w: RAID10 requires an even number of disks", store.ErrInvalidArgument)
 	}
 	return nil
 }
@@ -277,6 +279,15 @@ func (s *Server) handleCreatePool(w http.ResponseWriter, r *http.Request) {
 	cleanup := context.WithoutCancel(ctx)
 	fail := func(raidCreated bool, err error) {
 		if raidCreated {
+			// The lvstore may exist even though creating it "failed" (e.g. a timeout while
+			// spdk_tgt went on and finished), and a RAID can't be deleted from under it: the
+			// delete would hang half-done. Remove the lvstore first.
+			if derr := s.spdk.BdevLvolDeleteLvstore(cleanup, "", pool.LVSName); derr != nil && !spdk.IsNotFound(derr) {
+				err = fmt.Errorf("%w (rollback: delete lvstore %s: %v; RAID %s left in place)", err, pool.LVSName, derr, pool.BaseBdevName)
+				_ = s.store.DeletePool(pool.ID)
+				writeError(w, err)
+				return
+			}
 			_ = s.spdk.BdevRaidDelete(cleanup, pool.BaseBdevName, true)
 		}
 		_ = s.store.DeletePool(pool.ID)

@@ -85,6 +85,9 @@ type raidBdev struct {
 	Superblock bool
 	Members    []string // ordered base bdev names (empty slot = "")
 	MediaKey   string   // key into lvstoreMedia
+	// deleting: bdev_raid_delete was called while an lvstore was loaded on top. Real spdk_tgt
+	// then leaves the RAID half-deleted ("offline") until the lvstore goes away.
+	deleting, deleteClearSB bool
 }
 
 type subsystem struct {
@@ -123,6 +126,7 @@ type Fake struct {
 	targetNodes  map[string]*spdk.IscsiTargetNode
 	nvmeConns    map[string][]spdk.NvmfController // subsystem NQN -> connected hosts
 	failures     map[string]int                   // method -> remaining failures (<0 = forever)
+	lateFailures map[string]int                   // method -> calls that succeed in SPDK but report an error
 	calls        []string
 	uuidCounter  int
 }
@@ -131,13 +135,14 @@ type Fake struct {
 func New(t testing.TB) *Fake {
 	t.Helper()
 	f := &Fake{
-		t:          t,
-		sockPath:   filepath.Join(t.TempDir(), "spdk.sock"),
-		nvmeMedia:  map[string]bool{},
-		fileMedia:  map[string]bool{},
-		superblock: map[string]*raidSuperblock{},
-		lvsMedia:   map[string]*mediaLvstore{},
-		failures:   map[string]int{},
+		t:            t,
+		sockPath:     filepath.Join(t.TempDir(), "spdk.sock"),
+		nvmeMedia:    map[string]bool{},
+		fileMedia:    map[string]bool{},
+		superblock:   map[string]*raidSuperblock{},
+		lvsMedia:     map[string]*mediaLvstore{},
+		failures:     map[string]int{},
+		lateFailures: map[string]int{},
 	}
 	f.resetRuntime()
 	ln, err := net.Listen("unix", f.sockPath)
@@ -191,6 +196,25 @@ func (f *Fake) Fail(method string, n int) {
 		return
 	}
 	f.failures[method] = n
+}
+
+// FailAfterApplying makes the next n calls to method take effect in the fake but report an
+// error, like a client that timed out while spdk_tgt went on and completed the request.
+func (f *Fake) FailAfterApplying(method string, n int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.lateFailures[method] = n
+}
+
+func (f *Fake) finishRaidDelete(name string, clearSB bool) {
+	if clearSB {
+		for k, sb := range f.superblock {
+			if sb.Name == name {
+				delete(f.superblock, k)
+			}
+		}
+	}
+	delete(f.raids, name)
 }
 
 // Calls returns the methods invoked so far.
@@ -386,7 +410,12 @@ func (f *Fake) dispatch(method string, raw json.RawMessage) (any, *rpcErr) {
 	if !ok {
 		return nil, errf(-32601, "Method not found")
 	}
-	return h(f, p)
+	res, rerr := h(f, p)
+	if n := f.lateFailures[method]; n > 0 && rerr == nil {
+		f.lateFailures[method] = n - 1
+		return nil, errf(-5, "injected failure after applying %s", method)
+	}
+	return res, rerr
 }
 
 // ---------- param helpers ----------
@@ -638,6 +667,9 @@ var handlers = map[string]handler{
 		var out []spdk.RaidBdevInfo
 		for _, r := range f.raids {
 			state := "online"
+			if r.deleting {
+				state = "offline"
+			}
 			disc := 0
 			var list []spdk.RaidBaseBdev
 			for _, m := range r.Members {
@@ -703,19 +735,19 @@ var handlers = map[string]handler{
 		if !ok {
 			return nil, errf(codeENODEV, "No such device")
 		}
-		for lvsName, key := range f.loadedLvs {
+		if r.deleting {
+			return nil, errf(-32603, "Operation already in progress")
+		}
+		for _, key := range f.loadedLvs {
 			if key == r.MediaKey {
-				delete(f.loadedLvs, lvsName)
+				// As observed on spdk_tgt v26.09: the RAID is deconfigured but can't finish
+				// while the lvstore holds it; the request never completes (the client times
+				// out) and the RAID stays "offline" until the lvstore is deleted.
+				r.deleting, r.deleteClearSB = true, boolean(p, "clear_sb")
+				return nil, errf(-110, "bdev_raid_delete did not complete: %s is still claimed", name)
 			}
 		}
-		if boolean(p, "clear_sb") {
-			for k, sb := range f.superblock {
-				if sb.Name == name {
-					delete(f.superblock, k)
-				}
-			}
-		}
-		delete(f.raids, name)
+		f.finishRaidDelete(name, boolean(p, "clear_sb"))
 		return true, nil
 	},
 	"bdev_lvol_get_lvstores": func(f *Fake, p map[string]any) (any, *rpcErr) {
@@ -784,6 +816,11 @@ var handlers = map[string]handler{
 			if name == str(p, "lvs_name") || lvs.UUID == str(p, "uuid") {
 				delete(f.loadedLvs, name)
 				delete(f.lvsMedia, key)
+				for rn, r := range f.raids {
+					if r.deleting && r.MediaKey == key {
+						f.finishRaidDelete(rn, r.deleteClearSB)
+					}
+				}
 				return true, nil
 			}
 		}

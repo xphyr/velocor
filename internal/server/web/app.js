@@ -433,7 +433,6 @@ async function disks() {
 const RAID_LEVELS = [
   { value: "RAID0", label: "RAID 0: striped, no redundancy" },
   { value: "RAID1", label: "RAID 1: mirrored (2 or more disks)" },
-  { value: "RAID10", label: "RAID 10: striped mirrors (4 or more, even)" },
 ];
 
 async function createPoolDialog() {

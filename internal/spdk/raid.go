@@ -41,7 +41,7 @@ func (c *Client) BdevRaidGetBdevs(ctx context.Context, category string) ([]RaidB
 }
 
 // NormalizeRaidLevel converts Velocor RAID enum strings (e.g., "RAID0", "RAID5F")
-// to SPDK bdev_raid_create level strings ("raid0", "raid1", "raid10", "raid5f").
+// to SPDK bdev_raid_create level strings ("raid0", "raid1", "raid5f"; SPDK v26.09 has no raid10).
 func NormalizeRaidLevel(level string) string {
 	l := strings.ToLower(strings.TrimSpace(level))
 	switch l {

@@ -16,7 +16,7 @@
    - **Boot Disk Safety Guard:** `velod` resolves the backing block devices and PCIe BDF addresses for `/`, `/boot`, `/boot/efi`, and `/sysroot` on startup and permanently marks them `is_boot_device = true` so the OS drive can never be unbound or formatted.
 
 3. **Pool, Volume & Filter Bdev Hierarchy:**
-   - **Disks** (`bdev_nvme` or `bdev_uring`) are grouped into a **Pool** (`bdev_raid` RAID 0/1/10/5f + SPDK `lvol_store`).
+   - **Disks** (`bdev_nvme` or `bdev_uring`) are grouped into a **Pool** (`bdev_raid` RAID 0/1 + SPDK `lvol_store`; RAID10 and parity RAID are not supported yet, see TODO L-3/L-4).
    - Each Pool configures an `lvol_store` `cluster_size` (defaulting to `64 KiB` or `1 MiB` rather than SPDK's 4 MiB default) to keep thin-provisioning overhead low (the cluster is also the granularity any future changed-block tracking would report at).
    - **Volumes** (`bdev_lvol`) are thin- or thick-provisioned inside a Pool.
    - Every Pool and Volume tracks both its `base_bdev_name` (or `lvol_bdev_name`) and its `effective_bdev_name` so stackable SPDK filter bdevs (`bdev_crypto` for AES-XTS encryption and `bdev_compress` for LZ4/Deflate compression) can wrap volumes or pools transparently without changing the Export layer.

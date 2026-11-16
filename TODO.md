@@ -243,6 +243,24 @@ Everything here was written by Gemini and is in scope to rewrite.
   - verification against real SPDK (integration harness) and a Kasten incremental
     backup/restore round trip on NVW, comparing restored data byte-for-byte.
 
+- [ ] **L-3. Parity RAID (RAID5/6) for capacity efficiency.** Requested 2026-11-16. SPDK's only
+  parity RAID, `raid5f`, accepts full-stripe writes only and the lvol blobstore can't even create
+  a volume store on it (R3, `TestRAID5FRefused`), so pools today are RAID0/1/10. Options, all
+  substantial:
+  1. a write-gathering layer between lvols and raid5f that turns small writes into full stripes
+     (SPDK's FTL bdev works this way; large component with its own metadata and durability story);
+  2. a read-modify-write RAID5 in SPDK with a journal against the write hole (data-path change,
+     highest risk; candidate for upstreaming);
+  3. kernel md RAID5/6 with its partial-parity log underneath SPDK via AIO/io_uring (simplest,
+     but every write crosses the kernel and recovery spans two RAID layers).
+  Needs a design decision, then power-loss and rebuild testing on real hardware.
+
+- [ ] **L-4. RAID10.** SPDK v26.09's `bdev_raid` has no raid10 (levels: raid0, raid1, raid5f,
+  concat); velod sent "raid10" and SPDK rejected it, so RAID10 pools never worked (found on
+  velocor-1, 2026-11-16; the fake accepted it). Refused by the API, UI and CLI for now. *Needed:*
+  build it as raid0 over raid1 pairs, each with a superblock, and handle assembly after restart,
+  a degraded pair, rebuild and deletion of the nested layers; real-SPDK tests for all of those.
+
 ### Suggested order of work
 
 1. **P0-4 durability, interim handling**: detect the write cache per disk, PLP declaration,
@@ -321,6 +339,15 @@ code. Each now has a real-SPDK scenario and a matching unit test.
 ### Other second-review fixes
 
 - [x] **P0-5.** SPDK was killed 10 s into every shutdown (podman default): `StopTimeout=120`.
+- [x] **Slow operations were aborted halfway and left orphans** (velocor-1, 2026-11-16). Creating
+  a pool on 2 × 500 GB took longer than the SPDK client's 15 s per-call timeout and veloctl's
+  30 s: spdk_tgt finished the lvstore anyway, velod rolled back by deleting the RAID from under
+  it, and the RAID hung half-deleted ("offline", both disks unusable until fixed by hand).
+  Fixed: size-dependent SPDK methods get a 30 min timeout; mutating API requests are detached
+  from the client connection (a disconnect no longer aborts a change); the pool rollback deletes
+  the lvstore first; veloctl waits up to 30 min for changes; the CSI client follows the CSI
+  request's deadline. The fake SPDK now models a RAID delete under a loaded lvstore the way
+  spdk_tgt behaves (`TestPoolCreateRollbackAfterLateLvstore` fails with the old rollback).
 - [x] **Upgrades silently failed on UEFI appliances.** systemd-gpt-auto-generator put an
   automount for the EFI System Partition on `/boot`, shadowing ostree's bind mount; at shutdown
   `ostree-finalize-staged` failed with "Remounting /boot read-write: Invalid argument" and the

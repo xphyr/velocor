@@ -129,10 +129,10 @@ func NewHTTPClientWithCA(endpoint, token string, insecureSkipVerify bool, caPEM 
 	return &HTTPClient{
 		baseURL: endpoint,
 		token:   strings.TrimSpace(token),
-		http: &http.Client{
-			Timeout:   30 * time.Second,
-			Transport: tr,
-		},
+		// No client-wide timeout: each call carries the deadline of the CSI request (set by the
+		// sidecars), with a fallback in doJSON. velod finishes a change even if we give up, and
+		// every create is idempotent by name, so the sidecars' retry picks up the result.
+		http: &http.Client{Transport: tr},
 	}, nil
 }
 
@@ -144,6 +144,11 @@ func (c *HTTPClient) doJSON(ctx context.Context, method, path string, reqBody, o
 			return err
 		}
 		bodyReader = bytes.NewReader(b)
+	}
+	if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, 5*time.Minute)
+		defer cancel()
 	}
 	req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, bodyReader)
 	if err != nil {
