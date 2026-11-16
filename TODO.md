@@ -1,94 +1,266 @@
-# Velocor remediation TODO
+# Velocor TODO and review status
 
-Source: full code review (2026-11-15). Items are ordered by fix priority.
-Mark `[x]` when fixed **and** covered by a test. "HW" = needs verification on real hardware/cluster.
+This file tracks everything found by the two code reviews (2026-11-15 and 2026-11-16): the
+work still open, ranked by risk to data, how fixes are verified, and what has been done.
 
-## Critical — data loss / exposure
+- **P0**: can lose acknowledged data, or a pool, in plausible conditions. Fix before anyone stores real data.
+- **P1**: outage, lock-out, or silent degradation an operator can't see. Fix before production.
+- **P2**: hardening and operability.
+- "Verified" means demonstrated against a real `spdk_tgt` by the integration harness (see
+  [Verification](#verification)). An item is done when it is fixed **and** covered by a test.
 
-- [x] **C1. Reconciler can wipe pools on SPDK restart** — `internal/reconciler/reconciler.go`
-  - [x] lvstore list fetched before RAID re-created → `bdev_lvol_create_lvstore` on a RAID whose lvstore is still being examined (HW: confirm examine timing on SPDK v26.09)
-  - [x] Never create an lvstore for a pool that already has `LVSUUID`; call `bdev_wait_for_examine` after RAID create, re-fetch lvstores; mark DEGRADED instead
-  - [x] Never re-create a missing lvol that had data (`LvolUUID` set) — mark volume DEGRADED/MISSING instead of creating a blank one
-- [x] **C2. iSCSI LUN masking broken** — `internal/server/server.go` (iSCSI export)
-  - [x] Unique portal-group / initiator-group tags per export (not hard-coded 1/1)
-  - [x] Propagate errors from PG/IG/target-node creation
-  - [x] No implicit `ANY` access — require explicit `AllowAnyHost`
-  - [x] Reconciler restores iSCSI targets after SPDK restart
-- [x] **C3. Snapshot lvol names collide across volumes** — snapshot create/delete/CBT
-  - [x] Namespace SPDK snapshot names (e.g. by snapshot ID) and store the SPDK alias/UUID on the record
-  - [x] Delete/CBT by stored UUID, not by `lvs/<name>`
-- [x] **C4. SPDK errors swallowed; state persisted anyway** — `internal/server/server.go`
-  - [x] Claim disk (fabricated bdev names, NVMe left unbound on failure)
-  - [x] Create pool (ONLINE with no RAID when bdev name missing)
-  - [x] Create volume / clone / restore-from-snapshot
-  - [x] Resize, QoS, snapshot, export
-  - [x] Deletes: call SPDK first, then store (no leaked lvols)
-  - [x] Group snapshot: member names exceed SPDK 63-char lvol limit (HW: confirm external-snapshotter name format); fail instead of reporting ReadyToUse
-- [x] **C5. CSI node may mount/format wrong NVMe device** — `internal/csi/mounter.go`
-  - [x] Resolve block device via sysfs `subsysnqn` + nsid (multipath-aware naming) (HW)
-  - [x] Verify namespace UUID == lvol UUID before use
-  - [x] `detectFilesystem`: only treat blkid exit 2 as "empty"; refuse to format if PTTYPE present or blkid errors otherwise
-- [x] **C6. Boot-disk guard gaps** — `internal/hardware/manager.go`
-  - [x] Resolve `/dev/mapper/*` (LVM/LUKS) sources to physical disks
-  - [x] Protect any disk with mounted partitions, holders, active swap, FS/partition signatures (unless forced)
-  - [x] NVMe multipath `nvmeXcYnZ` sysfs entries when resolving boot NVMe PCI BDF (HW)
-  - [x] Stable SSD IDs via `/dev/disk/by-id` (WWN/serial) instead of `sdX`
+---
 
-- [x] **C7. CBT fabricated allocation data** — `BdevLvolGetFragmap` fallback synthesised a bitmap marking the first N clusters as changed when SPDK lacked the RPC → incremental backups silently wrong. Now fails with 501.
-- [x] **C8. CSI SnapshotMetadata route/field mismatch** — CSI client called `:allocated-blocks` / `:changed-blocks` (server only had `/blocks:*`) and read `length_bytes` (server sent `size_bytes`).
-- [x] **C9. Boot guard failed open** — velod ran with `hw == nil` (no guard at all) if hardware manager init failed. Now exits.
-- [x] **C10. Encryption/compression filter policies silently ignored** — requests now rejected until implemented.
+## Open work
 
-## High
+### P0: data loss
 
-- [x] **H1. CSI publish/unpublish ignore node_id** — exports must be per (volume, node); unpublish removes only that node's access
-- [x] **H2. CSI `PublishedNodeIds` returns initiator-group IDs** (ListVolumes + ControllerGetVolume)
-- [x] **H3. CSI DeleteVolume blocked by snapshots/clones** — snapshots must outlive source PVC
-- [x] **H4. RAID created with `superblock=false`**; reconciler requires all members → redundant pools never come back degraded
-- [x] **H5. Lost updates** — handlers/reconciler read-modify-write whole records outside a transaction; add field-level/atomic update helpers in store
-- [x] **H6. Sizes rounded down to MiB** — `internal/spdk/lvol.go` create/resize must round up
+- [ ] **P0-1. Disks can never be replaced, so a degraded mirror stays degraded until the next failure kills it.**
+  There is no API, reconciler path or UI to add a replacement member to a RAID and rebuild it.
+  A RAID1/RAID10 pool that loses a disk runs without redundancy indefinitely, and the second
+  failure destroys the pool. For a storage product this is the most important missing feature.
+  SPDK provides `bdev_raid_add_base_bdev` / `bdev_raid_remove_base_bdev`.
+  *Needed:* "replace disk" (claim a new disk, add it to the array, track rebuild progress),
+  surfaced as a pool state (`REBUILDING n%`) and as an alert. See also P1-8.
 
-## Security
+- [ ] **P0-2. Thin pools can be overcommitted without limit or warning.**
+  Volume and clone creation never check pool capacity. When the pool fills, every thin and
+  snapshot-backed volume in it starts failing writes at once, which typically corrupts host
+  filesystems and databases. Snapshots keep old clusters alive, and nothing shows how much
+  space they hold.
+  *Needed:* an overcommit ratio per pool (refuse creation beyond it), a reserve so snapshots
+  and metadata can't take the last free space, warning/critical thresholds as pool health and
+  metrics, and per-volume/snapshot allocated space.
 
-- [x] **S1. Shell injection in container update** — `internal/server/lifecycle.go` (`%q` in `sh -c`); validate unit names, pass argv
-- [x] **S2. JWT not revocable** — re-check user existence/role/password-change epoch per request
-- [x] **S3. Default admin password** `velocor-admin-changeme` — generate random first-boot password / force change
-- [x] **S4. Login rate limiting**
-- [x] **S5. Password hashing** — replace iterated SHA-256 with PBKDF2-SHA256 (600k iterations, stdlib)
-- [x] **S6. `/metrics` unauthenticated**
-- [x] **S7. Helm chart defaults `insecure: "true"`**
-- [x] **S8. Request body limits + HTTP server Read/Write/Idle timeouts**
-- [x] **S9. iSCSI node plugin overwrites host `/etc/iscsi/initiatorname.iscsi`** — use an iscsiadm iface
-- [ ] **S10. CHAP modelled but not wired**; predictable NVMe host NQNs — *interim:* API now rejects `chap_user` instead of silently ignoring it. Remaining: iSCSI CHAP auth groups + NVMe DH-HMAC-CHAP with encrypted secrets; node plugin should register the host's real hostnqn/IQN instead of names derived from the node name.
-- [x] **S11. Validate resource names** before using them in SPDK names (charset/length)
-- [x] **S12. modprobe.d enables vfio noiommu unconditionally**
+- [ ] **P0-3. The metadata database is a single point of failure, with no backup or recovery.**
+  `/var/lib/velocor/velocor.db` is the only record of which volume is which, who may access it,
+  snapshot lineage and CBT order. If it is lost, the data is still on the pool disks but
+  nothing can name or export it.
+  *Needed, in order of value:*
+  1. A copy of the metadata **on the pool disks themselves** (a small reserved lvol per pool,
+     rewritten on every change), so a pool's disks carry what's needed to bring it back.
+  2. Scheduled `bbolt` backups (`Tx.WriteTo`) to a second location, plus `veloctl` backup/restore.
+  3. A recovery command that rebuilds pools/volumes/snapshots from SPDK (lvol names are
+     resource IDs and SSD bdev UUIDs are derived from disk IDs, so the skeleton is
+     recoverable) and from the on-pool copy.
 
-## Operational / medium
+- [ ] **P0-4. Hosts are told writes are durable when they may only be in a disk's volatile cache. (Verified)**
+  In SPDK v26.09 the lvol module does not support FLUSH (`vbdev_lvol_io_type_supported`), and
+  the RAID module always reports `write_cache = 0`. NVMe-oF advertises a volatile write cache
+  only when the namespace's bdev reports one, so **every Velocor volume tells hosts there is no
+  volatile write cache**. Hosts then never send FLUSH and treat a completed write as durable,
+  but the member drives (NVMe without power-loss protection, nearly all SATA SSDs) do cache
+  writes, so **a power cut can lose acknowledged writes**. Reproduced by
+  `TestWriteCacheAndFlushAdvertised` (reported as a known issue until this is decided).
+  *Options:*
+  1. **Patch SPDK** (lvol: support FLUSH and pass it to the blobstore device; RAID: report
+     `write_cache` if any member has one). The correct fix, worth upstreaming; nvweaver already
+     carries an SPDK durability patch.
+  2. **Turn the drives' volatile write caches off** at claim (NVMe Set Features VWC=0 via admin
+     passthrough; `hdparm -W0` for SATA), trading write speed for safety.
+  3. **Require power-loss-protected drives**: detect the volatile write cache at claim and
+     refuse or loudly warn.
 
-- [x] **M1. SPDK quadlet `AutoUpdate=registry` + `:latest`** — "apply all updates" restarts data plane under I/O; exclude SPDK, pin tag
-- [x] **M2. PAT use does a bbolt write+fsync per request** — throttle last-used updates
-- [x] **M3. Reconciler rewrites every record every 15s** — write only on change
-- [x] **M4. Reconciler doesn't repair partially-created NVMe-oF subsystems** (missing ns/listener)
-- [x] **M5. Group snapshots not crash-consistent** — pause subsystems during snapshot
-- [x] **M6. NVMe-oF listener hard-coded IPv4** — detect adrfam
-- [x] **M7. No iSCSI rescan on NodeExpandVolume**
-- [x] **M8. Docs claim gRPC/grpc-gateway** — update docs (or remove unused protos)
+  *Recommendation:* 2 + 3 now (safe by default, trade-off visible per disk), then 1.
+  **Decision needed.**
 
-## Follow-ups discovered during remediation
+- [ ] **P0-6. A failed io_uring setup crashes `spdk_tgt`. (Verified)**
+  Claiming an SSD with the io_uring backend where io_uring can't be set up (locked-memory
+  limits, seccomp, `kernel.io_uring_disabled`) makes `spdk_tgt` segfault instead of returning an
+  error, taking every export down. The production quadlet sets `memlock=-1`, which avoids the
+  known cause, but nothing checks it. *Done:* an `aio` backend (`--ssd-bdev aio` /
+  `VELOCOR_SSD_BDEV=aio`). *Needed:* velod should probe io_uring before using it and fall back
+  to AIO; report the SPDK crash upstream.
 
-- [ ] **F1.** HW: confirm `bdev_raid_delete` on a superblock RAID wipes member superblocks; otherwise released disks auto-assemble an orphan array on next attach.
-- [ ] **F2.** HW: confirm SPDK assembles a superblock RAID1/5F *degraded* when a member is missing at boot (pool currently reported DEGRADED, never re-created).
-- [ ] **F5.** Reconciler `EnsureExport` lists subsystems/target nodes per export (O(n²) RPCs); prefetch once per pass if export counts grow.
-- [x] **F6.** Web UI / veloctl: surface `force=true` for disk claim, `allow_any_host` for exports, `status_message`, forced initial password change, data-plane update consent.
+### P1: outages, lock-outs, things operators can't see
 
-- [ ] **F7.** Auth/server test suites are slow (~50-100 s under `-race`) because every login runs 600k PBKDF2 iterations; consider a test-only iteration override.
-- [x] **F9.** Session revocation precision: `iat` was second- (then millisecond-) granular, so a token issued just before a password/role change survived it. Now nanosecond `iat_ns`.
+- [ ] **P1-1. Nothing alerts anyone.** Degraded or faulted pools, SMART critical warnings, a
+  filling pool or a stalled reconciler are visible only in the UI. `/metrics` exports capacity
+  but no health. *Needed:* health gauges per disk/pool/volume/export (so Prometheus /
+  Alertmanager can page), and optionally a webhook or e-mail notifier.
 
-- [x] **F10.** Pre-release cleanup: removed all migration/compatibility code (legacy SSD ID migration, iSCSI tag backfill, non-superblock RAID re-creation, reconciler lvstore initialisation, v1 password hashes, second-granular JWTs, legacy CSI export attribution, duplicate CBT routes, whole-record `Update*` store methods).
+- [ ] **P1-3. Network changes can lock the appliance out.** `PUT /system/network/interfaces/{name}`
+  applies at once; a wrong static address or disabling the management interface cuts the
+  appliance off, and changing an interface that carries portals breaks the SAN silently.
+  *Needed:* apply, then confirm from a new connection within ~120 s or roll back automatically;
+  refuse or warn about interfaces that host portals.
 
-- [x] **F11.** Web UI rewritten in the nvweaver layout (top nav, hash-routed detail pages for pools/volumes/exports, filterable paged tables, `<dialog>` forms with typed confirmation, role-aware controls, forced password change). New API: `PATCH /exports/{id}`, `GET /exports/{id}/connections`, `PATCH /initiator-groups/{id}`, `GET /volumes/{id}/usage`, `warnings` in `/system/status`.
-- [x] **F12.** `veloctl`: `passwd`, `volume get|usage`, `export get|connections|access`, `initiator-group update`, `--cidrs`; TLS verification on by default (`--ca-cert`), password prompts without echo.
+- [ ] **P1-4. Deletion is immediate and irreversible.** With CSI automation and API tokens, one
+  mistake is unrecoverable. *Needed:* per-volume deletion protection and/or a recycle period in
+  which a deleted volume is unexported and hidden but kept for N hours.
 
-## Testing
+- [ ] **P1-5. Orphaned SPDK objects are invisible.** Lvols, RAIDs or lvstores in SPDK but not
+  in the store (failed rollback, crash between SPDK and store writes, manual changes) consume
+  space silently, and after metadata loss they're the only copy of the data. *Needed:* the
+  reconciler reports unmanaged objects (never deletes them).
 
-- [x] **T1. Fake SPDK JSON-RPC socket for tests** supporting error injection and "restart" (empty state) to cover C1–C4
+- [ ] **P1-6. Single node, no high availability.** One appliance, one copy of each pool; ANA
+  states are modelled but unused. A legitimate first-version scope, but it should be stated in
+  the docs together with what hosts see during an appliance reboot (I/O stalls until
+  `ctrl_loss_tmo`, then errors).
+
+- [ ] **P1-7. OS lifecycle.** `bootc upgrade` runs inside the HTTP request (minutes) and should
+  be a tracked background job. Reboot doesn't stop exports or SPDK cleanly first, and doesn't
+  warn about connected hosts.
+
+- [ ] **P1-8. A RAID1 missing a member at startup is not served. (Verified)** SPDK keeps a
+  superblock RAID1 in `configuring` until every member is present; it does not start degraded.
+  A disk that fails while the appliance is down makes the pool unavailable after boot (data
+  intact; Velocor reports DEGRADED and re-creates nothing). Online failures degrade gracefully.
+  *Needed:* a supported degraded start (SPDK investigation; possibly removing the absent member
+  from the superblock with operator confirmation). Together with P0-1 this is "redundancy".
+
+- [ ] **P1-9. Changed-block tracking is advertised but cannot work. (Verified)** SPDK v26.09
+  has no `bdev_lvol_get_fragmap`. Velocor returns 501 instead of made-up extents, but the CSI
+  driver still advertises the SnapshotMetadata service. *Needed:* stop advertising it (probe at
+  startup) or add the RPC to the SPDK build (a small patch exposing a blob's allocated-cluster map).
+
+### P2: hardening
+
+- [ ] **P2-1. CHAP and real host identities** (was S10). Any host that can spoof an allowed NQN
+  or IQN gets access. The API rejects `chap_user` rather than silently ignoring it. *Needed:*
+  iSCSI CHAP auth groups and NVMe DH-HMAC-CHAP with encrypted secrets; the CSI node plugin
+  should register the host's real hostnqn/IQN instead of names derived from the node name.
+- [ ] **P2-2. No background scrub.** Mirrors are never read and compared, so latent sector
+  errors surface only during a rebuild, when they turn a degraded pool into a lost one.
+- [ ] **P2-3. Reconciler cost.** `EnsureExport` lists subsystems/target nodes per export
+  (O(n²) RPCs); prefetch once per pass (was F5).
+- [ ] **P2-4. SPDK sizing.** One core and 1 GiB of memory; sizing isn't documented or
+  validated against the number of exports and connections.
+- [ ] **P2-5. Slow test suites.** Auth/server tests take ~50–100 s under `-race` because every
+  login runs 600k PBKDF2 iterations; consider a test-only iteration override (was F7).
+
+### Suggested order of work
+
+1. **P0-4 durability**: disable volatile write caches / require PLP (decision needed).
+2. **P0-1 + P1-8 redundancy**: replace-disk with rebuild, and a supported degraded start.
+3. **P0-2 capacity**: overcommit limits, reserve, thresholds.
+4. **P0-3 metadata**: on-pool metadata copy, backups, recovery from disks.
+5. **P1-1 alerting**: health metrics.
+6. P1-3 network rollback, P1-4 deletion protection, P1-5 orphan reporting, P1-9 CBT, P0-6 io_uring probe.
+
+---
+
+## Verification
+
+**Unit tests** (`go test ./...`) run against `internal/spdk/spdktest`, a stateful fake
+`spdk_tgt` that models restarts, asynchronous examine, RAID superblock matching by member UUID,
+and error injection.
+
+**Integration tests** (`make test-integration`) run against a real `spdk_tgt` from the shipped
+image: rootless podman, `--no-huge`, file-backed disks through `bdev_aio`, a real velod (store,
+API, reconciler), and SPDK's userspace NVMe/TCP initiator (`spdk_dd`, added by the `test` stage
+of `deploy/containers/Containerfile.spdk`) to write and read data through real exports. No
+root, hugepages or NVMe hardware needed.
+
+| Scenario | Checks |
+|---|---|
+| `TestDataSurvivesCrashAndRestart` | bit-identical data after `kill -9` and after a clean stop; pool/volume ONLINE; lvstore UUID unchanged |
+| `TestExportACLEnforced` | a host outside the ACL can't connect, before and after a restart |
+| `TestSnapshotsAndClones` | snapshot isolation, clone contents, clone outliving its source, CBT reports 501 |
+| `TestWriteCacheAndFlushAdvertised` | FLUSH support of disk, RAID and volume bdevs (known issue P0-4) |
+| `TestDegradedRAID1` | missing member at boot: nothing re-created, pool DEGRADED, lvstore unchanged (P1-8) |
+| `TestPoolDeleteThenReuseDisks` | a deleted pool's disks can build a new pool (R2) |
+| `TestRAID5FRefused` | API refuses RAID5F; SPDK still can't put a volume store on raid5f (R3) |
+
+All pass except the write-cache check, which is reported as the known issue P0-4.
+
+**Not yet covered:** real NVMe drives (`bdev_nvme`, vfio), io_uring (needs a host where it
+works, see P0-6), iSCSI data paths (needs an iSCSI initiator in the test image), power-loss
+tests on real hardware, killing SPDK *during* a multi-step API operation, and hardware checks
+of the boot-disk guard and CSI device resolution on NVMe native multipath.
+
+---
+
+## Done
+
+### Found by testing against real SPDK (second review)
+
+These were invisible to unit tests because the fake encoded the same wrong assumptions as the
+code. Each now has a real-SPDK scenario and a matching unit test.
+
+- [x] **R1.** io_uring/AIO bdevs got a random UUID on every creation, and SPDK re-assembles a
+  superblock RAID only from members whose UUID matches: **every SSD pool went offline after any
+  `spdk_tgt` restart** (data intact, unserved). Fixed with a deterministic per-disk bdev UUID
+  (`dataplane.DiskBdevUUID`); the fake now enforces UUID matching.
+- [x] **R2.** Deleting a superblock RAID left its superblocks on the disks, so the deleted array
+  re-assembled itself and blocked new pools (was F1). Fixed: `bdev_raid_delete` with `clear_sb`.
+- [x] **R3.** SPDK `raid5f` accepts only full-stripe writes and the lvol blobstore can't create
+  a volume store on it, so RAID5F pools could never work. Refused by the API, UI and CLI.
+- [x] **R4.** SPDK v26.09 has no `bdev_lvol_get_fragmap`: CBT returns 501 rather than fabricated
+  data (open follow-up: P1-9).
+- [x] **R5.** SPDK validates NQN syntax; bad host NQNs now fail when entered instead of as an
+  opaque "Internal error" at export time.
+
+### Other second-review fixes
+
+- [x] **P0-5.** SPDK was killed 10 s into every shutdown (podman default): `StopTimeout=120`.
+- [x] **P1-2.** A failed resume after a group snapshot left I/O paused forever: resume is now
+  retried with backoff. (A velod crash between pause and resume can still leave a subsystem
+  paused; SPDK doesn't expose pause state.)
+- [x] **P1-7 (part).** `bootc switch` passed the image reference straight to bootc's command
+  line: now validated.
+- [x] Kernel-AIO backend for SSDs (`--ssd-bdev aio`), see P0-6.
+
+### First review: critical (data loss / exposure)
+
+- [x] **C1.** Reconciler could wipe pools on SPDK restart (created lvstores during examine) and
+  re-created lost volumes as blank disks. The reconciler now never creates storage.
+- [x] **C2.** iSCSI LUN masking broken: unique portal/initiator group tags, errors propagated,
+  no implicit ANY, iSCSI targets restored after restart.
+- [x] **C3.** Snapshot lvol names collided across volumes: SPDK names come from resource IDs;
+  delete/CBT by UUID.
+- [x] **C4.** SPDK errors swallowed while state was persisted: SPDK first, store second,
+  rollback on failure, deletes SPDK-first; group snapshots fail instead of reporting ReadyToUse.
+- [x] **C5.** CSI node could mount/format the wrong NVMe device: sysfs resolution by
+  `subsysnqn` + nsid, namespace UUID must match the lvol UUID, strict `blkid`.
+- [x] **C6.** Boot-disk guard gaps: LVM/LUKS/md resolution, any mounted/swap/held disk
+  protected, multipath NVMe, stable SSD IDs from WWN/serial.
+- [x] **C7.** CBT fabricated allocation data when SPDK lacked the RPC: now 501.
+- [x] **C8.** CSI SnapshotMetadata route and field names didn't match the server.
+- [x] **C9.** Boot guard failed open if the hardware manager couldn't start: velod now exits.
+- [x] **C10.** Encryption/compression filter policies were silently ignored: now rejected.
+
+### First review: high
+
+- [x] **H1.** CSI publish/unpublish ignored node_id: exports are per (volume, node).
+- [x] **H2.** CSI `PublishedNodeIds` returned initiator-group IDs.
+- [x] **H3.** CSI DeleteVolume was blocked by snapshots; snapshots now outlive their source.
+- [x] **H4.** RAIDs were created without superblocks.
+- [x] **H5.** Lost updates from whole-record read-modify-write: atomic field-level `Mutate*`.
+- [x] **H6.** Sizes were rounded down to MiB: now rounded up.
+
+### First review: security
+
+- [x] **S1.** Shell injection in container updates.
+- [x] **S2.** JWTs not revocable: checked against the live user record, nanosecond `iat_ns`.
+- [x] **S3.** Shared default admin password: random bootstrap password, forced change.
+- [x] **S4.** Login rate limiting.
+- [x] **S5.** Password hashing: PBKDF2-SHA256, 600k iterations.
+- [x] **S6.** `/metrics` unauthenticated.
+- [x] **S7.** Helm chart and `veloctl` skipped TLS verification by default; CA-cert support added.
+- [x] **S8.** Request body limits and HTTP server timeouts.
+- [x] **S9.** iSCSI node plugin overwrote the host's initiator name: dedicated iscsiadm iface.
+- [x] **S11.** Resource names validated before use in SPDK names.
+- [x] **S12.** vfio no-IOMMU enabled unconditionally: now an explicit opt-in.
+
+### First review: operational
+
+- [x] **M1.** SPDK auto-updated with the other containers (restarting the data plane).
+- [x] **M2.** A bbolt write + fsync on every API-token request.
+- [x] **M3.** Reconciler rewrote every record every 15 s.
+- [x] **M4.** Partially created NVMe-oF subsystems weren't repaired.
+- [x] **M5.** Group snapshots weren't crash-consistent: NVMe-oF subsystems paused.
+- [x] **M6.** NVMe-oF listeners hard-coded to IPv4.
+- [x] **M7.** No iSCSI rescan on volume expansion.
+- [x] **M8.** Docs claimed a gRPC API that doesn't exist.
+
+### Features and cleanup
+
+- [x] Pre-release cleanup: all migration/compatibility code removed (no installed base).
+- [x] Web UI rewritten in the nvweaver layout, with new APIs: `PATCH /exports/{id}`,
+  `GET /exports/{id}/connections`, `PATCH /initiator-groups/{id}`, `GET /volumes/{id}/usage`,
+  `warnings` in `/system/status`.
+- [x] `veloctl`: `passwd`, `volume get|usage`, `export get|connections|access`,
+  `initiator-group update`, `--cidrs`, `--ca-cert`, password prompts without echo.
+- [x] Stateful fake SPDK (`spdktest`) and the real-SPDK integration harness.
