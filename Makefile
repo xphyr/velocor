@@ -25,7 +25,7 @@ BIB_CONFIG ?= $(if $(wildcard deploy/bootc/config.local.toml),deploy/bootc/confi
 PODMAN ?= podman
 SKOPEO ?= skopeo
 
-.PHONY: all build build-velod build-veloctl build-csi proto proto-lint test lint clean \
+.PHONY: all build build-velod build-veloctl build-csi proto proto-lint test lint clean spdk-test-image test-integration \
 	containers container-spdk container-velod container-csi container-bootc \
 	push-containers push-spdk push-velod push-csi push-bootc qcow2
 
@@ -112,6 +112,15 @@ proto-lint:
 
 test:
 	go test -race -v ./...
+
+# Integration tests against a real spdk_tgt (rootless podman; no root, hugepages or NVMe needed).
+SPDK_TEST_IMAGE ?= localhost/velocor-spdk:test
+
+spdk-test-image:
+	podman build --target test -t $(SPDK_TEST_IMAGE) -f deploy/containers/Containerfile.spdk .
+
+test-integration: spdk-test-image
+	VELOCOR_IT_IMAGE=$(SPDK_TEST_IMAGE) go test -tags integration -count=1 -v -timeout 30m ./internal/integration/
 
 lint:
 	golangci-lint run ./...

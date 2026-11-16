@@ -181,3 +181,12 @@ func TestContainerUpdateRejectsUnsafeUnits(t *testing.T) {
 		t.Fatalf("data-plane restart without consent: %d %v", code, resp)
 	}
 }
+
+func TestUpgradeRejectsOptionLikeImageRefs(t *testing.T) {
+	h := newHarness(t)
+	for _, ref := range []string{"--transport=dir:/", "-h", "quay.io/x/y; reboot", "quay.io/x/y\n--foo"} {
+		if code, resp := h.do("POST", "/api/v1/system/upgrade", h.admin, map[string]any{"image_ref": ref}); code != http.StatusBadRequest {
+			t.Fatalf("image ref %q accepted (%d %v)", ref, code, resp)
+		}
+	}
+}

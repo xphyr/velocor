@@ -96,7 +96,7 @@ func TestServerHostsAndInitiatorGroupACLs(t *testing.T) {
 
 	code, hostResp := doReq("POST", "/api/v1/hosts", map[string]any{
 		"name":          "worker-01",
-		"host_nqn":      "nqn.2014-08.org.nvmexpress:uuid:worker-01",
+		"host_nqn":      "nqn.2014-08.org.nvmexpress:uuid:0b4d2c3e-1111-4222-8333-444455556666",
 		"initiator_iqn": "iqn.1994-05.com.redhat:worker-01",
 		"ip_address":    "10.0.2.20",
 	})

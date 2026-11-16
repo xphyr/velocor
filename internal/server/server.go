@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/velocor/velocor/internal/auth"
+	"github.com/velocor/velocor/internal/dataplane"
 	"github.com/velocor/velocor/internal/hardware"
 	"github.com/velocor/velocor/internal/reconciler"
 	"github.com/velocor/velocor/internal/spdk"
@@ -728,6 +729,12 @@ func (s *Server) handleCreateHost(w http.ResponseWriter, r *http.Request) {
 		writeError(w, fmt.Errorf("%w: invalid json body", store.ErrInvalidArgument))
 		return
 	}
+	if nqn := strings.TrimSpace(req.HostNQN); nqn != "" {
+		if err := dataplane.ValidateNQN(nqn); err != nil {
+			writeError(w, fmt.Errorf("%w: %v", store.ErrInvalidArgument, err))
+			return
+		}
+	}
 	host := &store.Host{
 		ID:           newResourceID("host"),
 		Name:         req.Name,
@@ -780,6 +787,12 @@ func (s *Server) handleCreateInitiatorGroup(w http.ResponseWriter, r *http.Reque
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, fmt.Errorf("%w: invalid json body", store.ErrInvalidArgument))
 		return
+	}
+	for _, nqn := range req.HostNQNs {
+		if err := dataplane.ValidateNQN(strings.TrimSpace(nqn)); err != nil {
+			writeError(w, fmt.Errorf("%w: %v", store.ErrInvalidArgument, err))
+			return
+		}
 	}
 	if strings.TrimSpace(req.CHAPUser) != "" {
 		// Accepting CHAP settings without enforcing them would be a false sense of security.

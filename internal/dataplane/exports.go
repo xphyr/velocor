@@ -116,6 +116,42 @@ func hostCIDR(ip string) string {
 	return ip + "/32"
 }
 
+// ValidateNQN checks an NVMe Qualified Name the way spdk_tgt does, so a bad host NQN is
+// refused when it is entered rather than as an opaque "Internal error" at export time.
+func ValidateNQN(nqn string) error {
+	const uuidPrefix = "nqn.2014-08.org.nvmexpress:uuid:"
+	switch {
+	case len(nqn) > 223:
+		return fmt.Errorf("NQN %q is longer than 223 bytes", nqn)
+	case strings.HasPrefix(nqn, uuidPrefix):
+		u := strings.TrimPrefix(nqn, uuidPrefix)
+		if len(u) != 36 || u[8] != '-' || u[13] != '-' || u[18] != '-' || u[23] != '-' {
+			return fmt.Errorf("NQN %q: the part after \"uuid:\" must be a UUID (8-4-4-4-12 hex digits)", nqn)
+		}
+		for i, r := range u {
+			if i == 8 || i == 13 || i == 18 || i == 23 {
+				continue
+			}
+			if !strings.ContainsRune("0123456789abcdefABCDEF", r) {
+				return fmt.Errorf("NQN %q: the part after \"uuid:\" must be a UUID", nqn)
+			}
+		}
+		return nil
+	case strings.HasPrefix(nqn, "nqn.2014-08.org.nvmexpress.discovery"):
+		return fmt.Errorf("NQN %q is the discovery NQN, not a host", nqn)
+	}
+	// nqn.yyyy-mm.reverse.domain[:anything]
+	if len(nqn) < 12 || !strings.HasPrefix(nqn, "nqn.") || nqn[8] != '-' || nqn[11] != '.' {
+		return fmt.Errorf("NQN %q must look like nqn.yyyy-mm.reverse.domain:name or %s<uuid>", nqn, uuidPrefix)
+	}
+	for _, r := range nqn[4:8] + nqn[9:11] {
+		if r < '0' || r > '9' {
+			return fmt.Errorf("NQN %q must start with nqn.yyyy-mm.", nqn)
+		}
+	}
+	return nil
+}
+
 // IsNVMe reports whether p is an NVMe-oF protocol.
 func IsNVMe(p store.ExportProtocol) bool {
 	return p == store.ExportProtocolNVMeoFTCP || p == store.ExportProtocolNVMeoFRDMA

@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/velocor/velocor/internal/auth"
+	"github.com/velocor/velocor/internal/dataplane"
 	"github.com/velocor/velocor/internal/hardware"
 	"github.com/velocor/velocor/internal/reconciler"
 	"github.com/velocor/velocor/internal/server"
@@ -33,6 +34,7 @@ func main() {
 		tlsCertFile       = flag.String("tls-cert", os.Getenv("VELOCOR_TLS_CERT"), "TLS certificate file (auto-generates self-signed ECDSA cert if empty)")
 		tlsKeyFile        = flag.String("tls-key", os.Getenv("VELOCOR_TLS_KEY"), "TLS private key file")
 		insecureHTTP      = flag.Bool("insecure-http", os.Getenv("VELOCOR_INSECURE_HTTP") == "true", "Serve plain HTTP instead of HTTPS")
+		ssdBdev           = flag.String("ssd-bdev", envOrDefault("VELOCOR_SSD_BDEV", "uring"), "How SSDs are attached to SPDK: uring (default) or aio (for hosts without usable io_uring)")
 		metricsPublic     = flag.Bool("metrics-public", os.Getenv("VELOCOR_METRICS_PUBLIC") == "true", "Serve /metrics without authentication (default: requires a READONLY token)")
 		showVersion       = flag.Bool("version", false, "Print version information and exit")
 	)
@@ -51,6 +53,14 @@ func main() {
 		"db", *dbPath,
 		"spdk_socket", *spdkSocket,
 	)
+
+	switch *ssdBdev {
+	case "uring", "aio":
+		dataplane.SSDBackend = *ssdBdev
+	default:
+		logger.Error("invalid --ssd-bdev; use uring or aio", "value", *ssdBdev)
+		os.Exit(1)
+	}
 
 	if err := os.MkdirAll(filepath.Dir(*dbPath), 0700); err != nil {
 		logger.Error("failed to create state directory", "path", filepath.Dir(*dbPath), "err", err)

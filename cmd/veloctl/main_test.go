@@ -57,7 +57,7 @@ func newFixture(t *testing.T) *fixture {
 	vol := &store.Volume{ID: "v1", Name: "v1", PoolID: "p1", UUID: uuid, LvolBdevName: pool.LVSName + "/v1", SizeBytes: 1 << 30}
 	_ = st.CreateVolume(vol)
 	_ = st.CreatePortal(&store.Portal{ID: "pt", Name: "pt", Protocol: store.ExportProtocolNVMeoFTCP, IPAddress: "10.0.0.1", Port: 4420})
-	ig := &store.InitiatorGroup{ID: "ig1", Name: "g", HostNQNs: []string{"nqn.host-a"}}
+	ig := &store.InitiatorGroup{ID: "ig1", Name: "g", HostNQNs: []string{"nqn.2026-01.io.example:host-a"}}
 	_ = st.CreateInitiatorGroup(ig)
 	exp := &store.Export{ID: "e1", Name: "e1", VolumeID: "v1", Protocol: store.ExportProtocolNVMeoFTCP, SubsystemNQN: "nqn.test:e1",
 		NamespaceID: 1, PortalIDs: []string{"pt"}, InitiatorGroupIDs: []string{"ig1"}}
@@ -128,7 +128,7 @@ func TestExportAccessAndConnections(t *testing.T) {
 	if sub, _ := f.fake.Subsystem("nqn.test:e1"); sub.AllowAnyHost || len(sub.Hosts) != 1 {
 		t.Fatalf("ACL not restored: %+v", sub)
 	}
-	f.fake.ConnectHost("nqn.test:e1", "nqn.host-a")
+	f.fake.ConnectHost("nqn.test:e1", "nqn.2026-01.io.example:host-a")
 	for _, args := range [][]string{{"export", "connections", "e1"}, {"export", "get", "e1"}, {"volume", "usage", "v1"}, {"volume", "get", "v1"}, {"system", "status"}} {
 		if err := f.run(t, args...); err != nil {
 			t.Fatalf("%v: %v", args, err)
@@ -142,7 +142,7 @@ func TestInitiatorGroupUpdateSendsOnlyGivenLists(t *testing.T) {
 	if _, err := f.st.MutateInitiatorGroup("ig1", func(g *store.InitiatorGroup) error { g.InitiatorIQNs = []string{"iqn.keep"}; return nil }); err != nil {
 		t.Fatal(err)
 	}
-	if err := f.run(t, "initiator-group", "update", "ig1", "--nqns", "nqn.host-b, nqn.host-c"); err != nil {
+	if err := f.run(t, "initiator-group", "update", "ig1", "--nqns", "nqn.2026-01.io.example:host-b, nqn.2026-01.io.example:host-c"); err != nil {
 		t.Fatal(err)
 	}
 	g, _ := f.st.GetInitiatorGroup("ig1")

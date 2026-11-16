@@ -562,7 +562,7 @@ func runPool(cfg *cliConfig, args []string) error {
 	case "create":
 		fs := flag.NewFlagSet("pool create", flag.ExitOnError)
 		name := fs.String("name", "", "Pool name")
-		raid := fs.String("raid", "RAID0", "RAID level: RAID0 | RAID1 | RAID10 | RAID5F")
+		raid := fs.String("raid", "RAID0", "RAID level: RAID0 | RAID1 | RAID10")
 		disksCSV := fs.String("disks", "", "Comma-separated disk IDs")
 		clusterSz := fs.Uint("cluster-size", 65536, "SPDK lvol_store cluster size in bytes (default 64 KiB)")
 		_ = fs.Parse(args[1:])

@@ -32,6 +32,7 @@ const (
 	DiskDriverStateVfioPCI       DiskDriverState = "VFIO_PCI"
 	DiskDriverStateUioPCIGeneric DiskDriverState = "UIO_PCI_GENERIC"
 	DiskDriverStateUringClaimed  DiskDriverState = "URING_CLAIMED"
+	DiskDriverStateAIOClaimed    DiskDriverState = "AIO_CLAIMED"
 )
 
 // RaidLevel enumerates SPDK bdev_raid levels supported for Pools.

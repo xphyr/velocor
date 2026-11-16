@@ -17,10 +17,14 @@ Volume=/dev/hugepages:/dev/hugepages:rw
 Volume=/sys:/sys:rw
 Volume=/run/velocor:/run/velocor:rw
 Ulimit=memlock=-1:-1
+# Give spdk_tgt time to finish in-flight I/O and close its blobstores cleanly on shutdown;
+# podman's default of 10 s before SIGKILL turns every reboot into an unclean stop.
+StopTimeout=120
 Ulimit=nofile=1048576:1048576
 Exec=-r /run/velocor/spdk.sock -m 0x1 -s 1024 --json /etc/velocor/spdk.json
 
 [Service]
+TimeoutStopSec=150
 ExecStartPre=/usr/bin/mkdir -p /run/velocor
 ExecStartPre=/usr/bin/rm -f /run/velocor/spdk.sock
 Restart=always

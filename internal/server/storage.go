@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"time"
 	"unicode"
 
 	"github.com/velocor/velocor/internal/dataplane"
@@ -174,7 +175,12 @@ func (s *Server) releaseDisk(w http.ResponseWriter, r *http.Request, id string) 
 // --- Pools ---
 
 func validRaidLevel(l store.RaidLevel, disks int) error {
-	minDisks := map[store.RaidLevel]int{store.RaidLevel0: 1, store.RaidLevel1: 2, store.RaidLevel10: 4, store.RaidLevel5F: 3}
+	if l == store.RaidLevel5F {
+		// SPDK's raid5f only accepts full-stripe writes, and the lvol blobstore issues smaller
+		// ones, so a volume store can't even be created on it (verified against SPDK v26.09).
+		return fmt.Errorf("%w: RAID5F is not supported: SPDK raid5f cannot hold a volume store", store.ErrInvalidArgument)
+	}
+	minDisks := map[store.RaidLevel]int{store.RaidLevel0: 1, store.RaidLevel1: 2, store.RaidLevel10: 4}
 	n, ok := minDisks[l]
 	if !ok {
 		return fmt.Errorf("%w: unsupported raid_level %q", store.ErrInvalidArgument, l)
@@ -265,7 +271,7 @@ func (s *Server) handleCreatePool(w http.ResponseWriter, r *http.Request) {
 	cleanup := context.WithoutCancel(ctx)
 	fail := func(raidCreated bool, err error) {
 		if raidCreated {
-			_ = s.spdk.BdevRaidDelete(cleanup, pool.BaseBdevName)
+			_ = s.spdk.BdevRaidDelete(cleanup, pool.BaseBdevName, true)
 		}
 		_ = s.store.DeletePool(pool.ID)
 		writeError(w, err)
@@ -320,7 +326,7 @@ func (s *Server) handleDeletePool(w http.ResponseWriter, r *http.Request) {
 		writeError(w, fmt.Errorf("delete lvstore: %w", err))
 		return
 	}
-	if err := s.spdk.BdevRaidDelete(r.Context(), pool.BaseBdevName); err != nil && !spdk.IsNotFound(err) {
+	if err := s.spdk.BdevRaidDelete(r.Context(), pool.BaseBdevName, true); err != nil && !spdk.IsNotFound(err) {
 		writeError(w, fmt.Errorf("delete raid bdev: %w", err))
 		return
 	}
@@ -895,9 +901,7 @@ func (s *Server) handleCreateVolumeGroupSnapshot(w http.ResponseWriter, r *http.
 	var paused []string
 	resume := func() {
 		for _, nqn := range paused {
-			if err := s.spdk.NvmfSubsystemResume(cleanup, nqn); err != nil {
-				s.logger.Error("resume nvmf subsystem after group snapshot", "nqn", nqn, "error", err)
-			}
+			s.resumeSubsystem(cleanup, nqn)
 		}
 		paused = nil
 	}
@@ -1151,4 +1155,28 @@ func (s *Server) handleDeleteExport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{})
+}
+
+// resumeSubsystem resumes I/O on a subsystem paused for a group snapshot. A paused subsystem
+// holds every host's I/O, so a failed resume is retried (in the background, with backoff)
+// rather than left for an operator to notice.
+func (s *Server) resumeSubsystem(ctx context.Context, nqn string) {
+	if err := s.spdk.NvmfSubsystemResume(ctx, nqn); err == nil || spdk.IsNotFound(err) {
+		return
+	} else {
+		s.logger.Error("resume nvmf subsystem after group snapshot failed; retrying", "nqn", nqn, "error", err)
+	}
+	go func() {
+		delay := 200 * time.Millisecond
+		for attempt := 1; attempt <= 60; attempt++ {
+			time.Sleep(delay)
+			err := s.spdk.NvmfSubsystemResume(ctx, nqn)
+			if err == nil || spdk.IsNotFound(err) {
+				s.logger.Info("resumed nvmf subsystem", "nqn", nqn, "attempt", attempt)
+				return
+			}
+			delay = min(delay*2, 5*time.Second)
+		}
+		s.logger.Error("nvmf subsystem is still paused after retries; hosts' I/O is blocked", "nqn", nqn)
+	}()
 }

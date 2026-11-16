@@ -147,6 +147,12 @@ func (s *Server) handleStageUpgrade(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = json.NewDecoder(r.Body).Decode(&req)
 	imageRef := strings.TrimSpace(req.ImageRef)
+	// The reference reaches bootc's command line: anything that could be read as an option
+	// (or carries whitespace / control characters) is refused.
+	if imageRef != "" && !imageRefRe.MatchString(imageRef) {
+		writeError(w, fmt.Errorf("%w: %q is not a container image reference", store.ErrInvalidArgument, imageRef))
+		return
+	}
 
 	var cmd *exec.Cmd
 	if imageRef == "" {
@@ -282,6 +288,10 @@ func queryContainerUpdates(ctx context.Context) ContainerUpdatesStatus {
 	}
 	return res
 }
+
+// imageRefRe accepts registry/repo[:tag][@digest] references, optionally with a bootc
+// transport prefix (registry:, oci:, containers-storage:), and never a leading '-'.
+var imageRefRe = regexp.MustCompile(`^(?:(?:registry|oci|oci-archive|containers-storage):)?[a-zA-Z0-9][a-zA-Z0-9._/:@+-]{0,511}$`)
 
 // containerUnitRe restricts container updates to Velocor's own quadlet units. The unit name
 // reaches systemctl/podman on the host, so it must never be free-form.

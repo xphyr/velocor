@@ -47,9 +47,11 @@ RUN dnf install -y nasm autoconf automake libtool help2man python3-pyyaml python
       --without-fsdev && \
     make -j"$(nproc)" && \
     cp /src/spdk/build/bin/spdk_tgt /usr/bin/spdk_tgt && \
-    strip /usr/bin/spdk_tgt
+    strip /usr/bin/spdk_tgt && \
+    cp /src/spdk/build/bin/spdk_dd /usr/bin/spdk_dd && \
+    strip /usr/bin/spdk_dd
 
-FROM quay.io/fedora/fedora:45
+FROM quay.io/fedora/fedora:45 AS runtime
 
 RUN dnf install -y \
       libaio \
@@ -70,3 +72,12 @@ COPY --from=builder /usr/bin/spdk_tgt /usr/bin/spdk_tgt
 
 ENTRYPOINT ["/usr/bin/spdk_tgt"]
 CMD ["-r", "/run/velocor/spdk.sock", "-m", "0x1", "-s", "512", "--json", "/etc/velocor/spdk.json"]
+
+# Integration-test image (build with --target test): adds spdk_dd, which acts as a
+# userspace NVMe/TCP initiator so tests can write and verify data through real exports
+# without root or kernel NVMe modules. Never shipped.
+FROM runtime AS test
+COPY --from=builder /usr/bin/spdk_dd /usr/bin/spdk_dd
+
+# The shipped data-plane image is the last stage, so a plain build produces it.
+FROM runtime

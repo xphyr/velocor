@@ -80,8 +80,13 @@ func (c *Client) BdevRaidCreate(ctx context.Context, name, raidLevel string, str
 	return c.Call(ctx, "bdev_raid_create", params, nil)
 }
 
-// BdevRaidDelete destroys an SPDK RAID bdev by name.
-func (c *Client) BdevRaidDelete(ctx context.Context, name string) error {
+// BdevRaidDelete destroys an SPDK RAID bdev by name. With clearSuperblock, the RAID
+// superblock is wiped from every member; otherwise SPDK examine re-assembles the deleted
+// array as soon as its disks are attached again (verified against SPDK v26.09).
+func (c *Client) BdevRaidDelete(ctx context.Context, name string, clearSuperblock bool) error {
 	params := map[string]any{"name": name}
+	if clearSuperblock {
+		params["clear_sb"] = true
+	}
 	return c.Call(ctx, "bdev_raid_delete", params, nil)
 }

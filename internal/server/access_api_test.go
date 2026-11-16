@@ -3,6 +3,7 @@ package server
 import (
 	"net/http"
 	"testing"
+	"time"
 )
 
 // nvmeExport creates a pool, volume, NVMe/TCP portal and an export limited to a group with hostNQN.
@@ -23,7 +24,7 @@ func (h *harness) nvmeExport(hostNQN string) (exp, vol map[string]any, igID stri
 
 func TestUpdateExportAccess(t *testing.T) {
 	h := newHarness(t)
-	exp, _, igID := h.nvmeExport("nqn.host-a")
+	exp, _, igID := h.nvmeExport("nqn.2026-01.io.example:host-a")
 	path := "/api/v1/exports/" + exp["id"].(string)
 	nqn := exp["subsystem_nqn"].(string)
 
@@ -42,7 +43,7 @@ func TestUpdateExportAccess(t *testing.T) {
 	}
 	h.expect(h.do("PATCH", path, h.admin, map[string]any{"allow_any_host": false, "initiator_group_ids": []string{igID}}))(http.StatusOK)
 	sub, _ := h.fake.Subsystem(nqn)
-	if sub.AllowAnyHost || len(sub.Hosts) != 1 || sub.Hosts[0].Nqn != "nqn.host-a" {
+	if sub.AllowAnyHost || len(sub.Hosts) != 1 || sub.Hosts[0].Nqn != "nqn.2026-01.io.example:host-a" {
 		t.Fatalf("ACL not restored: %+v", sub)
 	}
 	if e, _ := h.st.GetExport(exp["id"].(string)); e.AllowAnyHost || len(e.InitiatorGroupIDs) != 1 {
@@ -58,22 +59,22 @@ func TestUpdateExportAccess(t *testing.T) {
 		t.Fatalf("failed update was persisted")
 	}
 
-	h.fake.ConnectHost(nqn, "nqn.host-a")
+	h.fake.ConnectHost(nqn, "nqn.2026-01.io.example:host-a")
 	conns := h.expect(h.do("GET", path+"/connections", h.admin, nil))(http.StatusOK)["connections"].([]any)
-	if len(conns) != 1 || conns[0].(map[string]any)["host"] != "nqn.host-a" {
+	if len(conns) != 1 || conns[0].(map[string]any)["host"] != "nqn.2026-01.io.example:host-a" {
 		t.Fatalf("connections wrong: %v", conns)
 	}
 }
 
 func TestUpdateInitiatorGroupReappliesExports(t *testing.T) {
 	h := newHarness(t)
-	exp, vol, igID := h.nvmeExport("nqn.host-a")
+	exp, vol, igID := h.nvmeExport("nqn.2026-01.io.example:host-a")
 	nqn := exp["subsystem_nqn"].(string)
 	path := "/api/v1/initiator-groups/" + igID
 
-	h.expect(h.do("PATCH", path, h.admin, map[string]any{"host_nqns": []string{"nqn.host-b"}}))(http.StatusOK)
+	h.expect(h.do("PATCH", path, h.admin, map[string]any{"host_nqns": []string{"nqn.2026-01.io.example:host-b"}}))(http.StatusOK)
 	sub, _ := h.fake.Subsystem(nqn)
-	if len(sub.Hosts) != 1 || sub.Hosts[0].Nqn != "nqn.host-b" {
+	if len(sub.Hosts) != 1 || sub.Hosts[0].Nqn != "nqn.2026-01.io.example:host-b" {
 		t.Fatalf("group change not applied to export: %+v", sub.Hosts)
 	}
 	if code, _ := h.do("PATCH", path, h.admin, map[string]any{"host_nqns": []string{}}); code != http.StatusBadRequest {
@@ -91,5 +92,20 @@ func TestUpdateInitiatorGroupReappliesExports(t *testing.T) {
 	usage = h.expect(h.do("GET", "/api/v1/volumes/"+vol["id"].(string)+"/usage", h.admin, nil))(http.StatusOK)
 	if usage["allocated_bytes"].(float64) == 0 {
 		t.Fatalf("allocation not reported: %v", usage)
+	}
+}
+
+func TestGroupSnapshotResumeIsRetried(t *testing.T) {
+	h := newHarness(t)
+	exp, vol, _ := h.nvmeExport("nqn.2026-01.io.example:host-a")
+	_ = exp
+	h.fake.Fail("nvmf_subsystem_resume", 2)
+	h.expect(h.do("POST", "/api/v1/volume-group-snapshots", h.admin, map[string]any{"name": "g", "volume_ids": []string{vol["id"].(string)}}))(http.StatusCreated)
+	deadline := time.Now().Add(5 * time.Second)
+	for h.fake.CallCount("nvmf_subsystem_resume") < 3 && time.Now().Before(deadline) {
+		time.Sleep(50 * time.Millisecond)
+	}
+	if n := h.fake.CallCount("nvmf_subsystem_resume"); n < 3 {
+		t.Fatalf("a failed resume must be retried until it succeeds; resume called %d times", n)
 	}
 }

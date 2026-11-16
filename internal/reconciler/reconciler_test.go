@@ -245,3 +245,47 @@ func TestIscsiExportRefusesImplicitAnyAccess(t *testing.T) {
 		t.Fatalf("export health %s, want DEGRADED", exp.HealthStatus)
 	}
 }
+
+// SSD (io_uring/AIO) members must get a stable bdev UUID, or SPDK won't re-assemble their
+// superblock RAID after a restart (found against real SPDK by internal/integration).
+func TestSSDPoolReassemblesAfterRestart(t *testing.T) {
+	e := newEnv(t)
+	c := e.fake.Client()
+	var ids, bdevs []string
+	for _, f := range []string{"/dev/disk/by-id/wwn-a", "/dev/disk/by-id/wwn-b"} {
+		e.fake.AddFile(f)
+		d := &store.Disk{ID: "ssd-" + f[len(f)-1:], Name: f, Type: store.DiskTypeSSD, DevicePath: f, SizeBytes: 1 << 40}
+		if err := e.st.UpsertDisk(d); err != nil {
+			t.Fatal(err)
+		}
+		bdev, drv, err := dataplane.AttachDisk(e.ctx, c, nil, d)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := e.st.ClaimDisk(d.ID, drv, bdev); err != nil {
+			t.Fatal(err)
+		}
+		ids, bdevs = append(ids, d.ID), append(bdevs, bdev)
+	}
+	pool := &store.Pool{ID: "pool-ssd", Name: "ssd", RaidLevel: store.RaidLevel1, DiskIDs: ids}
+	if err := e.st.CreatePool(pool); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.BdevRaidCreate(e.ctx, pool.BaseBdevName, "raid1", 0, bdevs, true); err != nil {
+		t.Fatal(err)
+	}
+	uuid, err := c.BdevLvolCreateLvstore(e.ctx, pool.EffectiveBdevName, pool.LVSName, 0, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.st.MutatePool(pool.ID, func(p *store.Pool) error { p.LVSUUID = uuid; return nil }); err != nil {
+		t.Fatal(err)
+	}
+
+	e.fake.Restart()
+	e.reconcile()
+	p, _ := e.st.GetPool(pool.ID)
+	if p.HealthStatus != store.HealthStatusOnline {
+		t.Fatalf("SSD pool did not come back after restart: %s %s", p.HealthStatus, p.StatusMessage)
+	}
+}

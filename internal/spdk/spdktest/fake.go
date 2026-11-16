@@ -69,11 +69,12 @@ type mediaLvstore struct {
 }
 
 type raidSuperblock struct {
-	Name    string
-	UUID    string
-	Level   string
-	Strip   uint32
-	Members []string // ordered media keys
+	Name        string
+	UUID        string
+	Level       string
+	Strip       uint32
+	Members     []string // ordered media keys
+	MemberUUIDs []string // bdev UUID of each member when the array was created
 }
 
 type raidBdev struct {
@@ -109,6 +110,7 @@ type Fake struct {
 
 	// Runtime state.
 	baseBdevs    map[string]string // bdev name -> media key
+	bdevUUID     map[string]string // base bdev name -> bdev UUID
 	nvmeCtrls    map[string]string // controller name -> PCI address
 	raids        map[string]*raidBdev
 	pendingLoad  map[string]bool   // raid media key with lvstore not yet examined
@@ -297,6 +299,7 @@ func (f *Fake) LvolSizeMiB(ref string) uint64 {
 
 func (f *Fake) resetRuntime() {
 	f.baseBdevs = map[string]string{}
+	f.bdevUUID = map[string]string{}
 	f.nvmeCtrls = map[string]string{}
 	f.raids = map[string]*raidBdev{}
 	f.pendingLoad = map[string]bool{}
@@ -373,6 +376,11 @@ func (f *Fake) dispatch(method string, raw json.RawMessage) (any, *rpcErr) {
 	}
 	if p == nil {
 		p = map[string]any{}
+	}
+	// AIO bdevs behave exactly like io_uring ones for the fake's purposes.
+	alias := map[string]string{"bdev_aio_create": "bdev_uring_create", "bdev_aio_delete": "bdev_uring_delete"}
+	if a, ok := alias[method]; ok {
+		method = a
 	}
 	h, ok := handlers[method]
 	if !ok {
@@ -511,9 +519,15 @@ func (f *Fake) assembleFromSuperblocksLocked(newBdev string) {
 		f.raids[sb.Name] = r
 	}
 	for i, mk := range sb.Members {
-		if mk == key {
-			r.Members[i] = newBdev
+		if mk != key {
+			continue
 		}
+		// Real SPDK only accepts a member whose bdev UUID matches the superblock
+		// (bdev_raid.c, "Failed to examine bdev ...: Invalid argument" otherwise).
+		if i < len(sb.MemberUUIDs) && sb.MemberUUIDs[i] != f.bdevUUID[newBdev] {
+			return
+		}
+		r.Members[i] = newBdev
 	}
 	if f.raidOnline(r) {
 		f.raidAppearedLocked(r)
@@ -577,6 +591,7 @@ var handlers = map[string]handler{
 		f.nvmeCtrls[name] = traddr
 		bdev := name + "n1"
 		f.baseBdevs[bdev] = traddr
+		f.bdevUUID[bdev] = "nvme-ns-" + traddr // NVMe namespaces report a stable UUID
 		f.assembleFromSuperblocksLocked(bdev)
 		return []string{bdev}, nil
 	},
@@ -604,6 +619,10 @@ var handlers = map[string]handler{
 			return nil, errf(codeEEXIST, "bdev %s already exists", name)
 		}
 		f.baseBdevs[name] = file
+		f.bdevUUID[name] = str(p, "uuid")
+		if f.bdevUUID[name] == "" {
+			f.bdevUUID[name] = f.newUUID() // like SPDK: random unless given
+		}
 		f.assembleFromSuperblocksLocked(name)
 		return name, nil
 	},
@@ -666,7 +685,11 @@ var handlers = map[string]handler{
 				if old := f.superblock[k]; old != nil {
 					delete(f.lvsMedia, "sb:"+old.UUID)
 				}
-				f.superblock[k] = &raidSuperblock{Name: name, UUID: r.UUID, Level: r.Level, Strip: r.Strip, Members: keys}
+				var memberUUIDs []string
+				for _, m := range members {
+					memberUUIDs = append(memberUUIDs, f.bdevUUID[m])
+				}
+				f.superblock[k] = &raidSuperblock{Name: name, UUID: r.UUID, Level: r.Level, Strip: r.Strip, Members: keys, MemberUUIDs: memberUUIDs}
 			}
 			delete(f.lvsMedia, "nosb:"+strings.Join(keys, ","))
 		}
@@ -683,6 +706,13 @@ var handlers = map[string]handler{
 		for lvsName, key := range f.loadedLvs {
 			if key == r.MediaKey {
 				delete(f.loadedLvs, lvsName)
+			}
+		}
+		if boolean(p, "clear_sb") {
+			for k, sb := range f.superblock {
+				if sb.Name == name {
+					delete(f.superblock, k)
+				}
 			}
 		}
 		delete(f.raids, name)
