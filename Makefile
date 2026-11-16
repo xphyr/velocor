@@ -131,7 +131,7 @@ image-os:
 	velod=$$(INSECURE_REGISTRY=$(INSECURE_REGISTRY) hack/pin-image.sh $(VELOD_IMAGE)); \
 	echo "OS image pins $$spdk and $$velod"; \
 	$(PODMAN) build $(LABEL_ARGS) $(TLS_FLAG) $(if $(TLS_FLAG),--network=host) \
-		--build-arg SPDK_IMAGE=$$spdk --build-arg VELOD_IMAGE=$$velod \
+		--build-arg SPDK_IMAGE=$$spdk --build-arg VELOD_IMAGE=$$velod --build-arg IMAGE_TAG=$(TAG) \
 		--build-arg INSECURE_REGISTRY=$(INSECURE_REGISTRY) \
 		-t $(BOOTC_IMAGE) -f deploy/bootc/Containerfile .
 

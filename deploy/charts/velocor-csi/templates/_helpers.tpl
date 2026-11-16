@@ -22,7 +22,7 @@ CSI image reference
 {{- define "velocor-csi.image" -}}
 {{- $tag := default .Chart.AppVersion .Values.image.tag -}}
 {{- if .Values.image.digest -}}
-{{- printf "%s:%s@%s" .Values.image.repository $tag .Values.image.digest -}}
+{{- printf "%s@%s" .Values.image.repository .Values.image.digest -}}
 {{- else -}}
 {{- printf "%s:%s" .Values.image.repository $tag -}}
 {{- end -}}

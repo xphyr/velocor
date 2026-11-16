@@ -16,7 +16,7 @@ for name in velocor-spdk velocor-velod; do
     podman image exists "$ref" || { echo "loaded ${archive} but ${ref} is still missing" >&2; exit 1; }
   fi
   wanted["$(podman image inspect --format '{{.Id}}' "$ref")"]=1
-  repo="${ref%@*}"; repo="${repo%:*}"
+  repo="${ref%@*}"
   while read -r id; do
     [[ -n "$id" && -z "${wanted[$id]:-}" ]] || continue
     podman image rm "$id" >/dev/null 2>&1 && echo "Removed superseded ${repo} image ${id:0:12}" || true

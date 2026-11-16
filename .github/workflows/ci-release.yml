@@ -183,7 +183,7 @@ jobs:
                 INSECURE_REGISTRY="$INSECURE_REGISTRY" "CSI_PLATFORMS=linux/amd64,linux/arm64")
           [[ "$RELEASE" == true ]] && args+=(VERSION="$TAG")
           make push "${args[@]}"
-          for f in bin/digests/*; do echo "$IMAGE_PREFIX/$(basename "$f"):$TAG@$(cat "$f")"; done | tee bin/digests/refs.txt
+          for f in bin/digests/velocor-*; do echo "$IMAGE_PREFIX/$(basename "$f")@$(cat "$f")  # $TAG"; done | tee bin/digests/refs.txt
 
       - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
@@ -306,7 +306,7 @@ jobs:
           IMAGE_PREFIX: ${{ needs.images.outputs.image_prefix }}
           TAG: ${{ needs.images.outputs.tag }}
         run: |
-          csi="$IMAGE_PREFIX/velocor-csi:$TAG@$(cat digests/velocor-csi)"
+          csi="$IMAGE_PREFIX/velocor-csi@$(cat digests/velocor-csi)"
           sed -E "s|image: \S+/velocor-csi:\S+|image: $csi|" deploy/k8s/csi/velocor-csi.yaml > dist/velocor-csi.yaml
           grep -q "image: $csi" dist/velocor-csi.yaml
           cp deploy/k8s/csi/volumesnapshotclass.yaml deploy/k8s/csi/volumegroupsnapshotclass.yaml dist/

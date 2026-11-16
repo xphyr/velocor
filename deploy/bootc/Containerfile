@@ -1,7 +1,8 @@
 # Thin immutable appliance OS on Fedora image mode (bootc) 45.
 # Runs spdk_tgt and velod as Podman quadlet containers.
 #
-# VELOD_IMAGE and SPDK_IMAGE are required and must be pinned by digest (repo:tag@sha256:...):
+# VELOD_IMAGE and SPDK_IMAGE are required and must be pinned by digest (repo@sha256:...);
+# IMAGE_TAG is the tag they were pushed under, used only to name the embedded images.
 # `make image-os` resolves them from the images pushed for the same commit. Both images
 # are embedded in this OS image and the quadlets reference them by digest, so an appliance runs
 # exactly the containers it was built and tested with, without a registry at boot, and only
@@ -16,6 +17,7 @@ FROM quay.io/fedora/fedora-bootc:45@sha256:1989dd9223dc2ef03e3be158165be13e55b55
 
 ARG VELOD_IMAGE
 ARG SPDK_IMAGE
+ARG IMAGE_TAG=pinned
 # Only for CI builds of pull requests, whose images live in a throwaway local registry.
 ARG INSECURE_REGISTRY=false
 
@@ -83,13 +85,14 @@ RUN set -eu; \
     mkdir -p /usr/share/velocor/images; \
     embed() { \
       ref="$1" name="$2"; \
-      case "$ref" in *@sha256:*) ;; *) echo "$name image '$ref' must be pinned by digest (repo:tag@sha256:...)" >&2; exit 1 ;; esac; \
-      repo_tag="${ref%@*}"; \
+      case "$ref" in */*@sha256:*) ;; *) echo "$name image '$ref' must be pinned by digest (repo@sha256:...)" >&2; exit 1 ;; esac; \
+      repo="${ref%@*}"; \
+      case "${repo##*/}" in *:*) echo "$name image '$ref': give repo@sha256:... without a tag" >&2; exit 1 ;; esac; \
       archive="/usr/share/velocor/images/$name.oci.tar"; \
-      skopeo copy -q $tls "docker://$ref" "oci-archive:$archive:$repo_tag"; \
+      skopeo copy -q $tls "docker://$ref" "oci-archive:$archive:$repo:${IMAGE_TAG}"; \
       digest="$(skopeo inspect --format '{{.Digest}}' "oci-archive:$archive")"; \
-      sed -i "s|^Image=.*|Image=${repo_tag}@${digest}|" "/usr/share/containers/systemd/$name.container"; \
-      echo "$name: Image=${repo_tag}@${digest}"; \
+      sed -i "s|^Image=.*|# Built from $repo:${IMAGE_TAG}\nImage=${repo}@${digest}|" "/usr/share/containers/systemd/$name.container"; \
+      echo "$name: Image=${repo}@${digest} ($repo:${IMAGE_TAG})"; \
     }; \
     embed "${SPDK_IMAGE}" velocor-spdk; \
     embed "${VELOD_IMAGE}" velocor-velod; \

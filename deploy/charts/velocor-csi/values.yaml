@@ -3,7 +3,7 @@ driverName: csi.velocor.io
 image:
   repository: ghcr.io/xphyr/velocor-csi
   tag: "" # Defaults to Chart.appVersion
-  # sha256:... pins the image; release charts set it, so the tag is informational only.
+  # sha256:... pins the image (used instead of the tag); release charts set it.
   digest: ""
   pullPolicy: IfNotPresent
 
