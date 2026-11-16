@@ -51,6 +51,22 @@ COPY --from=velod-bin /usr/bin/veloctl /usr/bin/veloctl
 COPY deploy/quadlets/velocor-spdk.container /usr/share/containers/systemd/velocor-spdk.container
 COPY deploy/quadlets/velocor-velod.container /usr/share/containers/systemd/velocor-velod.container
 
+# Administrator account: velocor-admin, SSH keys only; root cannot log in over SSH.
+# No keys or passwords are ever baked into this (public) image: they are added to a disk image
+# by hack/build-qcow2.sh (/etc/ssh/authorized_keys.d/velocor-admin) or at boot by cloud-init.
+COPY deploy/bootc/admin/velocor-admin.sysusers /usr/lib/sysusers.d/velocor-admin.conf
+COPY deploy/bootc/admin/velocor-admin.tmpfiles /usr/lib/tmpfiles.d/velocor-admin.conf
+COPY deploy/bootc/admin/velocor-admin.sudoers /etc/sudoers.d/velocor-admin
+COPY deploy/bootc/admin/40-velocor.sshd.conf /etc/ssh/sshd_config.d/40-velocor.conf
+COPY deploy/bootc/admin/10-velocor.cloud.cfg /etc/cloud/cloud.cfg.d/10-velocor.cfg
+RUN chmod 0440 /etc/sudoers.d/velocor-admin && \
+    chmod 0600 /etc/ssh/sshd_config.d/40-velocor.conf && \
+    install -d -m 0755 /etc/ssh/authorized_keys.d && \
+    visudo -cf /etc/sudoers.d/velocor-admin && \
+    ssh-keygen -q -t ed25519 -N '' -f /tmp/check-hostkey && \
+    sshd -t -f /etc/ssh/sshd_config -h /tmp/check-hostkey && \
+    rm -f /tmp/check-hostkey /tmp/check-hostkey.pub
+
 # Install ESXi-style appliance console splash banner (/etc/issue)
 COPY deploy/bootc/velocor-console-banner.sh /usr/libexec/velocor-console-banner
 COPY deploy/bootc/velocor-console.service /usr/lib/systemd/system/velocor-console.service

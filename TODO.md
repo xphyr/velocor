@@ -142,6 +142,50 @@ work still open, ranked by risk to data, how fixes are verified, and what has be
 - [ ] **P2-5. Slow test suites.** Auth/server tests take ~50–100 s under `-race` because every
   login runs 600k PBKDF2 iterations; consider a test-only iteration override (was F7).
 
+### Build, packaging and CI (review of 2026-11-16)
+
+Everything here was written by Gemini and is in scope to rewrite.
+
+- [ ] **B1. The OS image is not built from the same commit as the containers it runs.** On
+  non-release CI runs `build-os` pins the quadlets to `velocor-velod:latest` /
+  `velocor-spdk:latest` and pre-loads whatever `latest` is at that moment, not the images built
+  earlier in the same run. An appliance image for commit X can contain velod from commit Y (or
+  from a concurrent run). *Fix:* pass the digests produced by `build-containers` to `build-os`
+  and pin quadlets by digest (`image@sha256:…`).
+- [ ] **B2. Appliances reference images by mutable tags**, even for releases, so what an
+  appliance runs can change under it. *Fix:* pin by digest in the bootc image; keep tags only for
+  humans.
+- [ ] **B3. Unpinned base images**: `fedora:45`, `fedora-minimal:45`, `fedora-bootc:45`,
+  `bootc-image-builder:latest`. Builds aren't reproducible and a base-image change can land
+  silently. *Fix:* pin by digest; let a bot (Renovate/Dependabot) propose bumps.
+- [ ] **B4. Images compile with Fedora's `golang` package, not the Go version in `go.mod`**,
+  while CI tests with `setup-go` from `go.mod`, so the binaries shipped aren't built by the
+  toolchain that was tested. *Fix:* build stages from a digest-pinned `golang:<go.mod version>`
+  image (or `GOTOOLCHAIN` from `go.mod`).
+- [ ] **B5. CI never runs the integration tests, `golangci-lint`, or `bash -n`/shellcheck.**
+  *Fix:* add jobs; GitHub runners have passwordless sudo, so the real-SPDK suite can run rootful
+  there and also cover io_uring (P0-6).
+- [ ] **B6. Least privilege in CI.** `packages: write`, `id-token: write` and
+  `attestations: write` are granted workflow-wide, including to the test job. Third-party
+  actions are pinned to moving tags (`@v6`, `anchore/sbom-action@v0`) rather than commit SHAs.
+  *Fix:* per-job permissions; pin actions by SHA.
+- [ ] **B7. Makefile defaults push `latest`.** `push-*` and `container-*` default to `:latest`,
+  so a casual `make push-containers` overwrites the shared tag. *Fix:* default to
+  `dev-<sha>`; require an explicit release target for `latest`/version tags.
+- [ ] **B8. `make qcow2` needs sudo and `bootc-image-builder:latest`.** `hack/build-qcow2.sh`
+  (rootless, no credentials or keys baked in) replaces it for lab use; decide whether releases
+  should publish a qcow2 built in CI.
+- [ ] **B9. The internal registry name leaks into public artifacts.** `deploy/k8s/csi/*.yaml`
+  and the bootc Containerfile default to `registry.xphyrlab.net`, and the release job relies on
+  `sed` to rewrite one manifest. *Fix:* one image-reference setting, defaulting to the public
+  registry, overridden for lab builds.
+- [ ] **B10. Inconsistent SPDK settings**: the image's default `CMD` uses `-s 512` while the
+  quadlet uses `-s 1024`; the quadlet should be the only source.
+- [x] **B11.** Secrets could enter build contexts (`COPY . .` with a name-based ignore list):
+  `.containerignore` now excludes them by pattern.
+- [x] **B12.** The lab disk builder copied the host's registry credentials into disk images:
+  removed (images are pulled anonymously).
+
 ### Long-term
 
 - [ ] **L-1. Patch SPDK so flushes reach the drives (the real fix for P0-4).** Make the lvol

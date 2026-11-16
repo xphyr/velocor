@@ -1,0 +1,2 @@
+d /var/home/velocor-admin      0700 velocor-admin velocor-admin -
+d /var/home/velocor-admin/.ssh 0700 velocor-admin velocor-admin -

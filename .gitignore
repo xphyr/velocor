@@ -30,3 +30,4 @@ deploy/bootc/config.local.toml
 
 # Local, uncommitted notes for Claude Code (internal lab details, credentials pointers)
 CLAUDE.local.md
+*.priv.pub

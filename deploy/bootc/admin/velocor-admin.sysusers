@@ -1,0 +1,3 @@
+# The appliance's only interactive login. Root cannot log in over SSH.
+u velocor-admin - "Velocor appliance administrator" /var/home/velocor-admin /bin/bash
+m velocor-admin wheel

@@ -91,35 +91,33 @@ make push-containers IMAGE_PREFIX=registry.example.com/velocor
 
 ### Build a Local `qcow2` VM Image
 
-To build a bootable 32 GiB `qcow2` disk image locally for running `velocor-os` on another hypervisor or VM host (via `bootc-image-builder`):
+`hack/build-qcow2.sh` turns a published `velocor-os` image into a bootable qcow2 without root on
+the build host (it only needs KVM): a throwaway Fedora Cloud VM runs `bootc install to-disk`
+onto a second virtual disk. Nothing from the build host goes into the image.
 
 ```bash
-# Builds container-bootc and writes output/qcow2/disk.qcow2 (requires sudo for bootc-image-builder)
-make qcow2
+hack/build-qcow2.sh \
+  --image registry.xphyrlab.net/velocor/velocor-os:dev-<sha> \
+  --output velocor-os.qcow2 --size 32G \
+  --authorized-keys ~/.ssh/id_ed25519.pub   # repeatable
 ```
 
-If you want to customize the output directory, root filesystem, or `bootc` image tag:
+### Logging in to the appliance
 
-```bash
-make qcow2 QCOW2_OUTPUT_DIR=./build-qcow2 QCOW2_ROOTFS=xfs BOOTC_IMAGE=registry.example.com/velocor/velocor-os:latest
-```
+The appliance's only login is **`velocor-admin`** (member of `wheel`, passwordless sudo, SSH keys
+only). Root cannot log in over SSH, and password authentication is disabled. Neither the image nor
+the repository contains keys or passwords; give `velocor-admin` keys in one of these ways:
 
-The default [deploy/bootc/config.toml](deploy/bootc/config.toml) sets the root filesystem `minsize` to `32 GiB` (`[[customizations.filesystem]]`).
+- `hack/build-qcow2.sh --authorized-keys <file.pub>` writes them to
+  `/etc/ssh/authorized_keys.d/velocor-admin` in the installed disk.
+- **cloud-init** (included in `velocor-os`): keys supplied by the hypervisor or a seed ISO go to
+  `velocor-admin`.
+- After installing with `bootc install to-disk` (below), add the file
+  `/etc/ssh/authorized_keys.d/velocor-admin` (mode 0644, owned by root) to the installed system.
 
-#### Adding a Custom User or SSH Key to the `qcow2` Image
-
-Copy [deploy/bootc/config.toml](deploy/bootc/config.toml) to `deploy/bootc/config.local.toml` (which is gitignored) and add your `[[customizations.user]]` block there, or pass `BIB_CONFIG=/path/to/config.toml`. `make qcow2` automatically uses `deploy/bootc/config.local.toml` when present:
-
-```toml
-[[customizations.user]]
-name = "velocor"
-# Optional password (or hashed password); omit to allow SSH key login only
-password = "changeme"
-key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI... operator@workstation"
-groups = ["wheel"]
-```
-
-You can also inject an SSH key for `root` by adding a second `[[customizations.user]]` block with `name = "root"` and `key = "ssh-ed25519 ..."`. Then run `make qcow2` and boot `output/qcow2/disk.qcow2` on your target machine.
+`make qcow2` (bootc-image-builder, needs sudo) still works; to add keys with it, put a
+`[[customizations.user]]` block with `name = "velocor-admin"` and your `key` in
+`deploy/bootc/config.local.toml` (git-ignored).
 
 ---
 
@@ -133,7 +131,7 @@ The recommended production deployment installs the immutable `velocor-os` image 
 2. **Install `velocor-os` to the target boot drive** (e.g., `/dev/sda` or `/dev/nvme0n1`):
 
    ```bash
-   export BOOTC_IMAGE="registry.xphyrlab.net/velocor/velocor-os:latest"
+   export BOOTC_IMAGE="registry.xphyrlab.net/velocor/velocor-os:<tag>"
    export TARGET_DISK="/dev/sda"
 
    sudo podman pull "${BOOTC_IMAGE}"
@@ -142,14 +140,22 @@ The recommended production deployment installs the immutable `velocor-os` image 
      --security-opt label=type:unconfined_t \
      -v /var/lib/containers:/var/lib/containers \
      -v /dev:/dev \
-     -v /etc/ostree:/etc/ostree \
-     -v "${HOME}/.ssh/authorized_keys:/tmp/authorized_keys:ro" \
      "${BOOTC_IMAGE}" \
      bootc install to-disk \
        --filesystem xfs \
        --generic-image \
-       --root-ssh-authorized-keys /tmp/authorized_keys \
        "${TARGET_DISK}"
+   ```
+
+   Then give `velocor-admin` your SSH key (root SSH login is disabled):
+
+   ```bash
+   sudo mount /dev/disk/by-label/root /mnt
+   for d in /mnt/ostree/deploy/*/deploy/*.0; do
+     sudo install -d -m 0755 "$d/etc/ssh/authorized_keys.d"
+     sudo install -m 0644 ~/.ssh/id_ed25519.pub "$d/etc/ssh/authorized_keys.d/velocor-admin"
+   done
+   sudo umount /mnt
    ```
 
 3. **Reboot into the installed disk.** On first boot, systemd automatically generates and starts `velocor-spdk.service` and `velocor-velod.service` from `/usr/share/containers/systemd/`.

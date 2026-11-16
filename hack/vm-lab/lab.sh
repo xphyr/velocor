@@ -58,21 +58,6 @@ ensure_ssh_key() {
   fi
 }
 
-find_host_auth_json() {
-  local uid
-  uid="$(id -u)"
-  for candidate in \
-    "${REGISTRY_AUTH_FILE:-}" \
-    "/run/user/${uid}/containers/auth.json" \
-    "${HOME}/.config/containers/auth.json"; do
-    if [[ -n "${candidate}" && -f "${candidate}" ]]; then
-      echo "${candidate}"
-      return 0
-    fi
-  done
-  return 1
-}
-
 fetch_image() {
   mkdir -p "${LAB_DIR}"
   if [[ -f "${BASE_IMAGE}" ]]; then
@@ -148,114 +133,9 @@ build_bootc_disk() {
     echo "Fedora bootc disk already exists at ${BOOTC_DISK}"
     return 0
   fi
-
-  fetch_image
   ensure_ssh_key
-  build_seed_iso "velocor-bib"
-
-  local bib_os="${LAB_DIR}/bib-os.qcow2"
-  local bib_pidfile="${LAB_DIR}/bib.pid"
-  local bib_ssh_port=12229
-  local target_disk="${BOOTC_DISK}.part"
-
-  rm -f "${bib_os}" "${target_disk}"
-  qemu-img create -f qcow2 -F qcow2 -b "${BASE_IMAGE}" "${bib_os}" 20G >/dev/null
-  qemu-img create -f qcow2 "${target_disk}" 20G >/dev/null
-
-  echo "Starting temporary builder VM to run 'bootc install to-disk' for ${BOOTC_IMAGE}..."
-  qemu-system-x86_64 \
-    -name velocor-bib \
-    -machine q35,accel=kvm \
-    -cpu host \
-    -m 2048 \
-    -smp 4 \
-    -daemonize \
-    -pidfile "${bib_pidfile}" \
-    -display none \
-    -serial "file:${LAB_DIR}/bib-console.log" \
-    -drive "file=${bib_os},if=none,id=osdisk,format=qcow2" \
-    -device "virtio-blk-pci,drive=osdisk,bootindex=1" \
-    -drive "file=${target_disk},if=none,id=targetdisk,format=qcow2" \
-    -device "virtio-blk-pci,drive=targetdisk,serial=BOOTCTARGET" \
-    -drive "file=${LAB_DIR}/velocor-bib-cidata.iso,if=virtio,media=cdrom,readonly=on" \
-    -netdev "user,id=net0,hostfwd=tcp:127.0.0.1:${bib_ssh_port}-:22" \
-    -device virtio-net-pci,netdev=net0
-
-  cleanup_bib() {
-    if [[ -f "${bib_pidfile}" ]]; then
-      local pid
-      pid="$(cat "${bib_pidfile}")"
-      kill "${pid}" 2>/dev/null || true
-      rm -f "${bib_pidfile}"
-    fi
-    rm -f "${bib_os}"
-  }
-  trap cleanup_bib EXIT RETURN
-
-  local ssh_opts=(-i "${LAB_DIR}/id_ed25519" -o IdentitiesOnly=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5)
-  echo "Waiting for SSH on builder VM (127.0.0.1:${bib_ssh_port})..."
-  for _ in $(seq 1 40); do
-    if ssh "${ssh_opts[@]}" -p "${bib_ssh_port}" fedora@127.0.0.1 "true" 2>/dev/null; then
-      break
-    fi
-    sleep 2
-  done
-
-  local auth_file
-  if auth_file="$(find_host_auth_json)"; then
-    scp "${ssh_opts[@]}" -P "${bib_ssh_port}" "${auth_file}" fedora@127.0.0.1:/tmp/auth.json
-  fi
-  scp "${ssh_opts[@]}" -P "${bib_ssh_port}" "${LAB_DIR}/id_ed25519.pub" fedora@127.0.0.1:/tmp/id_ed25519.pub
-
-  echo "Installing ${BOOTC_IMAGE} onto /dev/vdb via 'bootc install to-disk'..."
-  ssh "${ssh_opts[@]}" -p "${bib_ssh_port}" fedora@127.0.0.1 "sudo BOOTC_IMAGE='${BOOTC_IMAGE}' bash -s" <<'EOF'
-set -euo pipefail
-dnf install -y podman xfsprogs >/dev/null
-
-mkdir -p /etc/ostree /root/.config/containers
-if [[ -f /tmp/auth.json ]]; then
-  install -m 0600 /tmp/auth.json /etc/ostree/auth.json
-  install -m 0600 /tmp/auth.json /root/.config/containers/auth.json
-fi
-
-podman pull "${BOOTC_IMAGE}"
-
-podman run --rm --privileged --pid=host \
-  --security-opt label=type:unconfined_t \
-  -v /var/lib/containers:/var/lib/containers \
-  -v /dev:/dev \
-  -v /etc/ostree:/etc/ostree \
-  -v /tmp/id_ed25519.pub:/tmp/id_ed25519.pub:ro \
-  "${BOOTC_IMAGE}" \
-  bootc install to-disk \
-    --filesystem xfs \
-    --generic-image \
-    --root-ssh-authorized-keys /tmp/id_ed25519.pub \
-    /dev/vdb
-
-# Inject registry auth into the installed ostree deployment so Quadlets can pull on first boot
-if [[ -f /tmp/auth.json ]]; then
-  mkdir -p /mnt/bootc-target
-  mount /dev/vdb3 /mnt/bootc-target
-  for deploy_dir in /mnt/bootc-target/ostree/deploy/*/deploy/*.0; do
-    mkdir -p "${deploy_dir}/etc/ostree" "${deploy_dir}/etc/containers"
-    install -m 0600 /tmp/auth.json "${deploy_dir}/etc/ostree/auth.json"
-  done
-  for var_dir in /mnt/bootc-target/ostree/deploy/*/var; do
-    mkdir -p "${var_dir}/roothome/.config/containers"
-    install -m 0600 /tmp/auth.json "${var_dir}/roothome/.config/containers/auth.json"
-  done
-  sync
-  umount /mnt/bootc-target
-fi
-sync
-EOF
-
-  cleanup_bib
-  trap - EXIT RETURN
-  sleep 1
-  mv "${target_disk}" "${BOOTC_DISK}"
-  echo "Successfully created Fedora bootc 45 disk image: ${BOOTC_DISK}"
+  "${REPO_ROOT}/hack/build-qcow2.sh" --image "${BOOTC_IMAGE}" --output "${BOOTC_DISK}" \
+    --size 20G --authorized-keys "${LAB_DIR}/id_ed25519.pub" --work "${LAB_DIR}/qcow2-build"
 }
 
 init_disks() {
@@ -367,20 +247,18 @@ verify_san() {
   local ssh_key="${LAB_DIR}/id_ed25519"
   local ssh_opts=(-i "${ssh_key}" -o IdentitiesOnly=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5)
 
-  echo "Waiting for SSH on velocor-san (root@127.0.0.1:${SAN_SSH_PORT})..."
+  echo "Waiting for SSH on velocor-san (velocor-admin@127.0.0.1:${SAN_SSH_PORT})..."
   for _ in $(seq 1 45); do
-    if ssh "${ssh_opts[@]}" -p "${SAN_SSH_PORT}" root@127.0.0.1 "true" 2>/dev/null; then
+    if ssh "${ssh_opts[@]}" -p "${SAN_SSH_PORT}" velocor-admin@127.0.0.1 "true" 2>/dev/null; then
       break
     fi
     sleep 2
   done
 
   echo "=== Verifying Fedora Image Mode (bootc 45) & Podman Quadlet Services on velocor-san ==="
-  scp "${ssh_opts[@]}" -P "${SAN_SSH_PORT}" \
-    "${REPO_ROOT}/deploy/quadlets/velocor-spdk.container" \
-    "${REPO_ROOT}/deploy/quadlets/velocor-velod.container" \
-    root@127.0.0.1:/etc/containers/systemd/
-  ssh "${ssh_opts[@]}" -p "${SAN_SSH_PORT}" root@127.0.0.1 "bash -s" <<'EOF'
+  # The image ships its quadlets pinned to the images it was built with; never override them
+  # with the repo's copies (which reference :latest) from /etc.
+  ssh "${ssh_opts[@]}" -p "${SAN_SSH_PORT}" velocor-admin@127.0.0.1 "sudo bash -s" <<'EOF'
 set -euo pipefail
 echo "--- bootc status ---"
 bootc status
@@ -462,7 +340,7 @@ EOF
 
   echo ""
   echo "=== Testing Live NVMe-oF/TCP Discovery, Connect & Block I/O ==="
-  ssh "${ssh_opts[@]}" -p "${SAN_SSH_PORT}" root@127.0.0.1 "bash -s" <<'EOF'
+  ssh "${ssh_opts[@]}" -p "${SAN_SSH_PORT}" velocor-admin@127.0.0.1 "sudo bash -s" <<'EOF'
 set -euo pipefail
 modprobe nvme-tcp
 echo "--- nvme discover -t tcp -a 10.0.2.15 -s 4420 ---"
@@ -477,13 +355,13 @@ EOF
   echo ""
   echo "=== Testing CoW Snapshots & Changed Block Tracking (CBT) on NVMe-oF/TCP Volume ==="
   snap1_id="$("${REPO_ROOT}/bin/veloctl" --endpoint "https://127.0.0.1:${SAN_API_PORT}" --insecure snapshot create --volume "${vol_nvmf_id}" --name snap-1 | jq -r '.snapshot.id')"
-  ssh "${ssh_opts[@]}" -p "${SAN_SSH_PORT}" root@127.0.0.1 "dd if=/dev/urandom of=/dev/nvme0n1 bs=64k count=2 seek=16 oflag=direct status=none && sync && nvme disconnect -n nqn.2026-11.io.velocor:exp-nvmf"
+  ssh "${ssh_opts[@]}" -p "${SAN_SSH_PORT}" velocor-admin@127.0.0.1 "sudo dd if=/dev/urandom of=/dev/nvme0n1 bs=64k count=2 seek=16 oflag=direct status=none && sync && sudo nvme disconnect -n nqn.2026-11.io.velocor:exp-nvmf"
   snap2_id="$("${REPO_ROOT}/bin/veloctl" --endpoint "https://127.0.0.1:${SAN_API_PORT}" --insecure snapshot create --volume "${vol_nvmf_id}" --name snap-2 | jq -r '.snapshot.id')"
   "${REPO_ROOT}/bin/veloctl" --endpoint "https://127.0.0.1:${SAN_API_PORT}" --insecure snapshot changed-blocks --base "${snap1_id}" --target "${snap2_id}"
 
   echo ""
   echo "=== Testing Live iSCSI Discovery (SendTargets), Login & Block I/O ==="
-  ssh "${ssh_opts[@]}" -p "${SAN_SSH_PORT}" root@127.0.0.1 "bash -s" <<'EOF'
+  ssh "${ssh_opts[@]}" -p "${SAN_SSH_PORT}" velocor-admin@127.0.0.1 "sudo bash -s" <<'EOF'
 set -euo pipefail
 echo "--- iscsiadm -m discovery -t sendtargets -p 10.0.2.15:3260 ---"
 iscsiadm -m discovery -t sendtargets -p 10.0.2.15:3260
@@ -498,7 +376,7 @@ EOF
 
 ssh_san() {
   local ssh_key="${LAB_DIR}/id_ed25519"
-  exec ssh -i "${ssh_key}" -o IdentitiesOnly=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 -p "${SAN_SSH_PORT}" root@127.0.0.1 "$@"
+  exec ssh -i "${ssh_key}" -o IdentitiesOnly=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 -p "${SAN_SSH_PORT}" velocor-admin@127.0.0.1 "$@"
 }
 
 ssh_init() {
