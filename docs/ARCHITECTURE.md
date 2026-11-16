@@ -17,14 +17,14 @@
 
 3. **Pool, Volume & Filter Bdev Hierarchy:**
    - **Disks** (`bdev_nvme` or `bdev_uring`) are grouped into a **Pool** (`bdev_raid` RAID 0/1/10/5f + SPDK `lvol_store`).
-   - Each Pool configures an `lvol_store` `cluster_size` (defaulting to `64 KiB` or `1 MiB` rather than SPDK's 4 MiB default) to optimize thin provisioning and **Changed Block Tracking (CBT)**.
+   - Each Pool configures an `lvol_store` `cluster_size` (defaulting to `64 KiB` or `1 MiB` rather than SPDK's 4 MiB default) to keep thin-provisioning overhead low (the cluster is also the granularity any future changed-block tracking would report at).
    - **Volumes** (`bdev_lvol`) are thin- or thick-provisioned inside a Pool.
    - Every Pool and Volume tracks both its `base_bdev_name` (or `lvol_bdev_name`) and its `effective_bdev_name` so stackable SPDK filter bdevs (`bdev_crypto` for AES-XTS encryption and `bdev_compress` for LZ4/Deflate compression) can wrap volumes or pools transparently without changing the Export layer.
    - Every Volume maintains an exclusive `attachment_state` (`UNATTACHED`, `BLOCK_EXPORT`, `FILESYSTEM`) so a volume can be exported over SAN protocols (NVMe-oF / iSCSI) now, or attached locally via SPDK `ublk` (`/dev/ublkbX`) for XFS + NFS/SMB in Phase 2 NAS, without ever allowing concurrent conflicting attachments.
 
-4. **Changed Block Tracking (CBT) & Kubernetes CSI Readiness:**
+4. **Snapshots & Kubernetes CSI Readiness:**
    - Snapshots (`bdev_lvol_snapshot`) record their parent lineage (`parent_snapshot_id`, `sequence_number`) in `bbolt`.
-   - `velod` exposes `GetSnapshotAllocatedBlocks` and `GetSnapshotChangedBlocks` using SPDK's `bdev_lvol_get_fragmap` RPC (`spdk_bdev_seek_data` / `spdk_bdev_seek_hole`), mapping directly to the Kubernetes CSI `SnapshotMetadata` API (`GetMetadataAllocated` and `GetMetadataDelta`, KEP-3314).
+   - **Changed Block Tracking (CBT) is deferred.** SPDK v26.09 has no RPC that reports a snapshot's allocated clusters (an earlier design assumed a `bdev_lvol_get_fragmap` RPC, which exists only in Longhorn's SPDK fork, never in upstream SPDK). Until it can be measured, the CSI driver neither serves nor advertises the `SnapshotMetadata` service (KEP-3314), and `velod`'s `blocks:allocated` / `blocks:changed` endpoints return `501 Not Implemented` rather than guessed extents, which would make incremental backups silently miss data. The planned route is a small read-only SPDK extension (`TODO.md` L-2): the lvol layer already knows which clusters each snapshot layer owns, so a snapshot's clusters relative to its parent in the same chain are exactly the blocks that changed.
    - Volume and Export creation endpoints are idempotent by name to satisfy Kubernetes CSI controller retry semantics.
 
 5. **Single-Port API + Embedded Web UI + Unified Auth:**

@@ -419,7 +419,7 @@ async function createPoolDialog() {
       { name: "level", kind: "radio", label: "RAID level", value: "RAID1", options: RAID_LEVELS },
       { name: "disks", kind: "checks", label: "Disks", options: free.map((d) => ({ value: d.id, label: `${d.name || d.id} (${d.type}, ${humanSize(d.size_bytes)})` })), empty: "No claimed disks are free. Claim some on the Disks screen first." },
       { name: "strip", label: "Strip size", when: (v) => v.level !== "RAID1", value: "64", options: ["16", "32", "64", "128", "256"].map((k) => ({ value: k, label: `${k} KiB` })) },
-      { name: "cluster", label: "Cluster size", value: String(64 * 1024), hint: "The unit of thin allocation and of changed-block tracking.",
+      { name: "cluster", label: "Cluster size", value: String(64 * 1024), hint: "The unit of thin allocation.",
         options: [[64 * 1024, "64 KiB"], [1 << 20, "1 MiB"], [4 << 20, "4 MiB"]].map(([v, l]) => ({ value: String(v), label: l })) },
     ],
     action: (v) => send("POST", "/pools", { name: v.name, raid_level: v.level, disk_ids: v.disks, strip_size_kb: Number(v.strip), cluster_size_bytes: Number(v.cluster) }),
@@ -574,28 +574,6 @@ function deleteVolumeDialog(v) {
   });
 }
 
-function changedBlocksDialog(snap, older) {
-  openDialog({
-    title: `What changed up to ${snap.name}`,
-    intro: "Changed-block tracking lists the regions written between two snapshots of a volume, which is what an incremental backup copies.",
-    submit: "Show",
-    fields: [{ name: "base", label: "Since snapshot", value: (older[older.length - 1] || {}).id, options: older.map((s) => ({ value: s.id, label: `${s.name} (${humanTime(s.created_at)})` })) }],
-    action: (x) => api(`/snapshots/${encodeURIComponent(snap.id)}/blocks:changed?base_snapshot_id=${encodeURIComponent(x.base)}`),
-    done: (r) => {
-      const extents = r.extents || [];
-      const total = extents.reduce((sum, e) => sum + e.length_bytes, 0);
-      openDialog({
-        title: "Changed blocks",
-        intro: `${extents.length} regions, ${humanSize(total)} in all, of a ${humanSize(r.volume_size_bytes)} volume.`,
-        warning: table([
-          { title: "Offset", num: true, cell: (e) => humanSize(e.offset_bytes) },
-          { title: "Length", num: true, cell: (e) => humanSize(e.length_bytes) },
-        ], extents, { filter: false, empty: "Nothing changed." }),
-      });
-    },
-  });
-}
-
 function volumeTable(items, poolList, options = {}) {
   const poolsById = byId(poolList);
   return table([
@@ -678,7 +656,6 @@ async function volume(id) {
       { title: "Taken", cell: (s) => humanTime(s.created_at) },
       { title: "Group", cell: (s) => (groupOf[s.id] ? groupOf[s.id].name : "-") },
       { title: "", cell: (s) => el("div", { class: "row-actions" },
-        snaps.indexOf(s) > 0 && el("button", { onclick: () => changedBlocksDialog(s, snaps.slice(0, snaps.indexOf(s))) }, "Changed blocks"),
         snapshotActions(s, groupOf)) },
     ], snaps, { empty: "No snapshots of this volume.", state: stateOf("volume-snapshots") }),
   ];

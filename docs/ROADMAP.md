@@ -11,7 +11,7 @@ This file tracks implementation progress directly inside the Git repository so a
   - [x] `auth.proto`
   - [x] `disk.proto`
   - [x] `pool.proto`
-  - [x] `volume.proto` (including Snapshots & CBT)
+  - [x] `volume.proto` (including Snapshots)
   - [x] `export.proto` (Portals, InitiatorGroups, NVMe-oF & iSCSI Exports)
   - [x] `system.proto`
 - [x] `bbolt` State Store (`internal/store`):
@@ -22,7 +22,7 @@ This file tracks implementation progress directly inside the Git repository so a
 
 ## Phase 2: SPDK JSON-RPC 2.0 Client & Hardware Manager
 - [x] SPDK JSON-RPC 2.0 socket client (`internal/spdk/client.go`)
-- [x] Typed SPDK RPC methods (`bdev`, `raid`, `lvol`, `fragmap` CBT, `nvmf`, `iscsi`, `iostat`, SMART)
+- [x] Typed SPDK RPC methods (`bdev`, `raid`, `lvol`, `nvmf`, `iscsi`, `iostat`, SMART)
 - [x] Linux Hardware Manager (`internal/hardware`) with boot-disk guard, hugepages, and VFIO/noiommu binding
 
 ## Phase 3: Reconciler, `velod` Control Plane & `veloctl` CLI
@@ -41,12 +41,13 @@ This file tracks implementation progress directly inside the Git repository so a
 - [x] Zero-dependency HTML/CSS/JS SPA embedded in `velod` via `go:embed` (`internal/server/web/`)
 - [x] JWT login, password management & Personal Access Token (`velo_pat_...`) UI
 - [x] Live SPDK bdev I/O telemetry (`bdev_get_iostat` polling with IOPS, MB/s, and latency)
-- [x] Disks (boot-disk guard, claim/release), Pools, Volumes (QoS/resize), Snapshots & CBT inspector, and SAN Exports (with copyable `nvme`/`iscsiadm` commands)
+- [x] Disks (boot-disk guard, claim/release), Pools, Volumes (QoS/resize), Snapshots, and SAN Exports (with copyable `nvme`/`iscsiadm` commands)
 
 ## Phase 6: Kubernetes CSI Driver (`velocor-csi`), Helm Chart & Release Pipeline
 - [x] CSI v1.x driver (`cmd/velocor-csi`, `internal/csi`) with NVMe-oF/TCP & iSCSI support, online expansion, CoW snapshots, cloning, and usage reporting (`NodeGetVolumeStats`, `GetCapacity`)
 - [x] Per-node Host & InitiatorGroup ACL automation during `ControllerPublishVolume`
-- [x] Changed Block Tracking (`SnapshotMetadata` / KEP-3314) & Volume Group Snapshots (`GroupController` / KEP-3476)
+- [x] Volume Group Snapshots (`GroupController` / KEP-3476)
+- [ ] Changed Block Tracking (`SnapshotMetadata` / KEP-3314): deferred until SPDK can report allocated clusters (TODO.md L-2)
 - [x] Official CSI sanity suite (`csi-test/v5`: 82 passed, 0 failed) & `k3s` VM lab end-to-end verification
 - [x] Multi-arch (`linux/amd64`, `linux/arm64`) `velocor-csi` container build & Helm chart (`deploy/charts/velocor-csi`)
 - [x] GitHub Actions CI/CD release pipeline (`.github/workflows/ci-release.yml`) with Cosign keyless signing, SPDX SBOMs, SLSA build provenance, and OCI Helm publishing

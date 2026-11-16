@@ -723,7 +723,7 @@ func runVolume(cfg *cliConfig, args []string) error {
 
 func runSnapshot(cfg *cliConfig, args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("subcommand required: list | create | clone | allocated-blocks | changed-blocks | delete")
+		return fmt.Errorf("subcommand required: list | create | clone | delete")
 	}
 	switch args[0] {
 	case "list":
@@ -766,32 +766,6 @@ func runSnapshot(cfg *cliConfig, args []string) error {
 			return fmt.Errorf("--snapshot and --name are required")
 		}
 		resp, err := cfg.request("POST", "/api/v1/snapshots/"+*snapID+":clone", map[string]any{"clone_name": *name})
-		if err != nil {
-			return err
-		}
-		return printJSON(resp)
-
-	case "allocated-blocks":
-		if len(args) < 2 {
-			return fmt.Errorf("usage: veloctl snapshot allocated-blocks <snapshot-id>")
-		}
-		resp, err := cfg.request("GET", "/api/v1/snapshots/"+args[1]+"/blocks:allocated", nil)
-		if err != nil {
-			return err
-		}
-		return printJSON(resp)
-
-	case "changed-blocks":
-		fs := flag.NewFlagSet("snapshot changed-blocks", flag.ExitOnError)
-		baseID := fs.String("base", "", "Base snapshot ID")
-		targetID := fs.String("target", "", "Target snapshot ID")
-		_ = fs.Parse(args[1:])
-		if *baseID == "" || *targetID == "" {
-			return fmt.Errorf("--base and --target snapshot IDs are required")
-		}
-		path := fmt.Sprintf("/api/v1/snapshots/%s/blocks:changed?base_snapshot_id=%s",
-			url.PathEscape(*targetID), url.QueryEscape(*baseID))
-		resp, err := cfg.request("GET", path, nil)
 		if err != nil {
 			return err
 		}
@@ -1275,7 +1249,7 @@ Commands:
   disk              List, scan, claim, or release NVMe and SSD drives
   pool              Create, list, or delete SPDK RAID + lvol_store pools
   volume            Create, list, get, show usage, resize, set QoS, or delete volumes
-  snapshot          Create, list, clone, delete snapshots & query CBT blocks
+  snapshot          Create, list, clone and delete snapshots
   group-snapshot    Create, list, get, or delete consistency group snapshots
   portal            Manage NVMe-oF and iSCSI network portals
   host              Register NVMe-oF / iSCSI initiator hosts

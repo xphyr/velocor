@@ -30,9 +30,9 @@ Velocor decouples the user-space block data plane (`spdk_tgt`) from the control 
 ## Core Components & Features
 
 - **`velod` (`cmd/velod`)**: Node control-plane daemon, hardware manager (`vfio-pci` & hugepages), transactional desired-state store (`bbolt`), background drift reconciler, and single-port (`:8443`) REST/JSON + OpenAPI server, authenticated Prometheus `/metrics` endpoint, and embedded Web UI console.
-- **`veloctl` (`cmd/veloctl`)**: Operator CLI for managing users, tokens, disks, pools, volumes, snapshots, Changed Block Tracking (CBT), network portals, initiator groups, and exports.
+- **`veloctl` (`cmd/veloctl`)**: Operator CLI for managing users, tokens, disks, pools, volumes, snapshots, network portals, initiator groups, and exports.
 - **`velocor-spdk` (`spdk_tgt`)**: User-space, polled-mode SPDK `v26.09` data plane managing PCIe NVMe (`vfio-pci` / `bdev_nvme`) and SATA/SAS SSD (`io_uring` / `bdev_uring`) devices directly.
-- **`velocor-csi` (`cmd/velocor-csi`)**: Kubernetes CSI driver (`csi.velocor.io`) supporting dynamic NVMe-oF/TCP and iSCSI provisioning, online volume expansion, CoW snapshots, cloning, `VolumeGroupSnapshot`, and CSI `SnapshotMetadata` (KEP-3314 CBT).
+- **`velocor-csi` (`cmd/velocor-csi`)**: Kubernetes CSI driver (`csi.velocor.io`) supporting dynamic NVMe-oF/TCP and iSCSI provisioning, online volume expansion, CoW snapshots, cloning, and `VolumeGroupSnapshot`. Changed Block Tracking (CSI `SnapshotMetadata`, KEP-3314) is not supported yet; see [Changed Block Tracking](#changed-block-tracking-cbt-not-yet-supported).
 - **Boot-Disk Safety Guard**: Automatically resolves backing devices and PCIe BDF addresses for `/`, `/boot`, `/boot/efi`, and `/sysroot` on startup and permanently marks them `is_boot_device = true` so OS drives can never be unbound or formatted.
 
 ---
@@ -239,7 +239,7 @@ For local development and end-to-end testing, `hack/vm-lab/lab.sh` provisions a 
 # 1. Start velocor-san (API forwarded to https://127.0.0.1:18443) and velocor-initiator
 ./hack/vm-lab/lab.sh up
 
-# 2. Run end-to-end verification (bootc, Quadlets, disk claim, RAID1 pool, NVMe-oF/TCP, CBT, iSCSI)
+# 2. Run end-to-end verification (bootc, Quadlets, disk claim, RAID1 pool, NVMe-oF/TCP, snapshots, iSCSI)
 ./hack/vm-lab/lab.sh verify
 
 # 3. Stop the lab VMs
@@ -354,7 +354,20 @@ The Velocor CSI driver (`velocor-csi`) integrates Kubernetes clusters with a Vel
 - **CoW Volume Snapshots & Restores** (`VolumeSnapshot`)
 - **Volume Cloning** (`dataSource` referencing an existing `PersistentVolumeClaim` or `VolumeSnapshot`)
 - **Volume Group Snapshots** (`VolumeGroupSnapshot` via CSI `GroupController`)
-- **Changed Block Tracking (CBT)** (`SnapshotMetadata` service implementing `GetMetadataAllocated` and `GetMetadataDelta`, KEP-3314)
+
+#### Changed Block Tracking (CBT): not yet supported
+
+The driver does **not** implement the CSI `SnapshotMetadata` service (KEP-3314) and does not
+advertise the `SNAPSHOT_METADATA_SERVICE` capability, so backup tools such as Kasten take full
+backups of Velocor volumes rather than incremental, CBT-based ones. Full backups and restores
+work normally.
+
+The reason: the SPDK release Velocor ships (v26.09) has no RPC that reports which clusters of a
+snapshot hold data, which is what CBT needs. Reporting changed blocks it can't actually measure
+would let an incremental backup silently miss data, so the feature stays off until it can be
+built correctly (an SPDK extension is planned; see `TODO.md`, item L-2). The appliance's
+`/api/v1/snapshots/{id}/blocks:allocated` and `blocks:changed` endpoints return
+`501 Not Implemented` for the same reason.
 
 ---
 
@@ -541,7 +554,7 @@ spec:
 
 ## Documentation
 
-- [Architecture Guide](docs/ARCHITECTURE.md) — Decoupled control/data planes, two-tier flash management, filter bdevs, CBT, and unified API design.
+- [Architecture Guide](docs/ARCHITECTURE.md) — Decoupled control/data planes, two-tier flash management, filter bdevs, snapshots, and unified API design.
 - [Implementation Roadmap](docs/ROADMAP.md) — Phase-by-phase breakdown of completed subsystems.
 - [QEMU/KVM 2-Node Lab Guide](hack/vm-lab/README.md) — Local virtualized SAN + initiator testing instructions.
 

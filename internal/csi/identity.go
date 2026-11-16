@@ -57,13 +57,6 @@ func (s *IdentityServer) GetPluginCapabilities(_ context.Context, _ *csi.GetPlug
 				},
 			},
 			{
-				Type: &csi.PluginCapability_Service_{
-					Service: &csi.PluginCapability_Service{
-						Type: csi.PluginCapability_Service_SNAPSHOT_METADATA_SERVICE,
-					},
-				},
-			},
-			{
 				Type: &csi.PluginCapability_VolumeExpansion_{
 					VolumeExpansion: &csi.PluginCapability_VolumeExpansion{
 						Type: csi.PluginCapability_VolumeExpansion_ONLINE,

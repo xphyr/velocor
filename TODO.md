@@ -122,11 +122,6 @@ work still open, ranked by risk to data, how fixes are verified, and what has be
   *Needed:* a supported degraded start (SPDK investigation; possibly removing the absent member
   from the superblock with operator confirmation). Together with P0-1 this is "redundancy".
 
-- [ ] **P1-9. Changed-block tracking is advertised but cannot work. (Verified)** SPDK v26.09
-  has no `bdev_lvol_get_fragmap`. Velocor returns 501 instead of made-up extents, but the CSI
-  driver still advertises the SnapshotMetadata service. *Needed:* stop advertising it (probe at
-  startup) or add the RPC to the SPDK build (a small patch exposing a blob's allocated-cluster map).
-
 ### P2: hardening
 
 - [ ] **P2-1. CHAP and real host identities** (was S10). Any host that can spoof an allowed NQN
@@ -141,6 +136,11 @@ work still open, ranked by risk to data, how fixes are verified, and what has be
   validated against the number of exports and connections.
 - [ ] **P2-5. Slow test suites.** Auth/server tests take ~50–100 s under `-race` because every
   login runs 600k PBKDF2 iterations; consider a test-only iteration override (was F7).
+- [ ] **P2-6. No health endpoint.** velod has no unauthenticated liveness/readiness route
+  (found in the 2026-11-16 qcow2 boot test), so quadlets can't use `HealthCmd=` and monitoring
+  can't tell "velod up but SPDK unreachable" from "all good". *Needed:* `/healthz` (process up)
+  and `/readyz` (SPDK RPC answers, DB open), no auth and no detail leakage, plus `HealthCmd=` in
+  the velod quadlet.
 
 ### Build, packaging and CI (review of 2026-11-16)
 
@@ -200,6 +200,27 @@ Everything here was written by Gemini and is in scope to rewrite.
   future phase**. Aim to upstream it rather than carry it; nvweaver's SPDK durability patch is
   prior art. Once it ships, the interim handling in P0-4 can relax (caches left on, the PLP flag
   kept as information).
+- [ ] **L-2. Changed-block tracking (CBT) for incremental backups.** Deferred by decision on
+  2026-11-16 (was P1-9): SPDK v26.09 has no RPC that reports a snapshot's allocated clusters, so
+  CBT is switched off rather than guessed. *Needed:*
+  - a small **read-only** SPDK extension (no data-path change, much lower risk than L-1) that
+    returns the clusters a snapshot/lvol owns itself, not inherited from its parent. Prior art:
+    `bdev_lvol_get_fragmap` exists **only in Longhorn's SPDK fork** (github.com/longhorn/spdk,
+    commit 3e764f556 "fragmap: implement bdev_lvol_get_fragmap", 2023, ~520 lines incl. test;
+    still carried on `longhorn-v26.05`), never upstream (checked v23.09–v26.09 and master on
+    2026-11-16). Porting it onto our v26.09 build is the likely route; verify its semantics
+    (own-layer vs. inherited clusters) before relying on it. For two
+    snapshots in the same chain, the clusters owned by the layers between them are exactly the
+    changed blocks (granularity = pool cluster size, 64 KiB–1 MiB);
+  - velod: rework `blocks:allocated` / `blocks:changed` (and `spdk.BdevLvolGetFragmap`, the fake
+    SPDK's `bdev_lvol_get_fragmap`, `TestStorageEndToEndAndCBT`) to the real RPC; the current
+    code was written against an RPC that doesn't exist, so its request/response shape is a guess;
+  - CSI: reinstate the `SnapshotMetadata` service and `SNAPSHOT_METADATA_SERVICE` capability
+    (removed; in git history), only advertised when velod reports CBT works, plus the
+    `external-snapshot-metadata` sidecar, its TLS and the `SnapshotMetadataService` CR in the Helm
+    chart; re-add veloctl `allocated-blocks` / `changed-blocks` and the UI "Changed blocks" view;
+  - verification against real SPDK (integration harness) and a Kasten incremental
+    backup/restore round trip on NVW, comparing restored data byte-for-byte.
 
 ### Suggested order of work
 
@@ -209,7 +230,7 @@ Everything here was written by Gemini and is in scope to rewrite.
 3. **P0-2 capacity**: overcommit limits, reserve, thresholds.
 4. **P0-3 metadata**: on-pool metadata copy, backups, recovery from disks.
 5. **P1-1 alerting**: health metrics.
-6. P1-3 network rollback, P1-4 deletion protection, P1-5 orphan reporting, P1-9 CBT, P0-6 io_uring probe.
+6. P1-3 network rollback, P1-4 deletion protection, P1-5 orphan reporting, P0-6 io_uring probe.
 
 ---
 
@@ -260,7 +281,11 @@ code. Each now has a real-SPDK scenario and a matching unit test.
 - [x] **R3.** SPDK `raid5f` accepts only full-stripe writes and the lvol blobstore can't create
   a volume store on it, so RAID5F pools could never work. Refused by the API, UI and CLI.
 - [x] **R4.** SPDK v26.09 has no `bdev_lvol_get_fragmap`: CBT returns 501 rather than fabricated
-  data (open follow-up: P1-9).
+  data (follow-up: P1-9, below).
+- [x] **P1-9.** The CSI driver advertised and served `SnapshotMetadata` (CBT) although it could
+  never work. CBT deferred (2026-11-16, now L-2): the service and capability are gone from the
+  driver (guarded by `TestSnapshotMetadataNotAdvertised`), veloctl/UI/lab CBT commands removed,
+  README/ARCHITECTURE/ROADMAP say it's unsupported. velod's CBT endpoints still return 501.
 - [x] **R5.** SPDK validates NQN syntax; bad host NQNs now fail when entered instead of as an
   opaque "Internal error" at export time.
 

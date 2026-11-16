@@ -353,11 +353,11 @@ sync
 EOF
 
   echo ""
-  echo "=== Testing CoW Snapshots & Changed Block Tracking (CBT) on NVMe-oF/TCP Volume ==="
+  echo "=== Testing CoW Snapshots on NVMe-oF/TCP Volume ==="
   snap1_id="$("${REPO_ROOT}/bin/veloctl" --endpoint "https://127.0.0.1:${SAN_API_PORT}" --insecure snapshot create --volume "${vol_nvmf_id}" --name snap-1 | jq -r '.snapshot.id')"
   ssh "${ssh_opts[@]}" -p "${SAN_SSH_PORT}" velocor-admin@127.0.0.1 "sudo dd if=/dev/urandom of=/dev/nvme0n1 bs=64k count=2 seek=16 oflag=direct status=none && sync && sudo nvme disconnect -n nqn.2026-11.io.velocor:exp-nvmf"
   snap2_id="$("${REPO_ROOT}/bin/veloctl" --endpoint "https://127.0.0.1:${SAN_API_PORT}" --insecure snapshot create --volume "${vol_nvmf_id}" --name snap-2 | jq -r '.snapshot.id')"
-  "${REPO_ROOT}/bin/veloctl" --endpoint "https://127.0.0.1:${SAN_API_PORT}" --insecure snapshot changed-blocks --base "${snap1_id}" --target "${snap2_id}"
+  "${REPO_ROOT}/bin/veloctl" --endpoint "https://127.0.0.1:${SAN_API_PORT}" --insecure snapshot list
 
   echo ""
   echo "=== Testing Live iSCSI Discovery (SendTargets), Login & Block I/O ==="
