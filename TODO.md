@@ -142,20 +142,33 @@ work still open, ranked by risk to data, how fixes are verified, and what has be
   *Needed:* a supported degraded start (SPDK investigation; possibly removing the absent member
   from the superblock with operator confirmation). Together with P0-1 this is "redundancy".
 
-- [ ] **P1-10. SPDK's iSCSI target stalls large writes (found on NVW, 2026-11-16).** After the
-  login fix (d60e9ec), `mkfs.ext4` on an iSCSI volume hung: 19 writes in flight (the LUN allows
-  4 MiB), never completed; the initiator aborted (`ABORT_TASK`: "abort task not supported"),
-  reset the LUN and reconnected. The writes never reach the volume's bdev, so they stall in the
-  iSCSI layer. NVMe/TCP over the same path and pool is fine. Suspects: the reduced iSCSI pools
-  in `/etc/velocor/spdk.json` (`immediate_data_pool_size`/`data_out_pool_size` 512,
-  `pdu_pool_size` 2048) with `-s 1024`, i.e. buffer starvation on large R2T/Data-Out writes.
-  *Next:* reproduce on the lab host with an iSCSI initiator VM and vary pools/memory/burst sizes;
-  add an iSCSI data-path scenario to the integration tests.
-- [ ] **P1-12. No ReadWriteMany: KubeVirt VMs on Velocor can't live-migrate.** The driver
-  supports only single-node access modes, so OpenShift Virtualization can't live-migrate VMs
-  whose disks are on Velocor (node drains and cluster upgrades then stop them). *Needed:*
-  multi-node block access (RWX `volumeMode: Block`): export a volume to both source and target
-  nodes during migration, with ACLs for both; NVMe-oF ANA / reservations to keep it safe.
+- [ ] **P1-10. SPDK's iSCSI target wedges on WRITE SAME after a large discard (NVW + lab,
+  2026-11-16).** Reproduced on the lab host (Fedora initiator VM -> velocor-1, open-iscsi
+  6.2.1.11): plain direct writes of 4 KiB-4 MiB, discards (64 MiB and whole device), single and
+  32 parallel 4 MiB zero-outs (BLKZEROOUT) and a first `mkfs.ext4` all work. **`mkfs.ext4` on a
+  volume that already holds data hangs:** it discards the whole device (the thin lvol frees its
+  clusters) and immediately zeroes ranges with SCSI `Write Same(10)` (the LUN advertises
+  `zeroing_mode=writesame`, `write_zeroes_max_bytes` 4 MiB); those commands never complete
+  (`cmd_age=305s`), the initiator aborts (SPDK: "abort task not supported"), resets and offlines
+  the disk. SPDK's iSCSI layer then can't stop (podman SIGKILL after 120 s) or delete the target.
+  **Worse: after an SPDK restart the same LUN still doesn't answer** (a rebooted initiator's
+  scan times out). Not yet known: whether the volume itself (lvol, shared with NVMe) is left in a
+  bad state; the NVMe cross-check failed because the wedged iSCSI target couldn't be removed
+  (and velod reported "Unable to add ns, subsystem in active state" for the new NVMe export).
+  SPDK implements WRITE SAME as one single-block bdev write per block (`bdev_scsi_split`), and
+  its split completion ignores `bdev_scsi_split`'s return value (a task ending in an error from
+  the resubmission is never completed): a suspected SPDK bug.
+  *Next:* reproduce on a fresh volume with SPDK debug logs; check the lvol over NVMe after a
+  hang; test whether the stuck writes are WRITE SAME-specific (plain writes racing a whole-device
+  discard); report upstream. Possible mitigation meanwhile: have the CSI node plugin set
+  `max_write_same_blocks=0` on Velocor iSCSI LUNs so the kernel never sends WRITE SAME (zeroing
+  then uses plain writes). Lab state: a Fedora initiator VM on serenity
+  (`~/.cache/iscsi-lab`); on velocor-1 a lab volume `iscsi-lab` (mirror250a), portals
+  `lab-iscsi-mgmt` / `lab-nvme-mgmt` on 172.16.15.112, host `lab-initiator`, group
+  `lab-initiators`; SPDK's iSCSI target for it is wedged (needs a data-plane restart).
+- [ ] **P2-11. velod reports ONLINE before a restarted data plane is restored.** After an SPDK
+  restart, status said ONLINE within ~10 s while volume stores, the iSCSI portal and target came
+  back about a minute later.
 
 ### P2: hardening
 
@@ -173,9 +186,6 @@ work still open, ranked by risk to data, how fixes are verified, and what has be
   login runs 600k PBKDF2 iterations; consider a test-only iteration override (was F7).
 - [ ] **P2-7. The CSI driver logs nothing per request.** Stage/publish failures are only
   visible as Kubernetes events; the node plugin's log shows just its start line.
-- [ ] **P2-9. CDI has no StorageProfile defaults for the Velocor classes**, so every
-  DataVolume must spell out `accessModes` and `volumeMode`. Ship or document a StorageProfile
-  (`claimPropertySets`: RWO + Block, RWO + Filesystem) and a clone strategy.
 - [ ] **P2-10. Recovery time after an unclean SPDK stop** is now ~1 min per 500 GB on emulated
   disks (was 16 min). If it matters on real hardware, lower the lvstore metadata reservation
   (`num_md_pages_per_cluster_ratio`) and report a "recovering" state instead of DEGRADED.
@@ -383,6 +393,16 @@ code. Each now has a real-SPDK scenario and a matching unit test.
   --reconnect-delay=5` so I/O stalls instead of failing; `bdev_wait_for_examine` gets the long
   RPC timeout. Still open: iSCSI's `replacement_timeout` (120 s default) has the same effect for
   iSCSI hosts, and velod should report "recovering" rather than DEGRADED while volume stores load.
+- [x] **P1-12. KubeVirt live migration** (was: no ReadWriteMany). Raw block volumes can be
+  ReadWriteMany / ReadOnlyMany: one shared export per volume, nodes added and removed on the
+  live subsystem (velod `shared` + `node_ids`); ReadWriteMany filesystems refused. Verified on
+  NVW (064d85e): a Fedora VM on a Velocor RWX block disk migrated 3 times between nodes while
+  writing one O_DIRECT write a second: 0 errors, slowest write 0.36 s, data intact, and the
+  subsystem's hosts always exactly the current node afterwards. `TestSharedBlockVolumeAcrossNodes`.
+- [x] **P2-9. CDI StorageProfile.** The chart's hook Job patches each Velocor class's profile
+  (RWX block first, csi-clone, snapshot golden images) after install/upgrade, which also
+  restores a profile reset by a recreated class; DataVolumes need no access/volume mode, and VMs
+  get live-migratable disks by default (verified on NVW).
 - [x] **P1-11. One stuck volume blocked the whole CSI node** (NVW, 2026-11-16): the node plugin
   serialized every stage/publish on one mutex, so a hung iSCSI format made the node's NVMe
   volumes time out too. Now per-volume locks (a busy volume answers Aborted, which the sidecars
