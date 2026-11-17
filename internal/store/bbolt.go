@@ -159,6 +159,11 @@ func (s *BoltStore) MutatePool(id string, fn func(*Pool) error) (*Pool, error) {
 	return mutateRecord(s.db, bucketPools, id, fn, func(p *Pool, id string) { p.ID = id })
 }
 
+// MutateSnapshot atomically applies fn to the Snapshot record.
+func (s *BoltStore) MutateSnapshot(id string, fn func(*Snapshot) error) (*Snapshot, error) {
+	return mutateRecord(s.db, bucketSnapshots, id, fn, func(sn *Snapshot, id string) { sn.ID = id })
+}
+
 // MutateVolume atomically applies fn to the Volume record.
 func (s *BoltStore) MutateVolume(id string, fn func(*Volume) error) (*Volume, error) {
 	return mutateRecord(s.db, bucketVolumes, id, fn, func(v *Volume, id string) { v.ID = id })

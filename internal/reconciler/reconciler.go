@@ -131,6 +131,7 @@ func (r *Reconciler) ReconcileOnce(ctx context.Context) (State, error) {
 	}
 
 	poolOnline := r.reconcilePools(ctx, p, examined)
+	r.reconcileSpace(ctx, p, poolOnline)
 	volOnline := r.reconcileVolumes(ctx, p, poolOnline)
 	r.reconcileExports(ctx, p, volOnline)
 

@@ -1,0 +1,105 @@
+package reconciler
+
+import (
+	"context"
+	"fmt"
+
+	"github.com/velocor/velocor/internal/store"
+)
+
+// reconcileSpace refreshes how much each volume and snapshot really holds, and each pool's
+// committed and available space and space state (TODO P0-2). Reads SPDK only; writes the
+// store only when a value changed.
+func (r *Reconciler) reconcileSpace(ctx context.Context, p *pass, poolOnline map[string]bool) {
+	pools, err := r.store.ListPools()
+	if err != nil || len(pools) == 0 {
+		return
+	}
+	lvols, err := r.spdk.BdevLvolGetLvols(ctx)
+	if err != nil {
+		p.errs = append(p.errs, fmt.Sprintf("list lvols: %v", err))
+		return
+	}
+	lvstores, err := r.spdk.BdevLvolGetLvstores(ctx, "", "")
+	if err != nil {
+		p.errs = append(p.errs, fmt.Sprintf("list lvstores: %v", err))
+		return
+	}
+	clusterSize := map[string]uint64{}
+	for _, l := range lvstores {
+		clusterSize[l.UUID] = uint64(l.ClusterSize)
+	}
+	// Bytes each lvol holds, in its own volume store's cluster size.
+	held := make(map[string]uint64, len(lvols))
+	for _, l := range lvols {
+		held[l.UUID] = l.NumAllocatedClusters * clusterSize[l.LVS.UUID]
+	}
+
+	for _, pool := range pools {
+		if !poolOnline[pool.ID] {
+			continue // nothing reliable to measure; keep the last values
+		}
+		volumes, err := r.store.ListVolumes(pool.ID)
+		if err != nil {
+			p.errs = append(p.errs, fmt.Sprintf("list volumes of %s: %v", pool.ID, err))
+			continue
+		}
+		snapshots, err := r.store.ListSnapshots(pool.ID, "")
+		if err != nil {
+			p.errs = append(p.errs, fmt.Sprintf("list snapshots of %s: %v", pool.ID, err))
+			continue
+		}
+		for _, v := range volumes {
+			if b, ok := held[v.UUID]; ok && b != v.AllocatedBytes {
+				v.AllocatedBytes = b
+				if _, err := r.store.MutateVolume(v.ID, func(cur *store.Volume) error { cur.AllocatedBytes = b; return nil }); err != nil {
+					p.errs = append(p.errs, fmt.Sprintf("update volume %s: %v", v.ID, err))
+				}
+			}
+		}
+		for _, s := range snapshots {
+			if b, ok := held[s.UUID]; ok && b != s.AllocatedBytes {
+				s.AllocatedBytes = b
+				if _, err := r.store.MutateSnapshot(s.ID, func(cur *store.Snapshot) error { cur.AllocatedBytes = b; return nil }); err != nil {
+					p.errs = append(p.errs, fmt.Sprintf("update snapshot %s: %v", s.ID, err))
+				}
+			}
+		}
+
+		committed := store.CommittedBytes(volumes, snapshots)
+		var before, after store.SpaceState
+		updated, err := r.store.MutatePool(pool.ID, func(cur *store.Pool) error {
+			before = cur.SpaceState
+			after = store.SpaceStateOf(cur)
+			avail := store.AvailableBytes(cur, committed)
+			if cur.CommittedBytes == committed && cur.AvailableBytes == avail && cur.SpaceState == after {
+				return store.ErrSkipWrite
+			}
+			cur.CommittedBytes, cur.AvailableBytes, cur.SpaceState = committed, avail, after
+			return nil
+		})
+		if err != nil {
+			p.errs = append(p.errs, fmt.Sprintf("update pool space %s: %v", pool.ID, err))
+			continue
+		}
+		if after != store.SpaceStateOK {
+			e := updated.SpacePolicy.Effective()
+			p.degrade("pool:"+pool.ID, fmt.Sprintf("space %s: %.0f%% used (warning at %.0f%%, critical at %.0f%%)%s",
+				after, store.UsedPercent(updated), e.WarningPercent, e.CriticalPercent, spaceAdvice(after)))
+		}
+		if before != after && before != "" {
+			r.logger.Warn("pool space state changed", "pool", pool.ID, "from", before, "to", after,
+				"used_percent", fmt.Sprintf("%.1f", store.UsedPercent(updated)))
+		}
+	}
+}
+
+func spaceAdvice(st store.SpaceState) string {
+	switch st {
+	case store.SpaceStateCritical:
+		return "; new volumes, snapshots, clones and expansions are refused: free space or add capacity"
+	case store.SpaceStateFull:
+		return "; writes to new space are failing now: free space immediately"
+	}
+	return ""
+}

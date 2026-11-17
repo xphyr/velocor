@@ -280,6 +280,20 @@ func (f *Fake) WriteCluster(ref string, idx uint64) {
 	}
 }
 
+// SetLvstoreClusters sets the number of data clusters of the lvstore named lvsName, to test a
+// pool filling up.
+func (f *Fake) SetLvstoreClusters(lvsName string, n uint64) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, lvs := range f.lvsMedia {
+		if lvs.Name == lvsName {
+			lvs.TotalClust = n
+			return
+		}
+	}
+	f.t.Fatalf("spdktest: SetLvstoreClusters: lvstore %s not found", lvsName)
+}
+
 // LvolSizeMiB returns the size of the lvol with alias or UUID ref.
 func (f *Fake) LvolSizeMiB(ref string) uint64 {
 	f.mu.Lock()

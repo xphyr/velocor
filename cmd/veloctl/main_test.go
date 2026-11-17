@@ -245,3 +245,23 @@ func TestPoolReplaceStartDegradedReleaseAndRebuildCommands(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestPoolSpaceCommands(t *testing.T) {
+	f := newFixture(t)
+	signedIn(t, f)
+	if err := f.run(t, "pool", "set-space", "p1", "--max-overcommit", "2", "--warning-percent", "75"); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.run(t, "pool", "set-space", "p1", "--critical-percent", "70"); err == nil {
+		t.Fatal("critical below warning must be refused")
+	}
+	p, _ := f.st.GetPool("p1")
+	if p.SpacePolicy.MaxOvercommit != 2 || p.SpacePolicy.WarningPercent != 75 {
+		t.Fatalf("policy not saved: %+v", p.SpacePolicy)
+	}
+	for _, args := range [][]string{{"pool", "get", "p1"}, {"pool", "list"}, {"volume", "list"}} {
+		if err := f.run(t, args...); err != nil {
+			t.Fatalf("%v: %v", args, err)
+		}
+	}
+}

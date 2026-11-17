@@ -87,6 +87,8 @@ type Store interface {
 	GetSnapshot(id string) (*Snapshot, error)
 	GetSnapshotByName(volumeID, name string) (*Snapshot, error)
 	ListSnapshots(poolID, volumeID string) ([]*Snapshot, error)
+	// MutateSnapshot atomically applies fn to the current Snapshot record.
+	MutateSnapshot(id string, fn func(*Snapshot) error) (*Snapshot, error)
 	DeleteSnapshot(id string) error
 	// CheckSnapshotDeletable returns nil if DeleteSnapshot(id) would currently succeed.
 	CheckSnapshotDeletable(id string) error

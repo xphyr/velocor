@@ -265,20 +265,26 @@ type Pool struct {
 	Members []PoolMember `json:"members,omitempty"`
 	// DetachedDiskIDs are disks that left the RAID (failed, removed or replaced) but stay
 	// bound to the pool until an operator releases them, so they can't be reused by accident.
-	DetachedDiskIDs   []string     `json:"detached_disk_ids,omitempty"`
-	StripSizeKB       uint32       `json:"strip_size_kb"`
-	ClusterSizeBytes  uint32       `json:"cluster_size_bytes"`
-	BaseBdevName      string       `json:"base_bdev_name"`
-	EffectiveBdevName string       `json:"effective_bdev_name"`
-	LVSUUID           string       `json:"lvs_uuid"`
-	LVSName           string       `json:"lvs_name"`
-	TotalBytes        uint64       `json:"total_bytes"`
-	FreeBytes         uint64       `json:"free_bytes"`
-	AllocatedBytes    uint64       `json:"allocated_bytes"`
-	FilterPolicy      FilterPolicy `json:"filter_policy"`
-	HealthStatus      HealthStatus `json:"health_status"`
-	StatusMessage     string       `json:"status_message,omitempty"`
-	CreatedAt         time.Time    `json:"created_at"`
+	DetachedDiskIDs   []string `json:"detached_disk_ids,omitempty"`
+	StripSizeKB       uint32   `json:"strip_size_kb"`
+	ClusterSizeBytes  uint32   `json:"cluster_size_bytes"`
+	BaseBdevName      string   `json:"base_bdev_name"`
+	EffectiveBdevName string   `json:"effective_bdev_name"`
+	LVSUUID           string   `json:"lvs_uuid"`
+	LVSName           string   `json:"lvs_name"`
+	TotalBytes        uint64   `json:"total_bytes"`
+	FreeBytes         uint64   `json:"free_bytes"`
+	AllocatedBytes    uint64   `json:"allocated_bytes"`
+	// Space accounting (P0-2), maintained by the reconciler: CommittedBytes is every volume's
+	// full size plus what snapshots hold; AvailableBytes is how much more the pool accepts.
+	SpacePolicy    SpacePolicy  `json:"space_policy"`
+	CommittedBytes uint64       `json:"committed_bytes"`
+	AvailableBytes uint64       `json:"available_bytes"`
+	SpaceState     SpaceState   `json:"space_state,omitempty"`
+	FilterPolicy   FilterPolicy `json:"filter_policy"`
+	HealthStatus   HealthStatus `json:"health_status"`
+	StatusMessage  string       `json:"status_message,omitempty"`
+	CreatedAt      time.Time    `json:"created_at"`
 }
 
 // Volume represents a logical volume (SPDK bdev_lvol) inside a Pool.

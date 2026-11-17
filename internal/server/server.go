@@ -41,6 +41,7 @@ type Server struct {
 	auth       *auth.Manager
 	reconciler *reconciler.Reconciler
 	logger     *slog.Logger
+	space      spaceReservations
 	startedAt  time.Time
 	mux        *http.ServeMux
 
@@ -174,6 +175,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("POST /api/v1/pools", s.withAuth(store.RoleAdmin, s.handleCreatePool))
 	s.mux.HandleFunc("GET /api/v1/pools/{id}", s.withAuth(store.RoleReadOnly, s.handleGetPool))
 	s.mux.HandleFunc("DELETE /api/v1/pools/{id}", s.withAuth(store.RoleAdmin, s.handleDeletePool))
+	s.mux.HandleFunc("PATCH /api/v1/pools/{id}", s.withAuth(store.RoleAdmin, s.handleUpdatePool))
 	s.mux.HandleFunc("POST /api/v1/pools/{id}/replace", s.withAuth(store.RoleAdmin, s.handleReplacePoolDisk))
 	s.mux.HandleFunc("POST /api/v1/pools/{id}/start-degraded", s.withAuth(store.RoleAdmin, s.handleStartPoolDegraded))
 	s.mux.HandleFunc("DELETE /api/v1/pools/{id}/disks/{disk_id}", s.withAuth(store.RoleAdmin, s.handleReleasePoolDisk))
@@ -968,6 +970,41 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 			fmt.Fprintf(&sb, "velocor_pool_total_bytes{pool=%q,raid=%q} %d\n", p.Name, p.RaidLevel, p.TotalBytes)
 			fmt.Fprintf(&sb, "velocor_pool_free_bytes{pool=%q,raid=%q} %d\n", p.Name, p.RaidLevel, p.FreeBytes)
 		}
+		sb.WriteString("# HELP velocor_pool_committed_bytes Space promised by a pool: every volume fully written plus what snapshots hold.\n")
+		sb.WriteString("# TYPE velocor_pool_committed_bytes gauge\n")
+		sb.WriteString("# HELP velocor_pool_available_bytes How much more a pool accepts under its space policy (0 at CRITICAL or FULL).\n")
+		sb.WriteString("# TYPE velocor_pool_available_bytes gauge\n")
+		sb.WriteString("# HELP velocor_pool_used_ratio Fraction of a pool's volume store that is allocated.\n")
+		sb.WriteString("# TYPE velocor_pool_used_ratio gauge\n")
+		sb.WriteString("# HELP velocor_pool_space_state Pool space state: 0 OK, 1 WARNING, 2 CRITICAL (growth refused), 3 FULL (writes to new space fail).\n")
+		sb.WriteString("# TYPE velocor_pool_space_state gauge\n")
+		for _, p := range pools {
+			fmt.Fprintf(&sb, "velocor_pool_committed_bytes{pool=%q} %d\n", p.Name, p.CommittedBytes)
+			fmt.Fprintf(&sb, "velocor_pool_available_bytes{pool=%q} %d\n", p.Name, p.AvailableBytes)
+			fmt.Fprintf(&sb, "velocor_pool_used_ratio{pool=%q} %.4f\n", p.Name, store.UsedPercent(p)/100)
+			fmt.Fprintf(&sb, "velocor_pool_space_state{pool=%q,state=%q} %d\n", p.Name, p.SpaceState, spaceStateValue(p.SpaceState))
+		}
+		poolName := map[string]string{}
+		for _, p := range pools {
+			poolName[p.ID] = p.Name
+		}
+		if vols, err := s.store.ListVolumes(""); err == nil {
+			sb.WriteString("# HELP velocor_volume_size_bytes Provisioned size of a volume.\n")
+			sb.WriteString("# TYPE velocor_volume_size_bytes gauge\n")
+			sb.WriteString("# HELP velocor_volume_allocated_bytes Space a volume holds in its pool.\n")
+			sb.WriteString("# TYPE velocor_volume_allocated_bytes gauge\n")
+			for _, v := range vols {
+				fmt.Fprintf(&sb, "velocor_volume_size_bytes{volume=%q,pool=%q} %d\n", v.Name, poolName[v.PoolID], v.SizeBytes)
+				fmt.Fprintf(&sb, "velocor_volume_allocated_bytes{volume=%q,pool=%q} %d\n", v.Name, poolName[v.PoolID], v.AllocatedBytes)
+			}
+		}
+		if snaps, err := s.store.ListSnapshots("", ""); err == nil {
+			sb.WriteString("# HELP velocor_snapshot_allocated_bytes Space a snapshot holds in its pool.\n")
+			sb.WriteString("# TYPE velocor_snapshot_allocated_bytes gauge\n")
+			for _, sn := range snaps {
+				fmt.Fprintf(&sb, "velocor_snapshot_allocated_bytes{snapshot=%q,pool=%q} %d\n", sn.Name, poolName[sn.PoolID], sn.AllocatedBytes)
+			}
+		}
 	}
 
 	if disks, err := s.store.ListDisks(); err == nil {
@@ -1128,6 +1165,8 @@ func writeError(w http.ResponseWriter, err error) {
 		status = http.StatusConflict
 	case errors.Is(err, store.ErrInvalidArgument):
 		status = http.StatusBadRequest
+	case errors.Is(err, store.ErrInsufficientCapacity):
+		status = http.StatusInsufficientStorage
 	case errors.Is(err, errDataPlaneUnavailable):
 		status = http.StatusServiceUnavailable
 	case errors.Is(err, spdk.ErrCBTUnsupported):
@@ -1142,4 +1181,16 @@ func newResourceID(prefix string) string {
 	var b [6]byte
 	_, _ = rand.Read(b[:])
 	return prefix + "-" + hex.EncodeToString(b[:])
+}
+
+func spaceStateValue(st store.SpaceState) int {
+	switch st {
+	case store.SpaceStateWarning:
+		return 1
+	case store.SpaceStateCritical:
+		return 2
+	case store.SpaceStateFull:
+		return 3
+	}
+	return 0
 }

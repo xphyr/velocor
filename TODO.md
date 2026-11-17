@@ -103,6 +103,38 @@ work still open, ranked by risk to data, how fixes are verified, and what has be
   *Needed:* an overcommit ratio per pool (refuse creation beyond it), a reserve so snapshots
   and metadata can't take the last free space, warning/critical thresholds as pool health and
   metrics, and per-volume/snapshot allocated space.
+  **In progress (2026-11-17):** measured on the lab appliance and real SPDK: 12 GiB of thin
+  volumes accepted on an 8 GiB pool; once full, every write needing a new cluster fails in all
+  thin volumes at once with NVMe Internal Error (EIO on Linux: filesystems shut down); data
+  already written stays intact and writes resume once space is freed. Also found: the
+  integration harness's `spdk_dd` reports success for failed writes. Design:
+  `docs/design/p0-2-capacity.md` (accounting incl. snapshots, admission control on every growth
+  path, per-pool max_overcommit/reserve/thresholds, space state separate from RAID health).
+  Decisions (2026-11-17): default max_overcommit 1.0, reserve 5%, warning 80%, critical 90%;
+  the ENOSPC SPDK patch is a follow-up (L-6).
+  - [x] Store: `SpacePolicy` per pool, committed/available bytes, space state OK / WARNING /
+    CRITICAL / FULL (pure functions in `store/capacity.go`); `ErrInsufficientCapacity` = 507.
+  - [x] Reconciler: per-volume/snapshot allocated bytes refreshed each pass (one read-only
+    `bdev_lvol_get_lvols`), pool committed/available/state, state changes logged, non-OK
+    pools flagged in system status; RAID health untouched.
+  - [x] API admission on create, clone, expand, snapshot and group snapshot (per-object
+    reservations, so concurrent requests can't overcommit together; race-tested), space
+    policy at pool creation and `PATCH /pools/{id}` (merges), metrics
+    (`velocor_pool_committed_bytes`, `_available_bytes`, `_used_ratio`, `_space_state`,
+    `velocor_volume_allocated_bytes`, `velocor_snapshot_allocated_bytes`).
+  - [x] CSI picks pools by available bytes (falls back to free bytes from a velod without
+    accounting) and skips pools that don't serve I/O; 507 -> RESOURCE_EXHAUSTED.
+  - [x] CLI (`pool list/get` space columns, `pool create`/`pool set-space` policy flags,
+    `volume list` allocated) and UI (space pill, committed/available, policy dialog).
+  - [x] Integration harness: writes are verified by reading back (spdk_dd reports success
+    for failed writes).
+  - [x] Real-SPDK integration test (`TestPoolSpaceLifecycle`): a volume over the default
+    limit refused (507); with 3x overcommit, filled through exports: OK 6% -> WARNING 83% ->
+    CRITICAL 95% (new volume and snapshot refused) -> the write to new space fails (FULL);
+    everything written before is intact; after deleting a volume the pool recovers and writes
+    work again. Harness: spdk_dd now runs with queue depth 32, no I/O retries and a 120 s
+    limit.
+  - [ ] Lab test on the appliance image (kernel NVMe/TCP host, UI) with the next image build.
 
 - [ ] **P0-3. The metadata database is a single point of failure, with no backup or recovery.**
   `/var/lib/velocor/velocor.db` is the only record of which volume is which, who may access it,
@@ -437,6 +469,11 @@ Everything here was written by Gemini and is in scope to rewrite.
   velocor-1, 2026-11-16; the fake accepted it). Refused by the API, UI and CLI for now. *Needed:*
   build it as raid0 over raid1 pairs, each with a superblock, and handle assembly after restart,
   a degraded pair, rebuild and deletion of the nested layers; real-SPDK tests for all of those.
+- [ ] **L-6. Report a full pool as "capacity exceeded" (ENOSPC) instead of an I/O error.**
+  When a thin pool is full SPDK fails writes with NVMe Internal Error, which Linux reports as
+  EIO (filesystems shut down). An SPDK patch completing lvol ENOSPC with NVMe Capacity Exceeded
+  (status 0x81) would give hosts ENOSPC, which filesystems and applications handle far better.
+  Agreed follow-up to P0-2 (2026-11-17); test with ext4/XFS hosts.
 - [ ] **L-5. Delta upgrades for the OS image.** Requested 2026-11-17 (back burner). A
   `bootc upgrade` pulls every changed layer of `velocor-os` in full; with the rolling Fedora base
   (B17) that is most of the image on every release. Goal: publish much smaller upgrade packages,

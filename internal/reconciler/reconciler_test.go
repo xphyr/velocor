@@ -223,7 +223,7 @@ func TestExportsRestoredWithACLsAfterRestart(t *testing.T) {
 	e.reconcile()
 	for _, c := range e.fake.Calls()[before:] {
 		if c != "spdk_get_version" && c != "bdev_wait_for_examine" && !slices.Contains([]string{
-			"bdev_get_bdevs", "bdev_raid_get_bdevs", "bdev_lvol_get_lvstores", "bdev_nvme_get_controller_health_info", "framework_get_config",
+			"bdev_get_bdevs", "bdev_raid_get_bdevs", "bdev_lvol_get_lvstores", "bdev_nvme_get_controller_health_info", "framework_get_config", "bdev_lvol_get_lvols",
 			"nvmf_get_transports", "nvmf_get_subsystems", "iscsi_get_portal_groups", "iscsi_get_initiator_groups", "iscsi_get_target_nodes",
 		}, c) {
 			t.Fatalf("steady-state pass issued mutating call %s", c)

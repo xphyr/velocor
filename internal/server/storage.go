@@ -218,8 +218,13 @@ func (s *Server) handleCreatePool(w http.ResponseWriter, r *http.Request) {
 		StripSizeKB      uint32             `json:"strip_size_kb"`
 		ClusterSizeBytes uint32             `json:"cluster_size_bytes"`
 		FilterPolicy     store.FilterPolicy `json:"filter_policy"`
+		SpacePolicy      store.SpacePolicy  `json:"space_policy"`
 	}
 	if err := decodeJSON(r, &req); err != nil {
+		writeError(w, err)
+		return
+	}
+	if err := req.SpacePolicy.Validate(); err != nil {
 		writeError(w, err)
 		return
 	}
@@ -274,6 +279,7 @@ func (s *Server) handleCreatePool(w http.ResponseWriter, r *http.Request) {
 		TotalBytes:        totalRaw,
 		FreeBytes:         totalRaw,
 		FilterPolicy:      req.FilterPolicy,
+		SpacePolicy:       req.SpacePolicy,
 		// The reconciler leaves RECONCILING pools without an lvstore UUID alone.
 		HealthStatus:  store.HealthStatusReconciling,
 		StatusMessage: "creating",
@@ -318,6 +324,8 @@ func (s *Server) handleCreatePool(w http.ResponseWriter, r *http.Request) {
 			p.TotalBytes, p.FreeBytes = stores[0].TotalDataClusters*cs, stores[0].FreeClusters*cs
 			p.AllocatedBytes = p.TotalBytes - p.FreeBytes
 		}
+		p.SpaceState = store.SpaceStateOf(p)
+		p.AvailableBytes = store.AvailableBytes(p, 0) // a new pool has nothing committed
 		return nil
 	})
 	if err != nil {
@@ -431,6 +439,12 @@ func (s *Server) handleCreateVolume(w http.ResponseWriter, r *http.Request) {
 	}
 
 	id := newResourceID("vol")
+	release, err := s.reserveSpace(r.Context(), pool.ID, req.SizeBytes, volumeRecorded(id, req.SizeBytes))
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	defer release()
 	alias := pool.LVSName + "/" + id
 	uuid, err := s.spdk.BdevLvolCreate(r.Context(), pool.LVSName, id, req.SizeBytes, req.ThinProvision, "")
 	if err != nil {
@@ -510,6 +524,12 @@ func (s *Server) resizeVolume(w http.ResponseWriter, r *http.Request, id string)
 		writeError(w, err)
 		return
 	}
+	release, err := s.reserveSpace(r.Context(), vol.PoolID, req.NewSizeBytes-vol.SizeBytes, volumeRecorded(vol.ID, req.NewSizeBytes))
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	defer release()
 	if err := s.spdk.BdevLvolResize(r.Context(), vol.UUID, req.NewSizeBytes); err != nil {
 		writeError(w, fmt.Errorf("resize lvol: %w", err))
 		return
@@ -582,6 +602,7 @@ func (s *Server) handleDeleteVolume(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
+	s.updatePoolSpace(vol.PoolID)
 	writeJSON(w, http.StatusOK, map[string]any{})
 }
 
@@ -621,11 +642,12 @@ func (s *Server) handleCreateSnapshot(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
-	snap, err := s.takeSnapshot(r.Context(), vol, pool, req.Name)
+	snap, release, err := s.takeSnapshot(r.Context(), vol, pool, req.Name)
 	if err != nil {
 		writeError(w, err)
 		return
 	}
+	defer release()
 	if err := s.store.CreateSnapshot(snap); err != nil {
 		_ = s.spdk.BdevLvolDelete(context.WithoutCancel(r.Context()), snap.UUID)
 		writeError(w, err)
@@ -636,21 +658,35 @@ func (s *Server) handleCreateSnapshot(w http.ResponseWriter, r *http.Request) {
 
 // takeSnapshot creates the SPDK snapshot lvol (named after the new snapshot ID) and
 // returns an unsaved Snapshot record for it.
-func (s *Server) takeSnapshot(ctx context.Context, vol *store.Volume, pool *store.Pool, name string) (*store.Snapshot, error) {
+//
+// The snapshot takes over the clusters the volume holds, which then count as committed space:
+// the space is reserved first, and release must be called once the snapshot is in the store
+// (or was rolled back).
+func (s *Server) takeSnapshot(ctx context.Context, vol *store.Volume, pool *store.Pool, name string) (*store.Snapshot, func(), error) {
+	held, err := s.lvolHeldBytes(ctx, vol.UUID)
+	if err != nil {
+		return nil, nil, err
+	}
 	id := newResourceID("snap")
+	release, err := s.reserveSpace(ctx, pool.ID, held, snapshotRecorded(id))
+	if err != nil {
+		return nil, nil, err
+	}
 	uuid, err := s.spdk.BdevLvolSnapshot(ctx, vol.UUID, id)
 	if err != nil {
-		return nil, fmt.Errorf("snapshot volume %s: %w", vol.ID, err)
+		release()
+		return nil, nil, fmt.Errorf("snapshot volume %s: %w", vol.ID, err)
 	}
 	return &store.Snapshot{
-		ID:           id,
-		Name:         name,
-		VolumeID:     vol.ID,
-		PoolID:       pool.ID,
-		UUID:         uuid,
-		LvolBdevName: pool.LVSName + "/" + id,
-		SizeBytes:    vol.SizeBytes,
-	}, nil
+		ID:             id,
+		Name:           name,
+		VolumeID:       vol.ID,
+		PoolID:         pool.ID,
+		UUID:           uuid,
+		LvolBdevName:   pool.LVSName + "/" + id,
+		SizeBytes:      vol.SizeBytes,
+		AllocatedBytes: held,
+	}, release, nil
 }
 
 func (s *Server) handleSnapshotAction(w http.ResponseWriter, r *http.Request) {
@@ -709,6 +745,12 @@ func (s *Server) cloneSnapshot(w http.ResponseWriter, r *http.Request, snapID st
 	}
 
 	id := newResourceID("vol")
+	release, err := s.reserveSpace(r.Context(), pool.ID, snap.SizeBytes, volumeRecorded(id, snap.SizeBytes))
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	defer release()
 	alias := pool.LVSName + "/" + id
 	uuid, err := s.spdk.BdevLvolClone(r.Context(), snap.UUID, id)
 	if err != nil {
@@ -840,6 +882,7 @@ func (s *Server) handleDeleteSnapshot(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
+	s.updatePoolSpace(snap.PoolID)
 	writeJSON(w, http.StatusOK, map[string]any{})
 }
 
@@ -944,6 +987,12 @@ func (s *Server) handleCreateVolumeGroupSnapshot(w http.ResponseWriter, r *http.
 	}
 
 	var snaps []*store.Snapshot
+	var releases []func()
+	defer func() {
+		for _, rel := range releases {
+			rel()
+		}
+	}()
 	rollback := func(err error) {
 		resume()
 		for _, sn := range snaps {
@@ -953,11 +1002,12 @@ func (s *Server) handleCreateVolumeGroupSnapshot(w http.ResponseWriter, r *http.
 		writeError(w, err)
 	}
 	for _, t := range targets {
-		snap, err := s.takeSnapshot(ctx, t.vol, t.pool, req.Name+"-"+t.vol.ID)
+		snap, release, err := s.takeSnapshot(ctx, t.vol, t.pool, req.Name+"-"+t.vol.ID)
 		if err != nil {
 			rollback(err)
 			return
 		}
+		releases = append(releases, release)
 		snaps = append(snaps, snap)
 	}
 	resume()
@@ -1039,6 +1089,7 @@ func (s *Server) handleDeleteVolumeGroupSnapshot(w http.ResponseWriter, r *http.
 			writeError(w, err)
 			return
 		}
+		s.updatePoolSpace(snap.PoolID)
 	}
 	if err := s.store.DeleteVolumeGroupSnapshot(id); err != nil {
 		writeError(w, err)

@@ -281,6 +281,8 @@ func (a *appliance) initiator(nqn, hostNQN string) *initiator {
 func (in *initiator) dd(args ...string) error {
 	in.t.Helper()
 	cfg := map[string]any{"subsystems": []any{map[string]any{"subsystem": "bdev", "config": []any{
+		// Don't retry failed I/O (a full pool fails writes; retries only make the test wait).
+		map[string]any{"method": "bdev_nvme_set_options", "params": map[string]any{"bdev_retry_count": 0}},
 		map[string]any{"method": "bdev_nvme_attach_controller", "params": map[string]any{
 			"name": "r", "trtype": "tcp", "adrfam": "ipv4", "traddr": "127.0.0.1", "trsvcid": strconv.Itoa(in.port),
 			"subnqn": in.nqn, "hostnqn": in.hostNQN,
@@ -291,9 +293,9 @@ func (in *initiator) dd(args ...string) error {
 	if err := os.WriteFile(cfgPath, b, 0o644); err != nil {
 		in.t.Fatal(err)
 	}
-	full := append([]string{"run", "--rm", "--network", "host", "--security-opt", "seccomp=unconfined",
+	full := append([]string{"run", "--rm", "--timeout", "120", "--network", "host", "--security-opt", "seccomp=unconfined",
 		"-v", in.tg.dir + ":" + in.tg.dir + ":z", "--entrypoint", "spdk_dd", image(),
-		"--no-huge", "--no-pci", "-s", "1024", "--aio", "--json", cfgPath}, args...)
+		"--no-huge", "--no-pci", "-s", "1024", "--aio", "--qd", "32", "--json", cfgPath}, args...)
 	out, err := exec.Command("podman", full...).CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("spdk_dd %v: %v\n%s", args, err, lastLines(string(out), 15))
@@ -316,8 +318,20 @@ func (in *initiator) write(blockOffset int, data []byte) error {
 	if err := os.WriteFile(src, data, 0o644); err != nil {
 		in.t.Fatal(err)
 	}
-	return in.dd("--if", src, "--ob", "rn1", "--bs", strconv.Itoa(blockSize),
-		"--count", strconv.Itoa(len(data)/blockSize), "--seek", strconv.Itoa(blockOffset))
+	if err := in.dd("--if", src, "--ob", "rn1", "--bs", strconv.Itoa(blockSize),
+		"--count", strconv.Itoa(len(data)/blockSize), "--seek", strconv.Itoa(blockOffset)); err != nil {
+		return err
+	}
+	// spdk_dd exits 0 even when writes fail (found measuring a full pool, P0-2): read back to
+	// know the write landed.
+	got, err := in.read(blockOffset, len(data))
+	if err != nil {
+		return fmt.Errorf("read back after write: %w", err)
+	}
+	if !bytes.Equal(got, data) {
+		return fmt.Errorf("write at block %d did not land: read back differs from byte %d (spdk_dd reported success)", blockOffset, firstDiff(got, data))
+	}
+	return nil
 }
 
 // read returns n bytes at block offset of the namespace.

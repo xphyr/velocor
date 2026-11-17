@@ -4,7 +4,9 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
+	"net/http"
 	"slices"
 	"strconv"
 	"strings"
@@ -478,8 +480,8 @@ func (s *ControllerServer) GetCapacity(ctx context.Context, req *csi.GetCapacity
 		if poolFilter != "" && p.ID != poolFilter && p.Name != poolFilter {
 			continue
 		}
-		if p.HealthStatus == store.HealthStatusOnline || p.HealthStatus == store.HealthStatusUnspecified {
-			totalFree += int64(p.FreeBytes)
+		if poolServes(p) {
+			totalFree += int64(poolAvailable(p))
 		}
 	}
 	return &csi.GetCapacityResponse{AvailableCapacity: totalFree}, nil
@@ -690,12 +692,14 @@ func (s *ControllerServer) selectPool(ctx context.Context, poolParam string, req
 		}
 		return "", status.Errorf(codes.InvalidArgument, "pool %q not found", poolParam)
 	}
+	// Pick by what admission would accept (committed space, overcommit policy, reserve, space
+	// state), not raw free space: thin volumes make free space meaningless for this.
 	for _, p := range pools {
-		if p.FreeBytes >= requiredBytes {
+		if poolServes(p) && poolAvailable(p) >= requiredBytes {
 			return p.ID, nil
 		}
 	}
-	return "", status.Errorf(codes.ResourceExhausted, "no storage pool has %d bytes free", requiredBytes)
+	return "", status.Errorf(codes.ResourceExhausted, "no storage pool can take %d more bytes (see each pool's available_bytes and space_state)", requiredBytes)
 }
 
 func (s *ControllerServer) ensureNodeInitiatorGroup(ctx context.Context, nodeID string) (string, error) {
@@ -877,5 +881,29 @@ func mapAPIError(err error) error {
 	if IsAlreadyExists(err) {
 		return status.Error(codes.AlreadyExists, err.Error())
 	}
+	var apiErr *ErrAPI
+	if errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusInsufficientStorage {
+		return status.Error(codes.ResourceExhausted, err.Error())
+	}
 	return status.Error(codes.Internal, err.Error())
+}
+
+// poolServes reports whether a pool can take new volumes: its RAID serves I/O (a degraded or
+// rebuilding pool still does).
+func poolServes(p *store.Pool) bool {
+	switch p.HealthStatus {
+	case store.HealthStatusFaulted, store.HealthStatusUnavailable, store.HealthStatusReconciling, store.HealthStatusOffline:
+		return false
+	}
+	return true
+}
+
+// poolAvailable is how much more a pool accepts. A velod without space accounting (older than
+// P0-2, e.g. while the CSI driver is upgraded first) reports no space state: fall back to its
+// free space.
+func poolAvailable(p *store.Pool) uint64 {
+	if p.SpaceState == "" {
+		return p.FreeBytes
+	}
+	return p.AvailableBytes
 }

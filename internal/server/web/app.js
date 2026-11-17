@@ -104,6 +104,15 @@ function bar(used, total) {
     el("div", { class: "bar " + kind, role: "img", "aria-label": `${percent.toFixed(0)} percent used` }, fill));
 }
 
+const SPACE_KIND = { OK: "ok", WARNING: "warn", CRITICAL: "bad", FULL: "bad" };
+const SPACE_HINT = {
+  WARNING: "Getting full.",
+  CRITICAL: "New volumes, snapshots, clones and expansions are refused until space is freed.",
+  FULL: "Writes to new space are failing now. Free space immediately.",
+};
+const spacePill = (p) => (p.space_state ? pill(p.space_state.toLowerCase(), SPACE_KIND[p.space_state]) : el("span", { class: "muted" }, "-"));
+const policyOf = (p) => ({ max_overcommit: 1, reserve_percent: 5, warning_percent: 80, critical_percent: 90, ...(p.space_policy || {}) });
+
 const poolBar = (p) => (p.total_bytes ? bar(p.allocated_bytes || (p.total_bytes - p.free_bytes), p.total_bytes) : el("span", { class: "muted" }, "unknown"));
 
 const PAGE_SIZES = [10, 25, 50, 100, 250];
@@ -471,7 +480,8 @@ function poolTable(items, volumes, options = {}) {
     { title: "Name", cell: (p) => el("strong", {}, link(p.name, "pool", p.id)), text: (p) => p.name },
     { title: "Health", cell: health, text: (p) => p.health_status },
     { title: "RAID", cell: (p) => [p.raid_level, el("span", { class: "sub" }, `${(p.disk_ids || []).length} disks`)], text: (p) => p.raid_level },
-    { title: "Space", cell: poolBar },
+    { title: "Space", cell: (p) => [spacePill(p), poolBar(p)], text: (p) => p.space_state || "" },
+    { title: "Committed", num: true, cell: (p) => [humanSize(p.committed_bytes || 0), el("span", { class: "sub" }, `${humanSize(p.available_bytes || 0)} more accepted`)] },
     { title: "Volumes", num: true, cell: (p) => link(String(count(p.id)), "volumes", p.id) },
   ], items, { empty: "No pools yet.", state: stateOf("pools"), ...options });
 }
@@ -545,6 +555,28 @@ function releasePoolDiskDialog(p, did) {
   });
 }
 
+function spacePolicyDialog(p) {
+  const cur = policyOf(p);
+  openDialog({
+    title: `Space policy of ${p.name}`,
+    intro: "Velocor refuses new volumes, snapshots, clones and expansions that would commit more than the pool may hold. Committed counts every volume as if fully written, plus the space snapshots hold.",
+    warning: el("div", { class: "panel-notice warn" }, "Overcommit above 1× lets thin volumes promise more than the pool holds. If they really fill it, every thin volume in the pool gets write errors at the same time."),
+    submit: "Save",
+    fields: [
+      { name: "overcommit", label: "Overcommit limit (× usable capacity)", value: String(cur.max_overcommit), required: true, hint: "1 means everything committed fits." },
+      { name: "reserve", label: "Reserve (% never committed)", value: String(cur.reserve_percent), required: true },
+      { name: "warning", label: "Warning at (% used)", value: String(cur.warning_percent), required: true },
+      { name: "critical", label: "Critical at (% used); growth refused", value: String(cur.critical_percent), required: true },
+    ],
+    action: (v) => {
+      const n = (x) => { const f = Number(x); if (!Number.isFinite(f)) throw new Error("Enter numbers."); return f; };
+      return send("PATCH", "/pools/" + encodeURIComponent(p.id), { space_policy: {
+        max_overcommit: n(v.overcommit), reserve_percent: n(v.reserve), warning_percent: n(v.warning), critical_percent: n(v.critical) } });
+    },
+    done: () => { notify("Saved."); rerender(); },
+  });
+}
+
 async function pool(id) {
   const [p, disksAll, volumes] = await Promise.all([
     api("/pools/" + encodeURIComponent(id)).then((r) => r.pool), list("/disks", "disks"), list("/volumes?pool_id=" + encodeURIComponent(id), "volumes"),
@@ -559,13 +591,18 @@ async function pool(id) {
     el("p", { class: "crumb" }, el("a", { href: "#/pools" }, "Pools")),
     el("h1", {}, p.name),
     el("div", { class: "toolbar" },
-      action(can.provision, { class: "primary", disabled: p.health_status === "UNAVAILABLE", onclick: () => createVolumeDialog(p.id) }, "Create volume"),
+      action(can.provision, { class: "primary", disabled: p.health_status === "UNAVAILABLE" || p.space_state === "CRITICAL" || p.space_state === "FULL", onclick: () => createVolumeDialog(p.id) }, "Create volume"),
       p.health_status === "UNAVAILABLE" && action(can.admin, { class: "danger", id: "start-degraded", onclick: () => startDegradedDialog(p) }, "Start degraded"),
       action(can.admin, { class: "danger-quiet", id: "delete-pool", disabled: volumes.length > 0, onclick: () => deletePoolDialog(p) }, "Delete"),
       volumes.length > 0 && can.admin && el("span", { class: "muted" }, "It can't be deleted while it has volumes.")),
     el("dl", { class: "facts" },
       fact("Health", health(p)),
-      fact("Space", poolBar(p)),
+      fact("Space", [spacePill(p), poolBar(p), SPACE_HINT[p.space_state] && el("span", { class: "sub" }, SPACE_HINT[p.space_state])]),
+      fact("Committed", [`${humanSize(p.committed_bytes || 0)} promised`, el("span", { class: "sub" },
+        `${humanSize(p.available_bytes || 0)} more accepted. Committed counts every volume as if fully written, plus what snapshots hold.`)]),
+      fact("Space policy", [
+        `Overcommit up to ${policyOf(p).max_overcommit}×, ${policyOf(p).reserve_percent}% reserved; warning at ${policyOf(p).warning_percent}%, critical at ${policyOf(p).critical_percent}%`,
+        can.admin && el("button", { id: "edit-space-policy", onclick: () => spacePolicyDialog(p) }, "Change")]),
       fact("RAID", `${p.raid_level}${p.raid_level !== "RAID1" ? `, ${p.strip_size_kb} KiB strips` : ""}`),
       fact("Cluster size", humanSize(p.cluster_size_bytes)),
       fact("RAID bdev", mono(p.base_bdev_name)),
@@ -685,6 +722,7 @@ function volumeTable(items, poolList, options = {}) {
     { title: "Health", cell: health, text: (v) => v.health_status },
     { title: "Pool", cell: (v) => (poolsById[v.pool_id] ? link(poolsById[v.pool_id].name, "pool", v.pool_id) : mono(v.pool_id)), text: (v) => (poolsById[v.pool_id] || {}).name || "" },
     { title: "Size", num: true, cell: (v) => [humanSize(v.size_bytes), el("span", { class: "sub" }, v.thin_provision ? "thin" : "thick")] },
+    { title: "Allocated", num: true, cell: (v) => humanSize(v.allocated_bytes || 0) },
     { title: "Exported", cell: (v) => (v.attachment_state === "BLOCK_EXPORT" ? pill("Exported", "ok") : pill("Not exported", "quiet")), text: (v) => v.attachment_state },
     { title: "Labels", cell: (v) => labelsText(v.labels) || "-" },
   ], items, { empty: "No volumes yet.", state: stateOf("volumes-table"), ...options });
