@@ -86,8 +86,14 @@ work still open, ranked by risk to data, how fixes are verified, and what has be
     namespaces now have fixed UUIDs, like real drives.
   - [x] **Intel IOMMU off by default on Fedora**: velod refused every NVMe claim on Intel
     servers ("no IOMMU is available"). The OS image's kargs.d now adds `intel_iommu=on iommu=pt`.
-  - [ ] Re-run the NVMe reboot test on an image with these fixes; real hardware (hot-swap bays,
-    consumer NVMe without NGUID) before release.
+  - [x] NVMe re-run on dev-fe45c4d (fresh VM; IOMMU now from the image's kargs.d): clean reboot
+    -> pool ONLINE, data intact; member hot-unplugged under writes (0 errors) -> replace ->
+    rebuilt -> reboot -> ONLINE with the new member, the returning failed drive stays on the
+    kernel driver (detached), data intact; rebooted without a member -> UNAVAILABLE ->
+    start-degraded -> data intact.
+  - [ ] Real hardware before release: hot-swap bays (SATA/SAS and NVMe surprise removal),
+    consumer NVMe without NGUID/UUID (generate_uuids path), a drive failing with I/O errors
+    rather than disappearing.
 
 - [ ] **P0-2. Thin pools can be overcommitted without limit or warning.**
   Volume and clone creation never check pool capacity. When the pool fills, every thin and
@@ -337,6 +343,9 @@ Everything here was written by Gemini and is in scope to rewrite.
   build and push of every image (incl. the OS image, so B21 works) and cosign signing passed.
   The attest steps now run only when the repository is public; until then images are only
   cosign-signed. The chart push and the release job are still unexercised.
+- [x] **First fully green `main` run** (44132095413, 8d828a4, 2026-11-17, repository now
+  public): integration tests, all images built, pushed (incl. the `main` tags), cosign-signed and
+  attested, Helm chart pushed to ghcr.io. Only the release job (v* tags) is still unexercised.
 - [ ] **B16. The new CI workflow has not fully run yet.** First run (PR #1, 2026-11-17, run
   44102090198, aa8411d): lint (incl. actionlint and the CDI hook render), unit tests, SPDK
   patch unit tests, images (integration tests on the runner, rootless podman, arm64 CSI via
