@@ -226,6 +226,10 @@ Everything here was written by Gemini and is in scope to rewrite.
   our own registry and pin those; or keep Renovate bumping the pin (reproducibility of older
   commits is then lost). Checked 2026-11-17: the pins of `fedora`, `fedora-minimal` and
   `fedora-bootc` (all set 2026-11-16) are already gone; `golang` (Docker Hub) still resolves.
+  **Decision (2026-11-17): follow Fedora's rolling `:45` tags** (daily security fixes). To do:
+  switch the Fedora `FROM`s to tags, relax `hack/check-pins.sh` for them, record the resolved
+  base digest in an image label so every build stays traceable, and drop the Renovate digest
+  rule for those images (keep pins for golang and the GitHub Actions).
 - [ ] **B14. RPM packages in image builds are not pinned.** Base images are pinned by digest, but
   `dnf install` takes whatever the Fedora mirrors have, so rebuilding a commit can produce
   different packages. *Option:* RPM lockfiles (e.g. rpm-lockfile-prototype) for the SPDK builder
