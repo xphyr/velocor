@@ -68,28 +68,6 @@ type mediaLvstore struct {
 	Generation  int                   // bumped each time the lvstore is (re)initialised
 }
 
-type raidSuperblock struct {
-	Name        string
-	UUID        string
-	Level       string
-	Strip       uint32
-	Members     []string // ordered media keys
-	MemberUUIDs []string // bdev UUID of each member when the array was created
-}
-
-type raidBdev struct {
-	Name       string
-	UUID       string
-	Level      string
-	Strip      uint32
-	Superblock bool
-	Members    []string // ordered base bdev names (empty slot = "")
-	MediaKey   string   // key into lvstoreMedia
-	// deleting: bdev_raid_delete was called while an lvstore was loaded on top. Real spdk_tgt
-	// then leaves the RAID half-deleted ("offline") until the lvstore goes away.
-	deleting, deleteClearSB bool
-}
-
 type subsystem struct {
 	spdk.NvmfSubsystem
 }
@@ -129,6 +107,9 @@ type Fake struct {
 	lateFailures map[string]int                   // method -> calls that succeed in SPDK but report an error
 	calls        []string
 	uuidCounter  int
+
+	rebuildStep    uint32 // percent a rebuild advances per bdev_raid_get_bdevs (0: manual)
+	rebuildMaxMBps uint32
 }
 
 // New starts a fake spdk_tgt listening on a UNIX socket in t.TempDir().
@@ -204,17 +185,6 @@ func (f *Fake) FailAfterApplying(method string, n int) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.lateFailures[method] = n
-}
-
-func (f *Fake) finishRaidDelete(name string, clearSB bool) {
-	if clearSB {
-		for k, sb := range f.superblock {
-			if sb.Name == name {
-				delete(f.superblock, k)
-			}
-		}
-	}
-	delete(f.raids, name)
 }
 
 // Calls returns the methods invoked so far.
@@ -493,15 +463,6 @@ func (f *Fake) canonicalBdevLocked(name string) string {
 	return name
 }
 
-func (f *Fake) raidOnline(r *raidBdev) bool {
-	for _, m := range r.Members {
-		if m == "" {
-			return false
-		}
-	}
-	return true
-}
-
 // examineLocked loads lvstores for online RAID bdevs whose load is pending.
 func (f *Fake) examineLocked() {
 	for key := range f.pendingLoad {
@@ -529,37 +490,6 @@ func (f *Fake) raidAppearedLocked(r *raidBdev) {
 	f.pendingLoad[r.MediaKey] = true
 	if !f.LazyExamine {
 		f.examineLocked()
-	}
-}
-
-// assembleFromSuperblocksLocked auto-assembles RAID bdevs from superblocks found on base bdevs.
-func (f *Fake) assembleFromSuperblocksLocked(newBdev string) {
-	key := f.baseBdevs[newBdev]
-	sb := f.superblock[key]
-	if sb == nil {
-		return
-	}
-	r, ok := f.raids[sb.Name]
-	if !ok {
-		r = &raidBdev{
-			Name: sb.Name, UUID: sb.UUID, Level: sb.Level, Strip: sb.Strip, Superblock: true,
-			Members: make([]string, len(sb.Members)), MediaKey: "sb:" + sb.UUID,
-		}
-		f.raids[sb.Name] = r
-	}
-	for i, mk := range sb.Members {
-		if mk != key {
-			continue
-		}
-		// Real SPDK only accepts a member whose bdev UUID matches the superblock
-		// (bdev_raid.c, "Failed to examine bdev ...: Invalid argument" otherwise).
-		if i < len(sb.MemberUUIDs) && sb.MemberUUIDs[i] != f.bdevUUID[newBdev] {
-			return
-		}
-		r.Members[i] = newBdev
-	}
-	if f.raidOnline(r) {
-		f.raidAppearedLocked(r)
 	}
 }
 
@@ -630,6 +560,7 @@ var handlers = map[string]handler{
 			return nil, errf(codeENODEV, "No such device")
 		}
 		delete(f.nvmeCtrls, name)
+		f.baseBdevRemovedLocked(name + "n1")
 		delete(f.baseBdevs, name+"n1")
 		return true, nil
 	},
@@ -660,73 +591,8 @@ var handlers = map[string]handler{
 		if _, ok := f.baseBdevs[name]; !ok {
 			return nil, errf(codeENODEV, "No such device")
 		}
+		f.baseBdevRemovedLocked(name)
 		delete(f.baseBdevs, name)
-		return true, nil
-	},
-	"bdev_raid_get_bdevs": func(f *Fake, _ map[string]any) (any, *rpcErr) {
-		var out []spdk.RaidBdevInfo
-		for _, r := range f.raids {
-			state := "online"
-			if r.deleting {
-				state = "offline"
-			}
-			disc := 0
-			var list []spdk.RaidBaseBdev
-			for _, m := range r.Members {
-				if m != "" {
-					disc++
-				}
-				list = append(list, spdk.RaidBaseBdev{Name: m, IsConfigured: m != ""})
-			}
-			if disc < len(r.Members) {
-				state = "configuring"
-			}
-			out = append(out, spdk.RaidBdevInfo{
-				Name: r.Name, UUID: r.UUID, RaidLevel: r.Level, State: state, Superblock: r.Superblock,
-				NumBaseBdevs: uint32(len(r.Members)), NumBaseBdevsDiscovered: uint32(disc), BaseBdevsList: list,
-			})
-		}
-		return out, nil
-	},
-	"bdev_raid_create": func(f *Fake, p map[string]any) (any, *rpcErr) {
-		name := str(p, "name")
-		if _, ok := f.raids[name]; ok {
-			return nil, errf(codeEEXIST, "raid bdev %s already exists", name)
-		}
-		members := strs(p, "base_bdevs")
-		var keys []string
-		for _, m := range members {
-			key, ok := f.baseBdevs[m]
-			if !ok {
-				return nil, errf(codeENODEV, "base bdev %s not found", m)
-			}
-			if f.memberOfRaid(m) {
-				return nil, errf(codeEBUSY, "base bdev %s already claimed", m)
-			}
-			keys = append(keys, key)
-		}
-		sb := boolean(p, "superblock")
-		r := &raidBdev{
-			Name: name, UUID: f.newUUID(), Level: str(p, "raid_level"), Strip: uint32(num(p, "strip_size_kb")),
-			Superblock: sb, Members: members, MediaKey: "nosb:" + strings.Join(keys, ","),
-		}
-		if sb {
-			// Writing a superblock destroys any pre-existing data layout on the members.
-			r.MediaKey = "sb:" + r.UUID
-			for _, k := range keys {
-				if old := f.superblock[k]; old != nil {
-					delete(f.lvsMedia, "sb:"+old.UUID)
-				}
-				var memberUUIDs []string
-				for _, m := range members {
-					memberUUIDs = append(memberUUIDs, f.bdevUUID[m])
-				}
-				f.superblock[k] = &raidSuperblock{Name: name, UUID: r.UUID, Level: r.Level, Strip: r.Strip, Members: keys, MemberUUIDs: memberUUIDs}
-			}
-			delete(f.lvsMedia, "nosb:"+strings.Join(keys, ","))
-		}
-		f.raids[name] = r
-		f.raidAppearedLocked(r)
 		return true, nil
 	},
 	"bdev_raid_delete": func(f *Fake, p map[string]any) (any, *rpcErr) {
@@ -1264,15 +1130,4 @@ var handlers = map[string]handler{
 		n.PgIgMaps = kept
 		return true, nil
 	},
-}
-
-func (f *Fake) memberOfRaid(bdev string) bool {
-	for _, r := range f.raids {
-		for _, m := range r.Members {
-			if m == bdev {
-				return true
-			}
-		}
-	}
-	return false
 }

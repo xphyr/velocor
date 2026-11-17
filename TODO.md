@@ -22,6 +22,24 @@ work still open, ranked by risk to data, how fixes are verified, and what has be
   SPDK provides `bdev_raid_add_base_bdev` / `bdev_raid_remove_base_bdev`.
   *Needed:* "replace disk" (claim a new disk, add it to the array, track rebuild progress),
   surfaced as a pool state (`REBUILDING n%`) and as an alert. See also P1-8.
+  **In progress (2026-11-17):** design in `docs/design/p0-1-disk-replacement.md` (SPDK v26.09
+  raid facts, member model, replace / start-degraded / throttle APIs, reconciler cases, tests).
+  Needs SPDK patch 0002 (`bdev_raid_start_degraded`) for P1-8.
+  - [x] Design approved (manual-only degraded start, `allow_degraded` for proactive
+    replacement, no hot spares yet, unlimited rebuild speed by default, carry patch 0002).
+  - [x] SPDK patch `0002-raid-start-degraded.patch`: `raid_bdev_start_degraded()` + RPC +
+    schema/CLI/doc entries + `test_raid_start_degraded`; all raid and scsi unit tests pass
+    (`make spdk-unit-tests`, which now also maps `module/<kind>/<name>` to its tests).
+  - [x] Go SPDK client (`BdevRaidAddBaseBdev`/`RemoveBaseBdev`/`StartDegraded`/`SetOptions`,
+    `num_base_bdevs_operational`, rebuild `process`) + fake SPDK RAID model rewritten
+    (`spdktest/raid.go`: per-member superblock copies with slot states and sequence numbers,
+    online failure, rebuild with progress, start-degraded, stale members, restarts; tests in
+    `raid_test.go`). Found on the way: the reconciler reports a pool ONLINE when its RAID is
+    online but degraded (it never read the operational count), so a mirror that loses a disk
+    while running still shows ONLINE; fixed by the member model below.
+  - [ ] Store (pool members), API (replace, start-degraded, rebuild speed, release member),
+    reconciler (health, interrupted rebuild), CLI, UI.
+  - [ ] Real-SPDK integration tests; serenity lab tests.
 
 - [ ] **P0-2. Thin pools can be overcommitted without limit or warning.**
   Volume and clone creation never check pool capacity. When the pool fills, every thin and
@@ -255,8 +273,13 @@ Everything here was written by Gemini and is in scope to rewrite.
   2026-11-17): password prompt used Linux-only termios ioctls; now `golang.org/x/term`. All five
   release targets cross-compile.
 - [ ] **B16. The new CI workflow has not fully run yet.** First run (PR #1, 2026-11-17, run
-  44102090198): lint (incl. actionlint), unit tests and the SPDK patch unit tests pass on
-  GitHub; veloctl failed (B19, fixed); images job pending. It passes actionlint and every step uses
+  44102090198, aa8411d): lint (incl. actionlint and the CDI hook render), unit tests, SPDK
+  patch unit tests, images (integration tests on the runner, rootless podman, arm64 CSI via
+  QEMU, OS image build, push to the PR's throwaway registry; one base digest per run) and the
+  Helm chart all pass; veloctl failed (B19, fixed in 9778130). Second run (44105853598,
+  0d04dbe): **every job passes**, including the veloctl cross-builds for all five targets.
+  *Still unproven:* the `main`/tag-only steps: ghcr.io login and push, cosign signing,
+  attestations, chart push, and the release job. Also enable Renovate on the repository. It passes actionlint and every step uses
   `make` targets verified locally, but the GitHub-side pieces (ghcr login, cosign, attestations,
   rootless podman with arm64 emulation on the runner, the PR local registry) are only proven by
   a first run. Also enable Renovate on the repository (`renovate.json`).
