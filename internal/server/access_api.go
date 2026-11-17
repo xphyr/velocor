@@ -22,13 +22,15 @@ func (s *Server) handleUpdateExport(w http.ResponseWriter, r *http.Request) {
 		AllowAnyHost      *bool     `json:"allow_any_host"`
 		// node_ids: the CSI nodes of a shared export, changed together with their groups.
 		NodeIDs *[]string `json:"node_ids"`
+		// enabled: serve (true) or stop serving (false) the export.
+		Enabled *bool `json:"enabled"`
 	}
 	if err := decodeJSON(r, &req); err != nil {
 		writeError(w, err)
 		return
 	}
-	if req.InitiatorGroupIDs == nil && req.AllowAnyHost == nil && req.NodeIDs == nil {
-		writeError(w, fmt.Errorf("%w: nothing to change; set initiator_group_ids and/or allow_any_host", store.ErrInvalidArgument))
+	if req.InitiatorGroupIDs == nil && req.AllowAnyHost == nil && req.NodeIDs == nil && req.Enabled == nil {
+		writeError(w, fmt.Errorf("%w: nothing to change; set initiator_group_ids, allow_any_host or enabled", store.ErrInvalidArgument))
 		return
 	}
 	exp, err := s.store.GetExport(id)
@@ -58,6 +60,13 @@ func (s *Server) handleUpdateExport(w http.ResponseWriter, r *http.Request) {
 		}
 		if req.AllowAnyHost != nil {
 			e.AllowAnyHost = *req.AllowAnyHost
+		}
+		if req.Enabled != nil {
+			e.Disabled = !*req.Enabled
+			e.DisabledReason = ""
+			if e.Disabled {
+				e.DisabledReason = "disabled by an administrator"
+			}
 		}
 		acl, err := dataplane.ResolveACL(s.store, e.InitiatorGroupIDs)
 		if err != nil {

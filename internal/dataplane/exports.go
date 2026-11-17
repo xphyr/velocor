@@ -221,11 +221,15 @@ func UpdateExport(ctx context.Context, c *spdk.Client, st store.Store, id string
 	}
 	return st.MutateExport(id, func(e *store.Export) error {
 		e.InitiatorGroupIDs, e.AllowAnyHost, e.NodeIDs = next.InitiatorGroupIDs, next.AllowAnyHost, next.NodeIDs
+		e.Disabled, e.DisabledReason = next.Disabled, next.DisabledReason
 		return nil
 	})
 }
 
 func ensureLocked(ctx context.Context, c *spdk.Client, st store.Store, exp *store.Export, vol *store.Volume) error {
+	if exp.Disabled {
+		return removeLocked(ctx, c, exp)
+	}
 	acl, err := ResolveACL(st, exp.InitiatorGroupIDs)
 	if err != nil {
 		return err
@@ -290,6 +294,10 @@ func Connections(ctx context.Context, c *spdk.Client, exp *store.Export) ([]Conn
 // RemoveExport tears down the SPDK objects owned by exp. Missing objects are not an error.
 func RemoveExport(ctx context.Context, c *spdk.Client, exp *store.Export) error {
 	defer lockExport(exp.ID)()
+	return removeLocked(ctx, c, exp)
+}
+
+func removeLocked(ctx context.Context, c *spdk.Client, exp *store.Export) error {
 	switch {
 	case IsNVMe(exp.Protocol):
 		if err := c.NvmfDeleteSubsystem(ctx, exp.SubsystemNQN); err != nil && !spdk.IsNotFound(err) {

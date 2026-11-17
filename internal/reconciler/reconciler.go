@@ -42,6 +42,7 @@ type Reconciler struct {
 	logger *slog.Logger
 
 	passMu sync.Mutex // serialises passes
+	meta   *metaSync  // on-pool metadata copies (nil: disabled)
 
 	mu    sync.Mutex
 	state State
@@ -134,6 +135,7 @@ func (r *Reconciler) ReconcileOnce(ctx context.Context) (State, error) {
 	r.reconcileSpace(ctx, p, poolOnline)
 	volOnline := r.reconcileVolumes(ctx, p, poolOnline)
 	r.reconcileExports(ctx, p, volOnline)
+	r.reconcileMeta(ctx, p, poolOnline)
 
 	lastErr := strings.Join(p.errs, "; ")
 	r.finishPass(p.repaired, p.degraded, lastErr)
@@ -556,7 +558,13 @@ func (r *Reconciler) reconcileExports(ctx context.Context, p *pass, volOnline ma
 	for _, exp := range exports {
 		res := "export:" + exp.ID
 		health, msg := store.HealthStatusOnline, ""
-		if vol, ok := volOnline[exp.VolumeID]; !ok {
+		if exp.Disabled {
+			health, msg = store.HealthStatusOffline, "disabled: "+exp.DisabledReason
+			if err := dataplane.RemoveExport(ctx, r.spdk, exp); err != nil {
+				msg += "; " + err.Error()
+			}
+			p.degrade(res, msg)
+		} else if vol, ok := volOnline[exp.VolumeID]; !ok {
 			health, msg = store.HealthStatusDegraded, "backing volume is not online"
 			p.degraded = append(p.degraded, res)
 		} else if err := dataplane.EnsureExport(ctx, r.spdk, r.store, exp, vol); err != nil {

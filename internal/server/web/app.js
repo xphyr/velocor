@@ -39,6 +39,35 @@ async function request(method, path, body) {
 
 const api = (path) => request("GET", path);
 const send = (method, path, body) => request(method, path, body);
+
+// raw sends a file as the request body (database restore).
+async function raw(method, path, file) {
+  const headers = { Accept: "application/json", "Content-Type": "application/octet-stream" };
+  const t = token();
+  if (t) headers.Authorization = "Bearer " + t;
+  const resp = await fetch(API + path, { method, headers, cache: "no-store", body: file });
+  if (resp.status === 401) throw new Unauthorized();
+  const answer = await resp.json().catch(() => ({}));
+  if (!resp.ok) throw new Error(answer.error || `The API answered with status ${resp.status}`);
+  return answer;
+}
+
+// download saves what path returns as a file (it needs the session token, so not a plain link).
+async function download(path, filename) {
+  const t = token();
+  const resp = await fetch(API + path, { headers: t ? { Authorization: "Bearer " + t } : {}, cache: "no-store" });
+  if (resp.status === 401) throw new Unauthorized();
+  if (!resp.ok) {
+    const answer = await resp.json().catch(() => ({}));
+    throw new Error(answer.error || `The API answered with status ${resp.status}`);
+  }
+  const url = URL.createObjectURL(await resp.blob());
+  const a = el("a", { href: url, download: filename });
+  document.body.append(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 10000);
+}
 // list returns the array the API wraps under key.
 const list = async (path, key) => (await api(path))[key] || [];
 
@@ -229,6 +258,11 @@ function radioField(field) {
   };
 }
 
+function fileField(field) {
+  const input = el("input", { type: "file", id: "field-" + field.name, required: field.required });
+  return { node: input, focus: input, value: () => input.files[0] };
+}
+
 // A list typed one per line (or comma separated).
 function linesField(field) {
   const area = el("textarea", { id: "field-" + field.name, placeholder: field.placeholder, spellcheck: "false" }, (field.value || []).join("\n"));
@@ -247,7 +281,7 @@ function plainField(field) {
 // openDialog asks for something, and stays open showing the API's answer if it's refused, with what was typed still there.
 // Without submit it only shows something, with a Close button.
 function openDialog({ title, intro, warning, fields = [], submit, danger, confirmText, action, done }) {
-  const makers = { checks: checksField, tick: tickField, radio: radioField, lines: linesField };
+  const makers = { checks: checksField, tick: tickField, radio: radioField, lines: linesField, file: fileField };
   const built = fields.map((field) => ({ field, ...(field.size ? sizeField(field) : (makers[field.kind] || plainField)(field)) }));
   const notice = el("div", {});
   const go = submit && el("button", { type: "submit", class: danger ? "danger" : "primary", id: "dialog-submit" }, submit);
@@ -490,9 +524,49 @@ async function pools() {
   const [items, volumes] = await Promise.all([list("/pools", "pools"), list("/volumes", "volumes")]);
   return [
     el("h1", {}, "Pools"),
-    el("div", { class: "toolbar" }, action(can.admin, { class: "primary", id: "create-pool", onclick: createPoolDialog }, "Create pool")),
+    el("div", { class: "toolbar" },
+      action(can.admin, { class: "primary", id: "create-pool", onclick: createPoolDialog }, "Create pool"),
+      action(can.admin, { id: "import-pool", onclick: importPoolDialog }, "Import pool")),
     poolTable(items, volumes),
   ];
+}
+
+async function importPoolDialog() {
+  const found = (await api("/pool-imports")).candidates || [];
+  if (!found.length) {
+    notify("No pools found on the unclaimed disks.");
+    return;
+  }
+  const label = (c) => `${c.pool_id}: ${c.raid_level}, ${c.present} of ${c.members} disks, ${humanSize(c.size_bytes)}${c.reason ? ` (${c.reason})` : ""}`;
+  const first = found.find((c) => c.importable);
+  openDialog({
+    title: "Import a pool",
+    intro: "These disks carry a Velocor pool this appliance doesn't know: after a reinstall, a lost boot disk, or disks moved from another appliance. Importing claims them without wiping and brings the pool back from the copy of its configuration kept on it. Users and API tokens aren't on the pool; they stay as they are here.",
+    submit: "Import",
+    fields: [
+      { name: "pool", kind: "radio", label: "Pool", value: first && first.pool_id, options: found.map((c) => ({ value: c.pool_id, label: label(c), disabled: !c.importable })) },
+      { name: "name", label: "New name (only if its name is taken here)", placeholder: "keep its name" },
+      { name: "degraded", kind: "tick", text: "Start it without its missing disks (RAID1 only; replace them afterwards)",
+        when: (v) => { const c = found.find((x) => x.pool_id === v.pool); return c && !c.complete; } },
+    ],
+    action: (v) => {
+      if (!v.pool) throw new Error("Choose a pool.");
+      return send("POST", "/pool-imports", { pool_id: v.pool, name: v.name || undefined, allow_degraded: !!v.degraded });
+    },
+    done: importResult,
+  });
+}
+
+function importResult(r) {
+  const from = r.source === "manifest"
+    ? `from the copy on the pool (generation ${r.generation}, written ${humanTime(r.written_at)})`
+    : "from SPDK only: the pool had no readable copy of its configuration";
+  openDialog({
+    title: `Imported ${r.pool.name}`,
+    intro: `Recovered ${from}: ${r.volumes} volumes, ${r.snapshots} snapshots; ${r.exports_enabled} exports served, ${r.exports_disabled} restored disabled.`,
+    warning: (r.warnings || []).length > 0 && el("div", { class: "panel-notice warn" }, el("ul", {}, r.warnings.map((w) => el("li", {}, w)))),
+  });
+  location.hash = hash("pool", r.pool.id);
 }
 
 const MEMBER_KIND = { ACTIVE: "ok", REBUILDING: "warn", FAILED: "bad", MISSING: "bad" };
@@ -607,6 +681,11 @@ async function pool(id) {
       fact("Cluster size", humanSize(p.cluster_size_bytes)),
       fact("RAID bdev", mono(p.base_bdev_name)),
       fact("Volume store", [mono(p.lvs_name), el("span", { class: "sub mono" }, p.lvs_uuid)]),
+      fact("Configuration copy", p.meta_error
+        ? [pill("out of date", "warn"), el("span", { class: "sub" }, p.meta_error)]
+        : p.meta_generation
+          ? [pill("current", "ok"), el("span", { class: "sub" }, `Generation ${p.meta_generation}, written ${humanTime(p.meta_written_at)}. Kept on the pool, so it can be imported if this appliance's database is lost.`)]
+          : el("span", { class: "muted" }, "not written yet")),
       fact("Created", humanTime(p.created_at)),
       fact("ID", mono(p.id))),
     el("h2", {}, "Disks"),
@@ -1009,6 +1088,21 @@ async function exportsScreen() {
   ];
 }
 
+function setExportEnabled(e, enabled) {
+  const go = () => send("PATCH", "/exports/" + encodeURIComponent(e.id), { enabled });
+  if (enabled) {
+    go().then(() => { notify(`Enabled ${e.name}.`); rerender(); }).catch((err) => notify(err.message));
+    return;
+  }
+  confirmDialog({
+    title: `Disable ${e.name}`,
+    intro: "Hosts are disconnected and can't reach the volume through this export until you enable it again. The volume and its data are not touched.",
+    submit: "Disable",
+    action: go,
+    done: () => { notify(`Disabled ${e.name}.`); rerender(); },
+  });
+}
+
 async function exportScreen(id) {
   const e = (await api("/exports/" + encodeURIComponent(id))).export;
   const [vol, portalList, groups, hostList, conns] = await Promise.all([
@@ -1021,7 +1115,12 @@ async function exportScreen(id) {
   return [
     el("p", { class: "crumb" }, el("a", { href: "#/exports" }, "Exports")),
     el("h1", {}, e.name),
-    el("div", { class: "toolbar" }, action(can.provision, { class: "danger-quiet", id: "delete-export", onclick: () => deleteExportDialog(e) }, "Delete")),
+    el("div", { class: "toolbar" },
+      e.disabled
+        ? action(can.provision, { class: "primary", id: "enable-export", onclick: () => setExportEnabled(e, true) }, "Enable")
+        : action(can.provision, { id: "disable-export", onclick: () => setExportEnabled(e, false) }, "Disable"),
+      action(can.provision, { class: "danger-quiet", id: "delete-export", onclick: () => deleteExportDialog(e) }, "Delete")),
+    e.disabled && el("div", { class: "panel-notice warn" }, `Not served: ${e.disabled_reason || "disabled"}.`),
     el("dl", { class: "facts" },
       fact("Health", health(e)),
       fact("Volume", vol ? link(vol.name, "volume", vol.id) : mono(e.volume_id)),
@@ -1288,7 +1387,8 @@ function rebootDialog(hostname) {
 
 async function system() {
   const soft = (err) => { if (err instanceof Unauthorized) throw err; return null; };
-  const [st, os, containers, rebuild] = await Promise.all([api("/system/status"), api("/system/os").catch(soft), api("/system/containers").catch(soft), api("/system/rebuild").catch(soft)]);
+  const [st, os, containers, rebuild, backups] = await Promise.all([api("/system/status"), api("/system/os").catch(soft), api("/system/containers").catch(soft), api("/system/rebuild").catch(soft),
+    can.admin ? api("/system/backups").catch(soft) : null]);
   const ctr = containers || { available: false };
   const rec = st.reconciler || {};
   const dep = (d) => (d ? [mono(d.image || "-"), el("span", { class: "sub" }, [d.version, d.timestamp && humanTime(d.timestamp)].filter(Boolean).join(", "))] : "-");
@@ -1320,6 +1420,7 @@ async function system() {
       el("p", {}, rebuild.max_mb_per_sec ? `Each rebuilding pool uses at most ${rebuild.max_mb_per_sec} MB/s.` : "Unlimited: rebuilds run as fast as the disks allow."),
       el("p", { class: "muted" }, "A limit leaves more bandwidth for hosts while a disk is rebuilt, but the pool stays without full redundancy for longer. A change applies to rebuilds that start after it; one already running keeps its speed."),
     ],
+    backups && backupSection(backups),
     el("div", { class: "section-head" }, el("h2", {}, "Containers")),
     el("p", { class: "muted" }, "The containers are part of the operating system image, pinned to exact versions. They change only when you upgrade the operating system."),
     !ctr.available
@@ -1329,6 +1430,64 @@ async function system() {
         { title: "Running", cell: (c) => c.running_status || "-" },
       ], ctr.containers || [], { filter: false, empty: "No containers found." }),
   ];
+}
+
+const BACKUP_KIND = { hourly: "Hourly", daily: "Daily", "pre-upgrade": "Before an upgrade", "pre-restore": "Before a restore", manual: "Taken by hand" };
+
+function backupSection(b) {
+  const stamp = () => new Date().toISOString().replace(/[-:]/g, "").slice(0, 15) + "Z";
+  return [
+    el("div", { class: "section-head" }, el("h2", {}, "Configuration backups"),
+      el("div", { class: "row-actions" },
+        el("button", { id: "backup-now", onclick: async () => {
+          try { const r = await send("POST", "/system/backups"); notify(`Backed up as ${r.backup.name}.`); rerender(); } catch (err) { notify(err.message); }
+        } }, "Back up now"),
+        el("button", { id: "backup-download", onclick: () => download("/system/backup", `velocor-${stamp()}.db`).catch((err) => notify(err.message)) }, "Download"),
+        el("button", { class: "danger-quiet", id: "restore-file", onclick: restoreFileDialog }, "Restore from a file"))),
+    el("p", { class: "muted" }, `Copies of the appliance's database: hourly for a day, daily for a week, and before every upgrade and restore, in ${b.directory} on the boot disk. Each pool also keeps a copy of its own configuration, for when the boot disk is lost. A backup holds password hashes and secrets: keep downloads safe.`),
+    table([
+      { title: "Taken", cell: (x) => [humanTime(x.created_at), el("span", { class: "sub mono" }, x.name)], text: (x) => x.name },
+      { title: "Kind", cell: (x) => BACKUP_KIND[x.kind] || x.kind },
+      { title: "Size", num: true, cell: (x) => humanSize(x.size_bytes) },
+      { title: "", cell: (x) => el("div", { class: "row-actions" },
+        el("button", { onclick: () => download("/system/backup?name=" + encodeURIComponent(x.name), x.name).catch((err) => notify(err.message)) }, "Download"),
+        el("button", { class: "danger-quiet", onclick: () => restoreDialog(x) }, "Restore")) },
+    ], b.backups || [], { empty: "No backups yet; the first is taken within minutes of velod starting.", state: stateOf("backups") }),
+  ];
+}
+
+const RESTORE_WARNING = "This replaces the whole configuration (pools, volumes, exports, access control, users and tokens) with the backup's, then restarts the control plane: sign in again afterwards. The current database is backed up first. Data on the pools isn't touched, but objects created after the backup are no longer known.";
+
+function afterRestore() {
+  notify("Restoring: the control plane restarts. Sign in again in a few seconds.");
+  setTimeout(() => { saveToken(""); location.reload(); }, 4000);
+}
+
+function restoreDialog(x) {
+  confirmDialog({
+    title: `Restore the backup of ${humanTime(x.created_at)}`,
+    intro: RESTORE_WARNING,
+    submit: "Restore",
+    confirmText: "restore",
+    action: () => send("POST", "/system/restore?name=" + encodeURIComponent(x.name)),
+    done: afterRestore,
+  });
+}
+
+function restoreFileDialog() {
+  openDialog({
+    title: "Restore from a file",
+    intro: RESTORE_WARNING,
+    danger: true,
+    submit: "Restore",
+    confirmText: "restore",
+    fields: [{ name: "file", kind: "file", label: "Database file", required: true }],
+    action: (v) => {
+      if (!v.file) throw new Error("Choose the file.");
+      return raw("POST", "/system/restore", v.file);
+    },
+    done: afterRestore,
+  });
 }
 
 function rebuildSpeedDialog(current) {

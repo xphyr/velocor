@@ -169,6 +169,42 @@ work still open, ranked by risk to data, how fixes are verified, and what has be
   download/restore, pool import from the manifest or the SPDK skeleton, importable-pool
   detection from RAID superblocks).
   - [x] SPDK built `--with-ublk` (Containerfile.spdk).
+  - [x] Manifest format (`internal/meta`): A/B slots with header + SHA-256, generation, digest
+    that ignores live figures; no accounts, tokens or CHAP secrets (CHAP secrets stripped: an
+    import disables exports whose groups use CHAP until they are set again).
+  - [x] ublk writer (`meta.UblkDevice`): I/O in the `velod meta-io` helper (O_DIRECT + fsync),
+    ublk ID 100 reserved, in-flight record in `/run/velocor/meta-ublk.json`, stale devices
+    recovered (`ublk_recover_disk`) and stopped before each use and every reconcile pass.
+    `--meta-copies=false` / `VELOCOR_META_COPIES=false` turns it off.
+  - [x] Reconciler sync: thick 8 MiB `velocor-meta` lvol per pool (created by the reconciler,
+    excluded from the commit limit), a new generation written whenever the manifest's digest
+    changes; never below the generation already on the pool (a restored older database
+    carries on above it); a failed write flags the pool ("out of date") and is retried.
+  - [x] Local backups (`internal/backup`): hourly x24, daily x7, before upgrade (`POST
+    /system/upgrade`) and restore, manual x5, in `/var/lib/velocor/backups/`; `GET
+    /system/backup[?name=]`, `GET|POST /system/backups`, `POST /system/restore` (validated,
+    current DB backed up, staged as `velocor.db.restore`, applied at the next velod start;
+    velod exits to be restarted). veloctl `system backup|backups|restore`; UI section.
+  - [x] Pool import: `GET /pool-imports` reads SPDK RAID superblocks of unclaimed disks
+    through the kernel (parser checked against real SPDK superblocks, CRC-32C included) and
+    lists arrays not in the database; `POST /pool-imports {pool_id, name?, allow_degraded?}`
+    claims without wiping, waits for assembly (starts a RAID1 degraded if asked), reads the
+    manifest (else the SPDK skeleton: volumes/snapshots by ID with sizes and parentage, no
+    exports; a snapshot shared by a volume and its clones is assigned with a warning, since
+    SPDK keeps no creation order), checks name/ID conflicts, records everything with the
+    original IDs in dependency order, restores exports disabled when a portal address isn't
+    on the appliance. A failure undoes only the database records: the disks stay claimed and
+    the array assembled (detaching RAID1 members one by one would mark the first failed in
+    the others' superblocks), and a retry resumes. Exports gained `disabled` /
+    `disabled_reason` (`PATCH {enabled}`; `veloctl export enable|disable`). veloctl `pool
+    importable|import`; UI Import dialog, configuration-copy status on the pool page.
+  - [x] Tests: unit (manifest, helper I/O, reconciler sync incl. torn write, failing device,
+    generation floor; backups schedule/retention/restore; import from manifest, skeleton,
+    conflict + resume; CLI), integration with real SPDK (skeleton import after losing the
+    database, superblocks read from the disk files, data read back).
+  - [ ] Lab test on the appliance (ublk for real): copies written; delete the database ->
+    import -> names, exports and data back; spdk_tgt killed during a write -> recovered;
+    disks moved to a fresh appliance VM -> exports restored disabled; backup/restore round trip.
 
 - [ ] **P0-4. Hosts are told writes are durable when they may only be in a disk's volatile cache. (Verified)**
   In SPDK v26.09 the lvol module does not support FLUSH (`vbdev_lvol_io_type_supported`), and

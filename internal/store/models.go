@@ -277,10 +277,16 @@ type Pool struct {
 	AllocatedBytes    uint64   `json:"allocated_bytes"`
 	// Space accounting (P0-2), maintained by the reconciler: CommittedBytes is every volume's
 	// full size plus what snapshots hold; AvailableBytes is how much more the pool accepts.
-	SpacePolicy    SpacePolicy  `json:"space_policy"`
-	CommittedBytes uint64       `json:"committed_bytes"`
-	AvailableBytes uint64       `json:"available_bytes"`
-	SpaceState     SpaceState   `json:"space_state,omitempty"`
+	SpacePolicy    SpacePolicy `json:"space_policy"`
+	CommittedBytes uint64      `json:"committed_bytes"`
+	AvailableBytes uint64      `json:"available_bytes"`
+	SpaceState     SpaceState  `json:"space_state,omitempty"`
+	// On-pool metadata copy (P0-3): the velocor-meta lvol and the last manifest written to it.
+	MetaLvolUUID   string       `json:"meta_lvol_uuid,omitempty"`
+	MetaGeneration uint64       `json:"meta_generation,omitempty"`
+	MetaHash       string       `json:"meta_hash,omitempty"`
+	MetaWrittenAt  time.Time    `json:"meta_written_at,omitempty"`
+	MetaError      string       `json:"meta_error,omitempty"`
 	FilterPolicy   FilterPolicy `json:"filter_policy"`
 	HealthStatus   HealthStatus `json:"health_status"`
 	StatusMessage  string       `json:"status_message,omitempty"`
@@ -393,6 +399,11 @@ type Export struct {
 	// NodeIDs lists the nodes it's published to, each allowed in through its initiator group.
 	Shared  bool     `json:"shared,omitempty"`
 	NodeIDs []string `json:"node_ids,omitempty"`
+	// Disabled exports are not served (SPDK objects removed). A pool import restores an export
+	// disabled when it can't be served as recorded (its portal addresses aren't on this
+	// appliance, or its CHAP secrets must be set again); DisabledReason says why.
+	Disabled       bool   `json:"disabled,omitempty"`
+	DisabledReason string `json:"disabled_reason,omitempty"`
 	// IscsiIgTag is the SPDK iSCSI initiator group tag owned by this export (unique, allocated by the store).
 	IscsiIgTag    int          `json:"iscsi_ig_tag,omitempty"`
 	HealthStatus  HealthStatus `json:"health_status"`

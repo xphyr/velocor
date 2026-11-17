@@ -24,8 +24,10 @@ import (
 	"time"
 
 	"github.com/velocor/velocor/internal/auth"
+	"github.com/velocor/velocor/internal/backup"
 	"github.com/velocor/velocor/internal/dataplane"
 	"github.com/velocor/velocor/internal/hardware"
+	"github.com/velocor/velocor/internal/meta"
 	"github.com/velocor/velocor/internal/reconciler"
 	"github.com/velocor/velocor/internal/spdk"
 	"github.com/velocor/velocor/internal/store"
@@ -49,6 +51,10 @@ type Server struct {
 	metricsPublic bool
 	insecureHTTP  bool
 	bootstrapFile string
+	backups       *backup.Manager
+	restart       func()
+	metaDev       meta.Device
+	sbReader      func(*store.Disk) (*hardware.RaidSuperblock, error) // tests
 }
 
 // WithInsecureHTTP records that the API is served over plain HTTP, so status can warn about it.
@@ -129,7 +135,11 @@ const maxRequestBodyBytes = 1 << 20
 // Handler returns the root http.Handler for the server.
 func (s *Server) Handler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
+		limit := int64(maxRequestBodyBytes)
+		if r.URL.Path == restorePath {
+			limit = maxRestoreBytes
+		}
+		r.Body = http.MaxBytesReader(w, r.Body, limit)
 		if r.Method != http.MethodGet && r.Method != http.MethodHead {
 			// A client that disconnects or times out must not abort a change halfway: SPDK
 			// finishes what it was asked to do regardless, and a rollback based on a cancelled
@@ -231,6 +241,12 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("PUT /api/v1/system/rebuild", s.withAuth(store.RoleAdmin, s.handlePutRebuildSettings))
 	s.mux.HandleFunc("GET /api/v1/system/iostats", s.withAuth(store.RoleReadOnly, s.handleGetIoStats))
 	s.mux.HandleFunc("GET /api/v1/system/os", s.withAuth(store.RoleReadOnly, s.handleGetOSStatus))
+	s.mux.HandleFunc("GET /api/v1/pool-imports", s.withAuth(store.RoleAdmin, s.handleListImportCandidates))
+	s.mux.HandleFunc("POST /api/v1/pool-imports", s.withAuth(store.RoleAdmin, s.handleImportPool))
+	s.mux.HandleFunc("GET /api/v1/system/backup", s.withAuth(store.RoleAdmin, s.handleDownloadBackup))
+	s.mux.HandleFunc("GET /api/v1/system/backups", s.withAuth(store.RoleAdmin, s.handleListBackups))
+	s.mux.HandleFunc("POST /api/v1/system/backups", s.withAuth(store.RoleAdmin, s.handleTakeBackup))
+	s.mux.HandleFunc("POST "+restorePath, s.withAuth(store.RoleAdmin, s.handleRestore))
 	s.mux.HandleFunc("POST /api/v1/system/upgrade", s.withAuth(store.RoleAdmin, s.handleStageUpgrade))
 	s.mux.HandleFunc("POST /api/v1/system/rollback", s.withAuth(store.RoleAdmin, s.handleRollbackUpgrade))
 	s.mux.HandleFunc("POST /api/v1/system/reboot", s.withAuth(store.RoleAdmin, s.handleRebootSystem))

@@ -340,9 +340,11 @@ func runToken(cfg *cliConfig, args []string) error {
 
 func runSystem(cfg *cliConfig, args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("subcommand required: status | os | reconcile | iostats | upgrade | rollback | reboot | containers | rebuild")
+		return fmt.Errorf("subcommand required: status | os | reconcile | iostats | upgrade | rollback | reboot | containers | rebuild | backup | backups | restore")
 	}
 	switch args[0] {
+	case "backup", "backups", "restore":
+		return runSystemBackup(cfg, args)
 	case "rebuild":
 		fs := flag.NewFlagSet("system rebuild", flag.ExitOnError)
 		limit := fs.Int("max-mb-per-sec", -1, "Limit RAID rebuild bandwidth for every pool (0 = unlimited); applies to rebuilds that start afterwards. Omit to show the current limit")
@@ -596,9 +598,11 @@ func runDisk(cfg *cliConfig, args []string) error {
 
 func runPool(cfg *cliConfig, args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("subcommand required: list | get | create | set-space | replace | start-degraded | release-disk | delete")
+		return fmt.Errorf("subcommand required: list | get | create | set-space | replace | start-degraded | release-disk | importable | import | delete")
 	}
 	switch args[0] {
+	case "importable", "import":
+		return runPoolImport(cfg, args)
 	case "list":
 		resp, err := cfg.request("GET", "/api/v1/pools", nil)
 		if err != nil {
@@ -1250,9 +1254,11 @@ func runInitiatorGroup(cfg *cliConfig, args []string) error {
 
 func runExport(cfg *cliConfig, args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("subcommand required: list | get | connections | access | create | delete")
+		return fmt.Errorf("subcommand required: list | get | connections | access | enable | disable | create | delete")
 	}
 	switch args[0] {
+	case "enable", "disable":
+		return runExportEnable(cfg, args)
 	case "get":
 		if len(args) < 2 {
 			return fmt.Errorf("usage: veloctl export get <export-id>")
@@ -1448,9 +1454,9 @@ Commands:
   passwd            Change your own password
   user              Manage local users (list, create, update, delete)
   token             Manage scoped service tokens (list, create, revoke)
-  system            Appliance status, containers, bootc upgrade/rollback
+  system            Appliance status, containers, bootc upgrade/rollback, database backup/restore
   disk              List, scan, claim, release drives; set write cache / power-loss protection
-  pool              Create, list, inspect or delete pools; space policy; replace a disk, start a pool degraded
+  pool              Create, list, inspect or delete pools; space policy; replace a disk, start a pool degraded; import a pool
   volume            Create, list, get, show usage, resize, set QoS, or delete volumes
   snapshot          Create, list, clone and delete snapshots
   group-snapshot    Create, list, get, or delete consistency group snapshots

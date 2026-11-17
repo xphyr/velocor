@@ -86,10 +86,17 @@ func CommittedBytes(volumes []*Volume, snapshots []*Snapshot) uint64 {
 	return k
 }
 
+// MetaLvolBytes is the size of each pool's metadata-copy lvol (meta.LvolBytes).
+const MetaLvolBytes = 8 << 20
+
 // LimitBytes is how much the pool may commit under its policy.
 func LimitBytes(p *Pool) uint64 {
 	e := p.SpacePolicy.Effective()
-	usable := float64(p.TotalBytes) * (1 - *e.ReservePercent/100)
+	total := p.TotalBytes
+	if p.MetaLvolUUID != "" { // the thick metadata-copy lvol (P0-3) is not for volumes
+		total -= min(total, MetaLvolBytes)
+	}
+	usable := float64(total) * (1 - *e.ReservePercent/100)
 	return uint64(math.Max(0, usable*e.MaxOvercommit))
 }
 

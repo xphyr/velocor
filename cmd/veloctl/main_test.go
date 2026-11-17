@@ -265,3 +265,36 @@ func TestPoolSpaceCommands(t *testing.T) {
 		}
 	}
 }
+
+func TestRecoveryCommands(t *testing.T) {
+	f := newFixture(t)
+	signedIn(t, f)
+	out := filepath.Join(t.TempDir(), "velocor.db")
+	if err := f.run(t, "system", "backup", "-o", out); err != nil {
+		t.Fatal(err)
+	}
+	if fi, err := os.Stat(out); err != nil || fi.Size() < 4096 || fi.Mode().Perm() != 0o600 {
+		t.Fatalf("backup file: %+v %v", fi, err)
+	}
+	if err := store.ValidateBackup(out); err != nil {
+		t.Fatalf("downloaded backup: %v", err)
+	}
+	if err := f.run(t, "system", "backup", "-o", out); err == nil {
+		t.Fatal("an existing file must not be overwritten")
+	}
+	if err := f.run(t, "pool", "importable"); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.run(t, "export", "disable", f.exp.ID); err != nil {
+		t.Fatal(err)
+	}
+	if e, _ := f.st.GetExport(f.exp.ID); !e.Disabled {
+		t.Fatal("export not disabled")
+	}
+	if err := f.run(t, "export", "enable", f.exp.ID); err != nil {
+		t.Fatal(err)
+	}
+	if e, _ := f.st.GetExport(f.exp.ID); e.Disabled || e.DisabledReason != "" {
+		t.Fatalf("export not enabled: %+v", e)
+	}
+}

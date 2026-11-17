@@ -3,6 +3,7 @@ package spdktest
 import (
 	"strings"
 
+	"github.com/velocor/velocor/internal/hardware"
 	"github.com/velocor/velocor/internal/spdk"
 )
 
@@ -489,4 +490,32 @@ func (f *Fake) RebuildMaxMBps() uint32 {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.rebuildMaxMBps
+}
+
+// SuperblockOf describes the RAID superblock on the given media (as a kernel read of the
+// disk would find it), or nil.
+func (f *Fake) SuperblockOf(key string) *hardware.RaidSuperblock {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	sb := f.superblock[key]
+	if sb == nil {
+		return nil
+	}
+	out := &hardware.RaidSuperblock{UUID: sb.UUID, Name: sb.Name, SeqNumber: sb.Seq, BlockSize: 512, NumMembers: len(sb.Slots)}
+	switch strings.ToLower(sb.Level) {
+	case "raid0":
+		out.Level = 0
+	case "raid1":
+		out.Level = 1
+	default:
+		out.Level = 99
+	}
+	for i, s := range sb.Slots {
+		st := uint32(hardware.RaidSBMemberMissing)
+		if s.UUID != "" && s.State == sbConfigured {
+			st = hardware.RaidSBMemberConfigured
+		}
+		out.Members = append(out.Members, hardware.RaidSBMember{Slot: i, BdevUUID: s.UUID, State: st})
+	}
+	return out
 }

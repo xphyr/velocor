@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/velocor/velocor/internal/backup"
 	"github.com/velocor/velocor/internal/store"
 )
 
@@ -141,6 +142,12 @@ func (s *Server) handleStageUpgrade(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if s.backups != nil {
+		if _, err := s.backups.Take(backup.KindPreUpgrade); err != nil {
+			writeError(w, fmt.Errorf("back up the database before the upgrade: %w", err))
+			return
+		}
+	}
 	var cmd *exec.Cmd
 	if imageRef == "" {
 		cmd = hostCommand(r.Context(), "bootc", "upgrade")

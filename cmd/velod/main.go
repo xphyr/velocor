@@ -15,8 +15,10 @@ import (
 	"time"
 
 	"github.com/velocor/velocor/internal/auth"
+	"github.com/velocor/velocor/internal/backup"
 	"github.com/velocor/velocor/internal/dataplane"
 	"github.com/velocor/velocor/internal/hardware"
+	"github.com/velocor/velocor/internal/meta"
 	"github.com/velocor/velocor/internal/reconciler"
 	"github.com/velocor/velocor/internal/server"
 	"github.com/velocor/velocor/internal/spdk"
@@ -25,6 +27,14 @@ import (
 )
 
 func main() {
+	// "velod meta-io ...": the helper that does the on-pool metadata I/O (internal/meta).
+	if len(os.Args) > 1 && os.Args[1] == "meta-io" {
+		if err := meta.RunHelper(os.Args[2:], os.Stdin, os.Stdout, true); err != nil {
+			fmt.Fprintln(os.Stderr, "meta-io:", err)
+			os.Exit(1)
+		}
+		return
+	}
 	var (
 		listenAddr        = flag.String("listen", envOrDefault("VELOCOR_LISTEN", ":8443"), "Address and port for the unified API/UI server")
 		dbPath            = flag.String("db", envOrDefault("VELOCOR_DB_PATH", "/var/lib/velocor/velocor.db"), "Path to persistent bbolt state database")
@@ -36,6 +46,7 @@ func main() {
 		insecureHTTP      = flag.Bool("insecure-http", os.Getenv("VELOCOR_INSECURE_HTTP") == "true", "Serve plain HTTP instead of HTTPS")
 		ssdBdev           = flag.String("ssd-bdev", envOrDefault("VELOCOR_SSD_BDEV", "uring"), "How SSDs are attached to SPDK: uring (default) or aio (for hosts without usable io_uring)")
 		metricsPublic     = flag.Bool("metrics-public", os.Getenv("VELOCOR_METRICS_PUBLIC") == "true", "Serve /metrics without authentication (default: requires a READONLY token)")
+		metaCopies        = flag.Bool("meta-copies", os.Getenv("VELOCOR_META_COPIES") != "false", "Keep a copy of each pool's configuration on the pool (needs SPDK built with ublk and the ublk_drv module)")
 		showVersion       = flag.Bool("version", false, "Print version information and exit")
 	)
 	flag.Parse()
@@ -67,6 +78,9 @@ func main() {
 		os.Exit(1)
 	}
 
+	if err := backup.ApplyPendingRestore(*dbPath, logger); err != nil {
+		logger.Error("database restore failed; starting on the current database", "err", err)
+	}
 	st, err := store.OpenBoltStore(*dbPath)
 	if err != nil {
 		logger.Error("failed to open bbolt state store", "path", *dbPath, "err", err)
@@ -115,15 +129,35 @@ func main() {
 
 	spdkClient := spdk.NewClient(*spdkSocket)
 	rec := reconciler.New(st, spdkClient, hwMgr, logger)
+	var metaDev meta.Device
+	if *metaCopies {
+		self, err := os.Executable()
+		if err != nil {
+			logger.Error("cannot locate the velod binary for metadata I/O", "err", err)
+			os.Exit(1)
+		}
+		nodeID := ""
+		if cfg, err := st.GetSystemConfig(); err == nil {
+			nodeID = cfg.NodeID
+		}
+		// One device for the reconciler (writes) and pool import (reads): it serializes them.
+		metaDev = &meta.UblkDevice{SPDK: spdkClient, Helper: self, StateDir: filepath.Dir(*spdkSocket), ID: metaUblkID}
+		rec.SetMetaDevice(metaDev, nodeID, version.Version)
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
 	go rec.Start(ctx, *reconcileInterval)
 
+	backups := &backup.Manager{Dir: filepath.Join(filepath.Dir(*dbPath), "backups"), DBPath: *dbPath, Source: st, Logger: logger}
+	go backups.Run(ctx)
+
 	srv := server.New(st, spdkClient, hwMgr, authMgr, rec, logger,
 		server.WithPublicMetrics(*metricsPublic),
 		server.WithInsecureHTTP(*insecureHTTP),
+		server.WithBackups(backups, stop),
+		server.WithMetaDevice(metaDev), // velod exits; systemd starts it on the restored database
 		server.WithBootstrapPasswordFile(filepath.Join(filepath.Dir(*dbPath), "initial-admin-password")))
 	httpServer := &http.Server{
 		Addr:              *listenAddr,
@@ -184,3 +218,6 @@ func envOrDefault(key, def string) string {
 	}
 	return def
 }
+
+// metaUblkID is the ublk device ID reserved for metadata I/O (/dev/ublkb<id>).
+const metaUblkID = 100

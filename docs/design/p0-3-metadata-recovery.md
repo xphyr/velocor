@@ -1,6 +1,6 @@
 # Design: metadata copies, backups and pool import (P0-3)
 
-Status: proposal, 2026-11-17. Tracks TODO P0-3.
+Status: implemented 2026-11-17 (lab test pending). Tracks TODO P0-3.
 
 ## What happens today
 
@@ -139,3 +139,31 @@ existing start-degraded path (P1-8).
     data;
   - move the disks to a fresh appliance VM, import, and check exports come back disabled with
     their portals flagged.
+
+## Implementation notes (2026-11-17)
+
+Where the implementation differs from the proposal above:
+
+- **When copies are written:** on every reconciler pass (15 s by default) whose manifest
+  digest differs from the last one written, not through a separate debounce. The first pass
+  after velod starts reads the pool's slots, so a database restored from an older backup
+  continues above the generation already on the pool.
+- **The commit limit** leaves out the 8 MiB lvol (`LimitBytes` subtracts it from the volume
+  store's size) rather than counting it as committed.
+- **CHAP secrets** are stripped from the copy too. An imported export whose initiator group
+  uses CHAP comes back disabled until the secrets are set again. (CHAP isn't enforced yet:
+  TODO P2-1.)
+- **API:** `GET|POST /api/v1/pool-imports`, not `POST /pools:import`. Detection runs on demand
+  (the list reads the superblocks of unclaimed disks), not as a disk attribute.
+- **Conflicts and failures:** checked after the manifest is read, because the manifest needs
+  the array assembled. A failed import undoes only the database records. The disks stay
+  claimed and the array assembled, and the candidate list includes such arrays, so a retry
+  (e.g. under another name) resumes. SPDK's state isn't undone: detaching RAID1 members one by
+  one marks the first as failed in the others' superblocks, and `bdev_raid_delete` under a
+  loaded volume store leaves the RAID half-deleted.
+- **Skeleton parentage:** SPDK keeps no creation order, so a snapshot that has both its volume
+  and clones as children can't be told apart. The import picks one (deterministically), records
+  the others as clones, and says so in its warnings.
+- **Disabled exports:** exports gained `disabled` / `disabled_reason`. The reconciler removes
+  their SPDK objects and reports them as needing attention. `PATCH /exports/{id}
+  {"enabled": true}` serves them again.
