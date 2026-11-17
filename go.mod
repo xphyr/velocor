@@ -8,7 +8,8 @@ require (
 	github.com/container-storage-interface/spec v1.13.0
 	github.com/kubernetes-csi/csi-test/v5 v5.6.0
 	go.etcd.io/bbolt v1.5.0
-	golang.org/x/sys v0.48.0
+	golang.org/x/sys v0.50.0
+	golang.org/x/term v0.48.0
 	google.golang.org/grpc v1.85.0
 	google.golang.org/protobuf v1.36.12
 )

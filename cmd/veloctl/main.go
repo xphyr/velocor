@@ -20,7 +20,7 @@ import (
 	"time"
 
 	"github.com/velocor/velocor/internal/version"
-	"golang.org/x/sys/unix"
+	"golang.org/x/term"
 )
 
 type cliConfig struct {
@@ -1401,22 +1401,19 @@ func tlsConfig(insecure bool, caCert string) (*tls.Config, error) {
 	return cfg, nil
 }
 
-// promptSecret reads a line from the terminal without echoing it. When stdin isn't a
-// terminal (a pipe in a script), it reads the line as is.
+// promptSecret reads a line from the terminal without echoing it (Linux, macOS, Windows). When
+// stdin isn't a terminal (a pipe in a script), it reads the line as is.
 func promptSecret(prompt string) (string, error) {
-	fd := int(os.Stdin.Fd())
-	old, err := unix.IoctlGetTermios(fd, unix.TCGETS)
-	if err == nil {
-		noEcho := *old
-		noEcho.Lflag &^= unix.ECHO
-		if err := unix.IoctlSetTermios(fd, unix.TCSETS, &noEcho); err == nil {
-			defer func() {
-				_ = unix.IoctlSetTermios(fd, unix.TCSETS, old)
-				fmt.Fprintln(os.Stderr)
-			}()
-		}
-	}
+	fd := int(os.Stdin.Fd()) //nolint:gosec // a file descriptor/handle always fits in int
 	fmt.Fprint(os.Stderr, prompt)
+	if term.IsTerminal(fd) {
+		b, err := term.ReadPassword(fd)
+		fmt.Fprintln(os.Stderr)
+		if err != nil {
+			return "", fmt.Errorf("read password: %w", err)
+		}
+		return string(b), nil
+	}
 	line, err := bufio.NewReader(os.Stdin).ReadString('\n')
 	if err != nil && line == "" {
 		return "", fmt.Errorf("read password: %w", err)
