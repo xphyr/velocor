@@ -95,7 +95,7 @@ work still open, ranked by risk to data, how fixes are verified, and what has be
     consumer NVMe without NGUID/UUID (generate_uuids path), a drive failing with I/O errors
     rather than disappearing.
 
-- [ ] **P0-2. Thin pools can be overcommitted without limit or warning.**
+- [x] **P0-2. Thin pools can be overcommitted without limit or warning.**
   Volume and clone creation never check pool capacity. When the pool fills, every thin and
   snapshot-backed volume in it starts failing writes at once, which typically corrupts host
   filesystems and databases. Snapshots keep old clusters alive, and nothing shows how much
@@ -134,7 +134,15 @@ work still open, ranked by risk to data, how fixes are verified, and what has be
     everything written before is intact; after deleting a volume the pool recovers and writes
     work again. Harness: spdk_dd now runs with queue depth 32, no I/O retries and a 120 s
     limit.
-  - [ ] Lab test on the appliance image (kernel NVMe/TCP host, UI) with the next image build.
+  - [x] Lab test on the appliance (dev-b083815, 8 GiB SSD mirror, kernel NVMe/TCP host,
+    2026-11-17): at the default policy a 6 GiB volume is accepted and a further 2 GiB refused
+    (507, "6.0 GiB committed of 7.6 GiB allowed"); with 2x overcommit and 12 GiB of thin
+    volumes filled through the kernel host: OK -> WARNING at 82% -> CRITICAL at 91% (new
+    volume and snapshot refused) -> FULL at 100% (the next write gets EIO); every transition
+    logged, system status DEGRADED naming the pool, metrics and UI correct (full pill, Create
+    volume disabled); deleting a volume brings the pool back to OK, all 6 GiB of the other
+    volume intact and writable.
+  P0-2 is done, apart from L-6 (ENOSPC instead of EIO).
 
 - [ ] **P0-3. The metadata database is a single point of failure, with no backup or recovery.**
   `/var/lib/velocor/velocor.db` is the only record of which volume is which, who may access it,
