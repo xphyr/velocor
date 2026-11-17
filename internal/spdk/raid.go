@@ -7,24 +7,24 @@ import (
 
 // RaidBaseBdev describes a member base bdev inside an SPDK RAID bdev.
 type RaidBaseBdev struct {
-	Name        string `json:"name"`
-	UUID        string `json:"uuid"`
-	IsConfigured bool  `json:"is_configured"`
-	DataOffset  uint64 `json:"data_offset"`
-	DataSize    uint64 `json:"data_size"`
+	Name         string `json:"name"`
+	UUID         string `json:"uuid"`
+	IsConfigured bool   `json:"is_configured"`
+	DataOffset   uint64 `json:"data_offset"`
+	DataSize     uint64 `json:"data_size"`
 }
 
 // RaidBdevInfo describes an SPDK RAID bdev returned by bdev_raid_get_bdevs.
 type RaidBdevInfo struct {
-	Name             string         `json:"name"`
-	UUID             string         `json:"uuid"`
-	StripSizeKb      uint32         `json:"strip_size_kb"`
-	State            string         `json:"state"`
-	RaidLevel        string         `json:"raid_level"`
-	Superblock       bool           `json:"superblock"`
-	NumBaseBdevs     uint32         `json:"num_base_bdevs"`
-	NumBaseBdevsDiscovered uint32   `json:"num_base_bdevs_discovered"`
-	BaseBdevsList    []RaidBaseBdev `json:"base_bdevs_list"`
+	Name                   string         `json:"name"`
+	UUID                   string         `json:"uuid"`
+	StripSizeKb            uint32         `json:"strip_size_kb"`
+	State                  string         `json:"state"`
+	RaidLevel              string         `json:"raid_level"`
+	Superblock             bool           `json:"superblock"`
+	NumBaseBdevs           uint32         `json:"num_base_bdevs"`
+	NumBaseBdevsDiscovered uint32         `json:"num_base_bdevs_discovered"`
+	BaseBdevsList          []RaidBaseBdev `json:"base_bdevs_list"`
 }
 
 // BdevRaidGetBdevs queries SPDK for RAID bdevs by category ("all", "online", "configuring", "offline").
@@ -41,7 +41,7 @@ func (c *Client) BdevRaidGetBdevs(ctx context.Context, category string) ([]RaidB
 }
 
 // NormalizeRaidLevel converts Velocor RAID enum strings (e.g., "RAID0", "RAID5F")
-// to SPDK bdev_raid_create level strings ("raid0", "raid1", "raid10", "raid5f").
+// to SPDK bdev_raid_create level strings ("raid0", "raid1", "raid5f"; SPDK v26.09 has no raid10).
 func NormalizeRaidLevel(level string) string {
 	l := strings.ToLower(strings.TrimSpace(level))
 	switch l {
@@ -58,7 +58,13 @@ func NormalizeRaidLevel(level string) string {
 	}
 }
 
-// BdevRaidCreate creates an SPDK RAID bdev across the specified base bdevs with superblock persistence.
+// BdevRaidCreate creates an SPDK RAID bdev across the specified base bdevs.
+//
+// When superblock is true SPDK writes RAID metadata to every member, so the array is
+// re-assembled automatically by bdev examine after a restart (including in degraded
+// mode for redundant levels). NEVER pass superblock=true for members of an existing
+// array that was created without one: the superblock shifts the data offset and
+// destroys the existing contents.
 func (c *Client) BdevRaidCreate(ctx context.Context, name, raidLevel string, stripSizeKB uint32, baseBdevs []string, superblock bool) error {
 	normLevel := NormalizeRaidLevel(raidLevel)
 	params := map[string]any{
@@ -74,8 +80,13 @@ func (c *Client) BdevRaidCreate(ctx context.Context, name, raidLevel string, str
 	return c.Call(ctx, "bdev_raid_create", params, nil)
 }
 
-// BdevRaidDelete destroys an SPDK RAID bdev by name.
-func (c *Client) BdevRaidDelete(ctx context.Context, name string) error {
+// BdevRaidDelete destroys an SPDK RAID bdev by name. With clearSuperblock, the RAID
+// superblock is wiped from every member; otherwise SPDK examine re-assembles the deleted
+// array as soon as its disks are attached again (verified against SPDK v26.09).
+func (c *Client) BdevRaidDelete(ctx context.Context, name string, clearSuperblock bool) error {
 	params := map[string]any{"name": name}
+	if clearSuperblock {
+		params["clear_sb"] = true
+	}
 	return c.Call(ctx, "bdev_raid_delete", params, nil)
 }

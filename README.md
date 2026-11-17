@@ -2,7 +2,7 @@
 
 **Velocor** is an open-source, API-first, all-flash SAN/NAS storage appliance distribution built on **SPDK** (Storage Performance Development Kit) and **Fedora Image Mode (`bootc`)**, written in Go.
 
-Velocor decouples the user-space block data plane (`spdk_tgt`) from the control plane (`velod`) using Podman Quadlet containers on a thin, immutable `fedora-bootc:45` host OS—enabling sub-second, zero-disruption control-plane upgrades while sustaining low-latency NVMe-oF and iSCSI I/O.
+Velocor decouples the user-space block data plane (`spdk_tgt`) from the control plane (`velod`) using Podman Quadlet containers on a thin, immutable `fedora-bootc:45` host OS—so the control plane can be upgraded or restarted without interrupting low-latency NVMe-oF and iSCSI I/O. (Updating the `spdk_tgt` data-plane container itself *does* interrupt I/O and is therefore never automatic.)
 
 ---
 
@@ -29,10 +29,10 @@ Velocor decouples the user-space block data plane (`spdk_tgt`) from the control 
 
 ## Core Components & Features
 
-- **`velod` (`cmd/velod`)**: Node control-plane daemon, hardware manager (`vfio-pci` & hugepages), transactional desired-state store (`bbolt`), background drift reconciler, and single-port (`:8443`) gRPC + REST/OpenAPI server, Prometheus `/metrics` endpoint, and embedded Web UI console.
-- **`veloctl` (`cmd/veloctl`)**: Operator CLI for managing users, tokens, disks, pools, volumes, snapshots, Changed Block Tracking (CBT), network portals, initiator groups, and exports.
+- **`velod` (`cmd/velod`)**: Node control-plane daemon, hardware manager (`vfio-pci` & hugepages), transactional desired-state store (`bbolt`), background drift reconciler, and single-port (`:8443`) REST/JSON + OpenAPI server, authenticated Prometheus `/metrics` endpoint, and embedded Web UI console.
+- **`veloctl` (`cmd/veloctl`)**: Operator CLI for managing users, tokens, disks, pools, volumes, snapshots, network portals, initiator groups, and exports.
 - **`velocor-spdk` (`spdk_tgt`)**: User-space, polled-mode SPDK `v26.09` data plane managing PCIe NVMe (`vfio-pci` / `bdev_nvme`) and SATA/SAS SSD (`io_uring` / `bdev_uring`) devices directly.
-- **`velocor-csi` (`cmd/velocor-csi`)**: Kubernetes CSI driver (`csi.velocor.io`) supporting dynamic NVMe-oF/TCP and iSCSI provisioning, online volume expansion, CoW snapshots, cloning, `VolumeGroupSnapshot`, and CSI `SnapshotMetadata` (KEP-3314 CBT).
+- **`velocor-csi` (`cmd/velocor-csi`)**: Kubernetes CSI driver (`csi.velocor.io`) supporting dynamic NVMe-oF/TCP and iSCSI provisioning, online volume expansion, CoW snapshots, cloning, and `VolumeGroupSnapshot`. Changed Block Tracking (CSI `SnapshotMetadata`, KEP-3314) is not supported yet; see [Changed Block Tracking](#changed-block-tracking-cbt-not-yet-supported).
 - **Boot-Disk Safety Guard**: Automatically resolves backing devices and PCIe BDF addresses for `/`, `/boot`, `/boot/efi`, and `/sysroot` on startup and permanently marks them `is_boot_device = true` so OS drives can never be unbound or formatted.
 
 ---
@@ -46,7 +46,7 @@ Velocor decouples the user-space block data plane (`spdk_tgt`) from the control 
 |  +-------------------------------------+   +-----------------------------------+  |
 |  | velocor-velod.service (Quadlet)     |   | velocor-spdk.service (Quadlet)    |  |
 |  | - velod Control Plane (:8443 TLS)   |   | - spdk_tgt (User-Space Polled IO) |  |
-|  | - gRPC + REST + Embedded Web UI     |-->| - bdev_nvme (vfio-pci)            |  |
+|  | - REST + Embedded Web UI            |-->| - bdev_nvme (vfio-pci)            |  |
 |  | - bbolt DB (/var/lib/velocor/*.db)  |   | - bdev_uring (Linux io_uring)     |  |
 |  | - Reconciler & Hardware Manager     |   | - bdev_raid + lvol_store + lvol   |  |
 |  +-------------------------------------+   | - NVMe-oF/TCP (:4420) & iSCSI     |  |
@@ -63,7 +63,7 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for a detailed breakdown of the
 
 ### Prerequisites
 
-- **Go** `1.23+`
+- **Go**: the version in `go.mod`'s `toolchain` line (container builds use exactly that version)
 - **Podman** (for building workload and `bootc` OS container images)
 - **QEMU/KVM**, `qemu-img`, `genisoimage`, and `jq` (optional, for the local 2-node VM lab)
 
@@ -79,47 +79,60 @@ make test
 
 ### Build & Push Container Images
 
-By default, images use `IMAGE_PREFIX=registry.xphyrlab.net/velocor`. Override `IMAGE_PREFIX` to push to your own container registry:
+Images are named `$(IMAGE_PREFIX)/<name>:$(TAG)`. `IMAGE_PREFIX` defaults to `ghcr.io/xphyr`;
+`TAG` defaults to `dev-<short sha>`, so a local build never overwrites a shared tag (`latest`
+and version tags are pushed only by CI's release job).
 
 ```bash
-# Build all container images (velocor-spdk, velocor-velod, velocor-csi, velocor-os)
-make containers IMAGE_PREFIX=registry.example.com/velocor
+# Build velocor-spdk, velocor-velod and velocor-csi locally
+make images IMAGE_PREFIX=registry.example.com/velocor
 
-# Push all container images to your registry
-make push-containers IMAGE_PREFIX=registry.example.com/velocor
+# Push them, then build and push velocor-os (refuses a dirty tree: commit first)
+make push IMAGE_PREFIX=registry.example.com/velocor
 ```
+
+The OS image (`velocor-os`) embeds the `velocor-spdk` and `velocor-velod` images of the same
+build, pinned by digest, so `make push` pushes those first and the OS image build resolves their
+digests from the registry. An appliance therefore runs exactly the containers it was built and
+tested with, needs no registry at boot, and changes them only through an OS upgrade.
+
+Local fixes to SPDK live in `deploy/containers/spdk-patches/` (applied at build time; each
+carries unit tests, which `make spdk-unit-tests` and CI run).
+
+The Go toolchain, the SPDK source commit and the GitHub Actions are pinned (`make check-pins`
+verifies it; Renovate proposes bumps). The Fedora base images follow Fedora's rolling release tag
+(`:45`) to pick up its daily fixes: each build resolves the tag to a digest, builds from exactly
+that digest and records it in the image's `org.opencontainers.image.base.name` /
+`org.opencontainers.image.base.digest` labels (`skopeo inspect` shows which base a build used).
 
 ### Build a Local `qcow2` VM Image
 
-To build a bootable 32 GiB `qcow2` disk image locally for running `velocor-os` on another hypervisor or VM host (via `bootc-image-builder`):
+`hack/build-qcow2.sh` turns a published `velocor-os` image into a bootable qcow2 without root on
+the build host (it only needs KVM): a throwaway Fedora Cloud VM runs `bootc install to-disk`
+onto a second virtual disk. Nothing from the build host goes into the image.
 
 ```bash
-# Builds container-bootc and writes output/qcow2/disk.qcow2 (requires sudo for bootc-image-builder)
-make qcow2
+hack/build-qcow2.sh \
+  --image registry.example.com/velocor/velocor-os:dev-<sha> \
+  --output velocor-os.qcow2 --size 32G \
+  --authorized-keys ~/.ssh/id_ed25519.pub   # repeatable
 ```
 
-If you want to customize the output directory, root filesystem, or `bootc` image tag:
+### Logging in to the appliance
 
-```bash
-make qcow2 QCOW2_OUTPUT_DIR=./build-qcow2 QCOW2_ROOTFS=xfs BOOTC_IMAGE=registry.example.com/velocor/velocor-os:latest
-```
+The appliance's only login is **`velocor-admin`** (member of `wheel`, passwordless sudo, SSH keys
+only). Root cannot log in over SSH, and password authentication is disabled. Neither the image nor
+the repository contains keys or passwords; give `velocor-admin` keys in one of these ways:
 
-The default [deploy/bootc/config.toml](deploy/bootc/config.toml) sets the root filesystem `minsize` to `32 GiB` (`[[customizations.filesystem]]`).
+- `hack/build-qcow2.sh --authorized-keys <file.pub>` writes them to
+  `/etc/ssh/authorized_keys.d/velocor-admin` in the installed disk.
+- **cloud-init** (included in `velocor-os`): keys supplied by the hypervisor or a seed ISO go to
+  `velocor-admin`.
+- After installing with `bootc install to-disk` (below), add the file
+  `/etc/ssh/authorized_keys.d/velocor-admin` (mode 0644, owned by root) to the installed system.
 
-#### Adding a Custom User or SSH Key to the `qcow2` Image
-
-Copy [deploy/bootc/config.toml](deploy/bootc/config.toml) to `deploy/bootc/config.local.toml` (which is gitignored) and add your `[[customizations.user]]` block there, or pass `BIB_CONFIG=/path/to/config.toml`. `make qcow2` automatically uses `deploy/bootc/config.local.toml` when present:
-
-```toml
-[[customizations.user]]
-name = "velocor"
-# Optional password (or hashed password); omit to allow SSH key login only
-password = "changeme"
-key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI... operator@workstation"
-groups = ["wheel"]
-```
-
-You can also inject an SSH key for `root` by adding a second `[[customizations.user]]` block with `name = "root"` and `key = "ssh-ed25519 ..."`. Then run `make qcow2` and boot `output/qcow2/disk.qcow2` on your target machine.
+`make qcow2 IMAGE_PREFIX=... QCOW2_KEYS="a.pub b.pub"` runs the same script for the OS image of
+the current commit.
 
 ---
 
@@ -133,7 +146,7 @@ The recommended production deployment installs the immutable `velocor-os` image 
 2. **Install `velocor-os` to the target boot drive** (e.g., `/dev/sda` or `/dev/nvme0n1`):
 
    ```bash
-   export BOOTC_IMAGE="registry.xphyrlab.net/velocor/velocor-os:latest"
+   export BOOTC_IMAGE="ghcr.io/xphyr/velocor-os:<version>"
    export TARGET_DISK="/dev/sda"
 
    sudo podman pull "${BOOTC_IMAGE}"
@@ -142,14 +155,22 @@ The recommended production deployment installs the immutable `velocor-os` image 
      --security-opt label=type:unconfined_t \
      -v /var/lib/containers:/var/lib/containers \
      -v /dev:/dev \
-     -v /etc/ostree:/etc/ostree \
-     -v "${HOME}/.ssh/authorized_keys:/tmp/authorized_keys:ro" \
      "${BOOTC_IMAGE}" \
      bootc install to-disk \
        --filesystem xfs \
        --generic-image \
-       --root-ssh-authorized-keys /tmp/authorized_keys \
        "${TARGET_DISK}"
+   ```
+
+   Then give `velocor-admin` your SSH key (root SSH login is disabled):
+
+   ```bash
+   sudo mount /dev/disk/by-label/root /mnt
+   for d in /mnt/ostree/deploy/*/deploy/*.0; do
+     sudo install -d -m 0755 "$d/etc/ssh/authorized_keys.d"
+     sudo install -m 0644 ~/.ssh/id_ed25519.pub "$d/etc/ssh/authorized_keys.d/velocor-admin"
+   done
+   sudo umount /mnt
    ```
 
 3. **Reboot into the installed disk.** On first boot, systemd automatically generates and starts `velocor-spdk.service` and `velocor-velod.service` from `/usr/share/containers/systemd/`.
@@ -163,8 +184,9 @@ The recommended production deployment installs the immutable `velocor-os` image 
 5. **Atomic OS Upgrades & Rollbacks:**
 
    ```bash
-   # Upgrade the appliance OS image via veloctl (or `bootc upgrade` on the host)
-   veloctl system upgrade registry.xphyrlab.net/velocor/velocor-os:v0.2.0
+   # Upgrade the appliance OS image via veloctl (or `bootc upgrade` on the host). The OS image
+   # carries velod and spdk_tgt, so this is also how the containers are updated.
+   veloctl system upgrade ghcr.io/xphyr/velocor-os:v0.2.0
 
    # Roll back to the previous OS deployment if needed
    veloctl system rollback
@@ -194,8 +216,9 @@ You can run Velocor on an existing **Fedora 45+**, **RHEL / CentOS Stream 9/10**
    ublk_drv
    EOF
 
-   # Enable noiommu fallback only if running inside a VM without vIOMMU
-   echo "options vfio enable_unsafe_noiommu_mode=1" | sudo tee /etc/modprobe.d/velocor-vfio.conf
+   # Lab VMs without a vIOMMU only: velod refuses to bind NVMe drives without an IOMMU
+   # unless VELOCOR_ALLOW_UNSAFE_NOIOMMU=true is set in velocor-velod.container. Never
+   # enable this on production hardware: it lets SPDK DMA anywhere in host memory.
 
    # Allocate at least 1024 MiB of 2 MiB hugepages for SPDK
    echo "vm.nr_hugepages = 512" | sudo tee /etc/sysctl.d/90-velocor.conf
@@ -232,7 +255,7 @@ For local development and end-to-end testing, `hack/vm-lab/lab.sh` provisions a 
 # 1. Start velocor-san (API forwarded to https://127.0.0.1:18443) and velocor-initiator
 ./hack/vm-lab/lab.sh up
 
-# 2. Run end-to-end verification (bootc, Quadlets, disk claim, RAID1 pool, NVMe-oF/TCP, CBT, iSCSI)
+# 2. Run end-to-end verification (bootc, Quadlets, disk claim, RAID1 pool, NVMe-oF/TCP, snapshots, iSCSI)
 ./hack/vm-lab/lab.sh verify
 
 # 3. Stop the lab VMs
@@ -248,23 +271,31 @@ See [hack/vm-lab/README.md](hack/vm-lab/README.md) for environment overrides and
 ### 1. Access the Web UI or Authenticate `veloctl`
 
 - **Web UI Console**: Open `https://<appliance-ip>:8443` in your browser.
-- **Default Bootstrap Credentials**:
+- **Bootstrap Credentials**:
   - **Username**: `admin`
-  - **Password**: `velocor-admin-changeme` (unless overridden via `VELOCOR_INIT_PASSWORD` on first boot)
+  - **Password**: generated randomly on first boot and written to `/var/lib/velocor/initial-admin-password` (root-only), unless `VELOCOR_INIT_PASSWORD` is set on first boot. There is no shared default password.
+  - The bootstrap password must be changed at first login; until then the API only allows changing it. Delete the file afterwards.
 
 Authenticate via `veloctl` (session token is saved to `~/.config/velocor/token`):
 
 ```bash
 export VELOCOR_ENDPOINT="https://<appliance-ip>:8443"
+# veloctl verifies TLS. Trust the appliance's self-signed certificate (copy it once):
+scp root@<appliance-ip>:/var/lib/velocor/tls.crt ~/.config/velocor/appliance.crt
+export VELOCOR_CA_CERT=~/.config/velocor/appliance.crt   # or pass --ca-cert
 
-veloctl login --username admin --password velocor-admin-changeme
+sudo cat /var/lib/velocor/initial-admin-password   # on the appliance
+veloctl login --username admin                      # prompts for the password
 
-# Recommended: change the default admin password immediately
-veloctl user update --username admin --password "<new-strong-password>"
+# Required before any other API call: replace the bootstrap password
+# (or simply sign in to the Web UI, which prompts for it)
+veloctl passwd
 
-# Check appliance health, SPDK connection, and hugepage status
+# Check appliance health, SPDK connection, hugepages, and configuration warnings
 veloctl system status
 ```
+
+`VELOCOR_INSECURE=true` (or `--insecure`) skips certificate verification entirely; use it only in a lab.
 
 ### 2. Discover & Claim Physical Disks
 
@@ -281,12 +312,12 @@ veloctl disk claim nvme-0000-00-04-0
 ### 3. Create a Storage Pool & Network Portal
 
 ```bash
-# Create an SPDK RAID1 pool with a 64 KiB cluster size
+# Create an SPDK RAID1 pool (1 MiB clusters, the default)
 veloctl pool create \
   --name flash-pool-0 \
   --raid RAID1 \
   --disks nvme-0000-00-03-0,nvme-0000-00-04-0 \
-  --cluster-size 65536
+  --cluster-size 1048576
 
 veloctl pool list
 
@@ -303,14 +334,26 @@ veloctl portal list
 # Create a 50 GiB thin-provisioned volume
 veloctl volume create --name app-data --pool <pool-id> --size-gib 50 --thin=true
 
-# Export the volume over NVMe-oF/TCP
+# Say which hosts may connect (NQN from /etc/nvme/hostnqn on each host)
+veloctl initiator-group create --name app-hosts --nqns nqn.2014-08.org.nvmexpress:uuid:<host-uuid>
+
+# Export the volume over NVMe-oF/TCP to that group only
 veloctl export create \
   --name exp-app-data \
   --volume <volume-id> \
   --protocol NVMEOF_TCP \
   --portals <portal-id> \
-  --allow-any-host=true
+  --initiator-groups <initiator-group-id>
+
+# Later: add a host to the group (re-applied to every export using it), see who's connected,
+# or change who may reach one export
+veloctl initiator-group update <initiator-group-id> --nqns nqn...:host-a,nqn...:host-b
+veloctl export connections <export-id>
+veloctl export access <export-id> --initiator-groups <id1>,<id2>
+veloctl volume usage <volume-id>
 ```
+
+Exports with no initiator groups are refused unless `--allow-any-host` is given explicitly, which lets anyone who can reach the portal connect.
 
 ---
 
@@ -327,7 +370,34 @@ The Velocor CSI driver (`velocor-csi`) integrates Kubernetes clusters with a Vel
 - **CoW Volume Snapshots & Restores** (`VolumeSnapshot`)
 - **Volume Cloning** (`dataSource` referencing an existing `PersistentVolumeClaim` or `VolumeSnapshot`)
 - **Volume Group Snapshots** (`VolumeGroupSnapshot` via CSI `GroupController`)
-- **Changed Block Tracking (CBT)** (`SnapshotMetadata` service implementing `GetMetadataAllocated` and `GetMetadataDelta`, KEP-3314)
+
+#### Shared volumes and KubeVirt live migration
+
+- **ReadWriteMany (and ReadOnlyMany) are supported for raw block volumes (`volumeMode: Block`)**,
+  which is what a KubeVirt VM needs to live-migrate: during a migration the VM's disk is used by
+  the source and the target node at once. A shared volume gets one export (one NVMe-oF
+  subsystem) that each node using it is allowed into; nodes are added and removed while the
+  others stay connected. Whatever shares the device must coordinate its writes and use direct
+  I/O, as QEMU does.
+- **A ReadWriteMany filesystem is refused:** a filesystem written from two nodes is corrupted.
+- **CDI StorageProfile:** on clusters with KubeVirt CDI, the chart's hook Job fills in each
+  Velocor StorageClass's StorageProfile (`cdi.storageProfile` in `values.yaml`): ReadWriteMany
+  block first, driver clones (`csi-clone`), snapshots for golden images. DataVolumes then need no
+  access or volume mode of their own, and VMs created from them are live-migratable.
+
+#### Changed Block Tracking (CBT): not yet supported
+
+The driver does **not** implement the CSI `SnapshotMetadata` service (KEP-3314) and does not
+advertise the `SNAPSHOT_METADATA_SERVICE` capability, so backup tools such as Kasten take full
+backups of Velocor volumes rather than incremental, CBT-based ones. Full backups and restores
+work normally.
+
+The reason: the SPDK release Velocor ships (v26.09) has no RPC that reports which clusters of a
+snapshot hold data, which is what CBT needs. Reporting changed blocks it can't actually measure
+would let an incremental backup silently miss data, so the feature stays off until it can be
+built correctly (an SPDK extension is planned; see `TODO.md`, item L-2). The appliance's
+`/api/v1/snapshots/{id}/blocks:allocated` and `blocks:changed` endpoints return
+`501 Not Implemented` for the same reason.
 
 ---
 
@@ -378,20 +448,21 @@ kubectl create namespace velocor-csi
 kubectl -n velocor-csi create secret generic velocor-csi-auth \
   --from-literal=VELOCOR_ENDPOINT="https://<velocor-appliance-ip>:8443" \
   --from-literal=VELOCOR_TOKEN="velo_pat_<your-token>" \
-  --from-literal=VELOCOR_INSECURE="true"
+  --from-file=VELOCOR_CA_CERT=./velocor-tls.crt   # copy of /var/lib/velocor/tls.crt from the appliance
 ```
 
 | Environment Key | Description |
 | :--- | :--- |
 | `VELOCOR_ENDPOINT` | Base HTTPS URL of the `velod` API on the Velocor appliance (e.g., `https://10.0.2.15:8443`). |
 | `VELOCOR_TOKEN` | Personal/Service Access Token (`velo_pat_...`) with role `CSI_PROVISIONER` or `ADMIN`. |
-| `VELOCOR_INSECURE` | Set to `"true"` when using the appliance's auto-generated self-signed TLS certificate, or `"false"` if using a trusted CA certificate. |
+| `VELOCOR_CA_CERT` | PEM certificate used to verify the appliance. For the auto-generated self-signed certificate, use the contents of `/var/lib/velocor/tls.crt`. Not needed when the appliance uses a certificate from a CA the cluster already trusts. |
+| `VELOCOR_INSECURE` | Optional. `"true"` disables TLS verification entirely, exposing the API token to anyone on the network path. Lab use only. |
 
 ---
 
 ### 4. Deploy the CSI Driver & Snapshot Classes
 
-> **Custom Registry & Release Manifests:** If you pushed `velocor-csi` to a custom registry, update the `image:` field in [deploy/k8s/csi/velocor-csi.yaml](deploy/k8s/csi/velocor-csi.yaml) (default: `registry.xphyrlab.net/velocor/velocor-csi:latest`). For tagged GitHub Releases, a pre-configured `velocor-csi.yaml` pointing to `ghcr.io/<owner>/velocor-csi:<tag>` is attached directly to the release assets.
+> **Custom Registry & Release Manifests:** If you pushed `velocor-csi` to a custom registry, update the `image:` field in [deploy/k8s/csi/velocor-csi.yaml](deploy/k8s/csi/velocor-csi.yaml) (default: `ghcr.io/xphyr/velocor-csi:latest`). For tagged GitHub Releases, a `velocor-csi.yaml` pinned to that release's image digest is attached to the release; the Helm chart from a release pins the digest too (`image.digest`).
 
 Apply the CSI driver manifest (creates the `CSIDriver`, RBAC roles, `velocor-csi-controller` Deployment, `velocor-csi-node` DaemonSet, and the `velocor-nvme-tcp` and `velocor-iscsi` StorageClasses):
 
@@ -513,7 +584,7 @@ spec:
 
 ## Documentation
 
-- [Architecture Guide](docs/ARCHITECTURE.md) — Decoupled control/data planes, two-tier flash management, filter bdevs, CBT, and unified API design.
+- [Architecture Guide](docs/ARCHITECTURE.md) — Decoupled control/data planes, two-tier flash management, filter bdevs, snapshots, and unified API design.
 - [Implementation Roadmap](docs/ROADMAP.md) — Phase-by-phase breakdown of completed subsystems.
 - [QEMU/KVM 2-Node Lab Guide](hack/vm-lab/README.md) — Local virtualized SAN + initiator testing instructions.
 

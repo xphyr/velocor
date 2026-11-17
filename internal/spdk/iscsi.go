@@ -1,6 +1,9 @@
 package spdk
 
-import "context"
+import (
+	"context"
+	"errors"
+)
 
 // IscsiPortal represents an IP:Port endpoint inside an SPDK iSCSI Portal Group.
 type IscsiPortal struct {
@@ -81,11 +84,9 @@ func (c *Client) IscsiGetInitiatorGroups(ctx context.Context) ([]IscsiInitiatorG
 
 // IscsiCreateInitiatorGroup creates an iSCSI initiator group with allowed IQNs ("ANY" or list) and CIDR netmasks.
 func (c *Client) IscsiCreateInitiatorGroup(ctx context.Context, tag int, initiators, netmasks []string) error {
-	if len(initiators) == 0 {
-		initiators = []string{"ANY"}
-	}
-	if len(netmasks) == 0 {
-		netmasks = []string{"0.0.0.0/0"}
+	// Never silently widen an ACL: callers must state "ANY" explicitly.
+	if len(initiators) == 0 || len(netmasks) == 0 {
+		return errors.New("iscsi initiator group requires at least one initiator and one netmask")
 	}
 	params := map[string]any{
 		"tag":        tag,
@@ -141,4 +142,58 @@ func (c *Client) IscsiCreateTargetNode(
 func (c *Client) IscsiDeleteTargetNode(ctx context.Context, name string) error {
 	params := map[string]any{"name": name}
 	return c.Call(ctx, "iscsi_delete_target_node", params, nil)
+}
+
+// IscsiTargetNodeAddPgIgMaps adds portal-group/initiator-group mappings to an existing target node
+// without disrupting active sessions.
+func (c *Client) IscsiTargetNodeAddPgIgMaps(ctx context.Context, name string, maps []IscsiPgIgMap) error {
+	params := map[string]any{"name": name, "pg_ig_maps": maps}
+	return c.Call(ctx, "iscsi_target_node_add_pg_ig_maps", params, nil)
+}
+
+// IscsiTargetNodeRemovePgIgMaps removes portal-group/initiator-group mappings from a target node.
+func (c *Client) IscsiTargetNodeRemovePgIgMaps(ctx context.Context, name string, maps []IscsiPgIgMap) error {
+	params := map[string]any{"name": name, "pg_ig_maps": maps}
+	return c.Call(ctx, "iscsi_target_node_remove_pg_ig_maps", params, nil)
+}
+
+// IscsiInitiatorGroupAddInitiators adds initiators/netmasks to an existing initiator group.
+func (c *Client) IscsiInitiatorGroupAddInitiators(ctx context.Context, tag int, initiators, netmasks []string) error {
+	params := map[string]any{"tag": tag}
+	if len(initiators) > 0 {
+		params["initiators"] = initiators
+	}
+	if len(netmasks) > 0 {
+		params["netmasks"] = netmasks
+	}
+	return c.Call(ctx, "iscsi_initiator_group_add_initiators", params, nil)
+}
+
+// IscsiInitiatorGroupRemoveInitiators removes initiators/netmasks from an existing initiator group.
+func (c *Client) IscsiInitiatorGroupRemoveInitiators(ctx context.Context, tag int, initiators, netmasks []string) error {
+	params := map[string]any{"tag": tag}
+	if len(initiators) > 0 {
+		params["initiators"] = initiators
+	}
+	if len(netmasks) > 0 {
+		params["netmasks"] = netmasks
+	}
+	return c.Call(ctx, "iscsi_initiator_group_remove_initiators", params, nil)
+}
+
+// IscsiConnection is an active iSCSI session connection.
+type IscsiConnection struct {
+	ID             int    `json:"id"`
+	InitiatorAddr  string `json:"initiator_addr"`
+	TargetAddr     string `json:"target_addr"`
+	TargetNodeName string `json:"target_node_name"`
+}
+
+// IscsiGetConnections lists active iSCSI connections.
+func (c *Client) IscsiGetConnections(ctx context.Context) ([]IscsiConnection, error) {
+	var res []IscsiConnection
+	if err := c.Call(ctx, "iscsi_get_connections", nil, &res); err != nil {
+		return nil, err
+	}
+	return res, nil
 }

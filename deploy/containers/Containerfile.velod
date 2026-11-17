@@ -1,30 +1,31 @@
-# Control-Plane Container: velod & veloctl built on Fedora 45
-FROM quay.io/fedora/fedora:45 AS builder
+# Control-plane container: velod (and veloctl, which the OS image copies out of this image).
+#
+# The Go toolchain is the official image matching go.mod's `toolchain` line, pinned by digest
+# (hack/check-pins.sh enforces both), so the shipped binaries come from the same Go release CI
+# tests with. The runtime follows Fedora's rolling fedora-minimal 45 (resolved to a digest per
+# build by `make`, recorded in the org.opencontainers.image.base.* labels).
+ARG FEDORA_MINIMAL_IMAGE=quay.io/fedora/fedora-minimal:45
+FROM docker.io/library/golang:1.26.11@sha256:f6946db66567acc1497655237e58f06ec3a57478a5e0d67fca29d2ffcf2ea136 AS builder
 
-RUN dnf install -y golang git && dnf clean all
-
+ENV CGO_ENABLED=0 GOTOOLCHAIN=local
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 
 COPY . .
-ARG VERSION=v0.1.0
+ARG VERSION=unknown
 ARG COMMIT=unknown
 ARG BUILD_TIME=unknown
+RUN LDFLAGS="-s -w -X github.com/velocor/velocor/internal/version.Version=${VERSION} -X github.com/velocor/velocor/internal/version.Commit=${COMMIT} -X github.com/velocor/velocor/internal/version.BuildTime=${BUILD_TIME}" && \
+    go build -trimpath -ldflags="${LDFLAGS}" -o /out/velod ./cmd/velod && \
+    go build -trimpath -ldflags="${LDFLAGS}" -o /out/veloctl ./cmd/veloctl
 
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
-    go build -ldflags="-s -w -X github.com/velocor/velocor/internal/version.Version=${VERSION} -X github.com/velocor/velocor/internal/version.Commit=${COMMIT} -X github.com/velocor/velocor/internal/version.BuildTime=${BUILD_TIME}" \
-    -o /out/velod ./cmd/velod && \
-    CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
-    go build -ldflags="-s -w -X github.com/velocor/velocor/internal/version.Version=${VERSION} -X github.com/velocor/velocor/internal/version.Commit=${COMMIT} -X github.com/velocor/velocor/internal/version.BuildTime=${BUILD_TIME}" \
-    -o /out/veloctl ./cmd/veloctl
-
-FROM quay.io/fedora/fedora-minimal:45
+FROM ${FEDORA_MINIMAL_IMAGE}
 
 RUN mkdir -p /var/lib/velocor /run/velocor
 COPY --from=builder /out/velod /usr/bin/velod
 COPY --from=builder /out/veloctl /usr/bin/veloctl
 
 EXPOSE 8443
+# Arguments come from the quadlet (deploy/quadlets/velocor-velod.container), the only source.
 ENTRYPOINT ["/usr/bin/velod"]
-CMD ["--listen", ":8443", "--db", "/var/lib/velocor/velocor.db", "--spdk-socket", "/run/velocor/spdk.sock", "--hugepages-mb", "1024"]

@@ -1,0 +1,113 @@
+{{- /*
+CDI StorageProfiles for the Velocor StorageClasses. CDI owns those objects (it creates one per
+StorageClass), so they can't be Helm resources: a post-install/post-upgrade hook Job patches the
+settings in, after waiting for CDI to create each profile. See values.yaml (cdi.storageProfile).
+*/ -}}
+{{- $sp := .Values.cdi.storageProfile }}
+{{- $enabled := or (eq (toString $sp.enabled) "true") (and (eq (toString $sp.enabled) "auto") (.Capabilities.APIVersions.Has "cdi.kubevirt.io/v1beta1")) }}
+{{- $classes := list }}
+{{- if .Values.storageClasses.nvmeTcp.enabled }}{{ $classes = append $classes .Values.storageClasses.nvmeTcp.name }}{{ end }}
+{{- if .Values.storageClasses.iscsi.enabled }}{{ $classes = append $classes .Values.storageClasses.iscsi.name }}{{ end }}
+{{- if and $enabled $classes }}
+{{- $name := printf "%s-storageprofile" (include "velocor-csi.name" .) }}
+{{- $spec := dict "claimPropertySets" $sp.claimPropertySets "cloneStrategy" $sp.cloneStrategy "dataImportCronSourceFormat" $sp.dataImportCronSourceFormat }}
+{{- if .Values.snapshots.volumeSnapshotClass.enabled }}{{ $_ := set $spec "snapshotClass" .Values.snapshots.volumeSnapshotClass.name }}{{ end }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "velocor-csi.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/hook: post-install,post-upgrade
+    helm.sh/hook-weight: "-5"
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "velocor-csi.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/hook: post-install,post-upgrade
+    helm.sh/hook-weight: "-5"
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+rules:
+  - apiGroups: [cdi.kubevirt.io]
+    resources: [storageprofiles]
+    resourceNames:
+      {{- range $classes }}
+      - {{ . }}
+      {{- end }}
+    verbs: [get, patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "velocor-csi.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/hook: post-install,post-upgrade
+    helm.sh/hook-weight: "-5"
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ $name }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ $name }}
+    namespace: {{ .Release.Namespace }}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "velocor-csi.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/hook: post-install,post-upgrade
+    helm.sh/hook-weight: "0"
+    # A failed Job is kept for its log.
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 2
+  activeDeadlineSeconds: 600
+  template:
+    metadata:
+      labels:
+        {{- include "velocor-csi.labels" . | nindent 8 }}
+    spec:
+      serviceAccountName: {{ $name }}
+      restartPolicy: Never
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: storageprofile
+          image: {{ include "velocor-csi.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - storageprofile
+            {{- range $classes }}
+            - {{ . }}
+            {{- end }}
+          env:
+            - name: STORAGEPROFILE_SPEC
+              value: {{ toJson $spec | quote }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+          resources:
+            requests: {cpu: 10m, memory: 32Mi}
+            limits: {memory: 64Mi}
+{{- end }}

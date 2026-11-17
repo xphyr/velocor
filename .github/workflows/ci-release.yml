@@ -1,440 +1,358 @@
 name: Build, Test & Release Velocor
 
+# Build logic lives in the Makefile; this workflow only decides what to call it with.
+#  - pull requests: lint, unit + integration tests, the SPDK unit tests of our SPDK patches, and
+#    a full image build pushed to a throwaway local registry (so the OS image build is exercised
+#    too). Nothing is published.
+#  - main: images as sha-<sha> (+ moving tag "main"), signed and attested; dev Helm chart.
+#  - v* tags: release images (vX.Y.Z, X.Y, latest), chart, CLI binaries, GitHub release.
+# Every action is pinned to a commit SHA (hack/check-pins.sh enforces it) and every job gets
+# only the permissions it needs. The Fedora base images follow Fedora's rolling release tag; each
+# run resolves them once (BASE_PIN_DIR) and records the digests next to the image digests.
+
 on:
   push:
-    branches:
-      - main
-    tags:
-      - "v*"
+    branches: [main]
+    tags: ["v*"]
   pull_request:
-    branches:
-      - main
+    branches: [main]
   workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   REGISTRY: ghcr.io
 
-permissions:
-  contents: read
-  packages: write
-  id-token: write
-  attestations: write
-
 jobs:
-  test:
-    name: Test & Verify Binaries
-    runs-on: ubuntu-latest
+  lint:
+    name: Lint
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
-          fetch-depth: 0
-
-      - name: Set up Go
-        uses: actions/setup-go@v6
+          persist-credentials: false
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
           go-version-file: go.mod
-          cache: true
-
-      - name: Run go vet
-        run: go vet ./...
-
-      - name: Run unit & CSI sanity tests
-        run: make test
-
-      - name: Build all binaries (velod, veloctl, velocor-csi)
-        run: make build
-
-  build-cli:
-    name: Build veloctl CLI Release Binaries
-    needs: test
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-
-      - name: Set up Go
-        uses: actions/setup-go@v6
-        with:
-          go-version-file: go.mod
-          cache: true
-
-      - name: Cross-compile veloctl and package archives
+      - name: Pins (base images, Go toolchain, actions)
+        run: make check-pins
+      - name: actionlint
+        run: docker run --rm -v "$PWD:/repo" -w /repo docker.io/rhysd/actionlint@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667 -no-color
+      - name: go vet
         run: |
-          set -euo pipefail
+          go vet ./...
+          go vet -tags integration ./internal/integration/
+      - uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+        with:
+          version: v2.15.0
+          args: --build-tags integration
+      - name: shellcheck
+        run: make shellcheck
+      - uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5.1.0
+      - name: helm lint
+        run: |
+          helm lint deploy/charts/velocor-csi
+          # The CDI StorageProfile hook renders only where CDI exists: render it explicitly.
+          helm template velocor-csi deploy/charts/velocor-csi --api-versions cdi.kubevirt.io/v1beta1 |
+            yq -e 'select(.kind == "Job") | .metadata.name' >/dev/null
+
+  test:
+    name: Unit & CSI sanity tests
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+      - run: make test
+      - run: make build
+
+  veloctl:
+    name: veloctl binaries
+    needs: [lint, test]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+      - name: Cross-compile veloctl
+        run: |
           mkdir -p dist
-
-          VERSION="$(git describe --tags --always --dirty 2>/dev/null || echo 'v0.1.0-dev')"
-          COMMIT="$(git rev-parse --short HEAD 2>/dev/null || echo 'none')"
-          BUILD_TIME="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
-          LDFLAGS="-s -w -X github.com/velocor/velocor/internal/version.Version=${VERSION} -X github.com/velocor/velocor/internal/version.Commit=${COMMIT} -X github.com/velocor/velocor/internal/version.BuildTime=${BUILD_TIME}"
-
-          TARGETS=(
-            "linux:amd64"
-            "linux:arm64"
-            "darwin:amd64"
-            "darwin:arm64"
-            "windows:amd64"
-          )
-
-          for target in "${TARGETS[@]}"; do
-            GOOS="${target%%:*}"
-            GOARCH="${target##*:}"
-            STAGE_DIR="$(mktemp -d)"
-            BIN_NAME="veloctl"
-            if [[ "${GOOS}" == "windows" ]]; then
-              BIN_NAME="veloctl.exe"
-            fi
-
-            echo "Building ${BIN_NAME} for ${GOOS}/${GOARCH} (${VERSION})..."
-            CGO_ENABLED=0 GOOS="${GOOS}" GOARCH="${GOARCH}" \
-              go build -trimpath -ldflags "${LDFLAGS}" -o "${STAGE_DIR}/${BIN_NAME}" ./cmd/veloctl
-
-            cp README.md "${STAGE_DIR}/"
-
-            if [[ "${GOOS}" == "windows" ]]; then
-              (cd "${STAGE_DIR}" && zip -q "${GITHUB_WORKSPACE}/dist/veloctl-${GOOS}-${GOARCH}.zip" "${BIN_NAME}" README.md)
+          VERSION="$(git describe --tags --always --dirty)"
+          LDFLAGS="-s -w -X github.com/velocor/velocor/internal/version.Version=${VERSION} -X github.com/velocor/velocor/internal/version.Commit=$(git rev-parse --short=7 HEAD) -X github.com/velocor/velocor/internal/version.BuildTime=$(git log -1 --format=%cI)"
+          for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64; do
+            GOOS="${target%/*}" GOARCH="${target#*/}"
+            stage="$(mktemp -d)"; bin=veloctl; [[ "$GOOS" == windows ]] && bin=veloctl.exe
+            CGO_ENABLED=0 GOOS="$GOOS" GOARCH="$GOARCH" go build -trimpath -ldflags "$LDFLAGS" -o "$stage/$bin" ./cmd/veloctl
+            cp README.md "$stage/"
+            if [[ "$GOOS" == windows ]]; then
+              (cd "$stage" && zip -q "$GITHUB_WORKSPACE/dist/veloctl-$GOOS-$GOARCH.zip" "$bin" README.md)
             else
-              tar -C "${STAGE_DIR}" -czf "${GITHUB_WORKSPACE}/dist/veloctl-${GOOS}-${GOARCH}.tar.gz" "${BIN_NAME}" README.md
+              tar -C "$stage" -czf "dist/veloctl-$GOOS-$GOARCH.tar.gz" "$bin" README.md
             fi
-            rm -rf "${STAGE_DIR}"
           done
-
-          (cd dist && sha256sum veloctl-* > checksums.txt)
           ls -lh dist/
-
-      - name: Upload veloctl release artifacts
-        uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: veloctl-binaries
           path: dist/*
           if-no-files-found: error
 
-  build-containers:
-    name: Build Container (${{ matrix.image }})
-    needs: test
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - image: velocor-velod
-            containerfile: deploy/containers/Containerfile.velod
-            platforms: linux/amd64
-          - image: velocor-spdk
-            containerfile: deploy/containers/Containerfile.spdk
-            platforms: linux/amd64
-          - image: velocor-csi
-            containerfile: deploy/containers/Containerfile.csi
-            platforms: linux/amd64,linux/arm64
+  # SPDK's unit tests for the libraries our carried SPDK patches touch (deploy/containers/
+  # spdk-patches): a separate SPDK compile with unit tests enabled. Images aren't published
+  # unless they pass.
+  spdk-unit-tests:
+    name: SPDK patch unit tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - run: make spdk-unit-tests
+
+  # One job builds every image so the OS image embeds the spdk/velod images of this very run
+  # (pinned by digest), and SPDK is compiled once for both the integration tests and the image.
+  images:
+    name: Images (integration tests, build, push)
+    needs: [lint, test, spdk-unit-tests]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      # Resolve each rolling Fedora base once for this run: the integration-tested SPDK image and
+      # the pushed one then share one base and one SPDK compile.
+      BASE_PIN_DIR: bin/base-pins
+    permissions:
+      contents: read
+      packages: write     # push to ghcr.io (not used for pull requests)
+      id-token: write     # keyless cosign signing and attestations
+      attestations: write
+    outputs:
+      image_prefix: ${{ steps.vars.outputs.image_prefix }}
+      tag: ${{ steps.vars.outputs.tag }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+        with:
+          platforms: arm64
 
-      - name: Resolve build version metadata
+      - name: Free disk space (SPDK build + bootc image)
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL && df -h /
+
+      - name: Decide registry and tags
         id: vars
-        run: |
-          OWNER_LC="$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
-          VERSION="$(git describe --tags --always 2>/dev/null || echo 'v0.1.0-dev')"
-          COMMIT="$(git rev-parse --short HEAD 2>/dev/null || echo 'none')"
-          BUILD_TIME="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
-          echo "owner_lc=${OWNER_LC}" >> "${GITHUB_OUTPUT}"
-          echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
-          echo "commit=${COMMIT}" >> "${GITHUB_OUTPUT}"
-          echo "build_time=${BUILD_TIME}" >> "${GITHUB_OUTPUT}"
-
-      - name: Set up QEMU (for multi-arch builds)
-        if: contains(matrix.platforms, 'arm64')
-        uses: docker/setup-qemu-action@v4
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
-
-      - name: Log in to GitHub Container Registry
-        if: github.event_name != 'pull_request'
-        uses: docker/login-action@v4
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Extract Docker metadata for ${{ matrix.image }}
-        id: meta
-        uses: docker/metadata-action@v6
-        with:
-          images: ${{ env.REGISTRY }}/${{ steps.vars.outputs.owner_lc }}/${{ matrix.image }}
-          tags: |
-            type=ref,event=branch
-            type=ref,event=pr
-            type=ref,event=tag
-            type=semver,pattern={{version}}
-            type=semver,pattern=v{{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=sha,prefix=sha-
-            type=raw,value=latest,enable={{is_default_branch}}
-
-      - name: Build and push ${{ matrix.image }}
-        id: build
-        uses: docker/build-push-action@v7
-        with:
-          context: .
-          file: ${{ matrix.containerfile }}
-          platforms: ${{ matrix.platforms }}
-          push: ${{ github.event_name != 'pull_request' }}
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          sbom: ${{ github.event_name != 'pull_request' }}
-          provenance: ${{ github.event_name != 'pull_request' && 'mode=max' || false }}
-          build-args: |
-            VERSION=${{ steps.vars.outputs.version }}
-            COMMIT=${{ steps.vars.outputs.commit }}
-            BUILD_TIME=${{ steps.vars.outputs.build_time }}
-          cache-from: type=gha,scope=${{ matrix.image }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.image }}
-
-      - name: Install Cosign
-        if: github.event_name != 'pull_request'
-        uses: sigstore/cosign-installer@v4.1.3
-
-      - name: Sign ${{ matrix.image }} image with Cosign (keyless)
-        if: github.event_name != 'pull_request'
         env:
-          IMAGE_DIGEST: ${{ env.REGISTRY }}/${{ steps.vars.outputs.owner_lc }}/${{ matrix.image }}@${{ steps.build.outputs.digest }}
-        run: cosign sign --yes "${IMAGE_DIGEST}"
-
-  build-os:
-    name: Build Bootc Appliance OS (velocor-os)
-    needs:
-      - build-cli
-      - build-containers
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-
-      - name: Download veloctl linux-amd64 binary for OS image
-        uses: actions/download-artifact@v7
-        with:
-          name: veloctl-binaries
-          path: /tmp/veloctl-dist
-
-      - name: Prepare velod-bin build context and Quadlet image references
-        id: vars
+          EVENT: ${{ github.event_name }}
+          PR: ${{ github.event.pull_request.number }}
         run: |
-          mkdir -p /tmp/velod-rootfs/usr/bin
-          tar -xzf /tmp/veloctl-dist/veloctl-linux-amd64.tar.gz -C /tmp/velod-rootfs/usr/bin veloctl
-          chmod 0755 /tmp/velod-rootfs/usr/bin/veloctl
-
-          OWNER_LC="$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
-          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
-            QUADLET_TAG="${GITHUB_REF_NAME}"
+          owner="${GITHUB_REPOSITORY_OWNER,,}"
+          if [[ "$EVENT" == pull_request ]]; then
+            prefix=localhost:5000/velocor; tag="pr-${PR}"; extra=""; release=false; insecure=true
+          elif [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            v="${GITHUB_REF_NAME}"; minor="$(cut -d. -f1,2 <<<"${v#v}")"
+            prefix="$REGISTRY/$owner"; tag="$v"; extra="$minor latest"; release=true; insecure=false
           else
-            QUADLET_TAG="latest"
+            prefix="$REGISTRY/$owner"; tag="sha-${GITHUB_SHA::7}"; extra="${GITHUB_REF_NAME//\//-}"; release=false; insecure=false
           fi
-          echo "owner_lc=${OWNER_LC}" >> "${GITHUB_OUTPUT}"
-          echo "velod_image=${REGISTRY}/${OWNER_LC}/velocor-velod:${QUADLET_TAG}" >> "${GITHUB_OUTPUT}"
-          echo "spdk_image=${REGISTRY}/${OWNER_LC}/velocor-spdk:${QUADLET_TAG}" >> "${GITHUB_OUTPUT}"
+          {
+            echo "image_prefix=$prefix"; echo "tag=$tag"; echo "extra=$extra"
+            echo "release=$release"; echo "insecure=$insecure"
+          } >> "$GITHUB_OUTPUT"
 
-      - name: Set up QEMU (for multi-arch builds)
-        if: contains(matrix.platforms, 'arm64')
-        uses: docker/setup-qemu-action@v4
+      - name: Throwaway registry (pull requests)
+        if: github.event_name == 'pull_request'
+        run: podman run -d --name registry -p 5000:5000 docker.io/library/registry:2@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
-
-      - name: Log in to GitHub Container Registry
-        if: github.event_name != 'pull_request'
-        uses: docker/login-action@v4
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Prepare preloaded container image archives for bootc
-        run: |
-          mkdir -p /tmp/preload-images/preload-images
-          if [[ "${{ github.event_name }}" != "pull_request" ]]; then
-            docker pull "${{ steps.vars.outputs.spdk_image }}"
-            docker save -o /tmp/preload-images/preload-images/velocor-spdk.tar "${{ steps.vars.outputs.spdk_image }}"
-            docker pull "${{ steps.vars.outputs.velod_image }}"
-            docker save -o /tmp/preload-images/preload-images/velocor-velod.tar "${{ steps.vars.outputs.velod_image }}"
-          fi
-
-      - name: Extract Docker metadata for velocor-os
-        id: meta
-        uses: docker/metadata-action@v6
-        with:
-          images: ${{ env.REGISTRY }}/${{ steps.vars.outputs.owner_lc }}/velocor-os
-          tags: |
-            type=ref,event=branch
-            type=ref,event=pr
-            type=ref,event=tag
-            type=semver,pattern={{version}}
-            type=semver,pattern=v{{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=sha,prefix=sha-
-            type=raw,value=latest,enable={{is_default_branch}}
-
-      - name: Build and push velocor-os (bootc)
-        id: build
-        uses: docker/build-push-action@v7
-        with:
-          context: .
-          file: deploy/bootc/Containerfile
-          push: ${{ github.event_name != 'pull_request' }}
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          sbom: ${{ github.event_name != 'pull_request' }}
-          provenance: ${{ github.event_name != 'pull_request' && 'mode=max' || false }}
-          build-contexts: |
-            velod-bin=/tmp/velod-rootfs
-            preload-images=/tmp/preload-images
-          build-args: |
-            VELOCTL_FROM=velod-bin
-            PRELOAD_IMAGES_FROM=preload-images
-            PRELOAD_IMAGES=${{ github.event_name != 'pull_request' }}
-            VELOD_IMAGE=${{ steps.vars.outputs.velod_image }}
-            SPDK_IMAGE=${{ steps.vars.outputs.spdk_image }}
-          cache-from: type=gha,scope=velocor-os
-          cache-to: type=gha,mode=max,scope=velocor-os
-
-      - name: Install Cosign
-        if: github.event_name != 'pull_request'
-        uses: sigstore/cosign-installer@v4.1.3
-
-      - name: Sign velocor-os image with Cosign (keyless)
+      - name: Log in to ghcr.io
         if: github.event_name != 'pull_request'
         env:
-          IMAGE_DIGEST: ${{ env.REGISTRY }}/${{ steps.vars.outputs.owner_lc }}/velocor-os@${{ steps.build.outputs.digest }}
-        run: cosign sign --yes "${IMAGE_DIGEST}"
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          podman login -u "$GITHUB_ACTOR" --password-stdin "$REGISTRY" <<<"$TOKEN"
+          docker login -u "$GITHUB_ACTOR" --password-stdin "$REGISTRY" <<<"$TOKEN"   # cosign, attest
 
-  build-helm:
-    name: Lint, Package & Push CSI Helm Chart
-    needs: test
-    runs-on: ubuntu-latest
+      - name: Integration tests against real SPDK
+        run: make test-integration
+
+      - name: Build and push images
+        env:
+          IMAGE_PREFIX: ${{ steps.vars.outputs.image_prefix }}
+          TAG: ${{ steps.vars.outputs.tag }}
+          EXTRA_TAGS: ${{ steps.vars.outputs.extra }}
+          RELEASE: ${{ steps.vars.outputs.release }}
+          INSECURE_REGISTRY: ${{ steps.vars.outputs.insecure }}
+        run: |
+          args=(IMAGE_PREFIX="$IMAGE_PREFIX" TAG="$TAG" EXTRA_TAGS="$EXTRA_TAGS" RELEASE="$RELEASE"
+                INSECURE_REGISTRY="$INSECURE_REGISTRY" "CSI_PLATFORMS=linux/amd64,linux/arm64")
+          [[ "$RELEASE" == true ]] && args+=(VERSION="$TAG")
+          make push "${args[@]}"
+          {
+            for f in bin/digests/velocor-*; do echo "$IMAGE_PREFIX/$(basename "$f")@$(cat "$f")  # $TAG"; done
+            for f in "$BASE_PIN_DIR"/*; do echo "# base image $(basename "$f"): $(cat "$f")"; done
+          } | tee bin/digests/refs.txt
+
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: image-digests
+          path: bin/digests/
+          if-no-files-found: error
+
+      - uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
+        if: github.event_name != 'pull_request'
+      - name: Sign images (keyless)
+        if: github.event_name != 'pull_request'
+        env:
+          IMAGE_PREFIX: ${{ steps.vars.outputs.image_prefix }}
+        run: for n in velocor-spdk velocor-velod velocor-csi velocor-os; do cosign sign --yes "$IMAGE_PREFIX/$n@$(cat "bin/digests/$n")"; done
+
+      - name: Read digests for attestations
+        if: github.event_name != 'pull_request'
+        id: digests
+        run: for n in velocor-spdk velocor-velod velocor-csi velocor-os; do echo "${n#velocor-}=$(cat "bin/digests/$n")" >> "$GITHUB_OUTPUT"; done
+      - uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        if: github.event_name != 'pull_request'
+        with:
+          subject-name: ${{ steps.vars.outputs.image_prefix }}/velocor-spdk
+          subject-digest: ${{ steps.digests.outputs.spdk }}
+          push-to-registry: true
+      - uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        if: github.event_name != 'pull_request'
+        with:
+          subject-name: ${{ steps.vars.outputs.image_prefix }}/velocor-velod
+          subject-digest: ${{ steps.digests.outputs.velod }}
+          push-to-registry: true
+      - uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        if: github.event_name != 'pull_request'
+        with:
+          subject-name: ${{ steps.vars.outputs.image_prefix }}/velocor-csi
+          subject-digest: ${{ steps.digests.outputs.csi }}
+          push-to-registry: true
+      - uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        if: github.event_name != 'pull_request'
+        with:
+          subject-name: ${{ steps.vars.outputs.image_prefix }}/velocor-os
+          subject-digest: ${{ steps.digests.outputs.os }}
+          push-to-registry: true
+
+  helm:
+    name: Helm chart
+    needs: images
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write   # push the chart to ghcr.io (not for pull requests)
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v6
-
-      - name: Set up Helm
-        uses: azure/setup-helm@v5
-
-      - name: Lint and package velocor-csi chart
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5.1.0
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: image-digests
+          path: digests
+      - name: Package (image pinned by digest)
         id: chart
+        env:
+          IMAGE_PREFIX: ${{ needs.images.outputs.image_prefix }}
+          TAG: ${{ needs.images.outputs.tag }}
         run: |
-          set -euo pipefail
-          mkdir -p dist
-          OWNER_LC="$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
-          CHART_DIR="deploy/charts/velocor-csi"
-
-          helm lint "${CHART_DIR}"
-          sed -i "s|repository: ghcr.io/velocor/velocor-csi|repository: ${REGISTRY}/${OWNER_LC}/velocor-csi|g" "${CHART_DIR}/values.yaml"
-
-          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
-            CHART_VER="${GITHUB_REF_NAME#v}"
-            APP_VER="${GITHUB_REF_NAME}"
-          else
-            CHART_VER="0.1.0-dev+${GITHUB_SHA::7}"
-            APP_VER="latest"
-          fi
-
-          helm package "${CHART_DIR}" --version "${CHART_VER}" --app-version "${APP_VER}" -d dist
-          CHART_PKG="$(ls dist/velocor-csi-*.tgz)"
-          echo "owner_lc=${OWNER_LC}" >> "${GITHUB_OUTPUT}"
-          echo "chart_pkg=${CHART_PKG}" >> "${GITHUB_OUTPUT}"
-
-      - name: Upload Helm chart artifact
-        uses: actions/upload-artifact@v6
+          chart=deploy/charts/velocor-csi
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then ver="${GITHUB_REF_NAME#v}"; else ver="0.0.0-${TAG}"; fi
+          yq -i ".image.repository = \"$IMAGE_PREFIX/velocor-csi\" | .image.tag = \"$TAG\" | .image.digest = \"$(cat digests/velocor-csi)\"" "$chart/values.yaml"
+          helm lint "$chart"
+          mkdir -p dist && helm package "$chart" --version "$ver" --app-version "$TAG" -d dist
+          echo "pkg=$(ls dist/velocor-csi-*.tgz)" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: velocor-csi-chart
           path: dist/velocor-csi-*.tgz
           if-no-files-found: error
-
-      - name: Push Helm chart to GHCR OCI registry
+      - name: Push chart to ghcr.io
         if: github.event_name != 'pull_request'
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PKG: ${{ steps.chart.outputs.pkg }}
         run: |
-          set -euo pipefail
-          echo "${GH_TOKEN}" | helm registry login "${REGISTRY}" -u "${GITHUB_ACTOR}" --password-stdin
-          helm push "${{ steps.chart.outputs.chart_pkg }}" "oci://${REGISTRY}/${{ steps.chart.outputs.owner_lc }}/charts"
+          helm registry login "$REGISTRY" -u "$GITHUB_ACTOR" --password-stdin <<<"$TOKEN"
+          helm push "$PKG" "oci://$REGISTRY/${GITHUB_REPOSITORY_OWNER,,}/charts"
 
   release:
-    name: Publish GitHub Release
+    name: GitHub release
     if: startsWith(github.ref, 'refs/tags/v')
-    needs:
-      - test
-      - build-cli
-      - build-containers
-      - build-os
-      - build-helm
-    runs-on: ubuntu-latest
+    needs: [veloctl, images, helm]
+    runs-on: ubuntu-24.04
     permissions:
-      contents: write
-      id-token: write
+      contents: write     # create the release
+      id-token: write     # keyless signing of checksums
       attestations: write
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v6
-
-      - name: Download veloctl release binaries
-        uses: actions/download-artifact@v7
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           name: veloctl-binaries
           path: dist
-
-      - name: Download CSI Helm chart
-        uses: actions/download-artifact@v7
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           name: velocor-csi-chart
           path: dist
-
-      - name: Generate repository & binary SBOM (SPDX)
-        uses: anchore/sbom-action@v0
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: image-digests
+          path: digests
+      - uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
         with:
           path: .
           format: spdx-json
           output-file: dist/velocor-sbom.spdx.json
-
-      - name: Package Kubernetes CSI manifests and checksums
-        id: meta
+      - name: Manifests (images pinned by digest) and checksums
+        id: rel
+        env:
+          IMAGE_PREFIX: ${{ needs.images.outputs.image_prefix }}
+          TAG: ${{ needs.images.outputs.tag }}
         run: |
-          OWNER_LC="$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
-          TAG="${GITHUB_REF_NAME}"
-          CSI_IMAGE="${REGISTRY}/${OWNER_LC}/velocor-csi:${TAG}"
-
-          sed "s|image: registry.xphyrlab.net/velocor/velocor-csi:latest|image: ${CSI_IMAGE}|g" \
-            deploy/k8s/csi/velocor-csi.yaml > dist/velocor-csi.yaml
-          cp deploy/k8s/csi/volumesnapshotclass.yaml dist/volumesnapshotclass.yaml
-          cp deploy/k8s/csi/volumegroupsnapshotclass.yaml dist/volumegroupsnapshotclass.yaml
-
-          (cd dist && sha256sum veloctl-* velocor-csi-*.tgz *.yaml velocor-sbom.spdx.json > checksums.txt)
-          echo "owner_lc=${OWNER_LC}" >> "${GITHUB_OUTPUT}"
-          echo "tag=${TAG}" >> "${GITHUB_OUTPUT}"
-          echo "chart_ver=${TAG#v}" >> "${GITHUB_OUTPUT}"
-
-      - name: Install Cosign
-        uses: sigstore/cosign-installer@v4.1.3
-
-      - name: Sign checksums.txt with Cosign (keyless)
+          csi="$IMAGE_PREFIX/velocor-csi@$(cat digests/velocor-csi)"
+          sed -E "s|image: \S+/velocor-csi:\S+|image: $csi|" deploy/k8s/csi/velocor-csi.yaml > dist/velocor-csi.yaml
+          grep -q "image: $csi" dist/velocor-csi.yaml
+          cp deploy/k8s/csi/volumesnapshotclass.yaml deploy/k8s/csi/volumegroupsnapshotclass.yaml dist/
+          cp digests/refs.txt dist/images.txt
+          (cd dist && sha256sum -- veloctl-* velocor-csi-*.tgz ./*.yaml images.txt velocor-sbom.spdx.json > checksums.txt)
+          echo "chart_version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+      - uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
+      - name: Sign checksums.txt (keyless)
         run: cosign sign-blob --yes --bundle dist/checksums.txt.sigstore.json dist/checksums.txt
-
-      - name: Attest SLSA build provenance for CLI and Helm chart
-        uses: actions/attest@v4
+      - uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-path: |
             dist/veloctl-*.tar.gz
             dist/veloctl-*.zip
             dist/velocor-csi-*.tgz
-
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v3
+      - uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3.0.4
         with:
           generate_release_notes: true
           files: |
@@ -443,34 +361,33 @@ jobs:
             dist/velocor-csi.yaml
             dist/volumesnapshotclass.yaml
             dist/volumegroupsnapshotclass.yaml
+            dist/images.txt
             dist/velocor-sbom.spdx.json
             dist/checksums.txt
             dist/checksums.txt.sigstore.json
           body: |
-            ## Container & Bootc OS Images (`${{ steps.meta.outputs.tag }}`)
+            ## Images
 
-            All container images are signed with Sigstore Cosign (keyless OIDC) and include BuildKit SBOM & SLSA provenance attestations.
+            Signed with Sigstore cosign (keyless) and attested (SLSA provenance). `images.txt`
+            lists every image pinned by digest (deploy by digest, not by tag) and the Fedora base
+            images this release was built on (also in each image's
+            `org.opencontainers.image.base.*` labels).
 
-            - **Appliance OS (`bootc`)**: `${{ env.REGISTRY }}/${{ steps.meta.outputs.owner_lc }}/velocor-os:${{ steps.meta.outputs.tag }}`
-            - **Control Plane (`velod`)**: `${{ env.REGISTRY }}/${{ steps.meta.outputs.owner_lc }}/velocor-velod:${{ steps.meta.outputs.tag }}`
-            - **Data Plane (`spdk_tgt`)**: `${{ env.REGISTRY }}/${{ steps.meta.outputs.owner_lc }}/velocor-spdk:${{ steps.meta.outputs.tag }}`
-            - **Kubernetes CSI Driver (`velocor-csi`)**: `${{ env.REGISTRY }}/${{ steps.meta.outputs.owner_lc }}/velocor-csi:${{ steps.meta.outputs.tag }}`
+            - Appliance OS (bootc): `${{ needs.images.outputs.image_prefix }}/velocor-os:${{ needs.images.outputs.tag }}`
+            - Kubernetes CSI driver: `${{ needs.images.outputs.image_prefix }}/velocor-csi:${{ needs.images.outputs.tag }}`
+            - velod and spdk_tgt are embedded in the OS image; they are not deployed separately.
 
-            ## Kubernetes CSI Driver (Helm & Manifests)
+            ## CSI driver
 
-            Install via Helm OCI chart:
             ```bash
-            helm install velocor-csi oci://${{ env.REGISTRY }}/${{ steps.meta.outputs.owner_lc }}/charts/velocor-csi --version ${{ steps.meta.outputs.chart_ver }} --namespace velocor-csi --create-namespace
+            helm install velocor-csi oci://${{ env.REGISTRY }}/${{ github.repository_owner }}/charts/velocor-csi \
+              --version ${{ steps.rel.outputs.chart_version }} --namespace velocor-csi --create-namespace
             ```
 
-            Or deploy with raw manifests:
-            ```bash
-            kubectl apply -f https://github.com/${{ github.repository }}/releases/download/${{ steps.meta.outputs.tag }}/velocor-csi.yaml
-            ```
+            ## Verifying
 
-            ## Verification (Cosign & SBOM)
-
-            Verify `checksums.txt` using Sigstore Cosign:
             ```bash
-            cosign verify-blob --bundle checksums.txt.sigstore.json --certificate-identity-regexp "https://github.com/${{ github.repository }}/" --certificate-oidc-issuer https://token.actions.githubusercontent.com checksums.txt
+            cosign verify-blob --bundle checksums.txt.sigstore.json \
+              --certificate-identity-regexp "https://github.com/${{ github.repository }}/" \
+              --certificate-oidc-issuer https://token.actions.githubusercontent.com checksums.txt
             ```

@@ -4,9 +4,11 @@ After=network-online.target velocor-spdk.service
 Wants=velocor-spdk.service
 
 [Container]
-Image=registry.xphyrlab.net/velocor/velocor-velod:latest
+# Filled in by the OS image build with the embedded image, pinned by digest.
+Image=@VELOCOR_VELOD_IMAGE@
 ContainerName=velocor-velod
-AutoUpdate=registry
+# No AutoUpdate: an appliance changes only through `bootc upgrade`, which ships quadlets pinned
+# to the image versions built from the same commit.
 Network=host
 SecurityLabelDisable=true
 PodmanArgs=--privileged --pid=host
@@ -14,6 +16,9 @@ Volume=/var/lib/velocor:/var/lib/velocor:rw
 Volume=/run/velocor:/run/velocor:rw
 Volume=/sys:/sys:rw
 Volume=/dev:/dev:rslave
+# Lab VMs without a (v)IOMMU: uncomment to allow binding NVMe drives in unsafe no-IOMMU mode.
+# Never enable this on production hardware; it lets SPDK DMA anywhere in host memory.
+#Environment=VELOCOR_ALLOW_UNSAFE_NOIOMMU=true
 Exec=--listen :8443 --db /var/lib/velocor/velocor.db --spdk-socket /run/velocor/spdk.sock --hugepages-mb 1024
 
 [Service]

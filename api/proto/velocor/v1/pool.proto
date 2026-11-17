@@ -24,7 +24,7 @@ message Pool {
   RaidLevel raid_level = 3;
   repeated string disk_ids = 4;
   uint32 strip_size_kb = 5;
-  // SPDK lvol_store cluster allocation unit (default 64 KiB or 1 MiB for fine-grained CBT).
+  // SPDK lvol_store cluster allocation unit (default 1 MiB).
   uint32 cluster_size_bytes = 6;
   // Underlying RAID or single-disk SPDK bdev name.
   string base_bdev_name = 7;

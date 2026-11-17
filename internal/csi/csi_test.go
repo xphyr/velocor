@@ -13,6 +13,7 @@ import (
 	"github.com/kubernetes-csi/csi-test/v5/pkg/sanity"
 	"github.com/velocor/velocor/internal/auth"
 	"github.com/velocor/velocor/internal/server"
+	"github.com/velocor/velocor/internal/spdk/spdktest"
 	"github.com/velocor/velocor/internal/store"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -34,6 +35,10 @@ func (f *fakeMounter) ConnectTarget(_ context.Context, publishCtx map[string]str
 }
 
 func (f *fakeMounter) DisconnectTarget(_ context.Context, _ map[string]string) error {
+	return nil
+}
+
+func (f *fakeMounter) FlushDevice(_ context.Context, _ string) error {
 	return nil
 }
 
@@ -83,6 +88,10 @@ func (f *fakeMounter) ResizeFilesystem(_ context.Context, _, _ string) error {
 	return nil
 }
 
+func (f *fakeMounter) RescanTarget(_ context.Context, _ map[string]string) error {
+	return nil
+}
+
 func (f *fakeMounter) GetVolumeStats(_ string) (VolumeStats, error) {
 	return VolumeStats{
 		AvailableBytes:  800 << 20,
@@ -102,30 +111,7 @@ func TestCSISanitySuite(t *testing.T) {
 	}
 	defer func() { _ = st.Close() }()
 
-	if err := st.UpsertDisk(&store.Disk{
-		ID:           "disk-1",
-		PCIAddress:   "0000:00:05.0",
-		SizeBytes:    100 << 30,
-		DriverState:  store.DiskDriverStateKernel,
-		HealthStatus: store.HealthStatusOnline,
-	}); err != nil {
-		t.Fatalf("UpsertDisk: %v", err)
-	}
-	if _, err := st.ClaimDisk("disk-1", store.DiskDriverStateVfioPCI, "Nvme0n1"); err != nil {
-		t.Fatalf("ClaimDisk: %v", err)
-	}
-	if err := st.CreatePool(&store.Pool{
-		ID:               "pool-nvme",
-		Name:             "nvme-pool",
-		LVSName:          "nvme-pool",
-		DiskIDs:          []string{"disk-1"},
-		TotalBytes:       100 << 30,
-		FreeBytes:        100 << 30,
-		ClusterSizeBytes: 4 << 20,
-		HealthStatus:     store.HealthStatusOnline,
-	}); err != nil {
-		t.Fatalf("CreatePool: %v", err)
-	}
+	fake := seedBackend(t, st, "pool-nvme")
 	if err := st.CreatePortal(&store.Portal{
 		ID:        "portal-nvme",
 		Name:      "nvme-tcp-default",
@@ -145,7 +131,7 @@ func TestCSISanitySuite(t *testing.T) {
 		t.Fatalf("CreateApiToken: %v", err)
 	}
 
-	srv := server.New(st, nil, nil, authMgr, nil, nil)
+	srv := server.New(st, fake.Client(), nil, authMgr, nil, nil)
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
 
@@ -185,103 +171,50 @@ func TestCSISanitySuite(t *testing.T) {
 	sanity.Test(t, cfg)
 }
 
-type mockCBTClient struct {
-	VelocorClient
-	alloc *BlockMetadataResult
-	delta *BlockMetadataResult
-}
+// TestSnapshotMetadataNotAdvertised guards the CBT deferral (TODO.md P1-9): until SPDK can
+// report allocated clusters, the driver must neither advertise nor serve SnapshotMetadata, or
+// backup tools would try incremental backups against it.
+func TestSnapshotMetadataNotAdvertised(t *testing.T) {
+	for _, mode := range []DriverMode{ModeAll, ModeController} {
+		t.Run(string(mode), func(t *testing.T) {
+			sockPath := filepath.Join(t.TempDir(), "csi.sock")
+			endpoint := "unix://" + sockPath
+			drv, err := NewDriver(DriverConfig{Endpoint: endpoint, Mode: mode, NodeID: "node-1"})
+			if err != nil {
+				t.Fatalf("NewDriver: %v", err)
+			}
+			go func() { _ = drv.Run() }()
+			defer drv.Stop()
+			for i := 0; i < 50; i++ {
+				if _, err := os.Stat(sockPath); err == nil {
+					break
+				}
+				time.Sleep(20 * time.Millisecond)
+			}
+			conn, err := grpc.NewClient(endpoint, grpc.WithTransportCredentials(insecure.NewCredentials()))
+			if err != nil {
+				t.Fatalf("grpc.NewClient: %v", err)
+			}
+			defer func() { _ = conn.Close() }()
 
-func (m *mockCBTClient) GetSnapshotAllocatedBlocks(_ context.Context, _ string) (*BlockMetadataResult, error) {
-	return m.alloc, nil
-}
-
-func (m *mockCBTClient) GetSnapshotChangedBlocks(_ context.Context, _, _ string) (*BlockMetadataResult, error) {
-	return m.delta, nil
-}
-
-func TestSnapshotMetadataCBT(t *testing.T) {
-	tmp := t.TempDir()
-	sockPath := filepath.Join(tmp, "cbt.sock")
-	endpoint := "unix://" + sockPath
-
-	mock := &mockCBTClient{
-		alloc: &BlockMetadataResult{
-			SnapshotID:      "snap-2",
-			VolumeSizeBytes: 16 << 20,
-			Extents: []BlockExtent{
-				{OffsetBytes: 0, LengthBytes: 4 << 20},
-				{OffsetBytes: 8 << 20, LengthBytes: 4 << 20},
-			},
-		},
-		delta: &BlockMetadataResult{
-			SnapshotID:      "snap-2",
-			VolumeSizeBytes: 16 << 20,
-			Extents: []BlockExtent{
-				{OffsetBytes: 8 << 20, LengthBytes: 4 << 20},
-			},
-		},
-	}
-
-	drv, err := NewDriver(DriverConfig{
-		Endpoint: endpoint,
-		Mode:     ModeController,
-		Client:   mock,
-	})
-	if err != nil {
-		t.Fatalf("NewDriver: %v", err)
-	}
-	go func() { _ = drv.Run() }()
-	defer drv.Stop()
-
-	for i := 0; i < 50; i++ {
-		if _, err := os.Stat(sockPath); err == nil {
-			break
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-
-	conn, err := grpc.NewClient(endpoint, grpc.WithTransportCredentials(insecure.NewCredentials()))
-	if err != nil {
-		t.Fatalf("grpc.NewClient: %v", err)
-	}
-	defer func() { _ = conn.Close() }()
-
-	cbt := csi.NewSnapshotMetadataClient(conn)
-
-	// Test GetMetadataAllocated with MaxResults=1 (verifies streaming chunking).
-	stream, err := cbt.GetMetadataAllocated(context.Background(), &csi.GetMetadataAllocatedRequest{
-		SnapshotId: "snap-2",
-		MaxResults: 1,
-	})
-	if err != nil {
-		t.Fatalf("GetMetadataAllocated: %v", err)
-	}
-	var gotAlloc []*csi.BlockMetadata
-	for {
-		resp, err := stream.Recv()
-		if err != nil {
-			break
-		}
-		gotAlloc = append(gotAlloc, resp.GetBlockMetadata()...)
-	}
-	if len(gotAlloc) != 2 || gotAlloc[0].GetByteOffset() != 0 || gotAlloc[1].GetByteOffset() != 8<<20 {
-		t.Fatalf("unexpected allocated metadata: %+v", gotAlloc)
-	}
-
-	// Test GetMetadataDelta.
-	dStream, err := cbt.GetMetadataDelta(context.Background(), &csi.GetMetadataDeltaRequest{
-		BaseSnapshotId:   "snap-1",
-		TargetSnapshotId: "snap-2",
-	})
-	if err != nil {
-		t.Fatalf("GetMetadataDelta: %v", err)
-	}
-	resp, err := dStream.Recv()
-	if err != nil {
-		t.Fatalf("Recv delta: %v", err)
-	}
-	if len(resp.GetBlockMetadata()) != 1 || resp.GetBlockMetadata()[0].GetByteOffset() != 8<<20 {
-		t.Fatalf("unexpected delta metadata: %+v", resp.GetBlockMetadata())
+			caps, err := csi.NewIdentityClient(conn).GetPluginCapabilities(context.Background(), &csi.GetPluginCapabilitiesRequest{})
+			if err != nil {
+				t.Fatalf("GetPluginCapabilities: %v", err)
+			}
+			for _, c := range caps.GetCapabilities() {
+				if c.GetService().GetType() == csi.PluginCapability_Service_SNAPSHOT_METADATA_SERVICE {
+					t.Fatal("driver advertises SNAPSHOT_METADATA_SERVICE although CBT is deferred")
+				}
+			}
+			stream, err := csi.NewSnapshotMetadataClient(conn).GetMetadataAllocated(context.Background(),
+				&csi.GetMetadataAllocatedRequest{SnapshotId: "snap-1"})
+			if err == nil {
+				_, err = stream.Recv()
+			}
+			if status.Code(err) != codes.Unimplemented {
+				t.Fatalf("SnapshotMetadata call: got %v, want Unimplemented", err)
+			}
+		})
 	}
 }
 
@@ -293,34 +226,19 @@ func TestVolumeGroupSnapshot(t *testing.T) {
 	}
 	defer func() { _ = db.Close() }()
 
-	if err := db.UpsertDisk(&store.Disk{
-		ID:           "disk-1",
-		PCIAddress:   "0000:00:05.0",
-		SizeBytes:    100 << 30,
-		DriverState:  store.DiskDriverStateKernel,
-		HealthStatus: store.HealthStatusOnline,
-	}); err != nil {
-		t.Fatalf("UpsertDisk: %v", err)
-	}
-	if _, err := db.ClaimDisk("disk-1", store.DiskDriverStateVfioPCI, "Nvme0n1"); err != nil {
-		t.Fatalf("ClaimDisk: %v", err)
-	}
-	if err := db.CreatePool(&store.Pool{
-		ID:         "pool-1",
-		Name:       "pool-1",
-		LVSName:    "lvs0",
-		DiskIDs:    []string{"disk-1"},
-		TotalBytes: 10 << 30,
-		FreeBytes:  10 << 30,
-	}); err != nil {
-		t.Fatalf("CreatePool: %v", err)
-	}
+	fake := seedBackend(t, db, "pool-1")
+	pool, _ := db.GetPool("pool-1")
 	for _, vid := range []string{"vol-a", "vol-b"} {
+		uuid, err := fake.Client().BdevLvolCreate(context.Background(), pool.LVSName, vid, 1<<30, true, "")
+		if err != nil {
+			t.Fatal(err)
+		}
 		if err := db.CreateVolume(&store.Volume{
 			ID:           vid,
 			Name:         vid,
 			PoolID:       "pool-1",
-			LvolBdevName: "lvs0/" + vid,
+			UUID:         uuid,
+			LvolBdevName: pool.LVSName + "/" + vid,
 			SizeBytes:    1 << 30,
 		}); err != nil {
 			t.Fatalf("CreateVolume %s: %v", vid, err)
@@ -336,7 +254,7 @@ func TestVolumeGroupSnapshot(t *testing.T) {
 		t.Fatalf("CreateApiToken: %v", err)
 	}
 
-	srv := server.New(db, nil, nil, authMgr, nil, nil)
+	srv := server.New(db, fake.Client(), nil, authMgr, nil, nil)
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
 
@@ -471,4 +389,40 @@ func TestVolumeGroupSnapshot(t *testing.T) {
 	if len(snaps) != 0 {
 		t.Fatalf("expected 0 remaining snapshots after group delete, got %d", len(snaps))
 	}
+}
+
+// seedBackend creates a fake spdk_tgt holding one claimed NVMe disk, a RAID0 bdev and an
+// lvstore, and records the matching disk + pool (ID poolID) in st.
+func seedBackend(t *testing.T, st *store.BoltStore, poolID string) *spdktest.Fake {
+	t.Helper()
+	ctx := context.Background()
+	fake := spdktest.New(t)
+	fake.AddNVMe("0000:00:05.0")
+	c := fake.Client()
+	bdevs, err := c.BdevNvmeAttachController(ctx, "Nvme0", "PCIe", "0000:00:05.0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpsertDisk(&store.Disk{ID: "disk-1", Type: store.DiskTypeNVMe, PCIAddress: "0000:00:05.0", SizeBytes: 100 << 30}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.ClaimDisk("disk-1", store.DiskDriverStateVfioPCI, bdevs[0]); err != nil {
+		t.Fatal(err)
+	}
+	pool := &store.Pool{ID: poolID, Name: poolID, DiskIDs: []string{"disk-1"}, RaidLevel: store.RaidLevel0,
+		TotalBytes: 100 << 30, FreeBytes: 100 << 30, HealthStatus: store.HealthStatusOnline}
+	if err := st.CreatePool(pool); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.BdevRaidCreate(ctx, pool.BaseBdevName, "raid0", 64, bdevs, true); err != nil {
+		t.Fatal(err)
+	}
+	uuid, err := c.BdevLvolCreateLvstore(ctx, pool.EffectiveBdevName, pool.LVSName, 0, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.MutatePool(poolID, func(p *store.Pool) error { p.LVSUUID = uuid; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	return fake
 }

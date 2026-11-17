@@ -3,12 +3,15 @@ package csi
 import (
 	"context"
 	"crypto/sha256"
-	"encoding/json"
+	"encoding/hex"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -29,20 +32,85 @@ type VolumeStats struct {
 type Mounter interface {
 	ConnectTarget(ctx context.Context, publishCtx map[string]string, hostNQN, initiatorIQN string) (string, error)
 	DisconnectTarget(ctx context.Context, publishCtx map[string]string) error
+	// FlushDevice writes out what the node still caches for a raw block device.
+	FlushDevice(ctx context.Context, devicePath string) error
 	FormatAndMount(ctx context.Context, source, target, fsType string, mountOpts []string) error
 	BindMount(ctx context.Context, source, target string, mountOpts []string, isBlock bool) error
 	Unmount(ctx context.Context, target string) error
 	IsMountPoint(target string) (bool, error)
 	ResizeFilesystem(ctx context.Context, devicePath, mountPath string) error
+	// RescanTarget makes the host pick up a capacity change of an attached volume.
+	RescanTarget(ctx context.Context, publishCtx map[string]string) error
 	GetVolumeStats(path string) (VolumeStats, error)
 }
 
 // LinuxMounter implements Mounter using nvme-cli, iscsiadm, mount/umount, mkfs, and unix syscalls.
-type LinuxMounter struct{}
+type LinuxMounter struct {
+	SysRoot string // defaults to /sys
+}
 
 // NewLinuxMounter creates a LinuxMounter.
 func NewLinuxMounter() *LinuxMounter {
-	return &LinuxMounter{}
+	return &LinuxMounter{SysRoot: "/sys"}
+}
+
+func (m *LinuxMounter) sys(parts ...string) string {
+	root := m.SysRoot
+	if root == "" {
+		root = "/sys"
+	}
+	return filepath.Join(append([]string{root}, parts...)...)
+}
+
+// hostMountNS is the host's mount namespace: the node plugin runs with hostPID, so PID 1 is the
+// host's init.
+const hostMountNS = "/proc/1/ns/mnt"
+
+var (
+	hostISCSIAdmOnce sync.Once
+	hostISCSIAdm     bool
+)
+
+// iscsiadm runs open-iscsi's iscsiadm. iscsiadm passes node records to iscsid as raw C structs,
+// so it must be the same build as the host's iscsid: a container's iscsiadm talking to a
+// different host build fails logins with "iSCSI driver not found" (error 12) although
+// everything is set up (seen on OpenShift/RHCOS with a Fedora-based image). So it runs the
+// host's own iscsiadm, in the host's mount namespace, whenever the plugin runs beside a host;
+// VELOCOR_ISCSIADM=container forces the bundled one.
+func iscsiadm(ctx context.Context, args ...string) *exec.Cmd {
+	hostISCSIAdmOnce.Do(func() {
+		if os.Getenv("VELOCOR_ISCSIADM") == "container" {
+			return
+		}
+		host, err1 := os.Readlink(hostMountNS)
+		self, err2 := os.Readlink("/proc/self/ns/mnt")
+		hostISCSIAdm = err1 == nil && err2 == nil && host != self
+	})
+	if !hostISCSIAdm {
+		return exec.CommandContext(ctx, "iscsiadm", args...)
+	}
+	full := append([]string{"--mount=" + hostMountNS, "--", "/usr/bin/env", "PATH=/usr/sbin:/usr/bin:/sbin:/bin", "iscsiadm"}, args...)
+	return exec.CommandContext(ctx, "nsenter", full...)
+}
+
+// iscsiIface returns the dedicated open-iscsi interface used for an initiator IQN, creating
+// it on first use. Logging in through our own iface avoids rewriting the host's global
+// /etc/iscsi/initiatorname.iscsi, which other iSCSI users on the node depend on.
+func iscsiIface(ctx context.Context, initiatorIQN string) (string, error) {
+	if initiatorIQN == "" {
+		return "default", nil
+	}
+	sum := sha256.Sum256([]byte(initiatorIQN))
+	name := "velocor-" + hex.EncodeToString(sum[:4])
+	if out, err := iscsiadm(ctx, "-m", "iface", "-I", name, "-o", "new").CombinedOutput(); err != nil &&
+		!strings.Contains(strings.ToLower(string(out)), "exists") {
+		return "", fmt.Errorf("iscsiadm iface new %s: %w (%s)", name, err, strings.TrimSpace(string(out)))
+	}
+	if out, err := iscsiadm(ctx, "-m", "iface", "-I", name, "-o", "update",
+		"-n", "iface.initiatorname", "-v", initiatorIQN).CombinedOutput(); err != nil {
+		return "", fmt.Errorf("iscsiadm iface update %s: %w (%s)", name, err, strings.TrimSpace(string(out)))
+	}
+	return name, nil
 }
 
 func (m *LinuxMounter) ConnectTarget(ctx context.Context, publishCtx map[string]string, hostNQN, initiatorIQN string) (string, error) {
@@ -68,15 +136,22 @@ func (m *LinuxMounter) ConnectTarget(ctx context.Context, publishCtx map[string]
 		if iqn == "" {
 			return "", fmt.Errorf("missing target_iqn in publish_context")
 		}
-		if initiatorIQN != "" {
-			_ = os.WriteFile("/etc/iscsi/initiatorname.iscsi", []byte("InitiatorName="+initiatorIQN+"\n"), 0644)
+		iface, err := iscsiIface(ctx, initiatorIQN)
+		if err != nil {
+			return "", err
 		}
-		portal := ip + ":" + port
-		if out, err := exec.CommandContext(ctx, "iscsiadm", "-m", "discovery", "-t", "sendtargets", "-p", portal).CombinedOutput(); err != nil {
+		portal := iscsiPortalAddr(ip, port)
+		if out, err := iscsiadm(ctx, "-m", "discovery", "-t", "sendtargets", "-p", portal, "-I", iface).CombinedOutput(); err != nil {
 			return "", fmt.Errorf("iscsiadm discovery %s: %w (%s)", portal, err, strings.TrimSpace(string(out)))
 		}
+		// Kubernetes decides when this node uses the volume: iscsid must never log in on its own
+		// at boot (node.startup defaults to automatic for discovered records).
+		if out, err := iscsiadm(ctx, "-m", "node", "-T", iqn, "-p", portal, "-I", iface, "-o", "update",
+			"-n", "node.startup", "-v", "manual").CombinedOutput(); err != nil {
+			return "", fmt.Errorf("iscsiadm set node.startup for %s: %w (%s)", iqn, err, strings.TrimSpace(string(out)))
+		}
 		// Ignore error if already logged in (exit code 15).
-		out, err := exec.CommandContext(ctx, "iscsiadm", "-m", "node", "-T", iqn, "-p", portal, "--login").CombinedOutput()
+		out, err := iscsiadm(ctx, "-m", "node", "-T", iqn, "-p", portal, "-I", iface, "--login").CombinedOutput()
 		if err != nil && !strings.Contains(string(out), "already present") {
 			return "", fmt.Errorf("iscsiadm login %s: %w (%s)", iqn, err, strings.TrimSpace(string(out)))
 		}
@@ -88,7 +163,14 @@ func (m *LinuxMounter) ConnectTarget(ctx context.Context, publishCtx map[string]
 		if nqn == "" {
 			return "", fmt.Errorf("missing target_nqn in publish_context")
 		}
-		args := []string{"connect", "-t", "tcp", "-a", ip, "-s", port, "-n", nqn}
+		trtype := "tcp"
+		if proto == "NVMEOF_RDMA" {
+			trtype = "rdma"
+		}
+		// Keep reconnecting for as long as it takes: an appliance or data-plane restart (which
+		// can include volume-store recovery) must stall I/O, not fail it. With the kernel's
+		// default ctrl_loss_tmo (600 s) pods got I/O errors during a 16-minute recovery.
+		args := []string{"connect", "-t", trtype, "-a", ip, "-s", port, "-n", nqn, "--ctrl-loss-tmo=-1", "--reconnect-delay=5"}
 		if hostNQN != "" {
 			args = append(args, "-q", hostNQN, "-I", deterministicHostID(hostNQN))
 		}
@@ -96,7 +178,7 @@ func (m *LinuxMounter) ConnectTarget(ctx context.Context, publishCtx map[string]
 		if err != nil && !strings.Contains(strings.ToLower(string(out)), "already connected") {
 			return "", fmt.Errorf("nvme connect %s: %w (%s)", nqn, err, strings.TrimSpace(string(out)))
 		}
-		return waitForNVMeDevice(ctx, nqn, publishCtx["namespace_id"])
+		return m.waitForNVMeDevice(ctx, nqn, publishCtx["namespace_id"], publishCtx["volume_uuid"])
 	}
 }
 
@@ -108,16 +190,44 @@ func (m *LinuxMounter) DisconnectTarget(ctx context.Context, publishCtx map[stri
 		ip := publishCtx["portal_ip"]
 		port := publishCtx["portal_port"]
 		if iqn != "" && ip != "" && port != "" {
-			_ = exec.CommandContext(ctx, "iscsiadm", "-m", "node", "-T", iqn, "-p", ip+":"+port, "--logout").Run()
+			portal := iscsiPortalAddr(ip, port)
+			// Exit status 21: no matching session (already logged out), which is fine.
+			if out, err := iscsiadm(ctx, "-m", "node", "-T", iqn, "-p", portal, "--logout").CombinedOutput(); err != nil && exitCode(err) != 21 {
+				return fmt.Errorf("iscsiadm logout %s: %w (%s)", iqn, err, strings.TrimSpace(string(out)))
+			}
+			// Forget the target too, so the node keeps no record of volumes it no longer uses
+			// (and iscsid doesn't keep retrying a target that's gone).
+			_ = iscsiadm(ctx, "-m", "node", "-T", iqn, "-p", portal, "-o", "delete").Run()
 		}
 		return nil
 	default:
 		nqn := publishCtx["target_nqn"]
 		if nqn != "" {
-			_ = exec.CommandContext(ctx, "nvme", "disconnect", "-n", nqn).Run()
+			out, err := exec.CommandContext(ctx, "nvme", "disconnect", "-n", nqn).CombinedOutput()
+			if err != nil && !strings.Contains(string(out), "disconnected 0 controller") {
+				return fmt.Errorf("nvme disconnect %s: %w (%s)", nqn, err, strings.TrimSpace(string(out)))
+			}
 		}
 		return nil
 	}
+}
+
+// FlushDevice writes out what the kernel still holds for a raw block device. Raw block
+// volumes go through the page cache with no filesystem to flush them; tearing the connection
+// down first would race the data against the next node's reads.
+func (m *LinuxMounter) FlushDevice(ctx context.Context, devicePath string) error {
+	if out, err := exec.CommandContext(ctx, "blockdev", "--flushbufs", devicePath).CombinedOutput(); err != nil {
+		return fmt.Errorf("blockdev --flushbufs %s: %w (%s)", devicePath, err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+func exitCode(err error) int {
+	var ee *exec.ExitError
+	if errors.As(err, &ee) {
+		return ee.ExitCode()
+	}
+	return -1
 }
 
 func deterministicHostID(hostNQN string) string {
@@ -229,9 +339,15 @@ func (m *LinuxMounter) IsMountPoint(target string) (bool, error) {
 }
 
 func (m *LinuxMounter) ResizeFilesystem(ctx context.Context, devicePath, mountPath string) error {
+	if devicePath == "" {
+		return fmt.Errorf("device path of staged volume is unknown")
+	}
 	fsType, err := detectFilesystem(ctx, devicePath)
-	if err != nil || fsType == "" {
+	if err != nil {
 		return err
+	}
+	if fsType == "" {
+		return nil // raw block volume: nothing to grow
 	}
 	switch fsType {
 	case "xfs":
@@ -284,15 +400,6 @@ func (m *LinuxMounter) GetVolumeStats(path string) (VolumeStats, error) {
 	}, nil
 }
 
-func detectFilesystem(ctx context.Context, devicePath string) (string, error) {
-	out, err := exec.CommandContext(ctx, "blkid", "-o", "value", "-s", "TYPE", devicePath).Output()
-	if err != nil {
-		// blkid exits 2 when no filesystem is present on the device.
-		return "", nil
-	}
-	return strings.TrimSpace(string(out)), nil
-}
-
 func waitForDevice(ctx context.Context, devPath string) (string, error) {
 	deadline := time.Now().Add(15 * time.Second)
 	for time.Now().Before(deadline) {
@@ -310,11 +417,93 @@ func waitForDevice(ctx context.Context, devPath string) (string, error) {
 	return "", fmt.Errorf("timed out waiting for device %s", devPath)
 }
 
-func waitForNVMeDevice(ctx context.Context, targetNQN, nsidStr string) (string, error) {
+func iscsiPortalAddr(ip, port string) string {
+	if strings.Contains(ip, ":") && !strings.HasPrefix(ip, "[") {
+		ip = "[" + ip + "]"
+	}
+	return ip + ":" + port
+}
+
+func (m *LinuxMounter) RescanTarget(ctx context.Context, publishCtx map[string]string) error {
+	switch normalizeProtocol(publishCtx["protocol"]) {
+	case "ISCSI":
+		iqn := publishCtx["target_iqn"]
+		if iqn == "" {
+			return fmt.Errorf("missing target_iqn in publish_context")
+		}
+		if out, err := iscsiadm(ctx, "-m", "node", "-T", iqn, "-R").CombinedOutput(); err != nil {
+			return fmt.Errorf("iscsiadm rescan %s: %w (%s)", iqn, err, strings.TrimSpace(string(out)))
+		}
+	default:
+		// NVMe namespaces report capacity changes via AEN; force a rescan of every controller
+		// of the subsystem in case the AEN was missed.
+		ctrls, _ := filepath.Glob(m.sys("class", "nvme", "nvme*"))
+		for _, c := range ctrls {
+			if readTrim(filepath.Join(c, "subsysnqn")) == publishCtx["target_nqn"] {
+				_ = os.WriteFile(filepath.Join(c, "rescan_controller"), []byte("1"), 0o200)
+			}
+		}
+	}
+	return nil
+}
+
+// parseBlkid interprets `blkid -p -o export` output and exit status. blkid exits 2 only
+// when it positively found no signature; any other failure is reported, never treated as
+// "blank", because the caller formats blank devices.
+func parseBlkid(out []byte, exitCode int) (string, error) {
+	switch exitCode {
+	case 0:
+	case 2:
+		return "", nil
+	default:
+		return "", fmt.Errorf("blkid failed with exit status %d: %s", exitCode, strings.TrimSpace(string(out)))
+	}
+	var fsType, ptType string
+	for _, line := range strings.Split(string(out), "\n") {
+		k, v, _ := strings.Cut(strings.TrimSpace(line), "=")
+		switch k {
+		case "TYPE":
+			fsType = v
+		case "PTTYPE":
+			ptType = v
+		}
+	}
+	if fsType == "" && ptType != "" {
+		return "", fmt.Errorf("device carries a %s partition table; refusing to format it", ptType)
+	}
+	if fsType == "" {
+		return "", fmt.Errorf("blkid reported a signature without a filesystem type; refusing to format")
+	}
+	return fsType, nil
+}
+
+func detectFilesystem(ctx context.Context, devicePath string) (string, error) {
+	out, err := exec.CommandContext(ctx, "blkid", "-p", "-o", "export", devicePath).CombinedOutput()
+	code := 0
+	if err != nil {
+		var ee *exec.ExitError
+		if !errors.As(err, &ee) {
+			return "", fmt.Errorf("run blkid on %s: %w", devicePath, err)
+		}
+		code = ee.ExitCode()
+	}
+	fs, perr := parseBlkid(out, code)
+	if perr != nil {
+		return "", fmt.Errorf("%s: %w", devicePath, perr)
+	}
+	return fs, nil
+}
+
+func (m *LinuxMounter) waitForNVMeDevice(ctx context.Context, targetNQN, nsidStr, wantUUID string) (string, error) {
 	deadline := time.Now().Add(15 * time.Second)
+	var lastErr error
 	for time.Now().Before(deadline) {
-		if dev := findNVMeDeviceByNQN(ctx, targetNQN, nsidStr); dev != "" {
+		dev, err := m.findNVMeNamespace(targetNQN, nsidStr, wantUUID)
+		if err == nil && dev != "" {
 			return dev, nil
+		}
+		if err != nil {
+			lastErr = err
 		}
 		select {
 		case <-ctx.Done():
@@ -322,42 +511,62 @@ func waitForNVMeDevice(ctx context.Context, targetNQN, nsidStr string) (string, 
 		case <-time.After(300 * time.Millisecond):
 		}
 	}
-	return "", fmt.Errorf("timed out waiting for NVMe device for %s", targetNQN)
+	if lastErr != nil {
+		return "", lastErr
+	}
+	return "", fmt.Errorf("timed out waiting for NVMe namespace %s of %s", nsidStr, targetNQN)
 }
 
-func findNVMeDeviceByNQN(ctx context.Context, targetNQN, nsidStr string) string {
-	out, err := exec.CommandContext(ctx, "nvme", "list-subsys", "-o", "json").Output()
+var nvmeNSRegex = regexp.MustCompile(`^nvme\d+n\d+$`)
+
+func readTrim(path string) string {
+	b, err := os.ReadFile(path)
 	if err != nil {
 		return ""
 	}
-	var parsed []struct {
-		Subsystems []struct {
-			NQN   string `json:"NQN"`
-			Paths []struct {
-				Name string `json:"Name"`
-			} `json:"Paths"`
-		} `json:"Subsystems"`
+	return strings.TrimSpace(string(b))
+}
+
+// findNVMeNamespace resolves the block device for namespace nsid of subsystem targetNQN
+// purely from sysfs. With native multipath (the Fedora/RHEL default) block devices are
+// named after the subsystem instance, not the controller, so "/dev/<ctrl>n<nsid>" can be an
+// unrelated volume; we therefore match on subsysnqn + nsid and then verify the namespace
+// UUID equals the Velocor volume UUID before the device is used.
+func (m *LinuxMounter) findNVMeNamespace(targetNQN, nsidStr, wantUUID string) (string, error) {
+	nsid := nsidStr
+	if nsid == "" || nsid == "0" {
+		nsid = "1"
 	}
-	if err := json.Unmarshal(out, &parsed); err != nil {
-		return ""
+	var parents []string
+	if subs, _ := filepath.Glob(m.sys("class", "nvme-subsystem", "*")); len(subs) > 0 {
+		parents = append(parents, subs...)
 	}
-	nsid := "1"
-	if nsidStr != "" && nsidStr != "0" {
-		nsid = nsidStr
+	if ctrls, _ := filepath.Glob(m.sys("class", "nvme", "nvme*")); len(ctrls) > 0 {
+		parents = append(parents, ctrls...)
 	}
-	for _, host := range parsed {
-		for _, sub := range host.Subsystems {
-			if sub.NQN != targetNQN {
+	for _, parent := range parents {
+		if readTrim(filepath.Join(parent, "subsysnqn")) != targetNQN {
+			continue
+		}
+		entries, _ := os.ReadDir(parent)
+		for _, e := range entries {
+			name := e.Name()
+			if !nvmeNSRegex.MatchString(name) {
 				continue
 			}
-			for _, p := range sub.Paths {
-				// /sys/class/nvme/<ctrl>/<ctrl>n<nsid>
-				candidate := "/dev/" + p.Name + "n" + nsid
-				if _, err := os.Stat(candidate); err == nil {
-					return candidate
+			blk := m.sys("class", "block", name)
+			if readTrim(filepath.Join(blk, "nsid")) != nsid {
+				continue
+			}
+			if wantUUID != "" {
+				got := readTrim(filepath.Join(blk, "uuid"))
+				if !strings.EqualFold(got, wantUUID) {
+					return "", fmt.Errorf("NVMe namespace %s (nsid %s of %s) has UUID %q, expected volume UUID %q; refusing to use it",
+						name, nsid, targetNQN, got, wantUUID)
 				}
 			}
+			return "/dev/" + name, nil
 		}
 	}
-	return ""
+	return "", nil
 }

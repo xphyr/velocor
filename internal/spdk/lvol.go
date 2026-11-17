@@ -70,12 +70,16 @@ func (c *Client) BdevLvolDeleteLvstore(ctx context.Context, uuid, lvsName string
 	return c.Call(ctx, "bdev_lvol_delete_lvstore", params, nil)
 }
 
+// BytesToMiBCeil converts a byte count to MiB, rounding up so that SPDK never
+// allocates less capacity than was requested.
+func BytesToMiBCeil(sizeBytes uint64) uint64 {
+	const mib = 1024 * 1024
+	return (sizeBytes + mib - 1) / mib
+}
+
 // BdevLvolCreate creates a logical volume inside an lvol_store and returns its UUID.
 func (c *Client) BdevLvolCreate(ctx context.Context, lvsName, lvolName string, sizeBytes uint64, thinProvision bool, clearMethod string) (string, error) {
-	sizeMiB := sizeBytes / (1024 * 1024)
-	if sizeMiB == 0 && sizeBytes > 0 {
-		sizeMiB = 1
-	}
+	sizeMiB := BytesToMiBCeil(sizeBytes)
 	params := map[string]any{
 		"lvs_name":       lvsName,
 		"lvol_name":      lvolName,
@@ -94,10 +98,7 @@ func (c *Client) BdevLvolCreate(ctx context.Context, lvsName, lvolName string, s
 
 // BdevLvolResize resizes an existing logical volume (name is "<lvs_name>/<lvol_name>" or UUID).
 func (c *Client) BdevLvolResize(ctx context.Context, name string, sizeBytes uint64) error {
-	sizeMiB := sizeBytes / (1024 * 1024)
-	if sizeMiB == 0 && sizeBytes > 0 {
-		sizeMiB = 1
-	}
+	sizeMiB := BytesToMiBCeil(sizeBytes)
 	params := map[string]any{
 		"name":        name,
 		"size_in_mib": sizeMiB,
@@ -197,54 +198,20 @@ func (c *Client) BdevLvolGetFragmap(ctx context.Context, name string, offset, si
 		params["size"] = size
 	}
 	var res FragmapResponse
-	err := c.Call(ctx, "bdev_lvol_get_fragmap", params, &res)
-	if err == nil {
-		return &res, nil
-	}
-	var rpcErr *RPCError
-	if !errors.As(err, &rpcErr) || rpcErr.Code != -32601 {
+	if err := c.Call(ctx, "bdev_lvol_get_fragmap", params, &res); err != nil {
+		var rpcErr *RPCError
+		if errors.As(err, &rpcErr) && rpcErr.Code == -32601 {
+			// Never synthesise allocation data: a guessed bitmap would make incremental
+			// backups silently skip changed blocks.
+			return nil, fmt.Errorf("%w: spdk_tgt does not support bdev_lvol_get_fragmap", ErrCBTUnsupported)
+		}
 		return nil, err
 	}
-
-	// Upstream SPDK (e.g. v26.09) exposes per-snapshot CoW delta cluster allocation counts
-	// via bdev_lvol_get_lvols (num_allocated_clusters) rather than bdev_lvol_get_fragmap.
-	lvols, lErr := c.BdevLvolGetLvols(ctx)
-	if lErr != nil {
-		return nil, err
-	}
-	var target *LvolInfo
-	for i := range lvols {
-		if lvols[i].Alias == name || lvols[i].UUID == name || lvols[i].Name == name {
-			target = &lvols[i]
-			break
-		}
-	}
-	if target == nil {
-		return nil, fmt.Errorf("lvol %s not found in bdev_lvol_get_lvols", name)
-	}
-	clusterSize := uint32(65536)
-	if target.LVS.Name != "" {
-		if stores, sErr := c.BdevLvolGetLvstores(ctx, target.LVS.Name, ""); sErr == nil && len(stores) > 0 && stores[0].ClusterSize > 0 {
-			clusterSize = stores[0].ClusterSize
-		}
-	}
-	totalClusters := size / uint64(clusterSize)
-	if totalClusters < target.NumAllocatedClusters {
-		totalClusters = target.NumAllocatedClusters
-	}
-	numBytes := (totalClusters + 7) / 8
-	mask := make([]byte, numBytes)
-	for i := uint64(0); i < target.NumAllocatedClusters && i < totalClusters; i++ {
-		mask[i/8] |= 1 << (i % 8)
-	}
-	return &FragmapResponse{
-		ClusterSize: clusterSize,
-		Offset:      offset,
-		Size:        size,
-		NumClusters: target.NumAllocatedClusters,
-		Bitmask:     base64.StdEncoding.EncodeToString(mask),
-	}, nil
+	return &res, nil
 }
+
+// ErrCBTUnsupported is returned when the running spdk_tgt cannot report per-cluster allocation.
+var ErrCBTUnsupported = errors.New("changed block tracking unsupported")
 
 // DecodeFragmapExtents decodes the base64-encoded bitmask from FragmapResponse into
 // coalesced contiguous BlockExtent ranges.

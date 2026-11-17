@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -38,20 +39,6 @@ func IsAlreadyExists(err error) bool {
 	return errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusConflict
 }
 
-// BlockExtent describes a contiguous allocated or changed byte range.
-type BlockExtent struct {
-	OffsetBytes uint64 `json:"offset_bytes"`
-	LengthBytes uint64 `json:"length_bytes"`
-}
-
-// BlockMetadataResult represents the CBT response from Velocor's fragmap endpoints.
-type BlockMetadataResult struct {
-	SnapshotID       string        `json:"snapshot_id"`
-	VolumeSizeBytes  uint64        `json:"volume_size_bytes"`
-	ClusterSizeBytes uint64        `json:"cluster_size_bytes"`
-	Extents          []BlockExtent `json:"extents"`
-}
-
 // VolumeGroupSnapshotResult represents a VolumeGroupSnapshot and its member Snapshots.
 type VolumeGroupSnapshotResult struct {
 	GroupSnapshot *store.VolumeGroupSnapshot `json:"volume_group_snapshot"`
@@ -75,6 +62,15 @@ type CreateExportRequest struct {
 	PortalIDs         []string             `json:"portal_ids"`
 	InitiatorGroupIDs []string             `json:"initiator_group_ids,omitempty"`
 	AllowAnyHost      bool                 `json:"allow_any_host"`
+	NodeID            string               `json:"node_id,omitempty"`
+	Shared            bool                 `json:"shared,omitempty"`
+	NodeIDs           []string             `json:"node_ids,omitempty"`
+}
+
+// UpdateExportRequest changes who may reach a live export (PATCH /api/v1/exports/{id}).
+type UpdateExportRequest struct {
+	InitiatorGroupIDs *[]string `json:"initiator_group_ids,omitempty"`
+	NodeIDs           *[]string `json:"node_ids,omitempty"`
 }
 
 // VelocorClient defines the control-plane operations required by the CSI driver.
@@ -94,8 +90,6 @@ type VelocorClient interface {
 	CreateSnapshot(ctx context.Context, volumeID, name string, labels map[string]string) (*store.Snapshot, error)
 	DeleteSnapshot(ctx context.Context, id string) error
 	CloneSnapshot(ctx context.Context, snapID, cloneName string, labels map[string]string) (*store.Volume, error)
-	GetSnapshotAllocatedBlocks(ctx context.Context, snapID string) (*BlockMetadataResult, error)
-	GetSnapshotChangedBlocks(ctx context.Context, targetSnapID, baseSnapID string) (*BlockMetadataResult, error)
 
 	CreateVolumeGroupSnapshot(ctx context.Context, name string, volumeIDs []string) (*VolumeGroupSnapshotResult, error)
 	GetVolumeGroupSnapshot(ctx context.Context, id string) (*VolumeGroupSnapshotResult, error)
@@ -109,6 +103,7 @@ type VelocorClient interface {
 	ListExports(ctx context.Context) ([]*store.Export, error)
 	CreateExport(ctx context.Context, req CreateExportRequest) (*store.Export, error)
 	DeleteExport(ctx context.Context, id string) error
+	UpdateExport(ctx context.Context, id string, req UpdateExportRequest) (*store.Export, error)
 }
 
 // HTTPClient implements VelocorClient over the velod REST/JSON API.
@@ -120,18 +115,34 @@ type HTTPClient struct {
 
 // NewHTTPClient creates a Velocor REST API client.
 func NewHTTPClient(endpoint, token string, insecureSkipVerify bool) *HTTPClient {
+	c, _ := NewHTTPClientWithCA(endpoint, token, insecureSkipVerify, "")
+	return c
+}
+
+// NewHTTPClientWithCA creates a client that verifies the Velocor API certificate against
+// caPEM (e.g. velod's self-signed /var/lib/velocor/tls.crt) in addition to the system roots.
+func NewHTTPClientWithCA(endpoint, token string, insecureSkipVerify bool, caPEM string) (*HTTPClient, error) {
 	endpoint = strings.TrimRight(strings.TrimSpace(endpoint), "/")
-	tr := &http.Transport{
-		TLSClientConfig: &tls.Config{InsecureSkipVerify: insecureSkipVerify}, // #nosec G402 - lab/self-signed certs
+	tlsCfg := &tls.Config{MinVersion: tls.VersionTLS12, InsecureSkipVerify: insecureSkipVerify} // #nosec G402 - explicit opt-in only
+	if strings.TrimSpace(caPEM) != "" {
+		pool, err := x509.SystemCertPool()
+		if err != nil || pool == nil {
+			pool = x509.NewCertPool()
+		}
+		if !pool.AppendCertsFromPEM([]byte(caPEM)) {
+			return nil, fmt.Errorf("VELOCOR_CA_CERT does not contain a valid PEM certificate")
+		}
+		tlsCfg.RootCAs = pool
 	}
+	tr := &http.Transport{TLSClientConfig: tlsCfg}
 	return &HTTPClient{
 		baseURL: endpoint,
 		token:   strings.TrimSpace(token),
-		http: &http.Client{
-			Timeout:   30 * time.Second,
-			Transport: tr,
-		},
-	}
+		// No client-wide timeout: each call carries the deadline of the CSI request (set by the
+		// sidecars), with a fallback in doJSON. velod finishes a change even if we give up, and
+		// every create is idempotent by name, so the sidecars' retry picks up the result.
+		http: &http.Client{Transport: tr},
+	}, nil
 }
 
 func (c *HTTPClient) doJSON(ctx context.Context, method, path string, reqBody, out any) error {
@@ -142,6 +153,11 @@ func (c *HTTPClient) doJSON(ctx context.Context, method, path string, reqBody, o
 			return err
 		}
 		bodyReader = bytes.NewReader(b)
+	}
+	if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, 5*time.Minute)
+		defer cancel()
 	}
 	req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, bodyReader)
 	if err != nil {
@@ -297,20 +313,6 @@ func (c *HTTPClient) CloneSnapshot(ctx context.Context, snapID, cloneName string
 	return resp.Volume, err
 }
 
-func (c *HTTPClient) GetSnapshotAllocatedBlocks(ctx context.Context, snapID string) (*BlockMetadataResult, error) {
-	var resp BlockMetadataResult
-	err := c.doJSON(ctx, http.MethodGet, "/api/v1/snapshots/"+url.PathEscape(snapID)+":allocated-blocks", nil, &resp)
-	return &resp, err
-}
-
-func (c *HTTPClient) GetSnapshotChangedBlocks(ctx context.Context, targetSnapID, baseSnapID string) (*BlockMetadataResult, error) {
-	var resp BlockMetadataResult
-	q := url.Values{}
-	q.Set("base_snapshot_id", baseSnapID)
-	err := c.doJSON(ctx, http.MethodGet, "/api/v1/snapshots/"+url.PathEscape(targetSnapID)+":changed-blocks?"+q.Encode(), nil, &resp)
-	return &resp, err
-}
-
 func (c *HTTPClient) ListPortals(ctx context.Context) ([]*store.Portal, error) {
 	var resp struct {
 		Portals []*store.Portal `json:"portals"`
@@ -372,6 +374,14 @@ func (c *HTTPClient) CreateExport(ctx context.Context, req CreateExportRequest) 
 		Export *store.Export `json:"export"`
 	}
 	err := c.doJSON(ctx, http.MethodPost, "/api/v1/exports", req, &resp)
+	return resp.Export, err
+}
+
+func (c *HTTPClient) UpdateExport(ctx context.Context, id string, req UpdateExportRequest) (*store.Export, error) {
+	var resp struct {
+		Export *store.Export `json:"export"`
+	}
+	err := c.doJSON(ctx, http.MethodPatch, "/api/v1/exports/"+url.PathEscape(id), req, &resp)
 	return resp.Export, err
 }
 

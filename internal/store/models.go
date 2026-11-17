@@ -1,6 +1,9 @@
 package store
 
-import "time"
+import (
+	"encoding/json"
+	"time"
+)
 
 // HealthStatus represents the operational health of a resource.
 type HealthStatus string
@@ -32,6 +35,7 @@ const (
 	DiskDriverStateVfioPCI       DiskDriverState = "VFIO_PCI"
 	DiskDriverStateUioPCIGeneric DiskDriverState = "UIO_PCI_GENERIC"
 	DiskDriverStateUringClaimed  DiskDriverState = "URING_CLAIMED"
+	DiskDriverStateAIOClaimed    DiskDriverState = "AIO_CLAIMED"
 )
 
 // RaidLevel enumerates SPDK bdev_raid levels supported for Pools.
@@ -95,9 +99,13 @@ const (
 	RoleReadOnly       Role = "READONLY"
 )
 
-// DefaultClusterSizeBytes is the default SPDK lvol_store cluster size (64 KiB)
-// used to optimize thin provisioning and Changed Block Tracking (CBT).
-const DefaultClusterSizeBytes uint32 = 64 * 1024
+// DefaultClusterSizeBytes is the default SPDK lvol_store cluster size (1 MiB).
+//
+// SPDK reserves one metadata page (4 KiB) per cluster, and after an unclean stop recovery reads
+// all of them: with 64 KiB clusters a 500 GB pool carried ~30 GiB of metadata (6% of the pool)
+// and took 16 minutes to recover on velocor-1, long enough for hosts to give up. 1 MiB keeps
+// that to ~0.4% and about a minute, while thin allocation stays fine-grained.
+const DefaultClusterSizeBytes uint32 = 1 << 20
 
 // FilterPolicy defines stackable SPDK filter bdev layers (crypto / compression).
 type FilterPolicy struct {
@@ -149,7 +157,68 @@ type Disk struct {
 	SPDKBdevName     string          `json:"spdk_bdev_name,omitempty"`
 	HealthStatus     HealthStatus    `json:"health_status"`
 	Smart            SmartHealth     `json:"smart"`
-	UpdatedAt        time.Time       `json:"updated_at"`
+	// WriteCache is what the hardware reports (refreshed by every scan; the last known value is
+	// kept while SPDK owns the device and the kernel can't see it).
+	WriteCache WriteCacheState `json:"write_cache"`
+	// PowerLossProtected is declared by an operator: there is no standard field for it, and
+	// drives with power-loss protection usually still report a volatile write cache.
+	PowerLossProtected bool `json:"power_loss_protected"`
+	// WriteCachePolicy is the operator's choice; DISABLED makes velod switch the drive's
+	// volatile write cache off and keep it off.
+	WriteCachePolicy WriteCachePolicy `json:"write_cache_policy,omitempty"`
+	UpdatedAt        time.Time        `json:"updated_at"`
+}
+
+// WriteCacheState is a disk's volatile write cache as reported by the hardware.
+type WriteCacheState string
+
+const (
+	WriteCacheUnknown      WriteCacheState = ""              // not determined (yet)
+	WriteCacheWriteBack    WriteCacheState = "WRITE_BACK"    // volatile cache present and in use
+	WriteCacheWriteThrough WriteCacheState = "WRITE_THROUGH" // no volatile cache in use
+)
+
+// WriteCachePolicy is what Velocor does with a disk's volatile write cache.
+type WriteCachePolicy string
+
+const (
+	WriteCachePolicyLeave    WriteCachePolicy = ""         // leave the drive's setting alone
+	WriteCachePolicyDisabled WriteCachePolicy = "DISABLED" // turn it off and keep it off
+)
+
+// Durability says whether a write the drive has acknowledged survives a power cut.
+type Durability string
+
+const (
+	DurabilityDurable Durability = "DURABLE"
+	// DurabilityAtRisk: the drive caches writes in volatile memory and isn't declared
+	// power-loss protected. SPDK v26.09 never passes FLUSH through lvols and RAID (TODO P0-4,
+	// L-1), so acknowledged writes can be lost on power failure.
+	DurabilityAtRisk  Durability = "AT_RISK"
+	DurabilityUnknown Durability = "UNKNOWN"
+)
+
+// Durability derives the disk's durability from its write cache and the operator's
+// power-loss-protection declaration.
+func (d *Disk) Durability() Durability {
+	switch {
+	case d.PowerLossProtected, d.WriteCache == WriteCacheWriteThrough:
+		return DurabilityDurable
+	case d.WriteCache == WriteCacheWriteBack:
+		return DurabilityAtRisk
+	default:
+		return DurabilityUnknown
+	}
+}
+
+// MarshalJSON adds the derived "durability" to every JSON form of a Disk (API responses);
+// it's recomputed on output, so a stored copy is never trusted.
+func (d Disk) MarshalJSON() ([]byte, error) {
+	type plain Disk
+	return json.Marshal(struct {
+		plain
+		Durability Durability `json:"durability"`
+	}{plain(d), d.Durability()})
 }
 
 // Pool aggregates one or more claimed Disks into an SPDK RAID bdev + lvol_store.
@@ -190,6 +259,7 @@ type Volume struct {
 	QosPolicy         QosPolicy         `json:"qos_policy"`
 	AttachmentState   AttachmentState   `json:"attachment_state"`
 	HealthStatus      HealthStatus      `json:"health_status"`
+	StatusMessage     string            `json:"status_message,omitempty"`
 	Labels            map[string]string `json:"labels,omitempty"`
 	CreatedAt         time.Time         `json:"created_at"`
 }
@@ -226,7 +296,9 @@ type Portal struct {
 	Protocol  ExportProtocol `json:"protocol"`
 	IPAddress string         `json:"ip_address"`
 	Port      uint32         `json:"port"`
-	CreatedAt time.Time      `json:"created_at"`
+	// IscsiPgTag is the SPDK iSCSI portal group tag for ISCSI portals (unique, allocated by the store).
+	IscsiPgTag int       `json:"iscsi_pg_tag,omitempty"`
+	CreatedAt  time.Time `json:"created_at"`
 }
 
 // Host represents a registered SAN initiator host (ESXi, Linux, Kubernetes worker)
@@ -269,17 +341,32 @@ type Export struct {
 	PortalIDs         []string       `json:"portal_ids"`
 	InitiatorGroupIDs []string       `json:"initiator_group_ids,omitempty"`
 	AllowAnyHost      bool           `json:"allow_any_host"`
-	HealthStatus      HealthStatus   `json:"health_status"`
-	CreatedAt         time.Time      `json:"created_at"`
+	// NodeID is the CSI node this export was published to (empty for manually created exports).
+	NodeID string `json:"node_id,omitempty"`
+	// Shared marks a CSI export that several nodes use at once (ReadWriteMany / ReadOnlyMany raw
+	// block, e.g. a KubeVirt VM disk during live migration). One shared export per volume;
+	// NodeIDs lists the nodes it's published to, each allowed in through its initiator group.
+	Shared  bool     `json:"shared,omitempty"`
+	NodeIDs []string `json:"node_ids,omitempty"`
+	// IscsiIgTag is the SPDK iSCSI initiator group tag owned by this export (unique, allocated by the store).
+	IscsiIgTag    int          `json:"iscsi_ig_tag,omitempty"`
+	HealthStatus  HealthStatus `json:"health_status"`
+	StatusMessage string       `json:"status_message,omitempty"`
+	CreatedAt     time.Time    `json:"created_at"`
 }
 
 // AdminUser stores local user credentials and RBAC role.
 type AdminUser struct {
-	Username     string    `json:"username"`
-	PasswordHash string    `json:"password_hash"`
-	Role         Role      `json:"role,omitempty"`
-	CreatedAt    time.Time `json:"created_at,omitempty"`
-	UpdatedAt    time.Time `json:"updated_at"`
+	Username     string `json:"username"`
+	PasswordHash string `json:"password_hash"`
+	Role         Role   `json:"role,omitempty"`
+	// SessionsValidAfter revokes every session JWT issued before it (password change,
+	// role change, user deletion and re-creation).
+	SessionsValidAfter time.Time `json:"sessions_valid_after,omitempty"`
+	// MustChangePassword restricts the account to changing its password (bootstrap admin).
+	MustChangePassword bool      `json:"must_change_password,omitempty"`
+	CreatedAt          time.Time `json:"created_at,omitempty"`
+	UpdatedAt          time.Time `json:"updated_at"`
 }
 
 // ApiToken represents a scoped Personal/Service Access Token (velo_pat_...).

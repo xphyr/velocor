@@ -84,7 +84,7 @@ spec:
       serviceAccountName: velocor-csi-controller
       containers:
         - name: velocor-csi
-          image: registry.xphyrlab.net/velocor/velocor-csi:latest
+          image: ghcr.io/xphyr/velocor-csi:latest
           imagePullPolicy: IfNotPresent
           args:
             - --mode=controller
@@ -158,7 +158,7 @@ spec:
       dnsPolicy: ClusterFirstWithHostNet
       containers:
         - name: velocor-csi
-          image: registry.xphyrlab.net/velocor/velocor-csi:latest
+          image: ghcr.io/xphyr/velocor-csi:latest
           imagePullPolicy: IfNotPresent
           securityContext:
             privileged: true
@@ -183,6 +183,8 @@ spec:
               mountPath: /dev
             - name: etc-iscsi
               mountPath: /etc/iscsi
+            - name: var-lib-iscsi
+              mountPath: /var/lib/iscsi
             - name: etc-nvme
               mountPath: /etc/nvme
         - name: csi-node-driver-registrar
@@ -215,6 +217,10 @@ spec:
         - name: etc-iscsi
           hostPath:
             path: /etc/iscsi
+            type: DirectoryOrCreate
+        - name: var-lib-iscsi
+          hostPath:
+            path: /var/lib/iscsi
             type: DirectoryOrCreate
         - name: etc-nvme
           hostPath:

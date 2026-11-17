@@ -90,10 +90,17 @@ func (c *Client) BdevNvmeGetControllerHealthInfo(ctx context.Context, controller
 }
 
 // BdevUringCreate claims a Linux kernel block device (e.g. /dev/sdb) via io_uring.
-func (c *Client) BdevUringCreate(ctx context.Context, name, filename string, blockSize uint32) (string, error) {
+//
+// uuid must be stable across restarts for any disk that is a RAID member: SPDK re-assembles
+// superblock RAIDs only from members whose bdev UUID matches the one recorded in the
+// superblock, and an io_uring/AIO bdev created without a UUID gets a random one each time.
+func (c *Client) BdevUringCreate(ctx context.Context, name, filename string, blockSize uint32, uuid string) (string, error) {
 	params := map[string]any{
 		"name":     name,
 		"filename": filename,
+	}
+	if uuid != "" {
+		params["uuid"] = uuid
 	}
 	if blockSize > 0 {
 		params["block_size"] = blockSize
@@ -224,4 +231,26 @@ func (c *Client) BdevGetIostat(ctx context.Context, name string) (*BdevGetIostat
 		return nil, err
 	}
 	return &res, nil
+}
+
+// BdevAioCreate exposes a kernel block device or file through Linux AIO (O_DIRECT).
+// See BdevUringCreate for why uuid must be stable.
+func (c *Client) BdevAioCreate(ctx context.Context, name, filename string, blockSize uint32, uuid string) (string, error) {
+	params := map[string]any{"name": name, "filename": filename}
+	if uuid != "" {
+		params["uuid"] = uuid
+	}
+	if blockSize > 0 {
+		params["block_size"] = blockSize
+	}
+	var bdevName string
+	if err := c.Call(ctx, "bdev_aio_create", params, &bdevName); err != nil {
+		return "", err
+	}
+	return bdevName, nil
+}
+
+// BdevAioDelete removes an AIO bdev.
+func (c *Client) BdevAioDelete(ctx context.Context, name string) error {
+	return c.Call(ctx, "bdev_aio_delete", map[string]any{"name": name}, nil)
 }

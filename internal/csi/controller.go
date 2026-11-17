@@ -2,7 +2,10 @@ package csi
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -265,51 +268,65 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 	if err != nil {
 		return nil, mapAPIError(err)
 	}
-
-	// Check if already exported (idempotent publish).
-	var existingExport *store.Export
-	for _, exp := range exports {
-		if exp.VolumeID == vol.ID {
-			existingExport = exp
-			break
-		}
-	}
-
 	portals, err := s.client.ListPortals(ctx)
 	if err != nil {
 		return nil, mapAPIError(err)
 	}
-
-	var portal *store.Portal
-	if existingExport != nil {
-		for _, p := range portals {
-			for _, pid := range existingExport.PortalIDs {
-				if p.ID == pid {
-					portal = p
-					break
-				}
-			}
-			if portal != nil {
-				break
-			}
+	// Single-node volumes get one export per (volume, node); a volume already published to a
+	// different node must not be handed to this one. Multi-node (shared) volumes get one export
+	// that every node using them is allowed into.
+	shared := isSharedMode(req.GetVolumeCapability())
+	var sharedExp *store.Export
+	for _, exp := range exports {
+		if exp.VolumeID != vol.ID {
+			continue
+		}
+		switch {
+		case exp.Shared && shared:
+			sharedExp = exp
+		case exp.Shared:
+			return nil, status.Errorf(codes.FailedPrecondition, "volume %s is published as a shared (multi-node) volume", vol.ID)
+		case exp.NodeID == "":
+			return nil, status.Errorf(codes.FailedPrecondition, "volume %s has a non-CSI export %s", vol.ID, exp.ID)
+		case exp.NodeID == req.GetNodeId() && !shared:
+			return &csi.ControllerPublishVolumeResponse{
+				PublishContext: buildPublishContext(exp, exportPortal(exp, portals), vol),
+			}, nil
+		default:
+			return nil, status.Errorf(codes.FailedPrecondition, "volume %s is already published to node %q", vol.ID, exp.NodeID)
+		}
+	}
+	if sharedExp != nil {
+		if slices.Contains(sharedExp.NodeIDs, req.GetNodeId()) {
+			return &csi.ControllerPublishVolumeResponse{
+				PublishContext: buildPublishContext(sharedExp, exportPortal(sharedExp, portals), vol),
+			}, nil
+		}
+		igID, err := s.ensureNodeInitiatorGroup(ctx, req.GetNodeId())
+		if err != nil {
+			return nil, mapAPIError(err)
+		}
+		// Added while the other nodes stay connected (a live migration's target joins its source).
+		igs := append(slices.Clone(sharedExp.InitiatorGroupIDs), igID)
+		nodes := append(slices.Clone(sharedExp.NodeIDs), req.GetNodeId())
+		updated, err := s.client.UpdateExport(ctx, sharedExp.ID, UpdateExportRequest{InitiatorGroupIDs: &igs, NodeIDs: &nodes})
+		if err != nil {
+			return nil, mapAPIError(err)
 		}
 		return &csi.ControllerPublishVolumeResponse{
-			PublishContext: buildPublishContext(existingExport, portal),
+			PublishContext: buildPublishContext(updated, exportPortal(updated, portals), vol),
 		}, nil
 	}
 
+	var portal *store.Portal
 	for _, p := range portals {
 		if p.Protocol == proto {
 			portal = p
 			break
 		}
 	}
-	if portal == nil && len(portals) > 0 {
-		portal = portals[0]
-		proto = portal.Protocol
-	}
 	if portal == nil {
-		return nil, status.Error(codes.FailedPrecondition, "no storage portal configured in Velocor")
+		return nil, status.Errorf(codes.FailedPrecondition, "no %s storage portal configured in Velocor", proto)
 	}
 
 	igID, err := s.ensureNodeInitiatorGroup(ctx, req.GetNodeId())
@@ -317,21 +334,44 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 		return nil, mapAPIError(err)
 	}
 
-	exp, err := s.client.CreateExport(ctx, CreateExportRequest{
-		Name:              "csi-" + vol.Name,
+	create := CreateExportRequest{
+		Name:              exportNameFor(vol.ID, req.GetNodeId()),
 		VolumeID:          vol.ID,
 		Protocol:          proto,
 		PortalIDs:         []string{portal.ID},
 		InitiatorGroupIDs: []string{igID},
 		AllowAnyHost:      false,
-	})
+		NodeID:            req.GetNodeId(),
+	}
+	if shared {
+		create.Name, create.NodeID, create.Shared, create.NodeIDs = "csi-"+vol.ID+"-shared", "", true, []string{req.GetNodeId()}
+	}
+	exp, err := s.client.CreateExport(ctx, create)
 	if err != nil {
 		return nil, mapAPIError(err)
 	}
 
 	return &csi.ControllerPublishVolumeResponse{
-		PublishContext: buildPublishContext(exp, portal),
+		PublishContext: buildPublishContext(exp, portal, vol),
 	}, nil
+}
+
+// exportNameFor derives a short, deterministic export name for a (volume, node) pair that
+// is valid inside NQNs/IQNs regardless of how long or exotic the Kubernetes node name is.
+func exportNameFor(volID, nodeID string) string {
+	sum := sha256.Sum256([]byte(nodeID))
+	return "csi-" + volID + "-" + hex.EncodeToString(sum[:6])
+}
+
+func exportPortal(exp *store.Export, portals []*store.Portal) *store.Portal {
+	for _, pid := range exp.PortalIDs {
+		for _, p := range portals {
+			if p.ID == pid {
+				return p
+			}
+		}
+	}
+	return nil
 }
 
 func (s *ControllerServer) ControllerUnpublishVolume(ctx context.Context, req *csi.ControllerUnpublishVolumeRequest) (*csi.ControllerUnpublishVolumeResponse, error) {
@@ -347,10 +387,22 @@ func (s *ControllerServer) ControllerUnpublishVolume(ctx context.Context, req *c
 		return nil, mapAPIError(err)
 	}
 	for _, exp := range exports {
-		if exp.VolumeID == req.GetVolumeId() {
-			if err := s.client.DeleteExport(ctx, exp.ID); err != nil && !IsNotFound(err) {
+		if exp.VolumeID == req.GetVolumeId() && exp.Shared {
+			if err := s.unpublishShared(ctx, exp, req.GetNodeId()); err != nil {
 				return nil, mapAPIError(err)
 			}
+			continue
+		}
+		// Only CSI-managed exports (NodeID set) are touched. An empty node_id means
+		// "unpublish from all nodes" per the CSI spec.
+		if exp.VolumeID != req.GetVolumeId() || exp.NodeID == "" {
+			continue
+		}
+		if req.GetNodeId() != "" && exp.NodeID != req.GetNodeId() {
+			continue
+		}
+		if err := s.client.DeleteExport(ctx, exp.ID); err != nil && !IsNotFound(err) {
+			return nil, mapAPIError(err)
 		}
 	}
 	return &csi.ControllerUnpublishVolumeResponse{}, nil
@@ -385,14 +437,9 @@ func (s *ControllerServer) ListVolumes(ctx context.Context, req *csi.ListVolumes
 	if err != nil {
 		return nil, mapAPIError(err)
 	}
-	exports, _ := s.client.ListExports(ctx)
-	pubByVol := map[string][]string{}
-	for _, exp := range exports {
-		if len(exp.InitiatorGroupIDs) > 0 {
-			pubByVol[exp.VolumeID] = append(pubByVol[exp.VolumeID], exp.InitiatorGroupIDs...)
-		} else {
-			pubByVol[exp.VolumeID] = append(pubByVol[exp.VolumeID], "exported")
-		}
+	pubByVol, err := s.publishedNodes(ctx)
+	if err != nil {
+		return nil, err
 	}
 
 	start, end, nextToken, err := paginate(len(vols), req.GetStartingToken(), req.GetMaxEntries())
@@ -558,19 +605,73 @@ func (s *ControllerServer) ControllerGetVolume(ctx context.Context, req *csi.Con
 	if err != nil {
 		return nil, mapAPIError(err)
 	}
-	exports, _ := s.client.ListExports(ctx)
-	var pubNodes []string
-	for _, exp := range exports {
-		if exp.VolumeID == vol.ID {
-			pubNodes = append(pubNodes, exp.InitiatorGroupIDs...)
-		}
+	pubByVol, err := s.publishedNodes(ctx)
+	if err != nil {
+		return nil, err
 	}
 	return &csi.ControllerGetVolumeResponse{
 		Volume: toCSIVolume(vol, nil, nil),
 		Status: &csi.ControllerGetVolumeResponse_VolumeStatus{
-			PublishedNodeIds: pubNodes,
+			PublishedNodeIds: pubByVol[vol.ID],
 		},
 	}, nil
+}
+
+// publishedNodes maps volume IDs to the CSI node IDs they are published to.
+// unpublishShared takes a node off a shared export (all nodes if nodeID is empty), and deletes
+// the export once no node uses it.
+func (s *ControllerServer) unpublishShared(ctx context.Context, exp *store.Export, nodeID string) error {
+	if nodeID != "" && !slices.Contains(exp.NodeIDs, nodeID) {
+		return nil
+	}
+	nodes := slices.DeleteFunc(slices.Clone(exp.NodeIDs), func(n string) bool { return nodeID == "" || n == nodeID })
+	if len(nodes) == 0 {
+		if err := s.client.DeleteExport(ctx, exp.ID); err != nil && !IsNotFound(err) {
+			return err
+		}
+		return nil
+	}
+	igs, err := s.client.ListInitiatorGroups(ctx)
+	if err != nil {
+		return err
+	}
+	groupName := "csi-node-" + sanitizeName(nodeID)
+	keep := slices.DeleteFunc(slices.Clone(exp.InitiatorGroupIDs), func(id string) bool {
+		for _, g := range igs {
+			if g.ID == id && g.Name == groupName {
+				return true
+			}
+		}
+		return false
+	})
+	_, err = s.client.UpdateExport(ctx, exp.ID, UpdateExportRequest{InitiatorGroupIDs: &keep, NodeIDs: &nodes})
+	return err
+}
+
+// isSharedMode reports access modes in which several nodes use a volume at once.
+func isSharedMode(cap *csi.VolumeCapability) bool {
+	switch cap.GetAccessMode().GetMode() {
+	case csi.VolumeCapability_AccessMode_MULTI_NODE_READER_ONLY,
+		csi.VolumeCapability_AccessMode_MULTI_NODE_SINGLE_WRITER,
+		csi.VolumeCapability_AccessMode_MULTI_NODE_MULTI_WRITER:
+		return true
+	}
+	return false
+}
+
+func (s *ControllerServer) publishedNodes(ctx context.Context) (map[string][]string, error) {
+	exports, err := s.client.ListExports(ctx)
+	if err != nil {
+		return nil, mapAPIError(err)
+	}
+	out := map[string][]string{}
+	for _, exp := range exports {
+		if exp.NodeID != "" {
+			out[exp.VolumeID] = append(out[exp.VolumeID], exp.NodeID)
+		}
+		out[exp.VolumeID] = append(out[exp.VolumeID], exp.NodeIDs...)
+	}
+	return out, nil
 }
 
 func (s *ControllerServer) selectPool(ctx context.Context, poolParam string, requiredBytes uint64) (string, error) {
@@ -594,7 +695,7 @@ func (s *ControllerServer) selectPool(ctx context.Context, poolParam string, req
 			return p.ID, nil
 		}
 	}
-	return pools[0].ID, nil
+	return "", status.Errorf(codes.ResourceExhausted, "no storage pool has %d bytes free", requiredBytes)
 }
 
 func (s *ControllerServer) ensureNodeInitiatorGroup(ctx context.Context, nodeID string) (string, error) {
@@ -669,10 +770,14 @@ func normalizeProtocol(p string) store.ExportProtocol {
 	}
 }
 
-func buildPublishContext(exp *store.Export, portal *store.Portal) map[string]string {
+func buildPublishContext(exp *store.Export, portal *store.Portal, vol *store.Volume) map[string]string {
 	ctx := map[string]string{
 		"export_id": exp.ID,
 		"protocol":  string(exp.Protocol),
+	}
+	if vol != nil && vol.UUID != "" {
+		// The node verifies the attached namespace carries this UUID before formatting/mounting.
+		ctx["volume_uuid"] = vol.UUID
 	}
 	if portal != nil {
 		ctx["portal_ip"] = portal.IPAddress
@@ -726,6 +831,15 @@ func validateVolumeCapabilities(caps []*csi.VolumeCapability) error {
 			csi.VolumeCapability_AccessMode_SINGLE_NODE_READER_ONLY,
 			csi.VolumeCapability_AccessMode_SINGLE_NODE_SINGLE_WRITER,
 			csi.VolumeCapability_AccessMode_SINGLE_NODE_MULTI_WRITER:
+		case csi.VolumeCapability_AccessMode_MULTI_NODE_READER_ONLY,
+			csi.VolumeCapability_AccessMode_MULTI_NODE_SINGLE_WRITER,
+			csi.VolumeCapability_AccessMode_MULTI_NODE_MULTI_WRITER:
+			// A filesystem mounted on several nodes is corrupted (even read-only nodes cache
+			// stale metadata). Raw block is what KubeVirt live migration needs; the users of a
+			// shared device coordinate their writes and use direct I/O, as QEMU does.
+			if cap.GetBlock() == nil {
+				return fmt.Errorf("access mode %v is only supported for raw block volumes (volumeMode: Block)", mode)
+			}
 		default:
 			return fmt.Errorf("unsupported access mode %v", mode)
 		}

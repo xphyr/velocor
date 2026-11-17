@@ -33,7 +33,11 @@ type DriverConfig struct {
 	Mounter    Mounter
 }
 
-// Driver hosts the CSI Identity, Controller, Node, and SnapshotMetadata gRPC services.
+// Driver hosts the CSI Identity, Controller, GroupController and Node gRPC services.
+//
+// The SnapshotMetadata service (changed-block tracking, KEP-3314) is deliberately absent:
+// SPDK has no RPC that reports a snapshot's allocated clusters, so the driver must not tell
+// backup tools it can answer. See TODO.md P1-9 / L-2.
 type Driver struct {
 	cfg    DriverConfig
 	server *grpc.Server
@@ -62,12 +66,10 @@ func NewDriver(cfg DriverConfig) (*Driver, error) {
 	case ModeAll:
 		csi.RegisterControllerServer(srv, NewControllerServer(cfg.Client, cfg.NodeID))
 		csi.RegisterGroupControllerServer(srv, NewGroupControllerServer(cfg.Client))
-		csi.RegisterSnapshotMetadataServer(srv, NewSnapshotMetadataServer(cfg.Client))
 		csi.RegisterNodeServer(srv, NewNodeServer(cfg.NodeID, cfg.Mounter))
 	case ModeController:
 		csi.RegisterControllerServer(srv, NewControllerServer(cfg.Client))
 		csi.RegisterGroupControllerServer(srv, NewGroupControllerServer(cfg.Client))
-		csi.RegisterSnapshotMetadataServer(srv, NewSnapshotMetadataServer(cfg.Client))
 	case ModeNode:
 		csi.RegisterNodeServer(srv, NewNodeServer(cfg.NodeID, cfg.Mounter))
 	default:

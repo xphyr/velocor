@@ -1,7 +1,6 @@
 package hardware
 
 import (
-	"bufio"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -37,6 +36,10 @@ type Config struct {
 	SysfsRoot string
 	ProcRoot  string
 	DevRoot   string
+	// AllowUnsafeNoIOMMU permits binding NVMe drives to vfio-pci in "unsafe noiommu" mode (or
+	// to uio_pci_generic) when the host has no IOMMU. Without an IOMMU, SPDK can DMA anywhere
+	// in host memory, so this is only appropriate for VMs/labs and must be opted into.
+	AllowUnsafeNoIOMMU bool
 }
 
 // HugepageStatus reports 2 MiB hugepage allocation on the node.
@@ -53,8 +56,10 @@ type Manager struct {
 	cfg Config
 
 	mu          sync.RWMutex
-	bootDevs    map[string]bool // e.g., "nvme0n1", "sda", "vda"
-	bootPCIAddr map[string]bool // e.g., "0000:00:04.0"
+	bootDevs    map[string]bool // whole disks backing OS mountpoints/swap, e.g. "nvme0n1", "sda" (sticky)
+	bootPCIAddr map[string]bool // NVMe controllers backing OS mountpoints, e.g. "0000:00:04.0" (sticky)
+	inUseDevs   map[string]bool // whole disks backing any mount or swap (recomputed every refresh)
+	inUsePCI    map[string]bool
 }
 
 // NewManager creates a new Linux Hardware Manager and initializes the boot-disk safety guard.
@@ -73,6 +78,8 @@ func NewManager(cfg Config) (*Manager, error) {
 		cfg:         cfg,
 		bootDevs:    make(map[string]bool),
 		bootPCIAddr: make(map[string]bool),
+		inUseDevs:   make(map[string]bool),
+		inUsePCI:    make(map[string]bool),
 	}
 
 	if err := m.RefreshBootGuard(); err != nil {
@@ -81,92 +88,57 @@ func NewManager(cfg Config) (*Manager, error) {
 	return m, nil
 }
 
-// RefreshBootGuard parses /proc/self/mountinfo (and /proc/1/mountinfo when running in a
-// container with host PID namespace) to identify all block devices and PCIe BDF
-// addresses backing /, /boot, /boot/efi, /sysroot, and /var. Once marked as a boot device,
-// a drive remains permanently protected for the lifetime of the process.
+// UnsafeNoIOMMUAllowed reports whether binding drives without an IOMMU was opted into.
+func (m *Manager) UnsafeNoIOMMUAllowed() bool {
+	return m.cfg.AllowUnsafeNoIOMMU
+}
+
+// RefreshBootGuard parses /proc/self/mountinfo, /proc/1/mountinfo and /proc/swaps to find
+// every whole disk (and NVMe controller) that backs a mounted filesystem or active swap,
+// resolving through partitions, device-mapper (LVM, LUKS), md and NVMe multipath.
+//
+// Disks backing OS mountpoints (/, /boot, /var, ...) or swap are remembered for the
+// lifetime of the process; other mounted disks are protected only while mounted.
 func (m *Manager) RefreshBootGuard() error {
-	candidates := []string{
+	sets := newGuardSets()
+	for _, p := range []string{
 		filepath.Join(m.cfg.ProcRoot, "self", "mountinfo"),
 		filepath.Join(m.cfg.ProcRoot, "1", "mountinfo"),
-	}
-
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	for _, mountinfoPath := range candidates {
-		if err := m.scanMountinfoFile(mountinfoPath); err != nil {
+	} {
+		if err := m.scanMountinfo(p, sets); err != nil {
 			return err
 		}
 	}
+	m.scanSwaps(sets)
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for k := range sets.bootDevs {
+		m.bootDevs[k] = true
+	}
+	for k := range sets.bootPCI {
+		m.bootPCIAddr[k] = true
+	}
+	m.inUseDevs, m.inUsePCI = sets.inUseDevs, sets.inUsePCI
 	return nil
 }
 
-func (m *Manager) scanMountinfoFile(mountinfoPath string) error {
-	f, err := os.Open(mountinfoPath)
-	if err != nil {
-		if os.IsNotExist(err) || os.IsPermission(err) {
-			return nil
-		}
-		return fmt.Errorf("open mountinfo %s: %w", mountinfoPath, err)
-	}
-	defer func() { _ = f.Close() }()
-
-	scanner := bufio.NewScanner(f)
-	for scanner.Scan() {
-		line := scanner.Text()
-		// mountinfo format:
-		// 36 35 98:0 /mnt1 /mnt2 rw,noatime master:1 - ext3 /dev/root rw,errors=continue
-		parts := strings.Split(line, " - ")
-		if len(parts) != 2 {
-			continue
-		}
-		leftFields := strings.Fields(parts[0])
-		rightFields := strings.Fields(parts[1])
-		if len(leftFields) < 5 || len(rightFields) < 2 {
-			continue
-		}
-		mountPoint := leftFields[4]
-		mountSource := rightFields[1]
-
-		if !protectedMountpoints[mountPoint] {
-			continue
-		}
-		if !strings.HasPrefix(mountSource, "/dev/") {
-			continue
-		}
-
-		devName := strings.TrimPrefix(mountSource, "/dev/")
-		baseDevs := m.resolveBaseBlockDevices(devName)
-		for _, baseDev := range baseDevs {
-			m.bootDevs[baseDev] = true
-			// Only NVMe controllers are unbound as whole PCI devices (vfio-pci);
-			// SATA/SAS/VirtIO-SCSI HBAs can host both boot (sda) and data (sdb, sdc) disks.
-			if strings.HasPrefix(baseDev, "nvme") {
-				if pci := m.resolveBlockDevicePCIAddress(baseDev); pci != "" {
-					m.bootPCIAddr[pci] = true
-				}
-			}
-		}
-	}
-
-	return scanner.Err()
-}
-
-// IsBootDevice returns true if the given PCIe BDF address or block device path/name
-// backs any protected OS mountpoint.
+// IsBootDevice returns true if the given PCIe BDF address or block device path (kernel
+// name, /dev path or /dev/disk/by-* link) backs an OS mountpoint, any mounted filesystem,
+// or swap.
 func (m *Manager) IsBootDevice(pciAddr, devicePath string) bool {
+	var disks []string
+	if devicePath != "" {
+		disks = m.physicalDisks(m.kernelNameForPath(devicePath))
+	}
+
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-
-	if pciAddr != "" && m.bootPCIAddr[strings.ToLower(pciAddr)] {
+	if pci := strings.ToLower(pciAddr); pci != "" && (m.bootPCIAddr[pci] || m.inUsePCI[pci]) {
 		return true
 	}
-	if devicePath != "" {
-		devName := strings.TrimPrefix(devicePath, m.cfg.DevRoot+"/")
-		devName = strings.TrimPrefix(devName, "/dev/")
-		base := stripPartitionSuffix(devName)
-		if m.bootDevs[devName] || m.bootDevs[base] {
+	for _, d := range disks {
+		if m.bootDevs[d] || m.inUseDevs[d] {
 			return true
 		}
 	}
@@ -244,6 +216,7 @@ func (m *Manager) DiscoverDisks() ([]*store.Disk, error) {
 				IsBootDevice:     isBoot,
 				Claimed:          claimed,
 				HealthStatus:     store.HealthStatusOnline,
+				WriteCache:       m.writeCacheState(blockName),
 				UpdatedAt:        time.Now().UTC(),
 			})
 		}
@@ -259,9 +232,10 @@ func (m *Manager) DiscoverDisks() ([]*store.Disk, error) {
 			}
 
 			blockDir := filepath.Join(sysBlockDir, devName)
-			devPath := filepath.Join(m.cfg.DevRoot, devName)
+			devPath := m.stableDiskPath(devName)
 			pciAddr := m.resolveBlockDevicePCIAddress(devName)
-			isBoot := m.IsBootDevice(pciAddr, devPath)
+			// The HBA's PCI address is shared by OS and data disks, so judge by device only.
+			isBoot := m.IsBootDevice("", filepath.Join(m.cfg.DevRoot, devName))
 			model := readSysfsString(filepath.Join(blockDir, "device", "model"))
 
 			rotational := readSysfsString(filepath.Join(blockDir, "queue", "rotational"))
@@ -287,8 +261,12 @@ func (m *Manager) DiscoverDisks() ([]*store.Disk, error) {
 				numaNode = 0
 			}
 
+			wwid := readSysfsString(filepath.Join(blockDir, "device", "wwid"))
+			if wwid == "" {
+				wwid = readSysfsString(filepath.Join(blockDir, "wwid"))
+			}
 			disks = append(disks, &store.Disk{
-				ID:               "ssd-" + devName,
+				ID:               stableSSDID(wwid, serial, devName),
 				Name:             devName,
 				Type:             store.DiskTypeSSD,
 				PCIAddress:       pciAddr,
@@ -303,6 +281,7 @@ func (m *Manager) DiscoverDisks() ([]*store.Disk, error) {
 				IsBootDevice:     isBoot,
 				Claimed:          false,
 				HealthStatus:     store.HealthStatusOnline,
+				WriteCache:       m.writeCacheState(devName),
 				UpdatedAt:        time.Now().UTC(),
 			})
 		}
@@ -400,10 +379,16 @@ func (m *Manager) BindNVMeToUserspace(pciAddr string, preferredDriver string) (s
 	}
 
 	if targetDriver == "vfio-pci" && !m.hasHardwareIOMMU(devDir) {
+		if !m.cfg.AllowUnsafeNoIOMMU {
+			return "", fmt.Errorf("%w: no IOMMU is available for %s; enable the IOMMU (intel_iommu=on / amd_iommu=on) "+
+				"or explicitly allow unsafe no-IOMMU DMA with VELOCOR_ALLOW_UNSAFE_NOIOMMU=true", store.ErrInvalidArgument, bdf)
+		}
 		// In VMs without vIOMMU, enable vfio unsafe noiommu mode if supported.
 		noiommuParam := filepath.Join(m.cfg.SysfsRoot, "module", "vfio", "parameters", "enable_unsafe_noiommu_mode")
 		if _, err := os.Stat(noiommuParam); err == nil {
-			_ = os.WriteFile(noiommuParam, []byte("1\n"), 0644)
+			if err := os.WriteFile(noiommuParam, []byte("1\n"), 0644); err != nil {
+				return "", fmt.Errorf("enable vfio noiommu mode: %w", err)
+			}
 		} else if _, err := os.Stat(filepath.Join(m.cfg.SysfsRoot, "bus", "pci", "drivers", "uio_pci_generic")); err == nil {
 			targetDriver = "uio_pci_generic"
 		}
@@ -482,19 +467,6 @@ func (m *Manager) hasHardwareIOMMU(devDir string) bool {
 	return err == nil && len(entries) > 0
 }
 
-func (m *Manager) resolveBaseBlockDevices(devName string) []string {
-	base := stripPartitionSuffix(devName)
-	slavesDir := filepath.Join(m.cfg.SysfsRoot, "class", "block", devName, "slaves")
-	if entries, err := os.ReadDir(slavesDir); err == nil && len(entries) > 0 {
-		var result []string
-		for _, e := range entries {
-			result = append(result, m.resolveBaseBlockDevices(e.Name())...)
-		}
-		return result
-	}
-	return []string{base}
-}
-
 func (m *Manager) resolveBlockDevicePCIAddress(baseDev string) string {
 	blockPath := filepath.Join(m.cfg.SysfsRoot, "class", "block", baseDev)
 	// Check /sys/class/block/<dev>/device/address (common on NVMe controllers).
@@ -529,17 +501,43 @@ func (m *Manager) inspectNVMeSysfs(pciDevDir string) (blockName, model, serial, 
 	nsEntries, err := os.ReadDir(ctrlDir)
 	if err == nil {
 		for _, entry := range nsEntries {
-			if strings.HasPrefix(entry.Name(), ctrlEntries[0].Name()+"n") {
-				blockName = entry.Name()
-				nsDir := filepath.Join(ctrlDir, blockName)
-				sectors := readSysfsUint64(filepath.Join(nsDir, "size"), 0)
-				sizeBytes = sectors * 512
+			name := entry.Name()
+			nsDir := filepath.Join(ctrlDir, name)
+			switch {
+			case nvmeHeadRegex.MatchString(name) && strings.HasPrefix(name, ctrlEntries[0].Name()+"n"):
+				blockName = name
+			case nvmePathRegex.MatchString(name):
+				// Native NVMe multipath: the controller only holds the hidden path device
+				// (nvme0c0n1); the usable block device is the subsystem head (nvmeXnY), whose
+				// instance number need not match the controller's.
+				blockName = m.multipathHead(name)
+				if blockName != "" {
+					nsDir = filepath.Join(m.cfg.SysfsRoot, "class", "block", blockName)
+				}
+			}
+			if blockName != "" {
+				sizeBytes = readSysfsUint64(filepath.Join(nsDir, "size"), 0) * 512
 				blockSize = uint32(readSysfsUint64(filepath.Join(nsDir, "queue", "logical_block_size"), 512))
 				break
 			}
 		}
 	}
 	return blockName, model, serial, fwRev, sizeBytes, blockSize
+}
+
+// multipathHead returns the NVMe multipath head device (nvmeXnY) that owns pathDev (nvmeXcYnZ).
+func (m *Manager) multipathHead(pathDev string) string {
+	heads, _ := filepath.Glob(filepath.Join(m.cfg.SysfsRoot, "class", "block", "nvme*n*"))
+	for _, h := range heads {
+		name := filepath.Base(h)
+		if !nvmeHeadRegex.MatchString(name) {
+			continue
+		}
+		if _, err := os.Stat(filepath.Join(h, "multipath", pathDev)); err == nil {
+			return name
+		}
+	}
+	return ""
 }
 
 func stripPartitionSuffix(devName string) string {

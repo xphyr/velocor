@@ -1,0 +1,59 @@
+package server
+
+import (
+	"net/http"
+	"strings"
+	"testing"
+
+	"github.com/velocor/velocor/internal/store"
+)
+
+func TestDiskDurabilityAPI(t *testing.T) {
+	h := newHarness(t)
+	if err := h.st.UpsertDisk(&store.Disk{ID: "ssd-1", Name: "sdb", Type: store.DiskTypeSSD, Claimed: true, WriteCache: store.WriteCacheWriteBack}); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.st.UpsertDisk(&store.Disk{ID: "ssd-boot", Name: "sda", Type: store.DiskTypeSSD, IsBootDevice: true}); err != nil {
+		t.Fatal(err)
+	}
+	warned := func() bool {
+		_, st := h.do("GET", "/api/v1/system/status", h.admin, nil)
+		for _, w := range st["warnings"].([]any) {
+			if strings.Contains(w.(string), "Power loss can lose acknowledged writes on sdb") {
+				return true
+			}
+		}
+		return false
+	}
+
+	_, resp := h.do("GET", "/api/v1/disks/ssd-1", h.admin, nil)
+	if got := resp["disk"].(map[string]any)["durability"]; got != string(store.DurabilityAtRisk) {
+		t.Fatalf("durability = %v, want AT_RISK", got)
+	}
+	if !warned() {
+		t.Fatal("no status warning for a claimed disk with its write cache on")
+	}
+
+	code, resp := h.do("PATCH", "/api/v1/disks/ssd-1", h.admin, map[string]any{"power_loss_protected": true})
+	if code != http.StatusOK || resp["disk"].(map[string]any)["durability"] != string(store.DurabilityDurable) {
+		t.Fatalf("declare PLP: %d %v", code, resp)
+	}
+	if warned() {
+		t.Fatal("still warning after declaring the disk power-loss protected")
+	}
+
+	for _, c := range []struct {
+		id   string
+		body map[string]any
+	}{
+		{"ssd-1", map[string]any{"write_cache_policy": "SOMETIMES"}},
+		{"ssd-boot", map[string]any{"power_loss_protected": true}},
+	} {
+		if code, resp := h.do("PATCH", "/api/v1/disks/"+c.id, h.admin, c.body); code != http.StatusBadRequest {
+			t.Errorf("PATCH %s %v: %d %v, want 400", c.id, c.body, code, resp)
+		}
+	}
+	if code, _ := h.do("PATCH", "/api/v1/disks/nope", h.admin, map[string]any{"power_loss_protected": true}); code != http.StatusNotFound {
+		t.Errorf("unknown disk: %d, want 404", code)
+	}
+}

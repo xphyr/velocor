@@ -1,0 +1,32 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended",
+    "docker:pinDigests",
+    "helpers:pinGitHubActionDigests"
+  ],
+  "dockerfile": {
+    "fileMatch": [
+      "(^|/)Containerfile[^/]*$"
+    ]
+  },
+  "packageRules": [
+    {
+      "description": "go.mod's toolchain and the golang build image must move together (hack/check-pins.sh)",
+      "matchPackageNames": [
+        "go",
+        "golang",
+        "docker.io/library/golang"
+      ],
+      "groupName": "Go toolchain"
+    },
+    {
+      "description": "Fedora base images follow the rolling release tag (B17): no digest pins; Renovate only proposes the next Fedora release",
+      "matchPackageNames": [
+        "/^quay\\.io/fedora//"
+      ],
+      "groupName": "Fedora base images",
+      "pinDigests": false
+    }
+  ]
+}

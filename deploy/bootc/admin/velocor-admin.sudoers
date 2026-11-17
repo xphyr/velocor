@@ -1,0 +1,2 @@
+# velocor-admin authenticates with SSH keys only (no password), so sudo can't ask for one.
+velocor-admin ALL=(ALL) NOPASSWD: ALL

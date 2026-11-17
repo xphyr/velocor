@@ -146,7 +146,7 @@ func TestSPDKClientTypedRPCs(t *testing.T) {
 		t.Fatalf("BdevNvmeGetControllerHealthInfo unexpected: %+v, err=%v", health, err)
 	}
 
-	uringBdev, err := client.BdevUringCreate(ctx, "uring_sdb", "/dev/sdb", 4096)
+	uringBdev, err := client.BdevUringCreate(ctx, "uring_sdb", "/dev/sdb", 4096, "")
 	if err != nil || uringBdev != "uring_sdb" {
 		t.Fatalf("BdevUringCreate failed: %q, %v", uringBdev, err)
 	}

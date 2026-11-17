@@ -7,8 +7,9 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"regexp"
+	"sort"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/velocor/velocor/internal/store"
@@ -31,35 +32,22 @@ type OSStatus struct {
 	Rollback  *OSDeployment `json:"rollback,omitempty"`
 }
 
-// ContainerUpdateEntry describes a running Quadlet container and whether a registry update is available.
-type ContainerUpdateEntry struct {
-	Unit            string `json:"unit"`
-	ContainerName   string `json:"container_name"`
-	Image           string `json:"image"`
-	Policy          string `json:"policy,omitempty"`
-	RunningStatus   string `json:"running_status,omitempty"`
-	UpdateStatus    string `json:"update_status"`
-	UpdateAvailable bool   `json:"update_available"`
+// ContainerInfo describes one of the appliance's quadlet containers. Containers change only
+// with the OS image (`bootc upgrade`), which embeds them pinned by digest, so this is read-only.
+type ContainerInfo struct {
+	Unit          string `json:"unit"`
+	ContainerName string `json:"container_name"`
+	Image         string `json:"image"`
+	ImageID       string `json:"image_id,omitempty"`
+	RunningStatus string `json:"running_status,omitempty"`
 }
 
-// ContainerUpdatesStatus summarizes the container update check and latest update job state.
-type ContainerUpdatesStatus struct {
-	Available         bool                   `json:"available"`
-	Message           string                 `json:"message,omitempty"`
-	CheckedAt         time.Time              `json:"checked_at"`
-	UpdatesAvailable  bool                   `json:"updates_available"`
-	Containers        []ContainerUpdateEntry `json:"containers"`
-	LastUpdateState   string                 `json:"last_update_state,omitempty"`
-	LastUpdateMessage string                 `json:"last_update_message,omitempty"`
-	LastUpdateAt      *time.Time             `json:"last_update_at,omitempty"`
+// ContainersStatus lists the running Velocor containers.
+type ContainersStatus struct {
+	Available  bool            `json:"available"`
+	Message    string          `json:"message,omitempty"`
+	Containers []ContainerInfo `json:"containers"`
 }
-
-var (
-	lifecycleMu       sync.Mutex
-	lastUpdateState   string
-	lastUpdateMessage string
-	lastUpdateAt      *time.Time
-)
 
 func hostCommand(ctx context.Context, name string, args ...string) *exec.Cmd {
 	if isInContainer() {
@@ -146,6 +134,12 @@ func (s *Server) handleStageUpgrade(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = json.NewDecoder(r.Body).Decode(&req)
 	imageRef := strings.TrimSpace(req.ImageRef)
+	// The reference reaches bootc's command line: anything that could be read as an option
+	// (or carries whitespace / control characters) is refused.
+	if imageRef != "" && !imageRefRe.MatchString(imageRef) {
+		writeError(w, fmt.Errorf("%w: %q is not a container image reference", store.ErrInvalidArgument, imageRef))
+		return
+	}
 
 	var cmd *exec.Cmd
 	if imageRef == "" {
@@ -188,166 +182,43 @@ func (s *Server) handleRebootSystem(w http.ResponseWriter, _ *http.Request) {
 	}()
 }
 
-func (s *Server) handleCheckContainerUpdates(w http.ResponseWriter, r *http.Request) {
-	status := queryContainerUpdates(r.Context())
-	writeJSON(w, http.StatusOK, status)
+func (s *Server) handleListContainers(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, listContainers(r.Context()))
 }
 
-func queryContainerUpdates(ctx context.Context) ContainerUpdatesStatus {
-	lifecycleMu.Lock()
-	stateCopy := lastUpdateState
-	msgCopy := lastUpdateMessage
-	atCopy := lastUpdateAt
-	lifecycleMu.Unlock()
-
-	res := ContainerUpdatesStatus{
-		Available:         true,
-		CheckedAt:         time.Now().UTC(),
-		Containers:        []ContainerUpdateEntry{},
-		LastUpdateState:   stateCopy,
-		LastUpdateMessage: msgCopy,
-		LastUpdateAt:      atCopy,
-	}
-
-	psOut, psErr := hostCommand(ctx, "podman", "ps", "--format", "json").CombinedOutput()
-	if psErr != nil {
+func listContainers(ctx context.Context) ContainersStatus {
+	res := ContainersStatus{Available: true, Containers: []ContainerInfo{}}
+	out, err := hostCommand(ctx, "podman", "ps", "--all", "--format", "json").CombinedOutput()
+	if err != nil {
 		res.Available = false
-		res.Message = strings.TrimSpace(fmt.Sprintf("podman unavailable: %v (%s)", psErr, strings.TrimSpace(string(psOut))))
+		res.Message = strings.TrimSpace(fmt.Sprintf("podman unavailable: %v (%s)", err, strings.TrimSpace(string(out))))
 		return res
 	}
-
-	runningMap := map[string]struct {
-		Image  string
-		Status string
-	}{}
-	var psItems []struct {
-		Names  []string `json:"Names"`
-		Image  string   `json:"Image"`
-		Status string   `json:"Status"`
+	var items []struct {
+		Names   []string `json:"Names"`
+		Image   string   `json:"Image"`
+		ImageID string   `json:"ImageID"`
+		Status  string   `json:"Status"`
 	}
-	if err := json.Unmarshal(psOut, &psItems); err == nil {
-		for _, item := range psItems {
-			for _, name := range item.Names {
-				runningMap[name] = struct {
-					Image  string
-					Status string
-				}{Image: item.Image, Status: item.Status}
-			}
-		}
+	if err := json.Unmarshal(out, &items); err != nil {
+		res.Available = false
+		res.Message = "unexpected podman output: " + err.Error()
+		return res
 	}
-
-	auOut, auErr := hostCommand(ctx, "podman", "auto-update", "--dry-run", "--format", "json").CombinedOutput()
-	if auErr != nil {
-		// Fall back to listing running velocor containers if auto-update dry-run fails.
-		for name, info := range runningMap {
+	for _, item := range items {
+		for _, name := range item.Names {
 			if strings.HasPrefix(name, "velocor-") {
-				res.Containers = append(res.Containers, ContainerUpdateEntry{
-					Unit:          name + ".service",
-					ContainerName: name,
-					Image:         info.Image,
-					RunningStatus: info.Status,
-					UpdateStatus:  "check-failed",
+				res.Containers = append(res.Containers, ContainerInfo{
+					Unit: name + ".service", ContainerName: name, Image: item.Image,
+					ImageID: item.ImageID, RunningStatus: item.Status,
 				})
 			}
 		}
-		res.Message = strings.TrimSpace(string(auOut))
-		return res
 	}
-
-	var auItems []struct {
-		Unit      string `json:"Unit"`
-		Container string `json:"ContainerName"`
-		Image     string `json:"Image"`
-		Policy    string `json:"Policy"`
-		Updated   string `json:"Updated"`
-	}
-	if err := json.Unmarshal(auOut, &auItems); err == nil {
-		for _, item := range auItems {
-			avail := strings.EqualFold(item.Updated, "pending")
-			if avail {
-				res.UpdatesAvailable = true
-			}
-			runInfo := runningMap[item.Container]
-			res.Containers = append(res.Containers, ContainerUpdateEntry{
-				Unit:            item.Unit,
-				ContainerName:   item.Container,
-				Image:           item.Image,
-				Policy:          item.Policy,
-				RunningStatus:   runInfo.Status,
-				UpdateStatus:    item.Updated,
-				UpdateAvailable: avail,
-			})
-		}
-	}
+	sort.Slice(res.Containers, func(i, j int) bool { return res.Containers[i].Unit < res.Containers[j].Unit })
 	return res
 }
 
-func (s *Server) handleApplyContainerUpdates(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		Unit string `json:"unit"`
-	}
-	_ = json.NewDecoder(r.Body).Decode(&req)
-	unit := strings.TrimSpace(req.Unit)
-
-	if unit != "" && !strings.HasSuffix(unit, ".service") {
-		writeError(w, fmt.Errorf("%w: unit must end with .service", store.ErrInvalidArgument))
-		return
-	}
-
-	now := time.Now().UTC()
-	lifecycleMu.Lock()
-	lastUpdateState = "running"
-	lastUpdateMessage = "Applying container updates..."
-	lastUpdateAt = &now
-	lifecycleMu.Unlock()
-
-	writeJSON(w, http.StatusAccepted, map[string]any{
-		"status":  "updating",
-		"unit":    unit,
-		"message": "Container update triggered; services may briefly restart.",
-	})
-
-	// Delay briefly so the HTTP response flushes before velod itself restarts.
-	go func() {
-		time.Sleep(500 * time.Millisecond)
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-		defer cancel()
-
-		var out []byte
-		var err error
-		if unit == "" {
-			// Run podman auto-update in its own transient host systemd unit so restarting
-			// velocor-velod.service does not kill the updater mid-flight.
-			out, err = hostCommand(ctx, "systemd-run", "--no-block", "--collect",
-				"--unit=velocor-container-update",
-				"podman", "auto-update").CombinedOutput()
-			if err != nil {
-				out, err = hostCommand(ctx, "podman", "auto-update", "--format", "json").CombinedOutput()
-			}
-		} else {
-			containerName := strings.TrimSuffix(unit, ".service")
-			script := fmt.Sprintf(
-				`img="$(podman inspect --format '{{.ImageName}}' %q 2>/dev/null || true)"; if [ -n "$img" ]; then podman pull "$img"; fi; systemctl restart %q`,
-				containerName, unit,
-			)
-			out, err = hostCommand(ctx, "systemd-run", "--no-block", "--collect",
-				"--unit=velocor-container-update",
-				"/bin/sh", "-c", script).CombinedOutput()
-			if err != nil {
-				out, err = hostCommand(ctx, "/bin/sh", "-c", script).CombinedOutput()
-			}
-		}
-
-		doneAt := time.Now().UTC()
-		lifecycleMu.Lock()
-		defer lifecycleMu.Unlock()
-		lastUpdateAt = &doneAt
-		if err != nil {
-			lastUpdateState = "failed"
-			lastUpdateMessage = strings.TrimSpace(fmt.Sprintf("%v: %s", err, strings.TrimSpace(string(out))))
-		} else {
-			lastUpdateState = "completed"
-			lastUpdateMessage = strings.TrimSpace(string(out))
-		}
-	}()
-}
+// imageRefRe accepts registry/repo[:tag][@digest] references, optionally with a bootc
+// transport prefix (registry:, oci:, containers-storage:), and never a leading '-'.
+var imageRefRe = regexp.MustCompile(`^(?:(?:registry|oci|oci-archive|containers-storage):)?[a-zA-Z0-9][a-zA-Z0-9._/:@+-]{0,511}$`)

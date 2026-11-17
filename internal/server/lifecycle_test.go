@@ -28,6 +28,7 @@ func TestLifecycleEndpointsAndRBAC(t *testing.T) {
 	if err != nil {
 		t.Fatalf("auth.NewManager failed: %v", err)
 	}
+	clearMustChange(t, st)
 	rec := reconciler.New(st, spdkClient, nil, nil)
 	srv := New(st, spdkClient, nil, authMgr, rec, nil)
 	ts := httptest.NewServer(srv.Handler())
@@ -61,8 +62,8 @@ func TestLifecycleEndpointsAndRBAC(t *testing.T) {
 	if code, _ := doJSON("GET", "/api/v1/system/os", "", nil); code != http.StatusUnauthorized {
 		t.Fatalf("expected 401 for unauthenticated GET /system/os, got %d", code)
 	}
-	if code, _ := doJSON("GET", "/api/v1/system/containers/updates", "", nil); code != http.StatusUnauthorized {
-		t.Fatalf("expected 401 for unauthenticated GET /system/containers/updates, got %d", code)
+	if code, _ := doJSON("GET", "/api/v1/system/containers", "", nil); code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for unauthenticated GET /system/containers, got %d", code)
 	}
 
 	// Login as admin.
@@ -94,24 +95,21 @@ func TestLifecycleEndpointsAndRBAC(t *testing.T) {
 		t.Fatalf("expected 'available' key in GET /system/os response: %v", osResp)
 	}
 
-	// GET /api/v1/system/containers/updates succeeds cleanly even without podman installed.
-	code, cuResp := doJSON("GET", "/api/v1/system/containers/updates", roTok, nil)
+	// GET /api/v1/system/containers succeeds cleanly even without podman installed.
+	code, cuResp := doJSON("GET", "/api/v1/system/containers", roTok, nil)
 	if code != http.StatusOK {
-		t.Fatalf("expected 200 on GET /system/containers/updates, got %d: %v", code, cuResp)
+		t.Fatalf("expected 200 on GET /system/containers, got %d: %v", code, cuResp)
 	}
 	if _, ok := cuResp["available"]; !ok {
-		t.Fatalf("expected 'available' key in GET /system/containers/updates response: %v", cuResp)
+		t.Fatalf("expected 'available' key in GET /system/containers response: %v", cuResp)
 	}
 	if _, ok := cuResp["containers"]; !ok {
-		t.Fatalf("expected 'containers' key in GET /system/containers/updates response: %v", cuResp)
+		t.Fatalf("expected 'containers' key in GET /system/containers response: %v", cuResp)
 	}
 
-	// READONLY cannot trigger OS reboot or container updates.
+	// READONLY cannot reboot the appliance.
 	if code, _ := doJSON("POST", "/api/v1/system/reboot", roTok, map[string]any{}); code != http.StatusForbidden {
 		t.Fatalf("expected 403 on POST /system/reboot for READONLY, got %d", code)
-	}
-	if code, _ := doJSON("POST", "/api/v1/system/containers/update", roTok, map[string]any{}); code != http.StatusForbidden {
-		t.Fatalf("expected 403 on POST /system/containers/update for READONLY, got %d", code)
 	}
 	if code, _ := doJSON("PUT", "/api/v1/system/network/interfaces/eth0", roTok, map[string]any{"method": "dhcp"}); code != http.StatusForbidden {
 		t.Fatalf("expected 403 on PUT /system/network/interfaces/eth0 for READONLY, got %d", code)
@@ -159,5 +157,24 @@ func TestLoadOrGenerateSelfSignedTLSConfigPersists(t *testing.T) {
 	}
 	if !bytes.Equal(cfg1.Certificates[0].Certificate[0], cfg2.Certificates[0].Certificate[0]) {
 		t.Fatalf("expected persisted TLS certificate to be reused across reloads")
+	}
+}
+
+// Containers change only with the OS image: there is no way to pull or restart them via the API.
+func TestNoContainerUpdateEndpoint(t *testing.T) {
+	h := newHarness(t)
+	for _, path := range []string{"/api/v1/system/containers/update", "/api/v1/system/containers/updates"} {
+		if code, _ := h.do("POST", path, h.admin, map[string]any{"unit": "velocor-velod.service"}); code != http.StatusNotFound && code != http.StatusMethodNotAllowed {
+			t.Fatalf("POST %s: got %d, want 404/405", path, code)
+		}
+	}
+}
+
+func TestUpgradeRejectsOptionLikeImageRefs(t *testing.T) {
+	h := newHarness(t)
+	for _, ref := range []string{"--transport=dir:/", "-h", "quay.io/x/y; reboot", "quay.io/x/y\n--foo"} {
+		if code, resp := h.do("POST", "/api/v1/system/upgrade", h.admin, map[string]any{"image_ref": ref}); code != http.StatusBadRequest {
+			t.Fatalf("image ref %q accepted (%d %v)", ref, code, resp)
+		}
 	}
 }
