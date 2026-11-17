@@ -232,30 +232,33 @@ jobs:
           IMAGE_PREFIX: ${{ steps.vars.outputs.image_prefix }}
         run: for n in velocor-spdk velocor-velod velocor-csi velocor-os; do cosign sign --yes "$IMAGE_PREFIX/$n@$(cat "bin/digests/$n")"; done
 
+      # GitHub artifact attestations aren't available for private repositories owned by a user
+      # ("Feature not available for user-owned private repositories"): they start once the
+      # repository is public. Until then the images are only cosign-signed.
       - name: Read digests for attestations
-        if: github.event_name != 'pull_request'
+        if: github.event_name != 'pull_request' && !github.event.repository.private
         id: digests
         run: for n in velocor-spdk velocor-velod velocor-csi velocor-os; do echo "${n#velocor-}=$(cat "bin/digests/$n")" >> "$GITHUB_OUTPUT"; done
       - uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
-        if: github.event_name != 'pull_request'
+        if: github.event_name != 'pull_request' && !github.event.repository.private
         with:
           subject-name: ${{ steps.vars.outputs.image_prefix }}/velocor-spdk
           subject-digest: ${{ steps.digests.outputs.spdk }}
           push-to-registry: true
       - uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
-        if: github.event_name != 'pull_request'
+        if: github.event_name != 'pull_request' && !github.event.repository.private
         with:
           subject-name: ${{ steps.vars.outputs.image_prefix }}/velocor-velod
           subject-digest: ${{ steps.digests.outputs.velod }}
           push-to-registry: true
       - uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
-        if: github.event_name != 'pull_request'
+        if: github.event_name != 'pull_request' && !github.event.repository.private
         with:
           subject-name: ${{ steps.vars.outputs.image_prefix }}/velocor-csi
           subject-digest: ${{ steps.digests.outputs.csi }}
           push-to-registry: true
       - uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
-        if: github.event_name != 'pull_request'
+        if: github.event_name != 'pull_request' && !github.event.repository.private
         with:
           subject-name: ${{ steps.vars.outputs.image_prefix }}/velocor-os
           subject-digest: ${{ steps.digests.outputs.os }}
@@ -350,6 +353,7 @@ jobs:
       - name: Sign checksums.txt (keyless)
         run: cosign sign-blob --yes --bundle dist/checksums.txt.sigstore.json dist/checksums.txt
       - uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        if: ${{ !github.event.repository.private }} # see the images job
         with:
           subject-path: |
             dist/veloctl-*.tar.gz

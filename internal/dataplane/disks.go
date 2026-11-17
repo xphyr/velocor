@@ -60,12 +60,22 @@ func AttachDisk(ctx context.Context, c *spdk.Client, hw *hardware.Manager, d *st
 		}
 		drv := d.DriverState
 		rebound := false
-		if hw != nil && drv != store.DiskDriverStateVfioPCI && drv != store.DiskDriverStateUioPCIGeneric {
-			st, err := hw.BindNVMeToUserspace(d.PCIAddress, "")
-			if err != nil {
-				return "", "", fmt.Errorf("bind %s to userspace driver: %w", d.PCIAddress, err)
+		if hw != nil {
+			// Check the binding the drive has now, not the recorded one: after a reboot every
+			// NVMe drive is back on the kernel nvme driver although the store still says vfio-pci
+			// (found on the P0-1 lab: every NVMe pool was unavailable after a reboot).
+			switch hw.PCIDriver(d.PCIAddress) {
+			case "vfio-pci":
+				drv = store.DiskDriverStateVfioPCI
+			case "uio_pci_generic":
+				drv = store.DiskDriverStateUioPCIGeneric
+			default:
+				st, err := hw.BindNVMeToUserspace(d.PCIAddress, "")
+				if err != nil {
+					return "", "", fmt.Errorf("bind %s to userspace driver: %w", d.PCIAddress, err)
+				}
+				drv, rebound = st, true
 			}
-			drv, rebound = st, true
 		}
 		bdevs, err := c.BdevNvmeAttachController(ctx, NVMeControllerName(d.PCIAddress), "PCIe", d.PCIAddress)
 		if err == nil && len(bdevs) == 0 {

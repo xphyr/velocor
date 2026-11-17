@@ -81,6 +81,12 @@ RUN ./configure ${SPDK_CONFIGURE} --enable-unit-tests && \
 
 FROM ${FEDORA_IMAGE} AS runtime
 
+# spdk_tgt startup configuration. generate_uuids: SPDK names an NVMe namespace's bdev by its
+# NGUID or UUID, and a namespace with neither gets a random UUID at every start; RAID
+# superblocks match members by bdev UUID, so a pool on such drives would never reassemble after
+# a restart. With generate_uuids SPDK derives a stable one from the controller serial and the
+# namespace ID instead (found on the P0-1 lab).
+
 RUN dnf install -y \
       libaio \
       liburing \
@@ -94,7 +100,7 @@ RUN dnf install -y \
     dnf clean all && \
     rm -rf /var/cache /var/log/dnf* /var/log/yum* && \
     mkdir -p /run/velocor /etc/velocor && \
-    printf '{"subsystems":[{"subsystem":"iscsi","config":[{"method":"iscsi_set_options","params":{"max_sessions":16,"pdu_pool_size":2048,"immediate_data_pool_size":512,"data_out_pool_size":512}}]}]}\n' > /etc/velocor/spdk.json
+    printf '{"subsystems":[{"subsystem":"bdev","config":[{"method":"bdev_nvme_set_options","params":{"generate_uuids":true}}]},{"subsystem":"iscsi","config":[{"method":"iscsi_set_options","params":{"max_sessions":16,"pdu_pool_size":2048,"immediate_data_pool_size":512,"data_out_pool_size":512}}]}]}\n' > /etc/velocor/spdk.json
 
 COPY --from=builder /usr/bin/spdk_tgt /usr/bin/spdk_tgt
 

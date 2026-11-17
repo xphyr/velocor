@@ -64,8 +64,30 @@ work still open, ranked by risk to data, how fixes are verified, and what has be
     now leaves such disks detached (also one the running array lost since the last pass); to
     reuse one, release (wipe) then replace. (2) The rebuild speed limit applies only to
     rebuilds that start after it is set.
-  - [ ] Serenity lab tests on the appliance image (hot-unplug virtio disks; reboot with a
-    disk removed).
+  - [x] Serenity lab, appliance image dev-7309a18 (QEMU VM: AHCI SATA, virtio-SCSI, NVMe on
+    hot-plug PCIe ports, vIOMMU; data checked through a loopback NVMe/TCP export), 2026-11-17:
+    - virtio-SCSI (io_uring, as SATA SSDs): hot-unplug under a write load (0 write errors) ->
+      DEGRADED -> replace with an unclaimed disk (wiped, claimed) -> rebuilt (8 GiB, ~55 s)
+      -> original unplugged, data read back from the rebuilt disk alone.
+    - SATA (AHCI): rebooted without one member -> UNAVAILABLE -> start-degraded (patch 0002)
+      -> data intact -> release a detached SSD (wiped) and replace with it -> rebuilt, data intact.
+    - NVMe (vfio-pci, SPDK's NVMe driver; the first time this path ever ran): claim, mirror,
+      hot-unplug under writes (0 errors; vfio relays the removal to SPDK) -> DEGRADED -> replace
+      -> rebuilt (~20 s) -> original unplugged, data read back from the rebuilt drive alone.
+    - Reboot: SSD and SATA pools reassemble with data intact; disks that left their pool and
+      came back (ssd0/ssd1, nvme0/nvme1) stay detached. **The NVMe pool did not come back**,
+      which found the next two bugs.
+  - [x] **NVMe drives weren't re-bound after a reboot** (all NVMe pools unavailable after every
+    reboot): bindings don't survive a reboot, but `AttachDisk` trusted the stored VFIO_PCI state
+    and skipped the bind. It now checks the actual driver (`hardware.PCIDriver`).
+  - [x] **NVMe namespaces without NGUID/UUID got a random bdev UUID at every start**, so RAID
+    superblocks (which match members by bdev UUID) never matched again: `spdk.json` now sets
+    `bdev_nvme_set_options generate_uuids=true` (stable UUID from serial + NSID). The lab's QEMU
+    namespaces now have fixed UUIDs, like real drives.
+  - [x] **Intel IOMMU off by default on Fedora**: velod refused every NVMe claim on Intel
+    servers ("no IOMMU is available"). The OS image's kargs.d now adds `intel_iommu=on iommu=pt`.
+  - [ ] Re-run the NVMe reboot test on an image with these fixes; real hardware (hot-swap bays,
+    consumer NVMe without NGUID) before release.
 
 - [ ] **P0-2. Thin pools can be overcommitted without limit or warning.**
   Volume and clone creation never check pool capacity. When the pool fills, every thin and
@@ -310,6 +332,11 @@ Everything here was written by Gemini and is in scope to rewrite.
   REGISTRY_AUTH_FILE (or podman's default) as a build secret (`--mount=type=secret`, never in a
   layer; an empty file when there are none), and CI points REGISTRY_AUTH_FILE at one file for
   podman login, skopeo and the build.
+- [x] **B22. Attestations fail on a private user-owned repository** (third `main` run,
+  44123550774): GitHub artifact attestations aren't available there. Integration tests, the
+  build and push of every image (incl. the OS image, so B21 works) and cosign signing passed.
+  The attest steps now run only when the repository is public; until then images are only
+  cosign-signed. The chart push and the release job are still unexercised.
 - [ ] **B16. The new CI workflow has not fully run yet.** First run (PR #1, 2026-11-17, run
   44102090198, aa8411d): lint (incl. actionlint and the CDI hook render), unit tests, SPDK
   patch unit tests, images (integration tests on the runner, rootless podman, arm64 CSI via
