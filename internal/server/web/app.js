@@ -85,7 +85,7 @@ function humanDuration(seconds) {
 }
 
 const pill = (text, kind) => el("span", { class: "pill " + (kind || "") }, text);
-const healthKind = (h) => ({ ONLINE: "ok", DEGRADED: "warn", RECONCILING: "warn", FAULTED: "bad", OFFLINE: "bad" }[h] || "quiet");
+const healthKind = (h) => ({ ONLINE: "ok", DEGRADED: "warn", RECONCILING: "warn", REBUILDING: "warn", FAULTED: "bad", OFFLINE: "bad", UNAVAILABLE: "bad" }[h] || "quiet");
 const health = (x) => [pill((x.health_status || "UNKNOWN").toLowerCase(), healthKind(x.health_status)), x.status_message && el("span", { class: "sub" }, x.status_message)];
 const hash = (...parts) => "#/" + parts.map(encodeURIComponent).join("/");
 const link = (text, ...parts) => el("a", { href: hash(...parts) }, text);
@@ -485,16 +485,82 @@ async function pools() {
   ];
 }
 
+const MEMBER_KIND = { ACTIVE: "ok", REBUILDING: "warn", FAILED: "bad", MISSING: "bad" };
+
+function memberState(m) {
+  const state = pill(m.state.toLowerCase(), MEMBER_KIND[m.state]);
+  if (m.state !== "REBUILDING") return state;
+  const pct = Math.min(m.rebuild_percent || 0, 100);
+  const fill = el("div");
+  fill.style.width = pct + "%";
+  return [state, el("span", { class: "sub" }, `${pct}% rebuilt`), el("div", { class: "bar", role: "img", "aria-label": `${pct} percent rebuilt` }, fill)];
+}
+
+async function replaceDiskDialog(p, m) {
+  const working = m.state === "ACTIVE" || m.state === "REBUILDING";
+  const candidates = (await list("/disks", "disks")).filter((d) => !d.pool_id && !d.is_boot_device);
+  if (!candidates.length) {
+    notify("No free disks: add a disk, or release one, first.");
+    return;
+  }
+  openDialog({
+    title: m.disk_id ? `Replace ${m.disk_id} in ${p.name}` : `Fill slot ${m.slot} of ${p.name}`,
+    intro: "The new disk is added to the RAID and rebuilt from the other disks; the pool serves I/O meanwhile. A disk that isn't claimed yet is wiped first.",
+    warning: working && el("div", { class: "panel-notice warn" }, "This disk still works. Replacing it removes it first, so the pool has no redundancy until the rebuild completes."),
+    submit: "Replace",
+    danger: working,
+    fields: [
+      { name: "disk", kind: "radio", label: "New disk", options: candidates.map((d) => ({ value: d.id, label: `${d.name || d.id} (${d.type}, ${humanSize(d.size_bytes)}${d.claimed ? ", claimed" : ""})` })) },
+      working && { name: "ok", kind: "tick", text: "I understand the pool runs without redundancy until the rebuild completes" },
+    ].filter(Boolean),
+    action: (v) => {
+      if (!v.disk) throw new Error("Choose the new disk.");
+      if (working && !v.ok) throw new Error("Confirm that the pool may run without redundancy.");
+      return send("POST", "/pools/" + encodeURIComponent(p.id) + "/replace",
+        { new_disk_id: v.disk, ...(m.disk_id ? { old_disk_id: m.disk_id } : {}), allow_degraded: working });
+    },
+    done: () => { notify(`Rebuilding ${p.name}.`); rerender(); },
+  });
+}
+
+function startDegradedDialog(p) {
+  confirmDialog({
+    title: `Start ${p.name} without its missing disk`,
+    intro: p.status_message,
+    warning: el("div", { class: "panel-notice warn" }, "The missing disk is dropped from the RAID: if it comes back, Velocor leaves it out until you release it or reuse it as a replacement (which rebuilds it). Use this when the disk is dead; if it's only disconnected, reconnect it instead. Afterwards, replace it to restore redundancy."),
+    submit: "Start degraded",
+    confirmText: p.name,
+    action: () => send("POST", "/pools/" + encodeURIComponent(p.id) + "/start-degraded", { confirm: p.name }),
+    done: () => { notify(`Started ${p.name} degraded.`); rerender(); },
+  });
+}
+
+function releasePoolDiskDialog(p, did) {
+  confirmDialog({
+    title: `Release ${did} from ${p.name}`,
+    intro: "The disk left this pool's RAID. Releasing it wipes the start and end of the disk so it can't be mistaken for a member, and returns it to the free disks.",
+    submit: "Release and wipe",
+    action: () => send("DELETE", "/pools/" + encodeURIComponent(p.id) + "/disks/" + encodeURIComponent(did)),
+    done: (r) => { notify(r.wiped ? `Released and wiped ${did}.` : `Released ${did}; it could not be wiped, wipe it before reusing it.`); rerender(); },
+  });
+}
+
 async function pool(id) {
   const [p, disksAll, volumes] = await Promise.all([
     api("/pools/" + encodeURIComponent(id)).then((r) => r.pool), list("/disks", "disks"), list("/volumes?pool_id=" + encodeURIComponent(id), "volumes"),
   ]);
-  const members = (p.disk_ids || []).map((did) => disksAll.find((d) => d.id === did) || { id: did, name: did, health_status: "OFFLINE", status_message: "not found" });
+  const diskOf = (did) => disksAll.find((d) => d.id === did) || {};
+  const slots = (p.members && p.members.length ? p.members : (p.disk_ids || []).map((did, i) => ({ slot: i, disk_id: did, state: "ACTIVE" })))
+    .map((m) => ({ ...m, disk: diskOf(m.disk_id) }));
+  const rebuilding = slots.some((m) => m.state === "REBUILDING");
+  const redundant = p.raid_level === "RAID1";
+  const detached = (p.detached_disk_ids || []).map((did) => ({ id: did, ...diskOf(did) }));
   return [
     el("p", { class: "crumb" }, el("a", { href: "#/pools" }, "Pools")),
     el("h1", {}, p.name),
     el("div", { class: "toolbar" },
-      action(can.provision, { class: "primary", onclick: () => createVolumeDialog(p.id) }, "Create volume"),
+      action(can.provision, { class: "primary", disabled: p.health_status === "UNAVAILABLE", onclick: () => createVolumeDialog(p.id) }, "Create volume"),
+      p.health_status === "UNAVAILABLE" && action(can.admin, { class: "danger", id: "start-degraded", onclick: () => startDegradedDialog(p) }, "Start degraded"),
       action(can.admin, { class: "danger-quiet", id: "delete-pool", disabled: volumes.length > 0, onclick: () => deletePoolDialog(p) }, "Delete"),
       volumes.length > 0 && can.admin && el("span", { class: "muted" }, "It can't be deleted while it has volumes.")),
     el("dl", { class: "facts" },
@@ -508,12 +574,23 @@ async function pool(id) {
       fact("ID", mono(p.id))),
     el("h2", {}, "Disks"),
     table([
-      { title: "Disk", cell: (d) => [el("strong", {}, d.name || d.id), el("span", { class: "sub mono" }, d.id)] },
-      { title: "Model", cell: (d) => d.model || "-" },
-      { title: "Size", num: true, cell: (d) => humanSize(d.size_bytes) },
-      { title: "SPDK bdev", cell: (d) => mono(d.spdk_bdev_name || "-") },
-      { title: "Health", cell: health },
-    ], members, { filter: false, empty: "No disks.", state: stateOf("pool-disks") }),
+      { title: "Slot", num: true, cell: (m) => String(m.slot) },
+      { title: "Disk", cell: (m) => (m.disk_id ? [el("strong", {}, m.disk.name || m.disk_id), el("span", { class: "sub mono" }, m.disk_id)] : el("span", { class: "muted" }, "empty")) },
+      { title: "State", cell: memberState },
+      { title: "Model", cell: (m) => m.disk.model || "-" },
+      { title: "Size", num: true, cell: (m) => (m.disk.size_bytes ? humanSize(m.disk.size_bytes) : "-") },
+      { title: "", cell: (m) => redundant && can.admin && !rebuilding && p.health_status !== "UNAVAILABLE" &&
+        el("button", { class: m.state === "ACTIVE" ? "danger-quiet" : "primary", onclick: () => replaceDiskDialog(p, m) }, "Replace") },
+    ], slots, { filter: false, empty: "No disks.", state: stateOf("pool-disks") }),
+    detached.length > 0 && [
+      el("h3", {}, "Disks that left the pool"),
+      el("p", { class: "muted" }, "Failed, removed or replaced disks stay tied to the pool until you release them, so they can't be reused by accident."),
+      table([
+        { title: "Disk", cell: (d) => [el("strong", {}, d.name || d.id), el("span", { class: "sub mono" }, d.id)] },
+        { title: "Health", cell: (d) => (d.health_status ? health(d) : "-") },
+        { title: "", cell: (d) => can.admin && el("button", { class: "danger-quiet", onclick: () => releasePoolDiskDialog(p, d.id) }, "Release") },
+      ], detached, { filter: false }),
+    ],
     el("h2", {}, "Volumes"),
     volumeTable(volumes, [p]),
   ];
@@ -1173,7 +1250,7 @@ function rebootDialog(hostname) {
 
 async function system() {
   const soft = (err) => { if (err instanceof Unauthorized) throw err; return null; };
-  const [st, os, containers] = await Promise.all([api("/system/status"), api("/system/os").catch(soft), api("/system/containers").catch(soft)]);
+  const [st, os, containers, rebuild] = await Promise.all([api("/system/status"), api("/system/os").catch(soft), api("/system/containers").catch(soft), api("/system/rebuild").catch(soft)]);
   const ctr = containers || { available: false };
   const rec = st.reconciler || {};
   const dep = (d) => (d ? [mono(d.image || "-"), el("span", { class: "sub" }, [d.version, d.timestamp && humanTime(d.timestamp)].filter(Boolean).join(", "))] : "-");
@@ -1199,6 +1276,12 @@ async function system() {
         os && os.available
           ? el("dl", { class: "facts" }, fact("Booted", dep(os.booted)), fact("Staged", dep(os.staged)), fact("Rollback", dep(os.rollback)))
           : el("div", { class: "panel-notice" }, (os && os.message) || "bootc isn't available on this host."))),
+    rebuild && [
+      el("div", { class: "section-head" }, el("h2", {}, "Rebuild speed"),
+        action(can.admin, { id: "rebuild-speed", onclick: () => rebuildSpeedDialog(rebuild.max_mb_per_sec) }, "Change")),
+      el("p", {}, rebuild.max_mb_per_sec ? `Each rebuilding pool uses at most ${rebuild.max_mb_per_sec} MB/s.` : "Unlimited: rebuilds run as fast as the disks allow."),
+      el("p", { class: "muted" }, "A limit leaves more bandwidth for hosts while a disk is rebuilt, but the pool stays without full redundancy for longer. A change applies to rebuilds that start after it; one already running keeps its speed."),
+    ],
     el("div", { class: "section-head" }, el("h2", {}, "Containers")),
     el("p", { class: "muted" }, "The containers are part of the operating system image, pinned to exact versions. They change only when you upgrade the operating system."),
     !ctr.available
@@ -1208,6 +1291,20 @@ async function system() {
         { title: "Running", cell: (c) => c.running_status || "-" },
       ], ctr.containers || [], { filter: false, empty: "No containers found." }),
   ];
+}
+
+function rebuildSpeedDialog(current) {
+  openDialog({
+    title: "Rebuild speed",
+    submit: "Save",
+    fields: [{ name: "limit", label: "Limit (MB/s, 0 = unlimited)", value: String(current || 0), required: true }],
+    action: (v) => {
+      const n = Number(v.limit);
+      if (!Number.isInteger(n) || n < 0) throw new Error("Enter a whole number of MB/s, or 0 for unlimited.");
+      return send("PUT", "/system/rebuild", { max_mb_per_sec: n });
+    },
+    done: () => { notify("Saved."); rerender(); },
+  });
 }
 
 // --- Access ---

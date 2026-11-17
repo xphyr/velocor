@@ -50,8 +50,22 @@ work still open, ranked by risk to data, how fixes are verified, and what has be
     name), `DELETE /pools/{id}/disks/{disk_id}` (release + wipe), `GET|PUT /system/rebuild`.
     Disk claim now also refuses disks with SPDK RAID/volume-store signatures unless forced;
     `hardware.WipeMetadata` zeroes the first 32 MiB and last 8 MiB (exclusive open).
-  - [ ] CLI (`veloctl pool replace|start-degraded|release-disk`, `system rebuild`), UI.
-  - [ ] Real-SPDK integration tests; serenity lab tests.
+  - [x] CLI: `veloctl pool get|replace|start-degraded|release-disk`, `system rebuild`
+    (tested against the API). UI: pool page by slot (state, rebuild %), Replace per slot, Start
+    degraded (typed confirmation), detached disks with Release; System > Rebuild speed (checked
+    in headless Chrome).
+  - [x] Real-SPDK integration tests (`internal/integration/rebuild_test.go`): replace a member
+    that failed online, rebuilt copy alone serves data written before and during the degraded
+    period; missing at boot -> UNAVAILABLE -> start degraded (patch 0002) -> replace -> restart,
+    old disk returning stays out; `kill -9` mid-rebuild -> rebuild restarted and completed.
+    Found on real SPDK: (1) **SPDK re-adds a returning member** to its still-empty slot and
+    rebuilds onto it (`raid_bdev_examine_sb` "Re-adding bdev"), so velod must not re-attach a
+    disk that left its pool, or a failed disk would silently be trusted again: the reconciler
+    now leaves such disks detached (also one the running array lost since the last pass); to
+    reuse one, release (wipe) then replace. (2) The rebuild speed limit applies only to
+    rebuilds that start after it is set.
+  - [ ] Serenity lab tests on the appliance image (hot-unplug virtio disks; reboot with a
+    disk removed).
 
 - [ ] **P0-2. Thin pools can be overcommitted without limit or warning.**
   Volume and clone creation never check pool capacity. When the pool fills, every thin and
@@ -289,6 +303,13 @@ Everything here was written by Gemini and is in scope to rewrite.
   skopeo rejects; PRs set no extra tags, so the path never ran. Now copied from `repo@digest`.
   The `sha-39e803b` spdk image was pushed; the `main` tags, signing, attestations and the chart
   push did not run.
+- [x] **B21. The OS image build couldn't pull private images** (second `main` run,
+  44116125345): the build embeds the spdk/velod images with skopeo inside the build container,
+  which had no registry credentials; ghcr.io packages of a private repository need them (the lab
+  registry allows anonymous pulls, so this never showed). Now `make image-os` passes
+  REGISTRY_AUTH_FILE (or podman's default) as a build secret (`--mount=type=secret`, never in a
+  layer; an empty file when there are none), and CI points REGISTRY_AUTH_FILE at one file for
+  podman login, skopeo and the build.
 - [ ] **B16. The new CI workflow has not fully run yet.** First run (PR #1, 2026-11-17, run
   44102090198, aa8411d): lint (incl. actionlint and the CDI hook render), unit tests, SPDK
   patch unit tests, images (integration tests on the runner, rootless podman, arm64 CSI via

@@ -255,7 +255,11 @@ func (f *Fake) assembleFromSuperblocksLocked(newBdev string) {
 	case ok && r.UUID != sb.UUID:
 		return // another array of that name
 	case ok && r.sb != nil && sb.Seq < r.sb.Seq:
-		return // stale member: "smaller than existing raid bdev", not taken back
+		// A member that left the array: SPDK checks it against the array's current superblock
+		// and, if the array runs and the member's slot is still empty, re-adds it and rebuilds
+		// it ("Re-adding bdev ... to raid bdev"). A slot filled by another disk refuses it.
+		f.readdStaleMemberLocked(r, newBdev)
+		return
 	case ok && r.sb != nil && sb.Seq > r.sb.Seq && !r.online:
 		// A newer superblock while configuring: SPDK re-creates the array from it.
 		delete(f.raids, sb.Name)
@@ -282,6 +286,21 @@ func (f *Fake) assembleFromSuperblocksLocked(newBdev string) {
 		}
 	}
 	f.joinSlotLocked(r, newBdev)
+}
+
+func (f *Fake) readdStaleMemberLocked(r *raidBdev, bdev string) {
+	if !r.online || r.rebuild != nil {
+		return
+	}
+	for i, s := range r.sb.Slots {
+		if s.State != sbConfigured && s.UUID == f.bdevUUID[bdev] && r.Members[i] == "" {
+			r.Members[i] = bdev
+			r.operational++
+			r.rebuild = &raidRebuild{Slot: i}
+			f.writeSuperblockLocked(r)
+			return
+		}
+	}
 }
 
 func (f *Fake) joinSlotLocked(r *raidBdev, bdev string) {
@@ -441,7 +460,7 @@ func init() {
 		}
 		for i, m := range r.Members {
 			if m == "" && r.sb.Slots[i].State == sbConfigured {
-				r.sb.Slots[i] = sbSlot{State: sbMissing}
+				r.sb.Slots[i].State = sbMissing
 			}
 		}
 		r.operational = r.discovered()

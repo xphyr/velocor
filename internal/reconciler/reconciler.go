@@ -219,6 +219,16 @@ func (r *Reconciler) reconcileDisks(ctx context.Context, p *pass) {
 		p.errs = append(p.errs, fmt.Sprintf("list disks: %v", err))
 		return
 	}
+	pools, err := r.store.ListPools()
+	if err != nil {
+		p.errs = append(p.errs, fmt.Sprintf("list pools: %v", err))
+		return
+	}
+	raids, err := r.spdk.BdevRaidGetBdevs(ctx, "all")
+	if err != nil {
+		p.errs = append(p.errs, fmt.Sprintf("list raid bdevs: %v", err))
+		return
+	}
 	for _, d := range disks {
 		if !d.Claimed || d.IsBootDevice {
 			continue
@@ -228,6 +238,13 @@ func (r *Reconciler) reconcileDisks(ctx context.Context, p *pass) {
 		var smart *store.SmartHealth
 
 		if _, ok := bdevs[bdevName]; !ok || bdevName == "" {
+			if pool := leftPool(d, pools, raids); pool != nil {
+				// SPDK re-adds a returning member to its empty slot and rebuilds onto it; a disk
+				// that failed must not be trusted again implicitly. It stays out until an
+				// operator releases it (and wipes it) or reuses it with replace.
+				p.degrade("disk:"+d.ID, fmt.Sprintf("left pool %s; release it, then replace with it to reuse it", pool.Name))
+				continue
+			}
 			name, st, err := dataplane.AttachDisk(ctx, r.spdk, r.hw, d)
 			if err != nil {
 				health = store.HealthStatusDegraded
@@ -407,6 +424,39 @@ func (r *Reconciler) reconcilePools(ctx context.Context, p *pass, examined bool)
 		}
 	}
 	return online
+}
+
+// leftPool returns the pool a disk is bound to but no longer a member of, or nil: its slot
+// failed, it was removed, replaced or dropped by a degraded start, or SPDK's running array no
+// longer contains it (it failed since the last pass, before the pool was updated). A disk an
+// UNAVAILABLE pool waits for is still a member: it must be attached so the RAID can assemble.
+// So is a rebuild target, so an interrupted rebuild can restart.
+func leftPool(d *store.Disk, pools []*store.Pool, raids []spdk.RaidBdevInfo) *store.Pool {
+	if d.PoolID == "" {
+		return nil
+	}
+	for _, p := range pools {
+		if p.ID != d.PoolID {
+			continue
+		}
+		if slices.Contains(p.DiskIDs, d.ID) {
+			ri := slices.IndexFunc(raids, func(rb spdk.RaidBdevInfo) bool { return rb.Name == p.BaseBdevName })
+			rebuilding := slices.ContainsFunc(store.PoolMembers(p), func(m store.PoolMember) bool {
+				return m.DiskID == d.ID && m.State == store.MemberStateRebuilding
+			})
+			if ri < 0 || !strings.EqualFold(raids[ri].State, "online") || rebuilding || inRaid(raids, d.SPDKBdevName) {
+				return nil
+			}
+			return p // the running array lost it: it failed
+		}
+		for _, m := range store.PoolMembers(p) {
+			if m.DiskID == d.ID && m.State == store.MemberStateMissing && p.HealthStatus == store.HealthStatusUnavailable {
+				return nil
+			}
+		}
+		return p
+	}
+	return nil
 }
 
 func (r *Reconciler) memberBdevs(pool *store.Pool, bdevs map[string]spdk.BdevInfo) ([]string, bool) {

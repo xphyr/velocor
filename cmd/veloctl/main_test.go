@@ -171,3 +171,77 @@ func TestTLSConfigVerifiesByDefault(t *testing.T) {
 		t.Fatalf("a non-PEM CA file must be an error")
 	}
 }
+
+func TestPoolReplaceStartDegradedReleaseAndRebuildCommands(t *testing.T) {
+	f := newFixture(t)
+	signedIn(t, f)
+	ctx := context.Background()
+	for i, id := range []string{"m1", "m2", "m3", "m4", "m5"} {
+		pci := "0000:1" + string(rune('1'+i)) + ":00.0"
+		f.fake.AddNVMe(pci)
+		if err := f.st.UpsertDisk(&store.Disk{ID: id, Type: store.DiskTypeNVMe, PCIAddress: pci, SizeBytes: 1 << 40, DriverState: store.DiskDriverStateVfioPCI}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, id := range []string{"m1", "m2"} {
+		if err := f.run(t, "disk", "claim", id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := f.run(t, "pool", "create", "--name", "mirror", "--raid", "RAID1", "--disks", "m1,m2"); err != nil {
+		t.Fatal(err)
+	}
+	pool, err := f.st.GetPoolByName("mirror")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A member fails; replace it with an unclaimed disk.
+	m2, _ := f.st.GetDisk("m2")
+	f.fake.FailMedia(m2.PCIAddress)
+	if err := f.run(t, "pool", "replace", pool.ID); err == nil {
+		t.Fatal("replace without --new-disk must fail")
+	}
+	if err := f.run(t, "pool", "replace", pool.ID, "--new-disk", "m3"); err != nil {
+		t.Fatal(err)
+	}
+	if p, _ := f.st.GetPool(pool.ID); p.Members[1].DiskID != "m3" || p.Members[1].State != store.MemberStateRebuilding {
+		t.Fatalf("after replace: %+v", p.Members)
+	}
+	if err := f.run(t, "pool", "get", pool.ID); err != nil {
+		t.Fatal(err)
+	}
+	f.fake.SetRebuildProgress(pool.BaseBdevName, 100)
+	if err := f.run(t, "pool", "release-disk", pool.ID, "m2"); err != nil {
+		t.Fatal(err)
+	}
+	if d, _ := f.st.GetDisk("m2"); d.PoolID != "" || d.Claimed {
+		t.Fatalf("m2 not released: %+v", d)
+	}
+
+	// The rebuild speed limit.
+	if err := f.run(t, "system", "rebuild", "--max-mb-per-sec", "250"); err != nil {
+		t.Fatal(err)
+	}
+	if f.fake.RebuildMaxMBps() != 250 {
+		t.Fatalf("limit not applied: %d", f.fake.RebuildMaxMBps())
+	}
+	if err := f.run(t, "system", "rebuild"); err != nil {
+		t.Fatal(err)
+	}
+
+	// m3 dies while spdk_tgt is down: start the pool degraded (confirmation by name).
+	m1, _ := f.st.GetDisk("m1")
+	m3, _ := f.st.GetDisk("m3")
+	f.fake.Restart()
+	f.fake.RemoveMedia(m3.PCIAddress)
+	if _, err := f.fake.Client().BdevNvmeAttachController(ctx, dataplane.NVMeControllerName(m1.PCIAddress), "PCIe", m1.PCIAddress); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.run(t, "pool", "start-degraded", pool.ID, "--confirm", "wrong"); err == nil {
+		t.Fatal("start-degraded with the wrong name must fail")
+	}
+	if err := f.run(t, "pool", "start-degraded", pool.ID, "--confirm", "mirror"); err != nil {
+		t.Fatal(err)
+	}
+}

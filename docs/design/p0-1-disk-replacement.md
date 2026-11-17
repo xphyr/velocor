@@ -36,10 +36,14 @@ All references are to `module/bdev/raid/`.
 - **Proactive replacement.** `bdev_raid_remove_base_bdev {name}` removes a healthy member
   (degrading the array). raid1 has a fixed number of slots and no spare, so replacing a
   still-working disk means remove, then add: there is a window without redundancy.
-- **A stale member returns.** A disk whose superblock has a lower `seq_number` than the running
-  array's is not taken back (`raid_bdev_examine_sb`: "smaller than existing").
+- **A member returns.** SPDK checks a disk with an older superblock against the array's
+  current one (`raid_bdev_examine_sb`). If its UUID still names an empty FAILED/MISSING slot of a
+  running array, SPDK **re-adds it and rebuilds it** ("Re-adding bdev ... to raid bdev"; found
+  by the integration tests). If another disk has taken the slot, the returning disk is refused.
+  It never resumes as an up-to-date member, so stale data is never served.
 - **Rebuild throttling.** `bdev_raid_set_options {process_max_bandwidth_mb_sec,
-  process_window_size_kb}` is global for the whole target.
+  process_window_size_kb}` is global for the whole target, and a rebuild takes the limit when it
+  starts: changing it doesn't affect one already running (found by the integration tests).
 
 ## Velocor model
 
@@ -121,6 +125,12 @@ unclaimed list.
   it as a "stale pool member" and offers to release it (operation 4). It never re-adds it
   automatically.
 - **Never adds a disk on its own.** There is no automatic hot spare in this version (see Later).
+- **Never re-attaches a disk that left its pool.** Because SPDK re-adds a returning member and
+  rebuilds onto it, a disk that failed would otherwise be trusted again as soon as it reappears
+  (a flapping disk over and over). The reconciler doesn't re-create the bdev of a disk whose slot
+  failed, that was replaced, removed or dropped by a degraded start, or that the running array
+  no longer contains. A disk an UNAVAILABLE pool waits for, and a rebuild target, are still
+  attached. To reuse such a disk, release it (which wipes it), then replace with it.
 
 ## SPDK patch 0002: start a superblock RAID degraded
 
@@ -132,8 +142,9 @@ New RPC `bdev_raid_start_degraded {name}`. It applies to a raid with a superbloc
 2. writes the superblock to the present members, then configures the array through the
    existing path, which then starts as on any degraded boot.
 
-The missing disk, if it ever returns, carries a lower `seq_number` and is refused by the
-existing examine logic. The patch carries unit tests, like 0001, and is a candidate for
+The missing disk, if it ever returns, carries a lower `seq_number`: like a member removed while
+online, it never resumes as an up-to-date member (examine re-adds it to a still-empty slot and
+rebuilds it; velod doesn't re-attach it in the first place). The patch carries unit tests, like 0001, and is a candidate for
 upstream (Linux md has the same concept in `mdadm --run`).
 
 ## Tests
@@ -163,7 +174,8 @@ upstream (Linux md has the same concept in `mdadm --run`).
   each member alone matches;
 - `kill -9` during a throttled rebuild: comes back degraded, re-adds, completes;
 - missing member at boot (needs patch 0002): start degraded, then replace;
-- the old disk returns and isn't taken back.
+- the failed disk's drive is still there: velod doesn't re-attach it and SPDK doesn't re-add it;
+- a disk dropped by a degraded start returns after its slot was filled: refused by SPDK.
 
 **Lab** (serenity VM, hot-unplug of virtio disks through QEMU's monitor): the same scenarios on
 the appliance image, plus a whole-appliance reboot with a disk removed.

@@ -11,7 +11,9 @@ raid with a superblock whose present members meet the level's minimum, the absen
 are marked MISSING in the superblock and their slots emptied (so bdev_raid_add_base_bdev
 can fill them and rebuild), and the raid is configured through the normal path, which
 writes the superblock with a new sequence number to the present members. A missing member
-that returns later carries an older sequence number and is not taken back by examine.
+that returns later carries an older sequence number, so it is handled like a member removed
+while online: it never resumes as an up-to-date member (examine re-adds it to its still-empty
+slot and rebuilds it).
 This is the equivalent of Linux md's `mdadm --run` and is meant to be an explicit operator
 decision, never automatic: a member that is merely slow to appear would otherwise be
 dropped.
@@ -22,7 +24,7 @@ Applies to SPDK v26.09 (0bbb7fe4dccfb31e8d446da8822360704949d1e9).
 ---
 --- a/module/bdev/raid/bdev_raid.c
 +++ b/module/bdev/raid/bdev_raid.c
-@@ -3680,6 +3680,91 @@
+@@ -3680,6 +3680,93 @@
  	return rc;
  }
  
@@ -31,8 +33,10 @@ Applies to SPDK v26.09 (0bbb7fe4dccfb31e8d446da8822360704949d1e9).
 + * configured in its superblock are absent (e.g. a disk failed while the application was not
 + * running). The absent members are marked missing and their slots emptied, so they can be
 + * replaced with bdev_raid_add_base_bdev later; configuring the raid then writes the superblock,
-+ * with a new sequence number, to the present members, so a missing member that returns later
-+ * is not taken back. Requires at least the minimum number of members for the raid level.
++ * with a new sequence number, to the present members. A missing member that returns later is
++ * handled like one removed while online: it never resumes as an up-to-date member (examine
++ * re-adds it to its still-empty slot and rebuilds it). Requires at least the minimum number of
++ * members for the raid level.
 + */
 +int
 +raid_bdev_start_degraded(struct raid_bdev *raid_bdev, raid_bdev_action_cb cb_fn, void *cb_ctx)

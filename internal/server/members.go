@@ -231,7 +231,7 @@ func (s *Server) handleStartPoolDegraded(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	if req.Confirm != pool.Name {
-		writeError(w, fmt.Errorf("%w: confirm must be the pool name (%q): the missing disk is dropped from the array and won't be taken back", store.ErrInvalidArgument, pool.Name))
+		writeError(w, fmt.Errorf("%w: confirm must be the pool name (%q): the missing disk is dropped from the array; if it returns, Velocor leaves it out until you release or reuse it", store.ErrInvalidArgument, pool.Name))
 		return
 	}
 	rb, _, err := s.poolRaid(ctx, pool)
@@ -319,8 +319,9 @@ func (s *Server) handleReleasePoolDisk(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleGetRebuildSettings / handlePutRebuildSettings: GET|PUT /api/v1/system/rebuild
-// {max_mb_per_sec} (0 = unlimited). SPDK applies the limit to every RAID; the reconciler
-// re-applies it after spdk_tgt restarts.
+// {max_mb_per_sec} (0 = unlimited). SPDK applies the limit to every RAID, but only to rebuilds
+// that start after it changes (a running rebuild keeps its rate); the reconciler re-applies it
+// after spdk_tgt restarts.
 func (s *Server) handleGetRebuildSettings(w http.ResponseWriter, _ *http.Request) {
 	st, err := s.store.GetSettings()
 	if err != nil {

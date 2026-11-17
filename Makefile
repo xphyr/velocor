@@ -156,12 +156,17 @@ image-csi:
 		-f deploy/containers/Containerfile.csi .
 
 # Needs the spdk and velod images in the registry: their digests are resolved there and pinned.
+# The build pulls them, so registry credentials (REGISTRY_AUTH_FILE, else podman's default auth
+# file) go in as a build secret, which is never stored in the image; without any, an empty file.
+REGISTRY_AUTH_FILE ?= $(XDG_RUNTIME_DIR)/containers/auth.json
 image-os:
+	auth="$(REGISTRY_AUTH_FILE)"; \
+	if [[ ! -s "$$auth" ]]; then mkdir -p $(BINARY_DIR) && echo '{}' > $(BINARY_DIR)/no-registry-auth.json && auth=$(BINARY_DIR)/no-registry-auth.json; fi; \
 	spdk=$$(INSECURE_REGISTRY=$(INSECURE_REGISTRY) hack/pin-image.sh $(SPDK_IMAGE)); \
 	velod=$$(INSECURE_REGISTRY=$(INSECURE_REGISTRY) hack/pin-image.sh $(VELOD_IMAGE)); \
 	echo "OS image pins $$spdk and $$velod"; \
 	$(call base-pin,BOOTC_BASE_IMAGE,$(BOOTC_BASE_IMAGE)) \
-	$(PODMAN) build $(LABEL_ARGS) $$base_args $(TLS_FLAG) $(if $(TLS_FLAG),--network=host) \
+	$(PODMAN) build $(LABEL_ARGS) $$base_args $(TLS_FLAG) $(if $(TLS_FLAG),--network=host) --secret id=registry-auth,src="$$auth" \
 		--build-arg SPDK_IMAGE=$$spdk --build-arg VELOD_IMAGE=$$velod --build-arg IMAGE_TAG=$(TAG) \
 		--build-arg INSECURE_REGISTRY=$(INSECURE_REGISTRY) \
 		-t $(BOOTC_IMAGE) -f deploy/bootc/Containerfile .

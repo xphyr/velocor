@@ -94,8 +94,11 @@ COPY deploy/bootc/90-velocor-banner /usr/lib/NetworkManager/dispatcher.d/90-velo
 # them by digest after loading) and pin the quadlets to exactly what was embedded.
 COPY deploy/bootc/velocor-preload-images.sh /usr/libexec/velocor-preload-images
 COPY deploy/bootc/velocor-preload-images.service /usr/lib/systemd/system/velocor-preload-images.service
-RUN set -eu; \
+# Registry credentials for private registries come in as a build secret (mounted for this step
+# only, never written to a layer); `make image-os` passes REGISTRY_AUTH_FILE, or an empty one.
+RUN --mount=type=secret,id=registry-auth set -eu; \
     tls=""; [ "${INSECURE_REGISTRY}" = "true" ] && tls="--src-tls-verify=false"; \
+    auth=""; [ -s /run/secrets/registry-auth ] && auth="--authfile /run/secrets/registry-auth"; \
     mkdir -p /usr/share/velocor/images; \
     embed() { \
       ref="$1" name="$2"; \
@@ -103,7 +106,7 @@ RUN set -eu; \
       repo="${ref%@*}"; \
       case "${repo##*/}" in *:*) echo "$name image '$ref': give repo@sha256:... without a tag" >&2; exit 1 ;; esac; \
       archive="/usr/share/velocor/images/$name.oci.tar"; \
-      skopeo copy -q $tls "docker://$ref" "oci-archive:$archive:$repo:${IMAGE_TAG}"; \
+      skopeo copy -q $tls $auth "docker://$ref" "oci-archive:$archive:$repo:${IMAGE_TAG}"; \
       digest="$(skopeo inspect --format '{{.Digest}}' "oci-archive:$archive")"; \
       sed -i "s|^Image=.*|# Built from $repo:${IMAGE_TAG}\nImage=${repo}@${digest}|" "/usr/share/containers/systemd/$name.container"; \
       echo "$name: Image=${repo}@${digest} ($repo:${IMAGE_TAG})"; \
