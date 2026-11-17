@@ -142,7 +142,7 @@ work still open, ranked by risk to data, how fixes are verified, and what has be
   *Needed:* a supported degraded start (SPDK investigation; possibly removing the absent member
   from the superblock with operator confirmation). Together with P0-1 this is "redundancy".
 
-- [ ] **P1-10. iSCSI WRITE SAME onto freshly discarded thin-volume space deadlocks SPDK
+- [x] **P1-10. iSCSI WRITE SAME onto freshly discarded thin-volume space deadlocks SPDK
   (root cause found 2026-11-17).** Symptom (NVW + lab): `mkfs.ext4` on a volume that already
   holds data hangs; the initiator aborts ("abort task not supported"), resets and offlines the
   LUN; SPDK can't stop (SIGKILL after 120 s). "Still wedged after a restart" was the initiator
@@ -167,7 +167,13 @@ work still open, ranked by risk to data, how fixes are verified, and what has be
   fan-out 8x larger than with 4 KiB blocks. A bigger bdev_io pool only moves the threshold.
   **Fix (a) implemented:** `deploy/containers/spdk-patches/0001-scsi-bound-WRITE-SAME-fan-out.patch`
   (applied by Containerfile.spdk; SPDK's scsi unit tests pass, and the 3 new WRITE SAME tests
-  fail on unpatched SPDK). Remaining: lab verification on velocor-1, then send upstream.
+  fail on unpatched SPDK). **Verified on velocor-1 (dev-559ea38, 2026-11-17):** after a whole-device
+  discard, 16/24/32/64 parallel 4 MiB WRITE SAMEs complete in 0.2/0.3/0.3/0.6 s (24 hung before);
+  zero WRITE SAME reads back zero with neighbouring blocks intact; patterned WRITE SAME (40 and
+  3000 blocks) exact; whole-device BLKZEROOUT reads zero; `mkfs.ext4` over a filesystem holding
+  data (twice) takes <1 s, fsck clean, write/remount/verify OK; no SPDK errors logged. NVW (RHCOS,
+  `velocor-iscsi`): 300 MB written on one node, verified and rewritten after re-attach on
+  another. *Remaining:* send the patch upstream (SPDK GitHub/Gerrit) and drop it once merged.
   *Fix options considered:* (a) carry an SPDK patch in Containerfile.spdk: WRITE SAME with an all-zero block
   and no UNMAP/ANCHOR bits -> one `spdk_bdev_write_zeroes_blocks`; other WRITE SAMEs split with a
   small cap on outstanding children per task; send upstream with the io_wait cross-thread
@@ -213,6 +219,13 @@ Everything here was written by Gemini and is in scope to rewrite.
 - [ ] **B8 (rest). Publish a qcow2 with releases?** `make qcow2` now runs `hack/build-qcow2.sh`
   (rootless, KVM only; bootc-image-builder and its sudo are gone). Undecided whether CI should
   attach a qcow2 to releases (GitHub runners have KVM).
+- [ ] **B17. Pinned Fedora base digests disappear from quay.io.** `quay.io/fedora/fedora`
+  deletes superseded `:45` builds: the pinned `sha256:e203b417…` now returns "manifest unknown"
+  (found 2026-11-17 when a test pod couldn't pull it; local builds only work from cache). Clean CI
+  runners and rebuilds of older commits will fail. Options: mirror the pinned base images into
+  our own registry and pin those; or keep Renovate bumping the pin (reproducibility of older
+  commits is then lost). Checked 2026-11-17: the pins of `fedora`, `fedora-minimal` and
+  `fedora-bootc` (all set 2026-11-16) are already gone; `golang` (Docker Hub) still resolves.
 - [ ] **B14. RPM packages in image builds are not pinned.** Base images are pinned by digest, but
   `dnf install` takes whatever the Fedora mirrors have, so rebuilding a commit can produce
   different packages. *Option:* RPM lockfiles (e.g. rpm-lockfile-prototype) for the SPDK builder
@@ -355,8 +368,8 @@ restore (point-in-time correct); PVC clone; raw block (`volumeMode: Block`) roun
 `kill -9` with a pod writing: I/O stalls ~72 s and resumes, no errors, no lost acknowledged write;
 KubeVirt: Fedora VM imported onto a Velocor block volume, boots, data survives a move to
 another node, online VM snapshot (guest-agent freeze) and restore are point-in-time correct;
-everything deleted cleanly (no PVs, snapshots, volumes or exports left). **iSCSI:** login works
-on RHCOS since d60e9ec, but the data path stalls (P1-10). Not covered: RWX / live migration
+everything deleted cleanly (no PVs, snapshots, volumes or exports left). **iSCSI:** works on RHCOS since
+d60e9ec + the SPDK WRITE SAME patch (P1-10, dev-559ea38): write, cross-node re-attach, verify. Not covered: RWX / live migration
 (P1-12), Kasten.
 
 **Not yet covered:** real NVMe drives (`bdev_nvme`, vfio), io_uring (needs a host where it
