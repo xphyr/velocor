@@ -174,6 +174,9 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("POST /api/v1/pools", s.withAuth(store.RoleAdmin, s.handleCreatePool))
 	s.mux.HandleFunc("GET /api/v1/pools/{id}", s.withAuth(store.RoleReadOnly, s.handleGetPool))
 	s.mux.HandleFunc("DELETE /api/v1/pools/{id}", s.withAuth(store.RoleAdmin, s.handleDeletePool))
+	s.mux.HandleFunc("POST /api/v1/pools/{id}/replace", s.withAuth(store.RoleAdmin, s.handleReplacePoolDisk))
+	s.mux.HandleFunc("POST /api/v1/pools/{id}/start-degraded", s.withAuth(store.RoleAdmin, s.handleStartPoolDegraded))
+	s.mux.HandleFunc("DELETE /api/v1/pools/{id}/disks/{disk_id}", s.withAuth(store.RoleAdmin, s.handleReleasePoolDisk))
 
 	// Volumes & Snapshots (CSI_PROVISIONER / READONLY)
 	s.mux.HandleFunc("GET /api/v1/volumes", s.withAuth(store.RoleReadOnly, s.handleListVolumes))
@@ -222,6 +225,8 @@ func (s *Server) registerRoutes() {
 	// System
 	s.mux.HandleFunc("GET /api/v1/system/status", s.withAuth(store.RoleReadOnly, s.handleSystemStatus))
 	s.mux.HandleFunc("POST /api/v1/system/reconcile", s.withAuth(store.RoleAdmin, s.handleTriggerReconcile))
+	s.mux.HandleFunc("GET /api/v1/system/rebuild", s.withAuth(store.RoleReadOnly, s.handleGetRebuildSettings))
+	s.mux.HandleFunc("PUT /api/v1/system/rebuild", s.withAuth(store.RoleAdmin, s.handlePutRebuildSettings))
 	s.mux.HandleFunc("GET /api/v1/system/iostats", s.withAuth(store.RoleReadOnly, s.handleGetIoStats))
 	s.mux.HandleFunc("GET /api/v1/system/os", s.withAuth(store.RoleReadOnly, s.handleGetOSStatus))
 	s.mux.HandleFunc("POST /api/v1/system/upgrade", s.withAuth(store.RoleAdmin, s.handleStageUpgrade))

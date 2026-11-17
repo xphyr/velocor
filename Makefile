@@ -182,12 +182,13 @@ check-push:
 	  [[ "$$(git describe --tags --exact-match 2>/dev/null)" == "$(VERSION)" ]] || \
 	    { echo "RELEASE=true needs HEAD tagged $(VERSION)"; exit 1; }; fi
 
-# push-one <local ref> <name>: push, record the digest, then push the extra tags.
+# push-one <local ref> <name>: push, record the digest, then push the extra tags. The extra
+# tags are copied from repo@digest: skopeo rejects a reference with both a tag and a digest.
 define push-one
 	@mkdir -p $(DIGEST_DIR)
 	$(PODMAN) push $(TLS_FLAG) --digestfile $(DIGEST_DIR)/$(2) $(1)
 	for t in $(EXTRA_TAGS); do $(SKOPEO) copy -q $(SKOPEO_TLS) --all \
-	  docker://$(1)@$$(cat $(DIGEST_DIR)/$(2)) docker://$(IMAGE_PREFIX)/$(2):$$t; done
+	  docker://$(IMAGE_PREFIX)/$(2)@$$(cat $(DIGEST_DIR)/$(2)) docker://$(IMAGE_PREFIX)/$(2):$$t; done
 endef
 
 push-spdk: check-push image-spdk
@@ -200,7 +201,7 @@ push-csi: check-push image-csi
 	@mkdir -p $(DIGEST_DIR)
 	$(PODMAN) manifest push $(TLS_FLAG) --all --digestfile $(DIGEST_DIR)/velocor-csi $(CSI_IMAGE) docker://$(CSI_IMAGE)
 	for t in $(EXTRA_TAGS); do $(SKOPEO) copy -q $(SKOPEO_TLS) --all \
-	  docker://$(CSI_IMAGE)@$$(cat $(DIGEST_DIR)/velocor-csi) docker://$(IMAGE_PREFIX)/velocor-csi:$$t; done
+	  docker://$(IMAGE_PREFIX)/velocor-csi@$$(cat $(DIGEST_DIR)/velocor-csi) docker://$(IMAGE_PREFIX)/velocor-csi:$$t; done
 
 push-os: check-push image-os
 	$(call push-one,$(BOOTC_IMAGE),velocor-os)

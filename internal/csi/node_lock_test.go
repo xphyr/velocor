@@ -44,7 +44,10 @@ func TestNodeVolumeLocksAreIndependent(t *testing.T) {
 	m := &blockingMounter{fakeMounter: newFakeMounter(), stuck: "exp-stuck", release: make(chan struct{})}
 	s := NewNodeServer("node-1", m)
 	done := make(chan error, 1)
-	go func() { _, err := s.NodeStageVolume(context.Background(), stageReq(t, "vol-stuck", "exp-stuck")); done <- err }()
+	go func() {
+		_, err := s.NodeStageVolume(context.Background(), stageReq(t, "vol-stuck", "exp-stuck"))
+		done <- err
+	}()
 	time.Sleep(100 * time.Millisecond)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)

@@ -449,6 +449,16 @@ func init() {
 		return true, nil
 	}
 
+	handlers["framework_get_config"] = func(f *Fake, p map[string]any) (any, *rpcErr) {
+		if str(p, "name") != "bdev" {
+			return []any{}, nil
+		}
+		return []map[string]any{{
+			"method": "bdev_raid_set_options",
+			"params": map[string]any{"process_window_size_kb": 1024, "process_max_bandwidth_mb_sec": f.rebuildMaxMBps},
+		}}, nil
+	}
+
 	handlers["bdev_raid_set_options"] = func(f *Fake, p map[string]any) (any, *rpcErr) {
 		f.rebuildMaxMBps = uint32(num(p, "process_max_bandwidth_mb_sec"))
 		return true, nil

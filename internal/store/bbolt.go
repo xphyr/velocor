@@ -575,6 +575,9 @@ func (s *BoltStore) CreatePool(pool *Pool) error {
 	}
 	cp := *pool
 	cp.DiskIDs = slices.Clone(pool.DiskIDs)
+	if len(cp.Members) == 0 {
+		SetPoolMembers(&cp, PoolMembers(&cp))
+	}
 	if cp.ClusterSizeBytes == 0 {
 		cp.ClusterSizeBytes = DefaultClusterSizeBytes
 	}
@@ -770,9 +773,9 @@ func (s *BoltStore) DeletePool(id string) error {
 			return err
 		}
 
-		// Release member disks from this pool.
+		// Release member and detached disks from this pool.
 		disksB := tx.Bucket(bucketDisks)
-		for _, diskID := range pool.DiskIDs {
+		for _, diskID := range slices.Concat(pool.DiskIDs, pool.DetachedDiskIDs) {
 			var d Disk
 			if err := getJSON(disksB, []byte(diskID), &d); err == nil {
 				if d.PoolID == id {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/velocor/velocor/internal/dataplane"
@@ -158,9 +159,13 @@ func TestDegradedRaidStaysUntouched(t *testing.T) {
 	if e.fake.CallCount("bdev_raid_create") != 1 || e.fake.CallCount("bdev_lvol_create_lvstore") != 1 {
 		t.Fatalf("reconciler mutated an incomplete array: %v", e.fake.Calls())
 	}
+	// The array serves nothing while it waits for the missing disk: UNAVAILABLE, naming it.
 	p, _ := e.st.GetPool(pool.ID)
-	if p.HealthStatus != store.HealthStatusDegraded || p.StatusMessage == "" {
-		t.Fatalf("pool %s %q, want DEGRADED with message", p.HealthStatus, p.StatusMessage)
+	if p.HealthStatus != store.HealthStatusUnavailable || !strings.Contains(p.StatusMessage, "disk-b") {
+		t.Fatalf("pool %s %q, want UNAVAILABLE naming disk-b", p.HealthStatus, p.StatusMessage)
+	}
+	if m := p.Members[1]; m.State != store.MemberStateMissing || m.DiskID != "disk-b" {
+		t.Fatalf("slot 1: %+v, want MISSING disk-b", m)
 	}
 }
 
@@ -218,7 +223,7 @@ func TestExportsRestoredWithACLsAfterRestart(t *testing.T) {
 	e.reconcile()
 	for _, c := range e.fake.Calls()[before:] {
 		if c != "spdk_get_version" && c != "bdev_wait_for_examine" && !slices.Contains([]string{
-			"bdev_get_bdevs", "bdev_raid_get_bdevs", "bdev_lvol_get_lvstores", "bdev_nvme_get_controller_health_info",
+			"bdev_get_bdevs", "bdev_raid_get_bdevs", "bdev_lvol_get_lvstores", "bdev_nvme_get_controller_health_info", "framework_get_config",
 			"nvmf_get_transports", "nvmf_get_subsystems", "iscsi_get_portal_groups", "iscsi_get_initiator_groups", "iscsi_get_target_nodes",
 		}, c) {
 			t.Fatalf("steady-state pass issued mutating call %s", c)

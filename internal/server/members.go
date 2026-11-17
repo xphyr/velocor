@@ -1,0 +1,358 @@
+package server
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"slices"
+	"strings"
+
+	"github.com/velocor/velocor/internal/dataplane"
+	"github.com/velocor/velocor/internal/spdk"
+	"github.com/velocor/velocor/internal/store"
+)
+
+// Disk replacement, rebuild and degraded start (TODO P0-1 / P1-8;
+// docs/design/p0-1-disk-replacement.md).
+
+// maxRebuildMBps bounds the rebuild speed limit to something a typo can't exceed.
+const maxRebuildMBps = 100_000
+
+func redundant(level store.RaidLevel) bool {
+	return strings.EqualFold(string(level), string(store.RaidLevel1))
+}
+
+// poolRaid returns SPDK's view of the pool's RAID bdev and of all RAID bdevs.
+func (s *Server) poolRaid(ctx context.Context, pool *store.Pool) (*spdk.RaidBdevInfo, []spdk.RaidBdevInfo, error) {
+	raids, err := s.spdk.BdevRaidGetBdevs(ctx, "all")
+	if err != nil {
+		return nil, nil, fmt.Errorf("list raid bdevs: %w", err)
+	}
+	i := slices.IndexFunc(raids, func(rb spdk.RaidBdevInfo) bool { return rb.Name == pool.BaseBdevName })
+	if i < 0 {
+		return nil, raids, fmt.Errorf("%w: RAID %s of pool %s is not assembled", store.ErrInvalidArgument, pool.BaseBdevName, pool.ID)
+	}
+	return &raids[i], raids, nil
+}
+
+func memberOf(raids []spdk.RaidBdevInfo, bdev string) string {
+	for _, rb := range raids {
+		for _, b := range rb.BaseBdevsList {
+			if bdev != "" && b.Name == bdev {
+				return rb.Name
+			}
+		}
+	}
+	return ""
+}
+
+func (s *Server) reconcileNow(ctx context.Context) {
+	if s.reconciler != nil {
+		_, _ = s.reconciler.ReconcileOnce(ctx)
+	}
+}
+
+// handleReplacePoolDisk puts a new disk into a pool's RAID and starts rebuilding it:
+//
+//	POST /api/v1/pools/{id}/replace {new_disk_id, old_disk_id?, allow_degraded?}
+//
+// Without old_disk_id the first failed or missing slot is filled. Naming a disk that still
+// works (proactive replacement) removes it first, which leaves the pool without redundancy
+// until the rebuild completes: allow_degraded must say so. An unclaimed new disk has any old
+// metadata wiped (so SPDK can't assemble it into an old array) and is claimed.
+func (s *Server) handleReplacePoolDisk(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		NewDiskID     string `json:"new_disk_id"`
+		OldDiskID     string `json:"old_disk_id"`
+		AllowDegraded bool   `json:"allow_degraded"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.NewDiskID == "" {
+		writeError(w, fmt.Errorf("%w: body must be JSON with new_disk_id", store.ErrInvalidArgument))
+		return
+	}
+	if err := s.requireSPDK(); err != nil {
+		writeError(w, err)
+		return
+	}
+	ctx := r.Context()
+	pool, err := s.store.GetPool(r.PathValue("id"))
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	if !redundant(pool.RaidLevel) {
+		writeError(w, fmt.Errorf("%w: pool %s is %s, which has no redundancy to rebuild a disk from", store.ErrInvalidArgument, pool.ID, pool.RaidLevel))
+		return
+	}
+	rb, raids, err := s.poolRaid(ctx, pool)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	switch {
+	case !strings.EqualFold(rb.State, "online"):
+		writeError(w, fmt.Errorf("%w: RAID %s is %s; a disk can only be replaced in a running pool (start it degraded first if it is waiting for a missing disk)",
+			store.ErrInvalidArgument, rb.Name, rb.State))
+		return
+	case rb.Process != nil:
+		writeError(w, fmt.Errorf("%w: RAID %s is already rebuilding %s (%d%%)", store.ErrInUse, rb.Name, rb.Process.Target, rb.Process.Progress.Percent))
+		return
+	}
+
+	members := store.PoolMembers(pool)
+	if len(members) != len(rb.BaseBdevsList) {
+		writeError(w, fmt.Errorf("%w: pool %s records %d slots but RAID %s has %d; wait for the reconciler", store.ErrInvalidArgument, pool.ID, len(members), rb.Name, len(rb.BaseBdevsList)))
+		return
+	}
+	var slot int
+	removeBdev := ""
+	if req.OldDiskID != "" {
+		slot = slices.IndexFunc(members, func(m store.PoolMember) bool { return m.DiskID == req.OldDiskID })
+		if slot < 0 {
+			writeError(w, fmt.Errorf("%w: disk %s is not in a slot of pool %s", store.ErrNotFound, req.OldDiskID, pool.ID))
+			return
+		}
+		if b := rb.BaseBdevsList[slot]; b.Name != "" && b.IsConfigured {
+			if !req.AllowDegraded {
+				writeError(w, fmt.Errorf("%w: disk %s is working; replacing it removes the pool's redundancy until the rebuild completes (pass allow_degraded=true)", store.ErrInvalidArgument, req.OldDiskID))
+				return
+			}
+			if rb.NumBaseBdevsOperational < 2 {
+				writeError(w, fmt.Errorf("%w: disk %s is the pool's only working member", store.ErrInvalidArgument, req.OldDiskID))
+				return
+			}
+			removeBdev = b.Name
+		}
+	} else {
+		slot = slices.IndexFunc(rb.BaseBdevsList, func(b spdk.RaidBaseBdev) bool { return b.Name == "" })
+		if slot < 0 {
+			writeError(w, fmt.Errorf("%w: pool %s has no failed or missing disk; name old_disk_id to replace a working one", store.ErrInvalidArgument, pool.ID))
+			return
+		}
+	}
+
+	newDisk, err := s.store.GetDisk(req.NewDiskID)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	switch {
+	case newDisk.IsBootDevice:
+		writeError(w, store.ErrBootDeviceProtected)
+		return
+	case newDisk.PoolID != "":
+		writeError(w, fmt.Errorf("%w: disk %s belongs to pool %s", store.ErrInUse, newDisk.ID, newDisk.PoolID))
+		return
+	}
+	for _, m := range members {
+		if d, err := s.store.GetDisk(m.DiskID); err == nil && m.State == store.MemberStateActive && newDisk.SizeBytes > 0 && newDisk.SizeBytes < d.SizeBytes {
+			writeError(w, fmt.Errorf("%w: disk %s (%d bytes) is smaller than member %s (%d bytes)", store.ErrInvalidArgument, newDisk.ID, newDisk.SizeBytes, d.ID, d.SizeBytes))
+			return
+		}
+	}
+	if !newDisk.Claimed {
+		if s.hw != nil {
+			if err := s.hw.WipeMetadata(newDisk); err != nil {
+				writeError(w, fmt.Errorf("wipe disk %s before use: %w", newDisk.ID, err))
+				return
+			}
+		}
+		if newDisk, err = s.attachAndClaim(ctx, newDisk, false); err != nil {
+			writeError(w, err)
+			return
+		}
+		if raids, err = s.spdk.BdevRaidGetBdevs(ctx, "all"); err != nil {
+			writeError(w, err)
+			return
+		}
+	}
+	if other := memberOf(raids, newDisk.SPDKBdevName); other != "" {
+		writeError(w, fmt.Errorf("%w: disk %s carries metadata of RAID %s and SPDK assembled it into that array; release it with a wipe first", store.ErrInUse, newDisk.ID, other))
+		return
+	}
+
+	if removeBdev != "" {
+		if err := s.spdk.BdevRaidRemoveBaseBdev(ctx, removeBdev); err != nil {
+			writeError(w, fmt.Errorf("remove %s from RAID %s: %w", req.OldDiskID, rb.Name, err))
+			return
+		}
+	}
+	prev := members[slot]
+	updated, err := s.store.ReplacePoolMember(pool.ID, slot, newDisk.ID)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	if err := s.spdk.BdevRaidAddBaseBdev(ctx, rb.Name, newDisk.SPDKBdevName); err != nil {
+		s.undoReplace(pool.ID, prev, newDisk.ID)
+		writeError(w, fmt.Errorf("add disk %s to RAID %s: %w", newDisk.ID, rb.Name, err))
+		return
+	}
+	s.reconcileNow(ctx)
+	if p, err := s.store.GetPool(pool.ID); err == nil {
+		updated = p
+	}
+	writeJSON(w, http.StatusAccepted, map[string]any{"pool": updated})
+}
+
+// undoReplace restores a slot after SPDK refused the new disk; the disk stays claimed.
+func (s *Server) undoReplace(poolID string, prev store.PoolMember, newDiskID string) {
+	_, _ = s.store.MutatePool(poolID, func(p *store.Pool) error {
+		m := store.PoolMembers(p)
+		if prev.Slot < len(m) {
+			m[prev.Slot] = prev
+		}
+		p.DetachedDiskIDs = slices.DeleteFunc(p.DetachedDiskIDs, func(id string) bool { return id == prev.DiskID })
+		store.SetPoolMembers(p, m)
+		return nil
+	})
+	_, _ = s.store.MutateDisk(newDiskID, func(d *store.Disk) error { d.PoolID = ""; return nil })
+}
+
+// handleStartPoolDegraded starts a pool whose RAID waits for a missing disk, without it:
+//
+//	POST /api/v1/pools/{id}/start-degraded {confirm: "<pool name>"}
+//
+// Never automatic: a disk that is only slow to appear would be dropped from the array.
+func (s *Server) handleStartPoolDegraded(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Confirm string `json:"confirm"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&req)
+	if err := s.requireSPDK(); err != nil {
+		writeError(w, err)
+		return
+	}
+	ctx := r.Context()
+	pool, err := s.store.GetPool(r.PathValue("id"))
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	if req.Confirm != pool.Name {
+		writeError(w, fmt.Errorf("%w: confirm must be the pool name (%q): the missing disk is dropped from the array and won't be taken back", store.ErrInvalidArgument, pool.Name))
+		return
+	}
+	rb, _, err := s.poolRaid(ctx, pool)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	if !strings.EqualFold(rb.State, "configuring") {
+		writeError(w, fmt.Errorf("%w: RAID %s is %s, not waiting for a missing disk", store.ErrInvalidArgument, rb.Name, rb.State))
+		return
+	}
+	if err := s.spdk.BdevRaidStartDegraded(ctx, rb.Name); err != nil {
+		writeError(w, fmt.Errorf("start RAID %s degraded: %w", rb.Name, err))
+		return
+	}
+	s.logger.Warn("pool started degraded by operator", "pool", pool.ID, "raid", rb.Name)
+	s.reconcileNow(ctx)
+	if p, err := s.store.GetPool(pool.ID); err == nil {
+		pool = p
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"pool": pool})
+}
+
+// handleReleasePoolDisk returns a disk that left a pool's RAID (failed, removed or
+// replaced) to the unclaimed list, wiping its metadata so it can't be mistaken for a member:
+//
+//	DELETE /api/v1/pools/{id}/disks/{disk_id}
+func (s *Server) handleReleasePoolDisk(w http.ResponseWriter, r *http.Request) {
+	if err := s.requireSPDK(); err != nil {
+		writeError(w, err)
+		return
+	}
+	ctx := r.Context()
+	poolID, diskID := r.PathValue("id"), r.PathValue("disk_id")
+	d, err := s.store.GetDisk(diskID)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	if d.Claimed {
+		raids, err := s.spdk.BdevRaidGetBdevs(ctx, "all")
+		if err != nil {
+			writeError(w, err)
+			return
+		}
+		if rb := memberOf(raids, d.SPDKBdevName); rb != "" {
+			writeError(w, fmt.Errorf("%w: disk %s is still a member of RAID %s", store.ErrInUse, diskID, rb))
+			return
+		}
+	}
+	if _, err := s.store.ReleasePoolDisk(poolID, diskID); err != nil {
+		writeError(w, err)
+		return
+	}
+	if d.Claimed {
+		if err := dataplane.DetachDisk(ctx, s.spdk, d); err != nil {
+			writeError(w, err)
+			return
+		}
+		if _, err := s.store.ReleaseDisk(diskID); err != nil {
+			writeError(w, err)
+			return
+		}
+		if d.Type == store.DiskTypeNVMe && s.hw != nil && d.PCIAddress != "" {
+			if err := s.hw.BindNVMeToKernel(d.PCIAddress); err != nil {
+				writeError(w, fmt.Errorf("disk %s released but rebinding %s to the kernel failed: %w", diskID, d.PCIAddress, err))
+				return
+			}
+		}
+	}
+	wiped := false
+	if s.hw != nil && d.DevicePath != "" {
+		if err := s.hw.WipeMetadata(d); err != nil {
+			s.logger.Warn("released disk not wiped", "disk", diskID, "error", err)
+		} else {
+			wiped = true
+		}
+	}
+	out, err := s.store.GetDisk(diskID)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"disk": out, "wiped": wiped})
+}
+
+// handleGetRebuildSettings / handlePutRebuildSettings: GET|PUT /api/v1/system/rebuild
+// {max_mb_per_sec} (0 = unlimited). SPDK applies the limit to every RAID; the reconciler
+// re-applies it after spdk_tgt restarts.
+func (s *Server) handleGetRebuildSettings(w http.ResponseWriter, _ *http.Request) {
+	st, err := s.store.GetSettings()
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"max_mb_per_sec": st.RebuildMaxMBps})
+}
+
+func (s *Server) handlePutRebuildSettings(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		MaxMBps *uint32 `json:"max_mb_per_sec"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.MaxMBps == nil || *req.MaxMBps > maxRebuildMBps {
+		writeError(w, fmt.Errorf("%w: body must be {\"max_mb_per_sec\": 0..%d} (0 = unlimited)", store.ErrInvalidArgument, maxRebuildMBps))
+		return
+	}
+	st, err := s.store.GetSettings()
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	st.RebuildMaxMBps = *req.MaxMBps
+	if err := s.store.SaveSettings(st); err != nil {
+		writeError(w, err)
+		return
+	}
+	if s.spdk != nil {
+		if err := s.spdk.BdevRaidSetOptions(r.Context(), st.RebuildMaxMBps); err != nil {
+			writeError(w, fmt.Errorf("saved, but applying it to SPDK failed (the reconciler retries): %w", err))
+			return
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"max_mb_per_sec": st.RebuildMaxMBps})
+}

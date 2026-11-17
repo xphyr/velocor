@@ -296,6 +296,7 @@ func (f *Fake) resetRuntime() {
 	f.bdevUUID = map[string]string{}
 	f.nvmeCtrls = map[string]string{}
 	f.raids = map[string]*raidBdev{}
+	f.rebuildMaxMBps = 0 // SPDK options don't survive a restart
 	f.pendingLoad = map[string]bool{}
 	f.loadedLvs = map[string]string{}
 	f.qos = map[string]spdk.BdevRateLimits{}

@@ -130,3 +130,23 @@ func (c *Client) BdevRaidStartDegraded(ctx context.Context, name string) error {
 func (c *Client) BdevRaidSetOptions(ctx context.Context, maxBandwidthMBps uint32) error {
 	return c.Call(ctx, "bdev_raid_set_options", map[string]any{"process_max_bandwidth_mb_sec": maxBandwidthMBps}, nil)
 }
+
+// BdevRaidGetMaxBandwidth returns the rebuild bandwidth limit SPDK currently applies
+// (0 = unlimited), read from the bdev subsystem's configuration.
+func (c *Client) BdevRaidGetMaxBandwidth(ctx context.Context) (uint32, error) {
+	var cfg []struct {
+		Method string `json:"method"`
+		Params struct {
+			MaxBandwidth uint32 `json:"process_max_bandwidth_mb_sec"`
+		} `json:"params"`
+	}
+	if err := c.Call(ctx, "framework_get_config", map[string]any{"name": "bdev"}, &cfg); err != nil {
+		return 0, err
+	}
+	for _, m := range cfg {
+		if m.Method == "bdev_raid_set_options" {
+			return m.Params.MaxBandwidth, nil
+		}
+	}
+	return 0, nil
+}

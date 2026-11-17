@@ -62,6 +62,13 @@ type Store interface {
 	CheckPoolDeletable(id string) error
 	ListPools() ([]*Pool, error)
 	DeletePool(id string) error
+	// ReplacePoolMember puts a disk into a RAID slot as REBUILDING; the slot's previous disk
+	// becomes detached (bound to the pool until released).
+	ReplacePoolMember(poolID string, slot int, newDiskID string) (*Pool, error)
+	// ReleasePoolDisk unbinds a detached disk from its pool.
+	ReleasePoolDisk(poolID, diskID string) (*Pool, error)
+	GetSettings() (*Settings, error)
+	SaveSettings(st *Settings) error
 
 	// Volumes
 	CreateVolume(vol *Volume) error
