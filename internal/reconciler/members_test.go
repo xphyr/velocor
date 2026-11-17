@@ -125,3 +125,29 @@ func TestInterruptedRebuildIsRestarted(t *testing.T) {
 		t.Fatalf("after the restarted rebuild: %s %q", p.HealthStatus, p.StatusMessage)
 	}
 }
+
+// A member whose bdev disappears while its drive is still there (an I/O error took it out,
+// a transient disconnect) must not be re-attached: SPDK would re-add it and rebuild onto a
+// disk that just failed. It stays out until an operator acts.
+func TestFailedMemberIsNotReattached(t *testing.T) {
+	e := newEnv(t)
+	pool, _ := e.provision(store.RaidLevel1, "0000:01:00.0", "0000:02:00.0")
+	e.reconcile()
+	if err := e.fake.Client().BdevNvmeDetachController(e.ctx, "Nvme_0000_02_00_0"); err != nil {
+		t.Fatal(err)
+	}
+	for range 3 {
+		e.reconcile()
+	}
+	p := e.pool()
+	if p.HealthStatus != store.HealthStatusDegraded || p.Members[1].State != store.MemberStateFailed {
+		t.Fatalf("after the member failed: %s %q %+v", p.HealthStatus, p.StatusMessage, p.Members)
+	}
+	if n := e.fake.CallCount("bdev_nvme_attach_controller"); n != 2 {
+		t.Fatalf("the failed member was re-attached (%d attaches, want the 2 at provisioning)", n)
+	}
+	if n := e.fake.CallCount("bdev_raid_add_base_bdev"); n != 0 {
+		t.Fatalf("a rebuild was started onto the failed disk")
+	}
+	_ = pool
+}

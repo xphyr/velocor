@@ -120,7 +120,8 @@ func (c *Client) BdevRaidRemoveBaseBdev(ctx context.Context, baseBdev string) er
 
 // BdevRaidStartDegraded starts a superblock RAID that is waiting for absent members without
 // them (Velocor SPDK patch 0002). The absent members are recorded as missing; one that
-// returns later is not taken back.
+// returns later never resumes as an up-to-date member (SPDK would re-add and rebuild it, and
+// velod doesn't re-attach disks that left their pool).
 func (c *Client) BdevRaidStartDegraded(ctx context.Context, name string) error {
 	return c.Call(ctx, "bdev_raid_start_degraded", map[string]any{"name": name}, nil)
 }

@@ -340,9 +340,33 @@ func runToken(cfg *cliConfig, args []string) error {
 
 func runSystem(cfg *cliConfig, args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("subcommand required: status | os | reconcile | iostats | upgrade | rollback | reboot | containers")
+		return fmt.Errorf("subcommand required: status | os | reconcile | iostats | upgrade | rollback | reboot | containers | rebuild")
 	}
 	switch args[0] {
+	case "rebuild":
+		fs := flag.NewFlagSet("system rebuild", flag.ExitOnError)
+		limit := fs.Int("max-mb-per-sec", -1, "Limit RAID rebuild bandwidth for every pool (0 = unlimited); applies to rebuilds that start afterwards. Omit to show the current limit")
+		_ = fs.Parse(args[1:])
+		var resp map[string]any
+		var err error
+		if *limit < 0 {
+			resp, err = cfg.request("GET", "/api/v1/system/rebuild", nil)
+		} else {
+			resp, err = cfg.request("PUT", "/api/v1/system/rebuild", map[string]any{"max_mb_per_sec": *limit})
+		}
+		if err != nil {
+			return err
+		}
+		if cfg.jsonOutput {
+			return printJSON(resp)
+		}
+		if v := uint64FromAny(resp["max_mb_per_sec"]); v == 0 {
+			fmt.Println("Rebuild speed: unlimited")
+		} else {
+			fmt.Printf("Rebuild speed: at most %d MB/s per pool\n", v)
+		}
+		return nil
+
 	case "status":
 		resp, err := cfg.request("GET", "/api/v1/system/status", nil)
 		if err != nil {
@@ -572,7 +596,7 @@ func runDisk(cfg *cliConfig, args []string) error {
 
 func runPool(cfg *cliConfig, args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("subcommand required: list | create | delete")
+		return fmt.Errorf("subcommand required: list | get | create | replace | start-degraded | release-disk | delete")
 	}
 	switch args[0] {
 	case "list":
@@ -614,6 +638,116 @@ func runPool(cfg *cliConfig, args []string) error {
 			return err
 		}
 		return printJSON(resp)
+
+	case "get":
+		if len(args) < 2 {
+			return fmt.Errorf("usage: veloctl pool get <pool-id>")
+		}
+		resp, err := cfg.request("GET", "/api/v1/pools/"+args[1], nil)
+		if err != nil {
+			return err
+		}
+		if cfg.jsonOutput {
+			return printJSON(resp)
+		}
+		p, _ := resp["pool"].(map[string]any)
+		fmt.Printf("Pool:    %v (%v)\n", p["name"], p["id"])
+		fmt.Printf("RAID:    %v on %v\n", p["raid_level"], p["base_bdev_name"])
+		fmt.Printf("Health:  %v %v\n", p["health_status"], strOrEmpty(p["status_message"]))
+		fmt.Printf("Size:    %s total, %s free\n", humanBytes(uint64FromAny(p["total_bytes"])), humanBytes(uint64FromAny(p["free_bytes"])))
+		tw := newTabWriter()
+		fmt.Fprintln(tw, "\nSLOT\tDISK\tSTATE\tREBUILD")
+		for _, m := range sliceOfMaps(p["members"]) {
+			rebuild := ""
+			if m["state"] == "REBUILDING" {
+				rebuild = fmt.Sprintf("%d%%", uint64FromAny(m["rebuild_percent"]))
+			}
+			fmt.Fprintf(tw, "%v\t%v\t%v\t%v\n", uint64FromAny(m["slot"]), strOrDash(m["disk_id"]), m["state"], rebuild)
+		}
+		if err := tw.Flush(); err != nil {
+			return err
+		}
+		if det := sliceOfAny(p["detached_disk_ids"]); len(det) > 0 {
+			fmt.Printf("\nDetached disks (left the RAID; release with `veloctl pool release-disk %v <disk-id>`):\n", p["id"])
+			for _, d := range det {
+				fmt.Printf("  %v\n", d)
+			}
+		}
+		return nil
+
+	case "replace":
+		fs := flag.NewFlagSet("pool replace", flag.ExitOnError)
+		newDisk := fs.String("new-disk", "", "Disk to add (an unclaimed disk is wiped and claimed)")
+		oldDisk := fs.String("old-disk", "", "Disk to replace (default: the failed or missing one)")
+		allowDegraded := fs.Bool("allow-degraded", false, "Allow replacing a disk that still works (the pool has no redundancy until the rebuild completes)")
+		id, err := parseWithID(fs, args[1:])
+		if err != nil || *newDisk == "" {
+			return fmt.Errorf("usage: veloctl pool replace <pool-id> --new-disk <disk-id> [--old-disk <disk-id> --allow-degraded]")
+		}
+		body := map[string]any{"new_disk_id": *newDisk, "allow_degraded": *allowDegraded}
+		if *oldDisk != "" {
+			body["old_disk_id"] = *oldDisk
+		}
+		resp, err := cfg.request("POST", "/api/v1/pools/"+id+"/replace", body)
+		if err != nil {
+			return err
+		}
+		if cfg.jsonOutput {
+			return printJSON(resp)
+		}
+		p, _ := resp["pool"].(map[string]any)
+		fmt.Printf("Rebuilding onto %s: pool %v is %v. Follow progress with `veloctl pool get %v`.\n", *newDisk, id, p["health_status"], id)
+		return nil
+
+	case "start-degraded":
+		fs := flag.NewFlagSet("pool start-degraded", flag.ExitOnError)
+		confirm := fs.String("confirm", "", "The pool name, to confirm")
+		id, err := parseWithID(fs, args[1:])
+		if err != nil {
+			return fmt.Errorf("usage: veloctl pool start-degraded <pool-id> [--confirm <pool-name>]")
+		}
+		if *confirm == "" {
+			resp, err := cfg.request("GET", "/api/v1/pools/"+id, nil)
+			if err != nil {
+				return err
+			}
+			p, _ := resp["pool"].(map[string]any)
+			fmt.Fprintf(os.Stderr, "Pool %v: %v\n", p["name"], strOrEmpty(p["status_message"]))
+			fmt.Fprintln(os.Stderr, "Starting it degraded drops the missing disk from the array; if it comes back, Velocor leaves it out until you release it or reuse it as a replacement.")
+			line, err := promptLine(fmt.Sprintf("Type the pool name (%v) to confirm: ", p["name"]))
+			if err != nil {
+				return err
+			}
+			*confirm = line
+		}
+		resp, err := cfg.request("POST", "/api/v1/pools/"+id+"/start-degraded", map[string]any{"confirm": *confirm})
+		if err != nil {
+			return err
+		}
+		if cfg.jsonOutput {
+			return printJSON(resp)
+		}
+		p, _ := resp["pool"].(map[string]any)
+		fmt.Printf("Pool %v started: %v %v\nReplace the missing disk with `veloctl pool replace %v --new-disk <disk-id>`.\n", id, p["health_status"], strOrEmpty(p["status_message"]), id)
+		return nil
+
+	case "release-disk":
+		if len(args) < 3 {
+			return fmt.Errorf("usage: veloctl pool release-disk <pool-id> <disk-id>")
+		}
+		resp, err := cfg.request("DELETE", "/api/v1/pools/"+args[1]+"/disks/"+args[2], nil)
+		if err != nil {
+			return err
+		}
+		if cfg.jsonOutput {
+			return printJSON(resp)
+		}
+		wiped := "not wiped (wipe it before reusing it elsewhere)"
+		if resp["wiped"] == true {
+			wiped = "and wiped"
+		}
+		fmt.Printf("Released disk %s from pool %s %s\n", args[2], args[1], wiped)
+		return nil
 
 	case "delete":
 		if len(args) < 2 {
@@ -1288,7 +1422,7 @@ Commands:
   token             Manage scoped service tokens (list, create, revoke)
   system            Appliance status, containers, bootc upgrade/rollback
   disk              List, scan, claim, release drives; set write cache / power-loss protection
-  pool              Create, list, or delete SPDK RAID + lvol_store pools
+  pool              Create, list, inspect or delete pools; replace a disk, start a pool degraded
   volume            Create, list, get, show usage, resize, set QoS, or delete volumes
   snapshot          Create, list, clone and delete snapshots
   group-snapshot    Create, list, get, or delete consistency group snapshots
@@ -1399,6 +1533,16 @@ func tlsConfig(insecure bool, caCert string) (*tls.Config, error) {
 	}
 	cfg.RootCAs = pool
 	return cfg, nil
+}
+
+// promptLine reads a line from stdin (echoed).
+func promptLine(prompt string) (string, error) {
+	fmt.Fprint(os.Stderr, prompt)
+	line, err := bufio.NewReader(os.Stdin).ReadString('\n')
+	if err != nil && line == "" {
+		return "", fmt.Errorf("read confirmation: %w", err)
+	}
+	return strings.TrimRight(line, "\r\n"), nil
 }
 
 // promptSecret reads a line from the terminal without echoing it (Linux, macOS, Windows). When

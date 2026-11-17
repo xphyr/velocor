@@ -123,21 +123,26 @@ func TestRaidMissingAtBootAndStartDegraded(t *testing.T) {
 		t.Fatal("start-degraded of an online array must be refused")
 	}
 
-	// The old disk comes back: older superblock, not taken back.
+	// The old disk comes back while its slot is still empty: SPDK re-adds it and rebuilds it
+	// (it never resumes as an up-to-date member).
 	f.AddFile("/dev/b")
 	attach(t, c, map[string]string{"db": "/dev/b"})
-	if r = raidState(t, c, "r1"); r.NumBaseBdevsOperational != 1 || r.BaseBdevsList[1].Name != "" {
-		t.Fatalf("stale member was taken back: %+v", r)
+	if r = raidState(t, c, "r1"); r.Process == nil || r.Process.Target != "db" {
+		t.Fatalf("returning member with an empty slot: %+v, want it re-added and rebuilding", r)
 	}
+	f.SetRebuildProgress("r1", 100)
 
-	// Its slot can be filled by a new disk.
+	// A member whose slot was filled by another disk is refused.
+	f.FailMedia("/dev/b")
 	attach(t, c, map[string]string{"dc": "/dev/c"})
 	if err := c.BdevRaidAddBaseBdev(ctx, "r1", "dc"); err != nil {
 		t.Fatal(err)
 	}
 	f.SetRebuildProgress("r1", 100)
-	if r = raidState(t, c, "r1"); r.NumBaseBdevsOperational != 2 {
-		t.Fatalf("after replacing: %+v", r)
+	f.AddFile("/dev/b")
+	attach(t, c, map[string]string{"db": "/dev/b"})
+	if r = raidState(t, c, "r1"); r.Process != nil || r.BaseBdevsList[1].Name != "dc" {
+		t.Fatalf("a member whose slot was filled must be refused: %+v", r)
 	}
 }
 

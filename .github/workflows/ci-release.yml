@@ -169,6 +169,9 @@ jobs:
           EVENT: ${{ github.event_name }}
           PR: ${{ github.event.pull_request.number }}
         run: |
+          # One credentials file for podman login, skopeo and the OS image build (which pulls the
+          # just-pushed spdk/velod images, private while the repository is; a build secret).
+          echo "REGISTRY_AUTH_FILE=$RUNNER_TEMP/registry-auth.json" >> "$GITHUB_ENV"
           owner="${GITHUB_REPOSITORY_OWNER,,}"
           if [[ "$EVENT" == pull_request ]]; then
             prefix=localhost:5000/velocor; tag="pr-${PR}"; extra=""; release=false; insecure=true
