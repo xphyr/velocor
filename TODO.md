@@ -251,7 +251,12 @@ Everything here was written by Gemini and is in scope to rewrite.
   every library a patch touches) and a CI job that gates image publication; (3) the lint job now
   runs actionlint (pinned image) and renders the CDI StorageProfile hook, which plain
   `helm lint` skips.
-- [ ] **B16. The new CI workflow has not run yet.** It passes actionlint and every step uses
+- [x] **B19. veloctl didn't build for macOS/Windows** (found by the first CI run, PR #1,
+  2026-11-17): password prompt used Linux-only termios ioctls; now `golang.org/x/term`. All five
+  release targets cross-compile.
+- [ ] **B16. The new CI workflow has not fully run yet.** First run (PR #1, 2026-11-17, run
+  44102090198): lint (incl. actionlint), unit tests and the SPDK patch unit tests pass on
+  GitHub; veloctl failed (B19, fixed); images job pending. It passes actionlint and every step uses
   `make` targets verified locally, but the GitHub-side pieces (ghcr login, cosign, attestations,
   rootless podman with arm64 emulation on the runner, the PR local registry) are only proven by
   a first run. Also enable Renovate on the repository (`renovate.json`).
@@ -348,13 +353,26 @@ Everything here was written by Gemini and is in scope to rewrite.
 
 ### Suggested order of work
 
-1. **P0-4 durability, interim handling**: detect the write cache per disk, PLP declaration,
-   optional cache disable, power-pull test (decided 2026-11-16; SPDK patch is L-1).
-2. **P0-1 + P1-8 redundancy**: replace-disk with rebuild, and a supported degraded start.
-3. **P0-2 capacity**: overcommit limits, reserve, thresholds.
-4. **P0-3 metadata**: on-pool metadata copy, backups, recovery from disks.
-5. **P1-1 alerting**: health metrics.
-6. P1-3 network rollback, P1-4 deletion protection, P1-5 orphan reporting, P0-6 io_uring probe.
+**Release gate (agreed 2026-11-17):** no first release until items 1–5 are done; work them in
+this order and keep this file current as each moves.
+
+1. **P0-1 + P1-8 redundancy** (in progress): replace a failed disk with rebuild progress
+   (`REBUILDING n%`), and a supported degraded start. Starts with a design note on SPDK's raid
+   rebuild API and its behaviour across restarts; tested with real SPDK (fail, replace,
+   rebuild, restart during rebuild, second failure) on the serenity VM lab, where disks can be
+   hot-unplugged.
+2. **P0-2 capacity**: overcommit limit, reserve for snapshots/metadata, thresholds,
+   per-volume/snapshot allocated space.
+3. **P0-3 metadata**: on-pool metadata copy, scheduled backups + `veloctl` backup/restore,
+   recovery from SPDK and the on-pool copy.
+4. **P0-4 durability, remaining**: NVMe write-cache detection/disable through SPDK admin
+   passthrough, pool-level flag; power-pull test on real hardware (user). The SPDK FLUSH patch
+   stays L-1.
+5. **P1-4 deletion protection** (recycle period / per-volume protection); fold in **P0-6**
+   (probe io_uring, fall back to AIO).
+
+After the release gate: P1-1 alerting, P1-3 network rollback, P1-5 orphan reporting, P2-2
+scrub, P2-11.
 
 ---
 
