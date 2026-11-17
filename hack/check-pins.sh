@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # Fail if anything the build depends on is referenced by a moving name:
-#  - every FROM in a Containerfile is pinned by digest (or names a build stage / build arg);
+#  - every FROM in a Containerfile is pinned by digest, names a build stage, or uses a build arg;
+#    a build arg's default must itself be pinned, except Fedora's rolling base images (B17: they
+#    follow the release tag for daily fixes; `make` resolves the tag to a digest per build and
+#    records it in the image's org.opencontainers.image.base.* labels);
 #  - the Go image used to build release binaries matches go.mod's toolchain line;
 #  - every GitHub Action is pinned to a full commit SHA.
 set -euo pipefail
@@ -15,6 +18,16 @@ for f in $(git ls-files 'deploy/**/Containerfile*'); do
     grep -qx "$(tr '[:upper:]' '[:lower:]' <<<"$ref")" <<<"$stages" && continue
     bad "$f: FROM $ref is not pinned by digest"
   done < <(awk 'toupper($1)=="FROM" {for (i=2;i<=NF;i++) if ($i !~ /^--/) {print $i; break}}' "$f")
+done
+
+# Base images allowed to follow a rolling tag (registry/repo:<Fedora release>).
+rolling='^quay\.io/fedora/(fedora|fedora-minimal|fedora-bootc):[0-9]+$'
+for f in $(git ls-files 'deploy/**/Containerfile*'); do
+  while read -r name value; do
+    [[ "$value" == */* ]] || continue                      # not an image reference
+    [[ "$value" == *@sha256:* || "$value" =~ $rolling ]] && continue
+    bad "$f: ARG $name defaults to $value, which is neither pinned by digest nor an allowed rolling base"
+  done < <(awk 'toupper($1)=="ARG" && index($2, "=") {split($2, kv, "="); print kv[1], kv[2]}' "$f")
 done
 
 toolchain=$(awk '$1=="toolchain" {sub(/^go/, "", $2); print $2}' go.mod)

@@ -1,8 +1,10 @@
 # Control-plane container: velod (and veloctl, which the OS image copies out of this image).
 #
-# Every base image is pinned by digest (Renovate proposes bumps). The Go toolchain is the
-# official image matching go.mod's `toolchain` line (hack/check-pins.sh enforces it), so the
-# shipped binaries come from the same Go release CI tests with.
+# The Go toolchain is the official image matching go.mod's `toolchain` line, pinned by digest
+# (hack/check-pins.sh enforces both), so the shipped binaries come from the same Go release CI
+# tests with. The runtime follows Fedora's rolling fedora-minimal 45 (resolved to a digest per
+# build by `make`, recorded in the org.opencontainers.image.base.* labels).
+ARG FEDORA_MINIMAL_IMAGE=quay.io/fedora/fedora-minimal:45
 FROM docker.io/library/golang:1.26.11@sha256:f6946db66567acc1497655237e58f06ec3a57478a5e0d67fca29d2ffcf2ea136 AS builder
 
 ENV CGO_ENABLED=0 GOTOOLCHAIN=local
@@ -18,7 +20,7 @@ RUN LDFLAGS="-s -w -X github.com/velocor/velocor/internal/version.Version=${VERS
     go build -trimpath -ldflags="${LDFLAGS}" -o /out/velod ./cmd/velod && \
     go build -trimpath -ldflags="${LDFLAGS}" -o /out/veloctl ./cmd/veloctl
 
-FROM quay.io/fedora/fedora-minimal:45@sha256:68173f6dc68d25b73ef343e098d8d3df7aaa1096b565012a143d536c52180227
+FROM ${FEDORA_MINIMAL_IMAGE}
 
 RUN mkdir -p /var/lib/velocor /run/velocor
 COPY --from=builder /out/velod /usr/bin/velod

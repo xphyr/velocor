@@ -56,6 +56,17 @@ LABEL_ARGS := --label org.opencontainers.image.source=https://github.com/xphyr/v
 	--label org.opencontainers.image.revision=$(GIT_SHA_FULL) \
 	--label org.opencontainers.image.version=$(VERSION) \
 	$(addprefix --label ,$(BUILD_LABELS))
+# Fedora base images follow Fedora's rolling release tags (daily fixes). Each build resolves the
+# tag to the digest it points to right then, builds from exactly that digest, and records it in
+# the OCI base-image labels, so every image says which base it was built on.
+FEDORA_IMAGE ?= quay.io/fedora/fedora:45
+FEDORA_MINIMAL_IMAGE ?= quay.io/fedora/fedora-minimal:45
+BOOTC_BASE_IMAGE ?= quay.io/fedora/fedora-bootc:45
+# $(call base-pin,<build arg>,<image ref>): shell prefix setting $$base_args for podman build.
+define base-pin
+base=$$(INSECURE_REGISTRY=false hack/pin-image.sh $(2)); echo "base image $(2) -> $$base"; \
+	base_args="--build-arg $(1)=$$base --label org.opencontainers.image.base.name=$(2) --label org.opencontainers.image.base.digest=$${base#*@}";
+endef
 GO_BUILD_ARGS := --build-arg VERSION=$(VERSION) --build-arg COMMIT=$(COMMIT) --build-arg BUILD_TIME=$(BUILD_TIME)
 DIGEST_DIR := $(BINARY_DIR)/digests
 
@@ -110,19 +121,23 @@ images: image-spdk image-velod image-csi
 
 # The test stage shares the builder stage, so building it first costs one SPDK compile in total.
 image-spdk-test:
-	$(PODMAN) build $(LABEL_ARGS) --target test -t $(SPDK_TEST_IMAGE) -f deploy/containers/Containerfile.spdk .
+	$(call base-pin,FEDORA_IMAGE,$(FEDORA_IMAGE)) \
+	$(PODMAN) build $(LABEL_ARGS) $$base_args --target test -t $(SPDK_TEST_IMAGE) -f deploy/containers/Containerfile.spdk .
 
 image-spdk:
-	$(PODMAN) build $(LABEL_ARGS) -t $(SPDK_IMAGE) -f deploy/containers/Containerfile.spdk .
+	$(call base-pin,FEDORA_IMAGE,$(FEDORA_IMAGE)) \
+	$(PODMAN) build $(LABEL_ARGS) $$base_args -t $(SPDK_IMAGE) -f deploy/containers/Containerfile.spdk .
 
 image-velod:
-	$(PODMAN) build $(LABEL_ARGS) $(GO_BUILD_ARGS) -t $(VELOD_IMAGE) -f deploy/containers/Containerfile.velod .
+	$(call base-pin,FEDORA_MINIMAL_IMAGE,$(FEDORA_MINIMAL_IMAGE)) \
+	$(PODMAN) build $(LABEL_ARGS) $$base_args $(GO_BUILD_ARGS) -t $(VELOD_IMAGE) -f deploy/containers/Containerfile.velod .
 
 # Always built as a manifest list (also for one platform) so single- and multi-arch builds push
 # the same way. The list is recreated each time; reusing it would accumulate old images.
 image-csi:
 	-$(PODMAN) manifest rm $(CSI_IMAGE) >/dev/null 2>&1
-	$(PODMAN) build $(LABEL_ARGS) $(GO_BUILD_ARGS) --platform $(CSI_PLATFORMS) --manifest $(CSI_IMAGE) \
+	$(call base-pin,FEDORA_MINIMAL_IMAGE,$(FEDORA_MINIMAL_IMAGE)) \
+	$(PODMAN) build $(LABEL_ARGS) $$base_args $(GO_BUILD_ARGS) --platform $(CSI_PLATFORMS) --manifest $(CSI_IMAGE) \
 		-f deploy/containers/Containerfile.csi .
 
 # Needs the spdk and velod images in the registry: their digests are resolved there and pinned.
@@ -130,7 +145,8 @@ image-os:
 	spdk=$$(INSECURE_REGISTRY=$(INSECURE_REGISTRY) hack/pin-image.sh $(SPDK_IMAGE)); \
 	velod=$$(INSECURE_REGISTRY=$(INSECURE_REGISTRY) hack/pin-image.sh $(VELOD_IMAGE)); \
 	echo "OS image pins $$spdk and $$velod"; \
-	$(PODMAN) build $(LABEL_ARGS) $(TLS_FLAG) $(if $(TLS_FLAG),--network=host) \
+	$(call base-pin,BOOTC_BASE_IMAGE,$(BOOTC_BASE_IMAGE)) \
+	$(PODMAN) build $(LABEL_ARGS) $$base_args $(TLS_FLAG) $(if $(TLS_FLAG),--network=host) \
 		--build-arg SPDK_IMAGE=$$spdk --build-arg VELOD_IMAGE=$$velod --build-arg IMAGE_TAG=$(TAG) \
 		--build-arg INSECURE_REGISTRY=$(INSECURE_REGISTRY) \
 		-t $(BOOTC_IMAGE) -f deploy/bootc/Containerfile .

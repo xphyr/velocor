@@ -7,13 +7,17 @@
 # are embedded in this OS image and the quadlets reference them by digest, so an appliance runs
 # exactly the containers it was built and tested with, without a registry at boot, and only
 # `bootc upgrade` changes them.
+# The base follows Fedora's rolling fedora-bootc 45 image (daily fixes); `make image-os`
+# resolves the tag to a digest per build and records it in the org.opencontainers.image.base.*
+# labels.
 ARG VELOD_IMAGE
 ARG SPDK_IMAGE
+ARG BOOTC_BASE_IMAGE=quay.io/fedora/fedora-bootc:45
 
 # veloctl for the host comes from the same velod image the appliance runs.
 FROM ${VELOD_IMAGE} AS velod-bin
 
-FROM quay.io/fedora/fedora-bootc:45@sha256:1989dd9223dc2ef03e3be158165be13e55b5571c62e9f3c88992950cf355416d
+FROM ${BOOTC_BASE_IMAGE}
 
 ARG VELOD_IMAGE
 ARG SPDK_IMAGE

@@ -219,17 +219,21 @@ Everything here was written by Gemini and is in scope to rewrite.
 - [ ] **B8 (rest). Publish a qcow2 with releases?** `make qcow2` now runs `hack/build-qcow2.sh`
   (rootless, KVM only; bootc-image-builder and its sudo are gone). Undecided whether CI should
   attach a qcow2 to releases (GitHub runners have KVM).
-- [ ] **B17. Pinned Fedora base digests disappear from quay.io.** `quay.io/fedora/fedora`
+- [x] **B17. Pinned Fedora base digests disappear from quay.io.** `quay.io/fedora/fedora`
   deletes superseded `:45` builds: the pinned `sha256:e203b417…` now returns "manifest unknown"
   (found 2026-11-17 when a test pod couldn't pull it; local builds only work from cache). Clean CI
   runners and rebuilds of older commits will fail. Options: mirror the pinned base images into
   our own registry and pin those; or keep Renovate bumping the pin (reproducibility of older
   commits is then lost). Checked 2026-11-17: the pins of `fedora`, `fedora-minimal` and
   `fedora-bootc` (all set 2026-11-16) are already gone; `golang` (Docker Hub) still resolves.
-  **Decision (2026-11-17): follow Fedora's rolling `:45` tags** (daily security fixes). To do:
-  switch the Fedora `FROM`s to tags, relax `hack/check-pins.sh` for them, record the resolved
-  base digest in an image label so every build stays traceable, and drop the Renovate digest
-  rule for those images (keep pins for golang and the GitHub Actions).
+  **Decision (2026-11-17): follow Fedora's rolling `:45` tags** (daily security fixes). Done:
+  the Containerfiles take the base as a build arg defaulting to the tag; `make` resolves it to a
+  digest per build, builds from that digest and labels the image with
+  `org.opencontainers.image.base.name/.digest`; `hack/check-pins.sh` allows only those three
+  Fedora repos to roll (any other unpinned base, including build-arg defaults, still fails);
+  Renovate no longer pins them. Accepted trade-offs: rebuilding an old commit gets today's base,
+  and a broken Fedora build reaches the next build (CI integration tests and lab upgrades of
+  dev builds are the guard).
 - [ ] **B14. RPM packages in image builds are not pinned.** Base images are pinned by digest, but
   `dnf install` takes whatever the Fedora mirrors have, so rebuilding a commit can produce
   different packages. *Option:* RPM lockfiles (e.g. rpm-lockfile-prototype) for the SPDK builder
@@ -321,6 +325,16 @@ Everything here was written by Gemini and is in scope to rewrite.
   velocor-1, 2026-11-16; the fake accepted it). Refused by the API, UI and CLI for now. *Needed:*
   build it as raid0 over raid1 pairs, each with a superblock, and handle assembly after restart,
   a degraded pair, rebuild and deletion of the nested layers; real-SPDK tests for all of those.
+- [ ] **L-5. Delta upgrades for the OS image.** Requested 2026-11-17 (back burner). A
+  `bootc upgrade` pulls every changed layer of `velocor-os` in full; with the rolling Fedora base
+  (B17) that is most of the image on every release. Goal: publish much smaller upgrade packages,
+  e.g. a delta between two released OS images that an appliance applies to the version it has
+  (also useful for offline / air-gapped upgrades). To evaluate: bootc/ostree-native options
+  (ostree static deltas, `rpm-ostree compose build-chunked-oci`-style rechunking so unchanged
+  content keeps identical layers), zstd:chunked layers (partial pulls), and OCI layer-delta
+  tools; check what `bootc upgrade` / `bootc switch` can consume natively before building our
+  own format. Needs: size measurements between two real dev builds, signing/verification of the
+  delta, and a fallback to a full pull.
 
 ### Suggested order of work
 
