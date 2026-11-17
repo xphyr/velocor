@@ -142,30 +142,40 @@ work still open, ranked by risk to data, how fixes are verified, and what has be
   *Needed:* a supported degraded start (SPDK investigation; possibly removing the absent member
   from the superblock with operator confirmation). Together with P0-1 this is "redundancy".
 
-- [ ] **P1-10. SPDK's iSCSI target wedges on WRITE SAME after a large discard (NVW + lab,
-  2026-11-16).** Reproduced on the lab host (Fedora initiator VM -> velocor-1, open-iscsi
-  6.2.1.11): plain direct writes of 4 KiB-4 MiB, discards (64 MiB and whole device), single and
-  32 parallel 4 MiB zero-outs (BLKZEROOUT) and a first `mkfs.ext4` all work. **`mkfs.ext4` on a
-  volume that already holds data hangs:** it discards the whole device (the thin lvol frees its
-  clusters) and immediately zeroes ranges with SCSI `Write Same(10)` (the LUN advertises
-  `zeroing_mode=writesame`, `write_zeroes_max_bytes` 4 MiB); those commands never complete
-  (`cmd_age=305s`), the initiator aborts (SPDK: "abort task not supported"), resets and offlines
-  the disk. SPDK's iSCSI layer then can't stop (podman SIGKILL after 120 s) or delete the target.
-  **Worse: after an SPDK restart the same LUN still doesn't answer** (a rebooted initiator's
-  scan times out). Not yet known: whether the volume itself (lvol, shared with NVMe) is left in a
-  bad state; the NVMe cross-check failed because the wedged iSCSI target couldn't be removed
-  (and velod reported "Unable to add ns, subsystem in active state" for the new NVMe export).
-  SPDK implements WRITE SAME as one single-block bdev write per block (`bdev_scsi_split`), and
-  its split completion ignores `bdev_scsi_split`'s return value (a task ending in an error from
-  the resubmission is never completed): a suspected SPDK bug.
-  *Next:* reproduce on a fresh volume with SPDK debug logs; check the lvol over NVMe after a
-  hang; test whether the stuck writes are WRITE SAME-specific (plain writes racing a whole-device
-  discard); report upstream. Possible mitigation meanwhile: have the CSI node plugin set
-  `max_write_same_blocks=0` on Velocor iSCSI LUNs so the kernel never sends WRITE SAME (zeroing
-  then uses plain writes). Lab state: a Fedora initiator VM on serenity
-  (`~/.cache/iscsi-lab`); on velocor-1 a lab volume `iscsi-lab` (mirror250a), portals
-  `lab-iscsi-mgmt` / `lab-nvme-mgmt` on 172.16.15.112, host `lab-initiator`, group
-  `lab-initiators`; SPDK's iSCSI target for it is wedged (needs a data-plane restart).
+- [ ] **P1-10. iSCSI WRITE SAME onto freshly discarded thin-volume space deadlocks SPDK
+  (root cause found 2026-11-17).** Symptom (NVW + lab): `mkfs.ext4` on a volume that already
+  holds data hangs; the initiator aborts ("abort task not supported"), resets and offlines the
+  LUN; SPDK can't stop (SIGKILL after 120 s). "Still wedged after a restart" was the initiator
+  resending the same commands to the restarted target, not damage: after a restart with the
+  initiator logged out, the volume reads end to end.
+  **Mechanism (SPDK v26.09, reproduced with `sg_write_same` from the lab initiator):**
+  1. SPDK advertises MAXIMUM WRITE SAME LENGTH = 4 MiB / block size (0x2000 blocks at 512 B)
+     and executes WRITE SAME as one single-block bdev write per block, submitting as many as the
+     bdev_io pool allows (`bdev_scsi_split`, lib/scsi/scsi_bdev.c): one 4 MiB command = 8192
+     bdev I/Os. Linux zeroing (BLKZEROOUT, mkfs) sends up to the queue depth (32) of them.
+  2. After a whole-device discard the thin lvol's clusters are freed, so every write needs a
+     cluster allocation, whose metadata update runs on the blobstore metadata thread (app_thread).
+  3. The iSCSI poll group's flood empties the global bdev_io pool (65535). The metadata thread's
+     I/O then waits in its own `io_wait_queue`, which is only woken by a bdev_io freed **on that
+     thread** (`spdk_bdev_free_io`, lib/bdev/bdev.c); nothing is in flight there, so it never
+     wakes, and the user writes wait on the allocation forever. The iSCSI thread spins at ~85%
+     CPU with zero writes completing; nothing is logged.
+  Evidence: after a discard, 16 parallel 4 MiB WRITE SAMEs (131k bdev writes) complete in 1 s,
+  24 hang; on **allocated** clusters 24 and 32 (262k writes) complete in 1.4 / 2 s.
+  NVMe/TCP is not affected the same way (Write Zeroes is one bdev I/O).
+  Our side: thin provisioning (the CSI default) makes it reachable, and 512-byte blocks make the
+  fan-out 8x larger than with 4 KiB blocks. A bigger bdev_io pool only moves the threshold.
+  **Fix (a) implemented:** `deploy/containers/spdk-patches/0001-scsi-bound-WRITE-SAME-fan-out.patch`
+  (applied by Containerfile.spdk; SPDK's scsi unit tests pass, and the 3 new WRITE SAME tests
+  fail on unpatched SPDK). Remaining: lab verification on velocor-1, then send upstream.
+  *Fix options considered:* (a) carry an SPDK patch in Containerfile.spdk: WRITE SAME with an all-zero block
+  and no UNMAP/ANCHOR bits -> one `spdk_bdev_write_zeroes_blocks`; other WRITE SAMEs split with a
+  small cap on outstanding children per task; send upstream with the io_wait cross-thread
+  starvation report. (b) interim: CSI node sets `max_write_same_blocks=0` on Velocor iSCSI LUNs
+  (protects CSI hosts only, not VMware/Windows initiators). (c) consider 4 KiB logical blocks for
+  new pools. Lab: Fedora initiator VM on serenity (`~/.cache/iscsi-lab`); on velocor-1 volume
+  `iscsi-lab` (mirror250a), portals `lab-iscsi-mgmt` / `lab-nvme-mgmt`, host `lab-initiator`,
+  group `lab-initiators`.
 - [ ] **P2-11. velod reports ONLINE before a restarted data plane is restored.** After an SPDK
   restart, status said ONLINE within ~10 s while volume stores, the iSCSI portal and target came
   back about a minute later.

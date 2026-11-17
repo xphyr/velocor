@@ -39,6 +39,13 @@ RUN git clone --depth 1 --branch ${SPDK_VERSION} --recurse-submodules --shallow-
       { echo "SPDK ${SPDK_VERSION} is not commit ${SPDK_COMMIT}" >&2; exit 1; }
 
 WORKDIR /src/spdk
+# Local fixes on top of the pinned SPDK, applied in order; `git apply --check` fails the build
+# if one no longer applies (e.g. after an SPDK bump). Drop a patch once it is upstream.
+COPY deploy/containers/spdk-patches/ /src/spdk-patches/
+RUN for p in /src/spdk-patches/*.patch; do \
+      echo "Applying ${p##*/}" && git apply --check "$p" && git apply "$p" || exit 1; \
+    done
+
 RUN dnf install -y nasm autoconf automake libtool help2man python3-pyyaml python3-jinja2 python3-tabulate && dnf clean all && \
     ./configure \
       --prefix=/usr \
