@@ -61,7 +61,7 @@ RUN for p in /src/spdk-patches/*.patch; do \
 
 # Configure options shared by both builds (the unit-tests build adds the unit tests).
 ENV SPDK_CONFIGURE="--prefix=/usr --target-arch=x86-64-v2 --disable-tests --disable-examples \
---with-uring --with-raid5f --without-isal-crypto --without-crypto --without-vhost --without-fsdev"
+--with-uring --with-ublk --with-raid5f --without-isal-crypto --without-crypto --without-vhost --without-fsdev"
 
 FROM source AS builder
 RUN ./configure ${SPDK_CONFIGURE} --disable-unit-tests && \

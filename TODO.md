@@ -155,6 +155,20 @@ work still open, ranked by risk to data, how fixes are verified, and what has be
   3. A recovery command that rebuilds pools/volumes/snapshots from SPDK (lvol names are
      resource IDs and SSD bdev UUIDs are derived from disk IDs, so the skeleton is
      recoverable) and from the on-pool copy.
+  **In progress (2026-11-17):** today a lost database leaves the data intact (the reconciler
+  never deletes unknown SPDK objects; exports even serve until spdk_tgt restarts) but nothing
+  comes back after a restart and there is no recovery path. SPDK has no RPC to write into a
+  bdev. Decisions: accounts stay out of pool copies (DB backups carry them); **ublk only** (no NBD
+  fallback); exports restored enabled when their portals exist on the appliance; backups hourly
+  x24, daily x7, before upgrade/restore. ublk tested on the lab appliance with a
+  `--with-ublk` spdk_tgt: direct-I/O data persists across devices and SPDK restarts; if spdk_tgt
+  dies with a ublk device open, its I/O hangs (D state) until a restarted SPDK runs
+  `ublk_recover_disk`, which worked; so the device I/O runs in a helper process and velod
+  recovers stale devices. Design: `docs/design/p0-3-metadata-recovery.md` (per-pool
+  `velocor-meta` lvol with an A/B-slot manifest written through ublk, local bbolt backups +
+  download/restore, pool import from the manifest or the SPDK skeleton, importable-pool
+  detection from RAID superblocks).
+  - [x] SPDK built `--with-ublk` (Containerfile.spdk).
 
 - [ ] **P0-4. Hosts are told writes are durable when they may only be in a disk's volatile cache. (Verified)**
   In SPDK v26.09 the lvol module does not support FLUSH (`vbdev_lvol_io_type_supported`), and
