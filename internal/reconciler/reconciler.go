@@ -120,6 +120,7 @@ func (r *Reconciler) ReconcileOnce(ctx context.Context) (State, error) {
 	}
 
 	r.reconcileDisks(ctx, p)
+	r.applySettings(ctx, p)
 
 	// Let SPDK finish examining every base bdev (RAID superblock assembly, lvstore load)
 	// before anything below concludes that on-disk metadata is missing.
@@ -309,6 +310,11 @@ func (r *Reconciler) reconcilePools(ctx context.Context, p *pass, examined bool)
 		p.errs = append(p.errs, fmt.Sprintf("list lvstores: %v", err))
 		return online
 	}
+	disks, err := r.store.ListDisks()
+	if err != nil {
+		p.errs = append(p.errs, fmt.Sprintf("list disks: %v", err))
+		return online
+	}
 
 	for _, pool := range pools {
 		if pool.HealthStatus == store.HealthStatusReconciling && pool.LVSUUID == "" {
@@ -325,17 +331,22 @@ func (r *Reconciler) reconcilePools(ctx context.Context, p *pass, examined bool)
 			p.degrade(res, reason)
 		}
 
-		// 1. RAID bdev (assembled by SPDK examine from its on-disk superblock).
+		// 1. RAID bdev (assembled by SPDK examine from its on-disk superblock): member states
+		// and RAID-level health.
 		ri := slices.IndexFunc(raids, func(rb spdk.RaidBdevInfo) bool { return rb.Name == pool.BaseBdevName })
 		raidOnline := false
-		switch {
-		case ri >= 0 && strings.EqualFold(raids[ri].State, "online"):
-			raidOnline = true
-		case ri >= 0:
-			fail(store.HealthStatusDegraded, fmt.Sprintf("RAID %s is %s (%d/%d members present)",
-				pool.BaseBdevName, raids[ri].State, raids[ri].NumBaseBdevsDiscovered, raids[ri].NumBaseBdevs))
-		default:
-			fail(store.HealthStatusDegraded, fmt.Sprintf("RAID %s not assembled by SPDK examine (%d/%d member bdevs present)",
+		members := store.PoolMembers(pool)
+		if ri >= 0 {
+			v := r.viewRaid(ctx, pool, &raids[ri], raids, disks, bdevs)
+			raidOnline, members = v.online, v.members
+			for _, reason := range v.reasons {
+				fail(v.health, reason)
+			}
+			if v.health != store.HealthStatusOnline && len(v.reasons) == 0 {
+				fail(v.health, "RAID "+pool.BaseBdevName+" is "+string(v.health))
+			}
+		} else {
+			fail(store.HealthStatusUnavailable, fmt.Sprintf("RAID %s not assembled by SPDK examine (%d/%d member bdevs present)",
 				pool.BaseBdevName, r.presentMembers(pool, bdevs), len(pool.DiskIDs)))
 		}
 
@@ -373,6 +384,10 @@ func (r *Reconciler) reconcilePools(ctx context.Context, p *pass, examined bool)
 		msg := strings.Join(reasons, "; ")
 		_, err := r.store.MutatePool(pool.ID, func(cur *store.Pool) error {
 			changed := cur.HealthStatus != health || cur.StatusMessage != msg
+			if !membersEqual(store.PoolMembers(cur), members) || len(cur.Members) == 0 {
+				changed = true
+				store.SetPoolMembers(cur, members)
+			}
 			if lvs != nil && (cur.TotalBytes != total || cur.FreeBytes != free) {
 				changed = true
 				cur.TotalBytes, cur.FreeBytes = total, free

@@ -34,6 +34,10 @@ var longRunningMethods = map[string]bool{
 	"bdev_lvol_resize":          true,
 	"bdev_raid_create":          true,
 	"bdev_raid_delete":          true,
+	// Membership changes quiesce I/O and read/write the members' superblocks.
+	"bdev_raid_add_base_bdev":    true,
+	"bdev_raid_remove_base_bdev": true,
+	"bdev_raid_start_degraded":   true,
 	// Loading a volume store after an unclean stop replays its whole metadata area.
 	"bdev_wait_for_examine": true,
 }

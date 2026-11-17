@@ -16,15 +16,29 @@ type RaidBaseBdev struct {
 
 // RaidBdevInfo describes an SPDK RAID bdev returned by bdev_raid_get_bdevs.
 type RaidBdevInfo struct {
-	Name                   string         `json:"name"`
-	UUID                   string         `json:"uuid"`
-	StripSizeKb            uint32         `json:"strip_size_kb"`
-	State                  string         `json:"state"`
-	RaidLevel              string         `json:"raid_level"`
-	Superblock             bool           `json:"superblock"`
-	NumBaseBdevs           uint32         `json:"num_base_bdevs"`
-	NumBaseBdevsDiscovered uint32         `json:"num_base_bdevs_discovered"`
-	BaseBdevsList          []RaidBaseBdev `json:"base_bdevs_list"`
+	Name                   string `json:"name"`
+	UUID                   string `json:"uuid"`
+	StripSizeKb            uint32 `json:"strip_size_kb"`
+	State                  string `json:"state"`
+	RaidLevel              string `json:"raid_level"`
+	Superblock             bool   `json:"superblock"`
+	NumBaseBdevs           uint32 `json:"num_base_bdevs"`
+	NumBaseBdevsDiscovered uint32 `json:"num_base_bdevs_discovered"`
+	// NumBaseBdevsOperational is how many members the array is running (or, while
+	// configuring, waiting) with: fewer than NumBaseBdevs means degraded.
+	NumBaseBdevsOperational uint32         `json:"num_base_bdevs_operational"`
+	Process                 *RaidProcess   `json:"process,omitempty"`
+	BaseBdevsList           []RaidBaseBdev `json:"base_bdevs_list"`
+}
+
+// RaidProcess is a background process (a rebuild) running on a RAID bdev.
+type RaidProcess struct {
+	Type     string `json:"type"`   // "rebuild"
+	Target   string `json:"target"` // base bdev being rebuilt
+	Progress struct {
+		Blocks  uint64 `json:"blocks"`
+		Percent uint32 `json:"percent"`
+	} `json:"progress"`
 }
 
 // BdevRaidGetBdevs queries SPDK for RAID bdevs by category ("all", "online", "configuring", "offline").
@@ -89,4 +103,50 @@ func (c *Client) BdevRaidDelete(ctx context.Context, name string, clearSuperbloc
 		params["clear_sb"] = true
 	}
 	return c.Call(ctx, "bdev_raid_delete", params, nil)
+}
+
+// BdevRaidAddBaseBdev adds a base bdev to an empty slot of a RAID bdev. On an online
+// redundant array SPDK then rebuilds it from the other members in the background (see
+// RaidBdevInfo.Process); the member is recorded in the superblock once the rebuild completes.
+func (c *Client) BdevRaidAddBaseBdev(ctx context.Context, raidBdev, baseBdev string) error {
+	return c.Call(ctx, "bdev_raid_add_base_bdev", map[string]any{"raid_bdev": raidBdev, "base_bdev": baseBdev}, nil)
+}
+
+// BdevRaidRemoveBaseBdev removes a member from its RAID bdev (the array degrades, or goes
+// offline when too few members remain). The superblock records the slot as missing.
+func (c *Client) BdevRaidRemoveBaseBdev(ctx context.Context, baseBdev string) error {
+	return c.Call(ctx, "bdev_raid_remove_base_bdev", map[string]any{"name": baseBdev}, nil)
+}
+
+// BdevRaidStartDegraded starts a superblock RAID that is waiting for absent members without
+// them (Velocor SPDK patch 0002). The absent members are recorded as missing; one that
+// returns later is not taken back.
+func (c *Client) BdevRaidStartDegraded(ctx context.Context, name string) error {
+	return c.Call(ctx, "bdev_raid_start_degraded", map[string]any{"name": name}, nil)
+}
+
+// BdevRaidSetOptions sets the background process (rebuild) bandwidth limit for every RAID
+// bdev; 0 means unlimited.
+func (c *Client) BdevRaidSetOptions(ctx context.Context, maxBandwidthMBps uint32) error {
+	return c.Call(ctx, "bdev_raid_set_options", map[string]any{"process_max_bandwidth_mb_sec": maxBandwidthMBps}, nil)
+}
+
+// BdevRaidGetMaxBandwidth returns the rebuild bandwidth limit SPDK currently applies
+// (0 = unlimited), read from the bdev subsystem's configuration.
+func (c *Client) BdevRaidGetMaxBandwidth(ctx context.Context) (uint32, error) {
+	var cfg []struct {
+		Method string `json:"method"`
+		Params struct {
+			MaxBandwidth uint32 `json:"process_max_bandwidth_mb_sec"`
+		} `json:"params"`
+	}
+	if err := c.Call(ctx, "framework_get_config", map[string]any{"name": "bdev"}, &cfg); err != nil {
+		return 0, err
+	}
+	for _, m := range cfg {
+		if m.Method == "bdev_raid_set_options" {
+			return m.Params.MaxBandwidth, nil
+		}
+	}
+	return 0, nil
 }

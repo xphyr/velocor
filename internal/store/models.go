@@ -15,7 +15,40 @@ const (
 	HealthStatusOffline     HealthStatus = "OFFLINE"
 	HealthStatusFaulted     HealthStatus = "FAULTED"
 	HealthStatusReconciling HealthStatus = "RECONCILING"
+	// HealthStatusRebuilding: a pool is rebuilding a member; it serves I/O without full
+	// redundancy until the rebuild completes.
+	HealthStatusRebuilding HealthStatus = "REBUILDING"
+	// HealthStatusUnavailable: a pool's RAID is waiting for a member that is missing (e.g. a
+	// disk that failed while the appliance was down). It serves no I/O until the disk returns
+	// or an operator starts it degraded.
+	HealthStatusUnavailable HealthStatus = "UNAVAILABLE"
 )
+
+// MemberState is the state of one RAID slot of a pool.
+type MemberState string
+
+const (
+	MemberStateActive     MemberState = "ACTIVE"     // in sync, serving I/O
+	MemberStateRebuilding MemberState = "REBUILDING" // being rebuilt from the other members
+	MemberStateFailed     MemberState = "FAILED"     // failed or removed while the pool ran; slot empty
+	MemberStateMissing    MemberState = "MISSING"    // absent when the pool was assembled; slot empty
+)
+
+// PoolMember is one RAID slot of a pool. DiskID is the disk in the slot, or for an empty
+// (FAILED/MISSING) slot the disk that was there, if known.
+type PoolMember struct {
+	Slot           int         `json:"slot"`
+	DiskID         string      `json:"disk_id,omitempty"`
+	State          MemberState `json:"state"`
+	RebuildPercent uint32      `json:"rebuild_percent,omitempty"`
+}
+
+// Settings holds operator-adjustable, node-wide settings.
+type Settings struct {
+	// RebuildMaxMBps limits RAID rebuild bandwidth (SPDK applies it to every array); 0 means
+	// unlimited.
+	RebuildMaxMBps uint32 `json:"rebuild_max_mbps"`
+}
 
 // DiskType categorizes physical flash media tiers.
 type DiskType string
@@ -223,10 +256,16 @@ func (d Disk) MarshalJSON() ([]byte, error) {
 
 // Pool aggregates one or more claimed Disks into an SPDK RAID bdev + lvol_store.
 type Pool struct {
-	ID                string       `json:"id"`
-	Name              string       `json:"name"`
-	RaidLevel         RaidLevel    `json:"raid_level"`
-	DiskIDs           []string     `json:"disk_ids"`
+	ID        string    `json:"id"`
+	Name      string    `json:"name"`
+	RaidLevel RaidLevel `json:"raid_level"`
+	// DiskIDs are the disks in the pool's RAID slots (ACTIVE or REBUILDING), in slot order.
+	DiskIDs []string `json:"disk_ids"`
+	// Members is the state of every RAID slot (maintained by the reconciler from SPDK).
+	Members []PoolMember `json:"members,omitempty"`
+	// DetachedDiskIDs are disks that left the RAID (failed, removed or replaced) but stay
+	// bound to the pool until an operator releases them, so they can't be reused by accident.
+	DetachedDiskIDs   []string     `json:"detached_disk_ids,omitempty"`
 	StripSizeKB       uint32       `json:"strip_size_kb"`
 	ClusterSizeBytes  uint32       `json:"cluster_size_bytes"`
 	BaseBdevName      string       `json:"base_bdev_name"`

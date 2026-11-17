@@ -215,6 +215,10 @@ func detectSignature(dev string) (string, error) {
 		return off+len(magic) <= len(buf) && bytes.Equal(buf[off:off+len(magic)], []byte(magic))
 	}
 	switch {
+	case at(0, "SPDKRAID"):
+		return "Velocor (SPDK) RAID member", nil
+	case at(0, "SPDKBLOB"):
+		return "Velocor (SPDK) volume store", nil
 	case at(512, "EFI PART"):
 		return "GPT partition table", nil
 	case at(0, "LUKS\xba\xbe"):

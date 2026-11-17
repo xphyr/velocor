@@ -111,36 +111,43 @@ func (s *Server) claimDisk(w http.ResponseWriter, r *http.Request, id string) {
 		writeError(w, err)
 		return
 	}
-	if s.hw != nil {
-		force := r.URL.Query().Get("force") == "true"
-		if err := s.hw.CheckClaimable(d, force); err != nil {
-			writeError(w, err)
-			return
-		}
-	}
-	if d.WriteCachePolicy == store.WriteCachePolicyDisabled && s.hw != nil {
-		if _, err := s.applyWriteCachePolicy(d); err != nil {
-			writeError(w, err)
-			return
-		}
-	}
-	bdev, drv, err := dataplane.AttachDisk(r.Context(), s.spdk, s.hw, d)
+	updated, err := s.attachAndClaim(r.Context(), d, r.URL.Query().Get("force") == "true")
 	if err != nil {
-		writeError(w, err)
-		return
-	}
-	updated, err := s.store.ClaimDisk(id, drv, bdev)
-	if err != nil {
-		attached := *d
-		attached.SPDKBdevName = bdev
-		_ = dataplane.DetachDisk(context.WithoutCancel(r.Context()), s.spdk, &attached)
-		if d.Type == store.DiskTypeNVMe && s.hw != nil {
-			_ = s.hw.BindNVMeToKernel(d.PCIAddress)
-		}
 		writeError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"disk": updated})
+}
+
+// attachAndClaim hands an unclaimed disk to SPDK and records it as claimed; on failure the
+// disk is returned to the kernel. force skips the existing-data check (never the in-use or
+// boot-disk checks).
+func (s *Server) attachAndClaim(ctx context.Context, d *store.Disk, force bool) (*store.Disk, error) {
+	if s.hw != nil {
+		if err := s.hw.CheckClaimable(d, force); err != nil {
+			return nil, err
+		}
+	}
+	if d.WriteCachePolicy == store.WriteCachePolicyDisabled && s.hw != nil {
+		if _, err := s.applyWriteCachePolicy(d); err != nil {
+			return nil, err
+		}
+	}
+	bdev, drv, err := dataplane.AttachDisk(ctx, s.spdk, s.hw, d)
+	if err != nil {
+		return nil, err
+	}
+	updated, err := s.store.ClaimDisk(d.ID, drv, bdev)
+	if err != nil {
+		attached := *d
+		attached.SPDKBdevName = bdev
+		_ = dataplane.DetachDisk(context.WithoutCancel(ctx), s.spdk, &attached)
+		if d.Type == store.DiskTypeNVMe && s.hw != nil {
+			_ = s.hw.BindNVMeToKernel(d.PCIAddress)
+		}
+		return nil, err
+	}
+	return updated, nil
 }
 
 func (s *Server) releaseDisk(w http.ResponseWriter, r *http.Request, id string) {
@@ -358,7 +365,11 @@ func (s *Server) handleDeletePool(w http.ResponseWriter, r *http.Request) {
 // --- Volumes ---
 
 func poolUsable(pool *store.Pool) error {
-	if pool.LVSUUID == "" || pool.HealthStatus == store.HealthStatusFaulted || pool.HealthStatus == store.HealthStatusReconciling {
+	switch {
+	case pool.LVSUUID == "",
+		pool.HealthStatus == store.HealthStatusFaulted,
+		pool.HealthStatus == store.HealthStatusReconciling,
+		pool.HealthStatus == store.HealthStatusUnavailable: // RAID waiting for a missing disk
 		return fmt.Errorf("%w: pool %s is not usable (%s %s)", store.ErrInvalidArgument, pool.ID, pool.HealthStatus, pool.StatusMessage)
 	}
 	return nil
