@@ -5,7 +5,9 @@
 # pinned by commit (the tag is checked against it) and patched from spdk-patches/. spdk_tgt's
 # arguments come from the quadlet (deploy/quadlets/velocor-spdk.container), the only source of them.
 ARG FEDORA_IMAGE=quay.io/fedora/fedora:45
-FROM ${FEDORA_IMAGE} AS builder
+
+# Patched SPDK source and its build dependencies, shared by the shipped build and the unit tests.
+FROM ${FEDORA_IMAGE} AS source
 
 ARG SPDK_VERSION=v26.09
 ARG SPDK_COMMIT=0bbb7fe4dccfb31e8d446da8822360704949d1e9
@@ -20,6 +22,9 @@ RUN dnf install -y \
       pkgconf-pkg-config \
       python3 \
       python3-pyelftools \
+      python3-pyyaml \
+      python3-jinja2 \
+      python3-tabulate \
       libaio-devel \
       liburing-devel \
       libuuid-devel \
@@ -29,6 +34,11 @@ RUN dnf install -y \
       json-c-devel \
       fuse3-devel \
       cunit-devel \
+      nasm \
+      autoconf \
+      automake \
+      libtool \
+      help2man \
       findutils \
       diffutils \
       patch && \
@@ -42,30 +52,32 @@ RUN git clone --depth 1 --branch ${SPDK_VERSION} --recurse-submodules --shallow-
 
 WORKDIR /src/spdk
 # Local fixes on top of the pinned SPDK, applied in order; `git apply --check` fails the build
-# if one no longer applies (e.g. after an SPDK bump). Drop a patch once it is upstream.
+# if one no longer applies (e.g. after an SPDK bump). Drop a patch once it is upstream. Each
+# patch carries unit tests; `make spdk-unit-tests` (the unit-tests stage) runs them.
 COPY deploy/containers/spdk-patches/ /src/spdk-patches/
 RUN for p in /src/spdk-patches/*.patch; do \
       echo "Applying ${p##*/}" && git apply --check "$p" && git apply "$p" || exit 1; \
     done
 
-RUN dnf install -y nasm autoconf automake libtool help2man python3-pyyaml python3-jinja2 python3-tabulate && dnf clean all && \
-    ./configure \
-      --prefix=/usr \
-      --target-arch=x86-64-v2 \
-      --disable-tests \
-      --disable-unit-tests \
-      --disable-examples \
-      --with-uring \
-      --with-raid5f \
-      --without-isal-crypto \
-      --without-crypto \
-      --without-vhost \
-      --without-fsdev && \
+# Configure options shared by both builds (the unit-tests build adds the unit tests).
+ENV SPDK_CONFIGURE="--prefix=/usr --target-arch=x86-64-v2 --disable-tests --disable-examples \
+--with-uring --with-raid5f --without-isal-crypto --without-crypto --without-vhost --without-fsdev"
+
+FROM source AS builder
+RUN ./configure ${SPDK_CONFIGURE} --disable-unit-tests && \
     make -j"$(nproc)" && \
     cp /src/spdk/build/bin/spdk_tgt /usr/bin/spdk_tgt && \
     strip /usr/bin/spdk_tgt && \
     cp /src/spdk/build/bin/spdk_dd /usr/bin/spdk_dd && \
     strip /usr/bin/spdk_dd
+
+# Unit tests of the SPDK libraries our patches touch (build with --target unit-tests; the build
+# fails if a test fails). Never shipped.
+FROM source AS unit-tests
+COPY hack/spdk-patch-unit-tests.sh /usr/local/bin/spdk-patch-unit-tests
+RUN ./configure ${SPDK_CONFIGURE} --enable-unit-tests && \
+    make -j"$(nproc)" && \
+    spdk-patch-unit-tests /src/spdk /src/spdk-patches
 
 FROM ${FEDORA_IMAGE} AS runtime
 

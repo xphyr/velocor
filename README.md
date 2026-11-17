@@ -96,6 +96,9 @@ build, pinned by digest, so `make push` pushes those first and the OS image buil
 digests from the registry. An appliance therefore runs exactly the containers it was built and
 tested with, needs no registry at boot, and changes them only through an OS upgrade.
 
+Local fixes to SPDK live in `deploy/containers/spdk-patches/` (applied at build time; each
+carries unit tests, which `make spdk-unit-tests` and CI run).
+
 The Go toolchain, the SPDK source commit and the GitHub Actions are pinned (`make check-pins`
 verifies it; Renovate proposes bumps). The Fedora base images follow Fedora's rolling release tag
 (`:45`) to pick up its daily fixes: each build resolves the tag to a digest, builds from exactly

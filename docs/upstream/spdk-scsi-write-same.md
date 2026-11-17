@@ -221,7 +221,8 @@ After a hang:
    `deploy/containers/Containerfile.spdk`), delete
    `deploy/containers/spdk-patches/0001-scsi-bound-WRITE-SAME-fan-out.patch`. The build fails if
    a patch no longer applies, so a stale patch is noticed at the bump.
-3. Until then, if review changes the patch (a different cap, reworked code), update the local
+3. Until then, CI keeps running the patch's tests (`make spdk-unit-tests`, the SPDK patch
+   unit-test job). If review changes the patch (a different cap, reworked code), update the local
    patch to match what merged, so the appliance runs the reviewed version.
 4. Update TODO P1-10 with the upstream link.
 

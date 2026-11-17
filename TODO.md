@@ -241,6 +241,16 @@ Everything here was written by Gemini and is in scope to rewrite.
 - [ ] **B15. CI compiles SPDK on every run** (one compile per run, shared by the integration
   tests and the image). *Option:* reuse the previous `velocor-spdk` image when
   `Containerfile.spdk` hasn't changed.
+- [x] **B18. CI review after the SPDK patch and rolling bases (2026-11-17).** Nothing we
+  changed broke the workflow (all builds go through `make`; the static CSI manifest still
+  matches the chart), but: (1) the integration tests and the push resolved the rolling Fedora
+  base separately, so the tested and the shipped SPDK image could differ (and compile SPDK
+  twice): the images job now sets `BASE_PIN_DIR`, resolving each base once per run, and lists the
+  bases in `images.txt`; (2) the unit tests that come with our SPDK patches never ran: new
+  `unit-tests` stage in Containerfile.spdk (`make spdk-unit-tests`, runs SPDK's unit tests for
+  every library a patch touches) and a CI job that gates image publication; (3) the lint job now
+  runs actionlint (pinned image) and renders the CDI StorageProfile hook, which plain
+  `helm lint` skips.
 - [ ] **B16. The new CI workflow has not run yet.** It passes actionlint and every step uses
   `make` targets verified locally, but the GitHub-side pieces (ghcr login, cosign, attestations,
   rootless podman with arm64 emulation on the runner, the PR local registry) are only proven by

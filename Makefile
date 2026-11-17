@@ -9,6 +9,7 @@
 #   make images                      build all container images locally (except the OS image)
 #   make push                        push spdk/velod/csi, then build and push the OS image
 #   make test-integration            Go integration tests against a real spdk_tgt (rootless podman)
+#   make spdk-unit-tests             SPDK unit tests for the libraries our SPDK patches touch
 #   make qcow2 QCOW2_KEYS=a.pub      bootable disk from the pushed OS image (needs KVM, no root)
 #
 # Registry credentials come from podman's usual auth file, or REGISTRY_AUTH_FILE.
@@ -62,16 +63,24 @@ LABEL_ARGS := --label org.opencontainers.image.source=https://github.com/xphyr/v
 FEDORA_IMAGE ?= quay.io/fedora/fedora:45
 FEDORA_MINIMAL_IMAGE ?= quay.io/fedora/fedora-minimal:45
 BOOTC_BASE_IMAGE ?= quay.io/fedora/fedora-bootc:45
+# BASE_PIN_DIR (optional; CI sets it): resolve each base once and reuse it for every build that
+# follows, so e.g. the integration-tested SPDK image and the pushed one share one base (and one
+# SPDK compile) even if Fedora publishes in between. The files there record what was used.
+BASE_PIN_DIR ?=
 # $(call base-pin,<build arg>,<image ref>): shell prefix setting $$base_args for podman build.
 define base-pin
-base=$$(INSECURE_REGISTRY=false hack/pin-image.sh $(2)); echo "base image $(2) -> $$base"; \
+pinfile="$(BASE_PIN_DIR)/$(1)"; \
+	if [[ -n "$(BASE_PIN_DIR)" && -s "$$pinfile" ]]; then base="$$(cat "$$pinfile")"; \
+	else base="$$(INSECURE_REGISTRY=false hack/pin-image.sh $(2))"; \
+	  if [[ -n "$(BASE_PIN_DIR)" ]]; then mkdir -p "$(BASE_PIN_DIR)" && echo "$$base" > "$$pinfile"; fi; fi; \
+	echo "base image $(2) -> $$base"; \
 	base_args="--build-arg $(1)=$$base --label org.opencontainers.image.base.name=$(2) --label org.opencontainers.image.base.digest=$${base#*@}";
 endef
 GO_BUILD_ARGS := --build-arg VERSION=$(VERSION) --build-arg COMMIT=$(COMMIT) --build-arg BUILD_TIME=$(BUILD_TIME)
 DIGEST_DIR := $(BINARY_DIR)/digests
 
 .PHONY: build build-velod build-veloctl build-csi test test-integration lint shellcheck check-pins \
-	proto proto-lint clean images image-spdk image-spdk-test image-velod image-csi image-os \
+	proto proto-lint clean images image-spdk image-spdk-test spdk-unit-tests image-velod image-csi image-os \
 	push push-spdk push-velod push-csi push-os check-push qcow2
 
 ## Go ---------------------------------------------------------------------------------------
@@ -123,6 +132,12 @@ images: image-spdk image-velod image-csi
 image-spdk-test:
 	$(call base-pin,FEDORA_IMAGE,$(FEDORA_IMAGE)) \
 	$(PODMAN) build $(LABEL_ARGS) $$base_args --target test -t $(SPDK_TEST_IMAGE) -f deploy/containers/Containerfile.spdk .
+
+# SPDK's unit tests for the libraries our patches (deploy/containers/spdk-patches) touch; the
+# build fails if one fails. A separate SPDK compile with unit tests enabled.
+spdk-unit-tests:
+	$(call base-pin,FEDORA_IMAGE,$(FEDORA_IMAGE)) \
+	$(PODMAN) build $$base_args --target unit-tests -t localhost/velocor-spdk:unit-tests -f deploy/containers/Containerfile.spdk .
 
 image-spdk:
 	$(call base-pin,FEDORA_IMAGE,$(FEDORA_IMAGE)) \

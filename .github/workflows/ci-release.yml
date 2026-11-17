@@ -1,12 +1,14 @@
 name: Build, Test & Release Velocor
 
 # Build logic lives in the Makefile; this workflow only decides what to call it with.
-#  - pull requests: lint, unit + integration tests, and a full image build pushed to a throwaway
-#    local registry (so the OS image build is exercised too). Nothing is published.
+#  - pull requests: lint, unit + integration tests, the SPDK unit tests of our SPDK patches, and
+#    a full image build pushed to a throwaway local registry (so the OS image build is exercised
+#    too). Nothing is published.
 #  - main: images as sha-<sha> (+ moving tag "main"), signed and attested; dev Helm chart.
 #  - v* tags: release images (vX.Y.Z, X.Y, latest), chart, CLI binaries, GitHub release.
 # Every action is pinned to a commit SHA (hack/check-pins.sh enforces it) and every job gets
-# only the permissions it needs.
+# only the permissions it needs. The Fedora base images follow Fedora's rolling release tag; each
+# run resolves them once (BASE_PIN_DIR) and records the digests next to the image digests.
 
 on:
   push:
@@ -40,6 +42,8 @@ jobs:
           go-version-file: go.mod
       - name: Pins (base images, Go toolchain, actions)
         run: make check-pins
+      - name: actionlint
+        run: docker run --rm -v "$PWD:/repo" -w /repo docker.io/rhysd/actionlint@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667 -no-color
       - name: go vet
         run: |
           go vet ./...
@@ -52,7 +56,11 @@ jobs:
         run: make shellcheck
       - uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5.1.0
       - name: helm lint
-        run: helm lint deploy/charts/velocor-csi
+        run: |
+          helm lint deploy/charts/velocor-csi
+          # The CDI StorageProfile hook renders only where CDI exists: render it explicitly.
+          helm template velocor-csi deploy/charts/velocor-csi --api-versions cdi.kubevirt.io/v1beta1 |
+            yq -e 'select(.kind == "Job") | .metadata.name' >/dev/null
 
   test:
     name: Unit & CSI sanity tests
@@ -106,13 +114,32 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
+  # SPDK's unit tests for the libraries our carried SPDK patches touch (deploy/containers/
+  # spdk-patches): a separate SPDK compile with unit tests enabled. Images aren't published
+  # unless they pass.
+  spdk-unit-tests:
+    name: SPDK patch unit tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - run: make spdk-unit-tests
+
   # One job builds every image so the OS image embeds the spdk/velod images of this very run
   # (pinned by digest), and SPDK is compiled once for both the integration tests and the image.
   images:
     name: Images (integration tests, build, push)
-    needs: [lint, test]
+    needs: [lint, test, spdk-unit-tests]
     runs-on: ubuntu-24.04
     timeout-minutes: 120
+    env:
+      # Resolve each rolling Fedora base once for this run: the integration-tested SPDK image and
+      # the pushed one then share one base and one SPDK compile.
+      BASE_PIN_DIR: bin/base-pins
     permissions:
       contents: read
       packages: write     # push to ghcr.io (not used for pull requests)
@@ -183,7 +210,10 @@ jobs:
                 INSECURE_REGISTRY="$INSECURE_REGISTRY" "CSI_PLATFORMS=linux/amd64,linux/arm64")
           [[ "$RELEASE" == true ]] && args+=(VERSION="$TAG")
           make push "${args[@]}"
-          for f in bin/digests/velocor-*; do echo "$IMAGE_PREFIX/$(basename "$f")@$(cat "$f")  # $TAG"; done | tee bin/digests/refs.txt
+          {
+            for f in bin/digests/velocor-*; do echo "$IMAGE_PREFIX/$(basename "$f")@$(cat "$f")  # $TAG"; done
+            for f in "$BASE_PIN_DIR"/*; do echo "# base image $(basename "$f"): $(cat "$f")"; done
+          } | tee bin/digests/refs.txt
 
       - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
@@ -339,7 +369,9 @@ jobs:
             ## Images
 
             Signed with Sigstore cosign (keyless) and attested (SLSA provenance). `images.txt`
-            lists every image pinned by digest; deploy by digest, not by tag.
+            lists every image pinned by digest (deploy by digest, not by tag) and the Fedora base
+            images this release was built on (also in each image's
+            `org.opencontainers.image.base.*` labels).
 
             - Appliance OS (bootc): `${{ needs.images.outputs.image_prefix }}/velocor-os:${{ needs.images.outputs.tag }}`
             - Kubernetes CSI driver: `${{ needs.images.outputs.image_prefix }}/velocor-csi:${{ needs.images.outputs.tag }}`
