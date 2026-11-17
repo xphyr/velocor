@@ -81,8 +81,12 @@ RUN chmod 0440 /etc/sudoers.d/velocor-admin && \
 # /boot read-write and every staged upgrade is silently dropped. Turn the generator off: by
 # kernel argument (bootc applies kargs.d on install and upgrade) and by masking it, which also
 # covers the first boot after upgrading from an image without the argument.
+# SPDK drives NVMe through vfio-pci, which needs an IOMMU: Fedora kernels leave Intel's off by
+# default (AMD's is on), so without intel_iommu=on velod can't claim any NVMe drive on Intel
+# servers (found on the P0-1 lab VM). iommu=pt keeps devices the kernel still drives on
+# passthrough mappings, as usual on SPDK/DPDK hosts.
 RUN mkdir -p /usr/lib/bootc/kargs.d /etc/systemd/system-generators && \
-    printf 'kargs = ["systemd.gpt_auto=0"]\n' > /usr/lib/bootc/kargs.d/10-velocor.toml && \
+    printf 'kargs = ["systemd.gpt_auto=0", "intel_iommu=on", "iommu=pt"]\n' > /usr/lib/bootc/kargs.d/10-velocor.toml && \
     ln -sf /dev/null /etc/systemd/system-generators/systemd-gpt-auto-generator
 
 # Install ESXi-style appliance console splash banner (/etc/issue)

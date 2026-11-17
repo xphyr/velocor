@@ -421,6 +421,17 @@ func (m *Manager) BindNVMeToUserspace(pciAddr string, preferredDriver string) (s
 	return store.DiskDriverStateVfioPCI, nil
 }
 
+// PCIDriver returns the driver a PCI device is bound to right now ("" if none or unknown).
+// Bindings don't survive a reboot: an NVMe drive given to vfio-pci comes back on the kernel
+// nvme driver, so callers must check this rather than a recorded state.
+func (m *Manager) PCIDriver(pciAddr string) string {
+	bdf := strings.ToLower(strings.TrimSpace(pciAddr))
+	if !pciBDFRegex.MatchString(bdf) {
+		return ""
+	}
+	return readSymlinkBase(filepath.Join(m.cfg.SysfsRoot, "bus", "pci", "devices", bdf, "driver"))
+}
+
 // BindNVMeToKernel unbinds an NVMe controller at pciAddr from vfio-pci/uio_pci_generic
 // and rebinds it to the Linux kernel nvme driver.
 func (m *Manager) BindNVMeToKernel(pciAddr string) error {
