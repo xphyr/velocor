@@ -86,6 +86,10 @@ FROM ${FEDORA_IMAGE} AS runtime
 # superblocks match members by bdev UUID, so a pool on such drives would never reassemble after
 # a restart. With generate_uuids SPDK derives a stable one from the controller serial and the
 # namespace ID instead (found on the P0-1 lab).
+# sock: no zero-copy sends. The NVMe/TCP target sends a read's response only when its data
+# send completes, and a zero-copy send completes when the host ACKs it: a 4K read is one TCP
+# segment, which Linux hosts ACK late (delayed ACK), so every small read took ~50 ms (4K reads
+# at QD1: 19 IOPS, ~2,900 without; measured from an OpenShift node, 2026-11-18).
 
 RUN dnf install -y \
       libaio \
@@ -100,7 +104,7 @@ RUN dnf install -y \
     dnf clean all && \
     rm -rf /var/cache /var/log/dnf* /var/log/yum* && \
     mkdir -p /run/velocor /etc/velocor && \
-    printf '{"subsystems":[{"subsystem":"bdev","config":[{"method":"bdev_nvme_set_options","params":{"generate_uuids":true}}]},{"subsystem":"iscsi","config":[{"method":"iscsi_set_options","params":{"max_sessions":16,"pdu_pool_size":2048,"immediate_data_pool_size":512,"data_out_pool_size":512}}]}]}\n' > /etc/velocor/spdk.json
+    printf '{"subsystems":[{"subsystem":"sock","config":[{"method":"sock_impl_set_options","params":{"impl_name":"posix","enable_zerocopy_send_server":false}}]},{"subsystem":"bdev","config":[{"method":"bdev_nvme_set_options","params":{"generate_uuids":true}}]},{"subsystem":"iscsi","config":[{"method":"iscsi_set_options","params":{"max_sessions":16,"pdu_pool_size":2048,"immediate_data_pool_size":512,"data_out_pool_size":512}}]}]}\n' > /etc/velocor/spdk.json
 
 COPY --from=builder /usr/bin/spdk_tgt /usr/bin/spdk_tgt
 

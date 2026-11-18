@@ -41,7 +41,9 @@ RUN dnf install -y \
     dnf clean all && \
     rm -rf /var/cache /var/log/dnf* /var/log/yum*
 
-# Kernel modules for user-space PCIe NVMe polling (VFIO/UIO), NVMe-oF TCP, and ublk (Phase 2 NAS)
+# Kernel modules for user-space PCIe NVMe polling (VFIO/UIO), NVMe-oF TCP, and ublk (Phase 2 NAS).
+# No TCP autocorking: it held each NVMe/TCP read's small response until the NIC reported the
+# data packet sent (lazily on virtio-net), adding ~1 ms to every small read (measured 2026-11-18).
 RUN mkdir -p \
       /usr/lib/modules-load.d \
       /usr/lib/modprobe.d \
@@ -50,6 +52,7 @@ RUN mkdir -p \
       /usr/share/containers/systemd && \
     printf "vfio\nvfio_iommu_type1\nvfio_pci\nuio_pci_generic\nnvme_tcp\nublk_drv\n" > /usr/lib/modules-load.d/velocor.conf && \
     printf "vm.nr_hugepages = 512\n" > /usr/lib/sysctl.d/90-velocor.conf && \
+    printf "net.ipv4.tcp_autocorking = 0\n" >> /usr/lib/sysctl.d/90-velocor.conf && \
     printf "d /var/lib/velocor 0700 root root -\nd /run/velocor 0755 root root -\n" > /usr/lib/tmpfiles.d/velocor.conf
 
 # Keep udev away from velod's short-lived metadata device (internal/meta)
