@@ -391,7 +391,9 @@ work still open, ranked by risk to data, how fixes are verified, and what has be
   next pass after the address appears serves it. Existing listeners are kept (a brief flap
   doesn't tear them down). Creating an export, adding such a portal or enabling the export is
   refused with that message; other changes to an export that already had the portal apply.
-  `TestPortalWithoutItsAddress`.
+  `TestPortalWithoutItsAddress`. Lab (dev-91f9415, 2026-11-18): after the reboot the export
+  was DEGRADED with that message and SPDK logged no errors; adding 10.77.0.1 made it ONLINE on
+  the next pass (data read over it); removing the address again kept the listener, no errors.
 
 ### P2: hardening
 
