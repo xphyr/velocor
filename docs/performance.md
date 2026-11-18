@@ -65,7 +65,27 @@ below, write results don't (part of the write gain is the NAS acknowledging from
   is one connection on one poll group, at 90–95% busy; NVMe/TCP has a lighter path per I/O.
 - **iSCSI sequential writes caught up** (446 vs 513 MB/s; 177 vs 301 before), so most of that gap
   was the 64K writes queueing on the shallow AHCI queue, not the split itself (P2-14).
-- **2 cores should now help**, unlike on emulated SATA: worth repeating `-m 0x3` on these disks.
+- **A second SPDK core didn't help here either** (dev-981f6b3, `-m 0x3`, same disks). Random
+  reads over NVMe/TCP rose 5% (48,084), everything else stayed level or fell: random writes
+  27,884 → 22,187 (NVMe/TCP) and 21,938 → 19,495 (iSCSI), iSCSI sequential writes 446 → 366 MB/s.
+  With two reactors the NVMe/TCP poll groups were only 50–75% busy each, so SPDK was no longer
+  the limit, yet writes got slower. Likely cause, not verified: each polling reactor spins a
+  vCPU at 100%, and the VM runs on the same 4-core NAS CPU that serves its disks, so a second
+  spinning core takes CPU away from the storage behind it (and leaves the guest kernel, which
+  does the io_uring and virtio-scsi work, two vCPUs instead of three). An iSCSI volume uses one
+  poll group either way. One core stays the default; size it on real hardware (P2-4).
+
+| Job | NVMe/TCP 1 core | NVMe/TCP 2 cores | iSCSI 1 core | iSCSI 2 cores |
+|---|---|---|---|---|
+| `lat-randread` | 1,680 | 1,740 | 1,682 | 1,691 |
+| `lat-randwrite` | 3,933 | 3,513 | 3,940 | 3,851 |
+| `iops-randread` | 45,628 | 48,084 | 34,319 | 30,928 |
+| `iops-randwrite` | 27,884 | 22,187 | 21,938 | 19,495 |
+| `mixed-70-30` | 29,039 | 28,564 | 22,745 | 22,514 |
+| `seq-read` MB/s | 984 | 970 | 788 | 785 |
+| `seq-write` MB/s | 513 | 504 | 446 | 366 |
+| `dsync-randwrite` | 27,285 | 21,936 | 20,803 | 21,457 |
+| `dsync-seq-write` MB/s | 549 | 505 | 449 | 370 |
 
 ## 2026-11-18: VM appliance on emulated SATA disks, arm64 OpenShift client
 
