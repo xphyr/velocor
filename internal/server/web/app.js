@@ -1069,6 +1069,23 @@ async function accessDialog(e) {
   });
 }
 
+function portalsDialog(e, portalList) {
+  const usable = portalList.filter((p) => p.protocol === e.protocol);
+  openDialog({
+    title: `Portals of ${e.name}`,
+    intro: "The addresses hosts reach the export on. Hosts connected through a portal you remove are cut off.",
+    submit: "Save",
+    danger: true,
+    fields: [{ name: "portals", kind: "checks", label: "Portals", value: e.portal_ids || [],
+      options: usable.map((p) => ({ value: p.id, label: `${p.name} (${p.ip_address}:${p.port})` })), empty: "No portals for this protocol. Add one on the Portals screen." }],
+    action: (x) => {
+      if (!x.portals.length) throw new Error("Choose at least one portal.");
+      return send("PATCH", "/exports/" + encodeURIComponent(e.id), { portal_ids: x.portals });
+    },
+    done: () => { notify("Portals saved."); rerender(); },
+  });
+}
+
 function connectCommand(e, p) {
   const addr = p.ip_address.includes(":") ? `[${p.ip_address}]` : p.ip_address;
   if (e.protocol === "ISCSI") {
@@ -1138,7 +1155,9 @@ async function exportScreen(id) {
         { title: "Initiator group", cell: (g) => el("strong", {}, g.name) },
         { title: "Members", cell: (g) => groupMembers(g, hostsById) },
       ], mine, { filter: false, empty: "Nobody, so no host can connect.", state: stateOf("export-groups") }),
-    el("h2", {}, "Portals"),
+    el("div", { class: "section-head" },
+      el("h2", {}, "Portals"),
+      action(can.admin, { id: "change-portals", onclick: () => portalsDialog(e, portalList) }, "Change")),
     table([
       { title: "Portal", cell: (p) => [el("strong", {}, p.name), el("span", { class: "sub mono" }, `${p.ip_address}:${p.port}`)] },
       { title: "To connect", cell: (p) => el("code", { class: "command" }, connectCommand(e, p)) },
@@ -1853,11 +1872,12 @@ function signOut() {
 }
 
 function drawAccount() {
-  account.replaceChildren(
+  // replaceChildren, unlike el, would show a skipped (false) child as the text "false".
+  account.replaceChildren(...[
     el("span", { class: "who" }, me.username.replace(/^token:/, "")),
     el("span", { class: "role" }, me.role.toLowerCase().replace("_", " ")),
     !me.username.startsWith("token:") && el("button", { id: "change-password", onclick: passwordDialog }, "Password"),
-    el("button", { id: "signout", onclick: signOut }, "Sign out"));
+    el("button", { id: "signout", onclick: signOut }, "Sign out")].filter(Boolean));
 }
 
 async function rerender() {

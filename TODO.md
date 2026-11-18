@@ -202,9 +202,35 @@ work still open, ranked by risk to data, how fixes are verified, and what has be
     generation floor; backups schedule/retention/restore; import from manifest, skeleton,
     conflict + resume; CLI), integration with real SPDK (skeleton import after losing the
     database, superblocks read from the disk files, data read back).
-  - [ ] Lab test on the appliance (ublk for real): copies written; delete the database ->
-    import -> names, exports and data back; spdk_tgt killed during a write -> recovered;
-    disks moved to a fresh appliance VM -> exports restored disabled; backup/restore round trip.
+  - [x] Lab test on the appliance (dev-497a397, serenity VM, 2026-11-17), RAID1 pools on
+    virtio-SCSI SSDs (io_uring) and on NVMe:
+    - copies written through real ublk (gen 3 / 2 after setup), no errors;
+    - spdk_tgt killed with the metadata device open and I/O waiting on it (D state): on velod's
+      first pass after spdk_tgt came back (~10 s) the device was recovered
+      ("Recovering ublk 100 ... recover done successfully") and stopped, the waiting I/O
+      ended (EIO; the next pass rewrites), the in-flight record was cleared;
+    - database, backups and bootstrap file deleted + reboot: both pools listed as importable
+      from their superblocks (SSD slots identified), imported from the manifests (latest
+      generations), names / labels / snapshots / host / group / portals back, exports served,
+      the export on a portal address gone after the reboot restored disabled; 64 MiB on
+      each volume read back identical through NVMe/TCP;
+    - restore of a manual backup: change undone, pre-restore backup taken, velod restarted;
+      pools held newer generations (6 / 4 vs 5 / 3): logged, and writes went on at 7 / 5;
+    - disks moved to a fresh install (new node ID): imported through the UI, data identical;
+      enabling the disabled export failed cleanly until its address existed, then ONLINE;
+    - UI: import dialog and result, configuration-copy fact, backups section.
+  - [x] Lab follow-ups (fixed after the run): SPDK logged an error on every write
+    (`ublk_create_target` on an existing target: now created once per spdk_tgt); the kernel
+    logged "I/O error, dev ublkb100" per write (its probe of the new device was still running
+    when velod stopped it: velod now waits until the device is idle, >= 300 ms, and a udev
+    rule keeps udev from probing it); stopping right after `ublk_recover_disk` made SPDK fail
+    END_USER_RECOVERY (now waits for the recovery); the disabled-export message told
+    operators to change a portal's address, which no API allows: exports' portals can now be
+    changed (`PATCH /exports/{id} {portal_ids}`, `veloctl export access --portals`, UI) and NVMe
+    listeners of dropped portals are removed; an import now restores the member disks'
+    power-loss-protected / write-cache-policy settings; UI header showed "false" for token
+    sessions. To re-check on the next lab image: no kernel I/O errors and no SPDK errors per
+    write.
 
 - [ ] **P0-4. Hosts are told writes are durable when they may only be in a disk's volatile cache. (Verified)**
   In SPDK v26.09 the lvol module does not support FLUSH (`vbdev_lvol_io_type_supported`), and

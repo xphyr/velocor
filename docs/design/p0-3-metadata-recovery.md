@@ -1,6 +1,6 @@
 # Design: metadata copies, backups and pool import (P0-3)
 
-Status: implemented 2026-11-17 (lab test pending). Tracks TODO P0-3.
+Status: implemented and lab-tested 2026-11-17. Tracks TODO P0-3.
 
 ## What happens today
 
@@ -167,3 +167,14 @@ Where the implementation differs from the proposal above:
 - **Disabled exports:** exports gained `disabled` / `disabled_reason`. The reconciler removes
   their SPDK objects and reports them as needing attention. `PATCH /exports/{id}
   {"enabled": true}` serves them again.
+- **Moving an export:** an export restored disabled because its portal's address isn't on the
+  new appliance is moved to a local portal with `PATCH /exports/{id} {"portal_ids": [...],
+  "enabled": true}`. Portals themselves can't be readdressed. The NVMe listeners of dropped
+  portals are removed.
+- **Disk settings:** the member disks' power-loss-protected flag and write-cache policy are
+  in the manifest, and an import restores them.
+- **ublk hygiene (from the lab run):** the ublk target is created once per spdk_tgt. Before
+  stopping the device, velod waits until it has been idle for 300 ms or more, because the
+  kernel's and udev's own probe reads would otherwise fail and log I/O errors. A udev rule
+  (`59-velocor-ublk.rules`) keeps udev from probing `ublkb100`. After `ublk_recover_disk`,
+  velod waits for the recovery to finish before stopping the device.

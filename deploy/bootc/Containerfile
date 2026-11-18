@@ -52,6 +52,9 @@ RUN mkdir -p \
     printf "vm.nr_hugepages = 512\n" > /usr/lib/sysctl.d/90-velocor.conf && \
     printf "d /var/lib/velocor 0700 root root -\nd /run/velocor 0755 root root -\n" > /usr/lib/tmpfiles.d/velocor.conf
 
+# Keep udev away from velod's short-lived metadata device (internal/meta)
+COPY deploy/bootc/59-velocor-ublk.rules /usr/lib/udev/rules.d/59-velocor-ublk.rules
+
 # Install operator CLI client on the host
 COPY --from=velod-bin /usr/bin/veloctl /usr/bin/veloctl
 

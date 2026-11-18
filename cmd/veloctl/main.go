@@ -1296,9 +1296,10 @@ func runExport(cfg *cliConfig, args []string) error {
 		fs := flag.NewFlagSet("export access", flag.ExitOnError)
 		igs := fs.String("initiator-groups", "", "Comma-separated InitiatorGroup IDs allowed to connect (replaces the current list; empty for none)")
 		allowAny := fs.Bool("allow-any-host", false, "Let any host connect, with no access control (--allow-any-host=false to require a list again)")
+		portals := fs.String("portals", "", "Comma-separated Portal IDs to serve the export on (replaces the current list)")
 		id, err := parseWithID(fs, args[1:])
 		if err != nil {
-			return fmt.Errorf("usage: veloctl export access <export-id> [--initiator-groups a,b] [--allow-any-host=true|false]")
+			return fmt.Errorf("usage: veloctl export access <export-id> [--initiator-groups a,b] [--allow-any-host=true|false] [--portals p1,p2]")
 		}
 		body := map[string]any{}
 		fs.Visit(func(f *flag.Flag) {
@@ -1307,10 +1308,12 @@ func runExport(cfg *cliConfig, args []string) error {
 				body["initiator_group_ids"] = splitList(*igs)
 			case "allow-any-host":
 				body["allow_any_host"] = *allowAny
+			case "portals":
+				body["portal_ids"] = splitList(*portals)
 			}
 		})
 		if len(body) == 0 {
-			return fmt.Errorf("nothing to change: give --initiator-groups and/or --allow-any-host")
+			return fmt.Errorf("nothing to change: give --initiator-groups, --allow-any-host and/or --portals")
 		}
 		resp, err := cfg.request("PATCH", "/api/v1/exports/"+url.PathEscape(id), body)
 		if err != nil {

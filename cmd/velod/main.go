@@ -141,7 +141,7 @@ func main() {
 			nodeID = cfg.NodeID
 		}
 		// One device for the reconciler (writes) and pool import (reads): it serializes them.
-		metaDev = &meta.UblkDevice{SPDK: spdkClient, Helper: self, StateDir: filepath.Dir(*spdkSocket), ID: metaUblkID}
+		metaDev = &meta.UblkDevice{SPDK: spdkClient, Helper: self, StateDir: filepath.Dir(*spdkSocket), ID: metaUblkID, Logger: logger}
 		rec.SetMetaDevice(metaDev, nodeID, version.Version)
 	}
 

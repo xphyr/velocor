@@ -69,6 +69,12 @@ func buildPool(t *testing.T, f *spdktest.Fake, dev meta.Device) (poolID, volID s
 			"portal_ids": []string{field(pt, "portal", "id").(string)}, "initiator_group_ids": []string{igID},
 		}))(http.StatusCreated)
 	}
+	if _, err := h.st.MutateDisk("d1", func(d *store.Disk) error {
+		d.PowerLossProtected, d.WriteCachePolicy = true, store.WriteCachePolicyDisabled
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
 	h.reconcile()
 	return poolID, volID
 }
@@ -102,6 +108,9 @@ func TestImportFromManifestAfterLosingTheDatabase(t *testing.T) {
 	if p["name"] != "tank" || p["health_status"] != "ONLINE" {
 		t.Fatalf("imported pool: %v %v", p["name"], p["health_status"])
 	}
+	if d, _ := h.st.GetDisk("d1"); !d.PowerLossProtected || d.WriteCachePolicy != store.WriteCachePolicyDisabled {
+		t.Fatalf("disk settings not restored: %+v", d)
+	}
 	v, err := h.st.GetVolume(volID)
 	if err != nil || v.Name != "db" {
 		t.Fatalf("imported volume: %+v %v", v, err)
@@ -116,6 +125,32 @@ func TestImportFromManifestAfterLosingTheDatabase(t *testing.T) {
 			t.Fatalf("reason: %q", e.DisabledReason)
 		}
 	}
+	// The operator moves the disabled export to a portal on this appliance and enables it.
+	var remote, local *store.Export
+	for _, e := range exps {
+		if e.Name == "remote" {
+			remote = e
+		} else {
+			local = e
+		}
+	}
+	path := "/api/v1/exports/" + remote.ID
+	h.expect(h.do("PATCH", path, h.admin, map[string]any{"portal_ids": []string{}}))(http.StatusBadRequest)
+	upd := h.expect(h.do("PATCH", path, h.admin, map[string]any{"portal_ids": local.PortalIDs, "enabled": true}))(http.StatusOK)["export"].(map[string]any)
+	if upd["disabled"] == true || upd["portal_ids"].([]any)[0] != local.PortalIDs[0] {
+		t.Fatalf("export after the portal change: %v", upd)
+	}
+	subs, _ := h.fake.Client().NvmfGetSubsystems(t.Context())
+	served := false
+	for _, sub := range subs {
+		if sub.Nqn == remote.SubsystemNQN {
+			served = len(sub.ListenAddresses) == 1 && sub.ListenAddresses[0].Traddr == "127.0.0.1"
+		}
+	}
+	if !served {
+		t.Fatalf("%s is not served on the local portal only: %+v", remote.SubsystemNQN, subs)
+	}
+
 	// The next copy continues the pool's generations.
 	if p := h.getPool(poolID); p["meta_generation"].(float64) < 2 {
 		t.Fatalf("meta generation after import: %v", p["meta_generation"])

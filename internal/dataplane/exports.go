@@ -222,6 +222,7 @@ func UpdateExport(ctx context.Context, c *spdk.Client, st store.Store, id string
 	return st.MutateExport(id, func(e *store.Export) error {
 		e.InitiatorGroupIDs, e.AllowAnyHost, e.NodeIDs = next.InitiatorGroupIDs, next.AllowAnyHost, next.NodeIDs
 		e.Disabled, e.DisabledReason = next.Disabled, next.DisabledReason
+		e.PortalIDs = next.PortalIDs
 		return nil
 	})
 }
@@ -395,15 +396,27 @@ func ensureNVMe(ctx context.Context, c *spdk.Client, exp *store.Export, vol *sto
 		}
 	}
 
+	same := func(a, b spdk.NvmfListenAddress) bool {
+		return strings.EqualFold(a.Trtype, b.Trtype) && a.Traddr == b.Traddr && a.Trsvcid == b.Trsvcid
+	}
+	var want []spdk.NvmfListenAddress
 	for _, p := range portals {
 		la := spdk.NvmfListenAddress{Trtype: trtype, Adrfam: AddressFamily(p.IPAddress), Traddr: p.IPAddress, Trsvcid: strconv.Itoa(int(p.Port))}
-		if slices.ContainsFunc(sub.ListenAddresses, func(l spdk.NvmfListenAddress) bool {
-			return strings.EqualFold(l.Trtype, la.Trtype) && l.Traddr == la.Traddr && l.Trsvcid == la.Trsvcid
-		}) {
+		want = append(want, la)
+		if slices.ContainsFunc(sub.ListenAddresses, func(l spdk.NvmfListenAddress) bool { return same(l, la) }) {
 			continue
 		}
 		if err := c.NvmfSubsystemAddListener(ctx, exp.SubsystemNQN, la.Trtype, la.Adrfam, la.Traddr, la.Trsvcid); err != nil {
 			return fmt.Errorf("add listener %s:%s to %s: %w", la.Traddr, la.Trsvcid, exp.SubsystemNQN, err)
+		}
+	}
+	// Listeners of portals the export no longer uses (its portals were changed).
+	for _, l := range sub.ListenAddresses {
+		if slices.ContainsFunc(want, func(w spdk.NvmfListenAddress) bool { return same(l, w) }) {
+			continue
+		}
+		if err := c.NvmfSubsystemRemoveListener(ctx, exp.SubsystemNQN, l.Trtype, l.Adrfam, l.Traddr, l.Trsvcid); err != nil && !spdk.IsNotFound(err) {
+			return fmt.Errorf("remove listener %s:%s from %s: %w", l.Traddr, l.Trsvcid, exp.SubsystemNQN, err)
 		}
 	}
 	return nil

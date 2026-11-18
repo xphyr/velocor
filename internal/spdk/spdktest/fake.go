@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"net"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -913,6 +914,21 @@ var handlers = map[string]handler{
 		}
 		s.ListenAddresses = append(s.ListenAddresses, la)
 		return true, nil
+	},
+	"nvmf_subsystem_remove_listener": func(f *Fake, p map[string]any) (any, *rpcErr) {
+		s, ok := f.subsystems[str(p, "nqn")]
+		if !ok {
+			return nil, errf(codeInvalidParams, "Unable to find subsystem")
+		}
+		var la spdk.NvmfListenAddress
+		remarshal(p["listen_address"], &la)
+		for i, l := range s.ListenAddresses {
+			if strings.EqualFold(l.Trtype, la.Trtype) && l.Traddr == la.Traddr && l.Trsvcid == la.Trsvcid {
+				s.ListenAddresses = slices.Delete(s.ListenAddresses, i, i+1)
+				return true, nil
+			}
+		}
+		return nil, errf(codeInvalidParams, "Unable to find listener")
 	},
 	"nvmf_subsystem_add_host": func(f *Fake, p map[string]any) (any, *rpcErr) {
 		s, ok := f.subsystems[str(p, "nqn")]

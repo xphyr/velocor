@@ -7,9 +7,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -39,8 +41,77 @@ type UblkDevice struct {
 	StateDir string // e.g. /run/velocor
 	ID       uint32 // ublk device ID reserved for metadata I/O
 	Timeout  time.Duration
+	Logger   *slog.Logger
 
-	mu sync.Mutex
+	mu       sync.Mutex
+	targetUp bool // ublk_create_target succeeded on the current spdk_tgt (as far as we know)
+}
+
+func (u *UblkDevice) logger() *slog.Logger {
+	if u.Logger != nil {
+		return u.Logger
+	}
+	return slog.Default()
+}
+
+// ensureTarget creates SPDK's ublk target once per spdk_tgt (each call on an existing target
+// makes SPDK log an error).
+func (u *UblkDevice) ensureTarget(ctx context.Context) error {
+	if u.targetUp {
+		return nil
+	}
+	if err := u.SPDK.UblkCreateTarget(ctx); err != nil {
+		return err
+	}
+	u.targetUp = true
+	return nil
+}
+
+// startDisk exposes lvol as the metadata device. The previous use of the ID may still be
+// finishing its stop; a failure for any other reason may mean spdk_tgt restarted without a
+// ublk target, so the target is created again once.
+func (u *UblkDevice) startDisk(ctx context.Context, lvol string) error {
+	retried := false
+	for deadline := time.Now().Add(5 * time.Second); ; {
+		err := u.SPDK.UblkStartDisk(ctx, lvol, u.ID)
+		switch {
+		case err == nil:
+			return nil
+		case time.Now().After(deadline):
+			return err
+		case strings.Contains(err.Error(), "exist") || strings.Contains(err.Error(), "busy"):
+			time.Sleep(200 * time.Millisecond)
+		case !retried:
+			retried, u.targetUp = true, false
+			if terr := u.ensureTarget(ctx); terr != nil {
+				return fmt.Errorf("%w (and creating the ublk target: %v)", err, terr)
+			}
+		default:
+			return err
+		}
+	}
+}
+
+// quiesce waits, before the device is stopped, until the kernel's and udev's own reads of a
+// new block device (partition scan, blkid) are done: stopped under them they fail and log
+// "I/O error, dev ublkbN" although nothing is wrong.
+func (u *UblkDevice) quiesce(since time.Time) {
+	inflight := fmt.Sprintf("/sys/block/ublkb%d/inflight", u.ID)
+	idle := 0
+	for deadline := since.Add(2 * time.Second); time.Now().Before(deadline); time.Sleep(50 * time.Millisecond) {
+		b, err := os.ReadFile(inflight)
+		if err != nil {
+			return
+		}
+		if f := strings.Fields(string(b)); len(f) == 2 && f[0] == "0" && f[1] == "0" {
+			idle++
+		} else {
+			idle = 0
+		}
+		if idle >= 3 && time.Since(since) >= 300*time.Millisecond {
+			return
+		}
+	}
 }
 
 // inflight records the ublk device being used, for recovery after a crash.
@@ -67,37 +138,29 @@ func (u *UblkDevice) with(ctx context.Context, lvol string, fn func(dev string) 
 	if err := u.recoverLocked(ctx); err != nil {
 		return fmt.Errorf("recover the previous metadata device: %w", err)
 	}
-	if err := u.SPDK.UblkCreateTarget(ctx); err != nil {
+	if err := u.ensureTarget(ctx); err != nil {
 		return fmt.Errorf("start the ublk target: %w", err)
 	}
 	rec, _ := json.Marshal(inflight{ID: u.ID, Bdev: lvol})
 	if err := os.WriteFile(u.stateFile(), rec, 0o600); err != nil {
 		return fmt.Errorf("record the metadata device: %w", err)
 	}
-	// The previous use of the ID may still be finishing its stop.
-	var startErr error
-	for deadline := time.Now().Add(5 * time.Second); ; {
-		startErr = u.SPDK.UblkStartDisk(ctx, lvol, u.ID)
-		if startErr == nil || time.Now().After(deadline) ||
-			(!strings.Contains(startErr.Error(), "exist") && !strings.Contains(startErr.Error(), "busy")) {
-			break
-		}
-		time.Sleep(200 * time.Millisecond)
-	}
-	if startErr != nil {
+	if err := u.startDisk(ctx, lvol); err != nil {
 		_ = os.Remove(u.stateFile())
-		return fmt.Errorf("expose the metadata lvol: %w", startErr)
+		return fmt.Errorf("expose the metadata lvol: %w", err)
 	}
 	if err := waitFor(ctx, u.devPath(), 10*time.Second); err != nil {
 		_ = u.SPDK.UblkStopDisk(context.WithoutCancel(ctx), u.ID)
 		_ = os.Remove(u.stateFile())
 		return err
 	}
+	appeared := time.Now()
 	ioErr := fn(u.devPath())
 	if errors.Is(ioErr, errHelperStuck) {
 		// The helper may be blocked on the device; leave it recorded for Recover.
 		return ioErr
 	}
+	u.quiesce(appeared)
 	if err := u.SPDK.UblkStopDisk(context.WithoutCancel(ctx), u.ID); err != nil && ioErr == nil {
 		ioErr = fmt.Errorf("stop the metadata device: %w", err)
 	}
@@ -181,12 +244,23 @@ func (u *UblkDevice) recoverLocked(ctx context.Context) error {
 		}
 	}
 	if _, statErr := os.Stat(fmt.Sprintf("/dev/ublkc%d", rec.ID)); !served && statErr == nil {
-		if err := u.SPDK.UblkCreateTarget(ctx); err != nil {
+		// spdk_tgt died with the device open (I/O on it waits in the kernel): take it over.
+		u.targetUp = false
+		if err := u.ensureTarget(ctx); err != nil {
 			return err
 		}
 		if err := u.SPDK.UblkRecoverDisk(ctx, rec.Bdev, rec.ID); err != nil {
 			return fmt.Errorf("recover ublk device %d: %w", rec.ID, err)
 		}
+		// Recovery completes asynchronously; stopping before it has makes SPDK fail its last
+		// recovery step (UBLK_CMD_END_USER_RECOVERY).
+		for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); time.Sleep(100 * time.Millisecond) {
+			if ds, err := u.SPDK.UblkGetDisks(ctx); err == nil && slices.ContainsFunc(ds, func(d spdk.UblkDisk) bool { return d.ID == rec.ID }) {
+				break
+			}
+		}
+		time.Sleep(500 * time.Millisecond)
+		u.logger().Warn("recovered the metadata device left open when spdk_tgt stopped", "ublk_id", rec.ID, "lvol", rec.Bdev)
 		served = true
 	}
 	if served {

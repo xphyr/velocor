@@ -458,6 +458,22 @@ func (s *Server) importPool(ctx context.Context, poolID, rename string, allowDeg
 	if err := s.importAccess(plan, vols, res); err != nil {
 		return nil, err
 	}
+	// The member disks' durability settings travel with the pool (the reconciler applies the
+	// write-cache policy).
+	for _, md := range plan.Disks {
+		if !slices.Contains(pool.DiskIDs, md.ID) {
+			continue
+		}
+		if _, err := s.store.MutateDisk(md.ID, func(d *store.Disk) error {
+			if d.PowerLossProtected == md.PowerLossProtected && d.WriteCachePolicy == md.WriteCachePolicy {
+				return store.ErrSkipWrite
+			}
+			d.PowerLossProtected, d.WriteCachePolicy = md.PowerLossProtected, md.WriteCachePolicy
+			return nil
+		}); err != nil {
+			res.Warnings = append(res.Warnings, fmt.Sprintf("disk %s: settings not restored: %v", md.ID, err))
+		}
+	}
 
 	s.logger.Warn("pool imported", "pool", pool.ID, "name", pool.Name, "source", res.Source,
 		"generation", res.Generation, "volumes", res.Volumes, "snapshots", res.Snapshots)
@@ -682,7 +698,7 @@ func (s *Server) importAccess(plan *meta.Manifest, vols []*store.Volume, res *Im
 		var why []string
 		for _, pid := range e.PortalIDs {
 			if !portalOK[pid] {
-				why = append(why, "portal "+pid+" has an address that isn't on this appliance; change its address, then enable the export")
+				why = append(why, "portal "+pid+" has an address that isn't on this appliance; give the export a portal on this appliance (or add the address here), then enable it")
 			}
 		}
 		for _, gid := range e.InitiatorGroupIDs {
