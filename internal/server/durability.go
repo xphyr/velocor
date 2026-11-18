@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"slices"
 	"strings"
 
 	"github.com/velocor/velocor/internal/hardware"
@@ -107,6 +108,9 @@ func (s *Server) durabilityWarnings() []string {
 		}
 	}
 	var out []string
+	slices.Sort(refused)
+	slices.Sort(atRisk)
+	slices.Sort(unknown)
 	if len(refused) > 0 {
 		out = append(out, fmt.Sprintf("The write cache of %s can't be turned off (%s), so power loss can lose acknowledged writes. Declare the disks power-loss protected if they are (e.g. a virtual disk whose host protects its cache), or set their write-cache policy to leave the drive alone.", strings.Join(refused, ", "), refusal))
 	}

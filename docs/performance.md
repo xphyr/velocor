@@ -29,6 +29,44 @@ While the jobs ran, a sampler on the appliance recorded every 10 s: CPU time, pe
 utilisation (`/proc/diskstats`), SAN NIC bytes, and each SPDK thread's busy/idle ticks
 (`thread_get_stats`).
 
+## 2026-11-18: the same appliance on virtio-scsi disks
+
+**Setup.** As in the run below, with two changes: the appliance's six pool disks were moved
+from emulated SATA to **virtio-scsi** (same virtual disks on the same NAS; they present as
+"SYNOLOGY Storage", queue depth 128), and the build is dev-a548637 (one SPDK core). The disks
+**refuse to turn their write cache off**, so writes are no longer flushed through to the NAS
+as they were on emulated SATA with the cache off: read results compare directly with the run
+below, write results don't (part of the write gain is the NAS acknowledging from its cache).
+
+**Results** (IOPS, except MB/s for the sequential jobs), against the tuned emulated-SATA run:
+
+| Job | NVMe/TCP SATA | NVMe/TCP virtio | iSCSI SATA | iSCSI virtio |
+|---|---|---|---|---|
+| `lat-randread` | 1,652 | 1,680 | 1,590 | 1,682 |
+| `lat-randwrite` | 2,334 | 3,933 | 2,283 | 3,940 |
+| `iops-randread` | 18,777 | 45,628 | 17,863 | 34,319 |
+| `iops-randwrite` | 8,200 | 27,884 | 7,741 | 21,938 |
+| `mixed-70-30` | 11,927 | 29,039 | 11,615 | 22,745 |
+| `seq-read` MB/s | 643 | 984 | 530 | 788 |
+| `seq-write` MB/s | 301 | 513 | 177 | 446 |
+| `dsync-randwrite-qd1` | 2,170 | 3,933 | 2,220 | 4,043 |
+| `dsync-randwrite` | 8,260 | 27,285 | 7,868 | 20,803 |
+| `dsync-seq-write` MB/s | 295 | 549 | 171 | 449 |
+| `fsync-randwrite-qd1` | 2,162 | 3,800 | 2,221 | 3,789 |
+
+**Findings.**
+- **Deep random reads went from about 18k to 46k IOPS (NVMe/TCP)**, and sequential reads
+  reach 984 MB/s, close to 10 GbE. QD1 reads didn't change: they are bound by the round trip
+  (NIC, SPDK, disk), not by queueing.
+- **The limit moved from the disks to SPDK's single core.** The busiest disk is now 60–94%
+  utilised (92–97% before), while the one reactor is 80–95% busy at depth. NVMe/TCP's poll
+  group and SPDK's app thread share that core.
+- **iSCSI now trails NVMe/TCP by 20–25% at depth** (34k vs 46k random reads). Each iSCSI volume
+  is one connection on one poll group, at 90–95% busy; NVMe/TCP has a lighter path per I/O.
+- **iSCSI sequential writes caught up** (446 vs 513 MB/s; 177 vs 301 before), so most of that gap
+  was the 64K writes queueing on the shallow AHCI queue, not the split itself (P2-14).
+- **2 cores should now help**, unlike on emulated SATA: worth repeating `-m 0x3` on these disks.
+
 ## 2026-11-18: VM appliance on emulated SATA disks, arm64 OpenShift client
 
 **Setup.**
