@@ -286,6 +286,16 @@ work still open, ranked by risk to data, how fixes are verified, and what has be
     (admin passthrough); until then the policy is refused for NVMe.
   - [ ] Pool-level flag in the pool API/UI (today: per-disk durability plus the status warning).
   - [ ] Step 5: power-pull test on real hardware.
+  - [x] **Disks whose cache can't be turned off.** Lab, 2026-11-18: virtio-scsi disks of a
+    Synology VM ("SYNOLOGY Storage", LIO behind them) report "write back" and refuse the change
+    (`cache_type` write: EINVAL). velod retried every pass and listed all six disks under the
+    reconciler's degraded resources and last error, half the dashboard. *Fixed:* a refusal is
+    recorded on the disk (`write_cache_error`, shown on the disk), logged once, and retried only
+    after velod restarts or the operator sets the policy again; the pass stays clean. The
+    status warnings carry one line naming such disks and what to do (declare PLP if the host
+    protects the cache, or leave the policy). Setting the policy through the API was already
+    refused when the drive refuses. `TestRefusedWriteCacheIsRecordedNotRetried`,
+    `TestRefusedWriteCacheWarning`.
 
 - [ ] **P0-6. A failed io_uring setup crashes `spdk_tgt`. (Verified)**
   Claiming an SSD with the io_uring backend where io_uring can't be set up (locked-memory
@@ -421,7 +431,12 @@ work still open, ranked by risk to data, how fixes are verified, and what has be
   `TestMovedStripeIsNotGuessed`, `TestMovedMirrorWaitsForEveryMember`,
   `TestImportMirrorUnderNewDiskIDs`, `TestMatchMovedMembers`.
   *Still open:* NVMe drives moved to another PCIe slot (their ID is the PCI address) aren't
-  relinked yet; no event is raised (velod logs a warning per relinked disk). Lab check pending.
+  relinked yet; no event is raised (velod logs a warning per relinked disk).
+  Lab (dev-a548637, 2026-11-18): velocor-1's three RAID1 pools, UNAVAILABLE after its six disks
+  moved from emulated SATA to virtio-scsi, came back ONLINE on the first boot of the upgrade
+  without any operator step; the members now have the new IDs and keep their old bdev UUIDs,
+  the old records are gone, serials no longer end in NUL, and the volume on `mirror250a` is
+  ONLINE. The new disks can't have their write cache switched off (see P0-4).
 - [ ] **P2-11. velod reports ONLINE before a restarted data plane is restored.** After an SPDK
   restart, status said ONLINE within ~10 s while volume stores, the iSCSI portal and target came
   back about a minute later.
@@ -730,6 +745,11 @@ of the boot-disk guard and CSI device resolution on NVMe native multipath.
 ---
 
 ## Done
+
+- [x] **The initial admin password file stayed on disk** after the password was changed, with
+  a permanent dashboard warning until someone deleted it by hand. velod now deletes it once
+  the admin password no longer matches it: after a password change, and at startup (for
+  appliances changed before). `TestBootstrapPasswordFileDeletedAfterChange`.
 
 ### Found by testing against real SPDK (second review)
 

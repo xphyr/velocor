@@ -463,6 +463,7 @@ func (s *BoltStore) upsertDisk(disk *Disk, syncBoot bool) error {
 			if cp.BdevUUID == "" {
 				cp.BdevUUID = existing.BdevUUID
 			}
+			cp.WriteCacheError = existing.WriteCacheError
 			if cp.WriteCache == WriteCacheUnknown {
 				cp.WriteCache = existing.WriteCache
 			}

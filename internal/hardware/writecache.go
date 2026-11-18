@@ -3,6 +3,7 @@ package hardware
 import (
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -63,7 +64,11 @@ func (m *Manager) SetWriteCache(d *store.Disk, enabled bool) (store.WriteCacheSt
 	}
 	if readSysfsString(f) != value {
 		if err := os.WriteFile(f, []byte(value), 0); err != nil {
-			return m.writeCacheState(kname), fmt.Errorf("set write cache of %s to %q: %w", kname, value, err)
+			var pe *fs.PathError
+			if errors.As(err, &pe) {
+				err = pe.Err // the sysfs path says nothing to an operator
+			}
+			return m.writeCacheState(kname), fmt.Errorf("%s refused %q: %w", kname, value, err)
 		}
 	}
 	got := m.writeCacheState(kname)

@@ -203,7 +203,10 @@ type Disk struct {
 	// WriteCachePolicy is the operator's choice; DISABLED makes velod switch the drive's
 	// volatile write cache off and keep it off.
 	WriteCachePolicy WriteCachePolicy `json:"write_cache_policy,omitempty"`
-	UpdatedAt        time.Time        `json:"updated_at"`
+	// WriteCacheError says why the DISABLED policy couldn't be applied (the drive refused);
+	// the disk is reported once in the durability warnings instead of on every pass.
+	WriteCacheError string    `json:"write_cache_error,omitempty"`
+	UpdatedAt       time.Time `json:"updated_at"`
 }
 
 // WriteCacheState is a disk's volatile write cache as reported by the hardware.

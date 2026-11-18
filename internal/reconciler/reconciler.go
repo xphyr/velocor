@@ -48,6 +48,11 @@ type Reconciler struct {
 	sbReader func(*store.Disk) (*hardware.RaidSuperblock, error)
 	discover func() ([]*store.Disk, error)
 
+	// cacheRefused: disks whose drive refused to turn its write cache off since velod started.
+	// They are retried once per start, not every pass (the refusal is recorded on the disk and
+	// reported in the durability warnings).
+	cacheRefused map[string]bool
+
 	mu    sync.Mutex
 	state State
 }
@@ -189,7 +194,9 @@ func (r *Reconciler) syncHardware(p *pass) []*store.Disk {
 }
 
 // enforceWriteCache keeps the volatile write cache off on disks whose policy says so (TODO.md
-// P0-4): drives can turn it back on after a power cycle or reset.
+// P0-4): drives can turn it back on after a power cycle or reset. A drive that refuses is
+// recorded (Disk.WriteCacheError, shown in the durability warnings) and tried again only after
+// velod restarts or the operator sets the policy again, so it doesn't fill every pass's errors.
 func (r *Reconciler) enforceWriteCache(p *pass) {
 	if r.hw == nil {
 		return
@@ -201,22 +208,40 @@ func (r *Reconciler) enforceWriteCache(p *pass) {
 	}
 	for _, d := range disks {
 		if d.WriteCachePolicy != store.WriteCachePolicyDisabled || d.IsBootDevice || d.WriteCache == store.WriteCacheWriteThrough {
+			if d.WriteCacheError != "" {
+				r.recordWriteCache(p, d.ID, d.WriteCache, "")
+			}
+			continue
+		}
+		if d.WriteCacheError != "" && r.cacheRefused[d.ID] {
 			continue
 		}
 		state, err := r.hw.SetWriteCache(d, false)
+		msg := ""
 		if err != nil {
-			p.degrade("disk:"+d.ID, "cannot disable the write cache: "+err.Error())
+			msg = err.Error()
+			if r.cacheRefused == nil {
+				r.cacheRefused = map[string]bool{}
+			}
+			r.cacheRefused[d.ID] = true
+			r.logger.Warn("the drive refuses to turn its write cache off; it stays at risk on power loss", "disk", d.ID, "err", err)
 		} else {
+			delete(r.cacheRefused, d.ID)
 			p.repaired++
 		}
-		if state != d.WriteCache {
-			if _, err := r.store.MutateDisk(d.ID, func(cur *store.Disk) error {
-				cur.WriteCache = state
-				return nil
-			}); err != nil {
-				p.errs = append(p.errs, fmt.Sprintf("record write cache of %s: %v", d.ID, err))
-			}
+		r.recordWriteCache(p, d.ID, state, msg)
+	}
+}
+
+func (r *Reconciler) recordWriteCache(p *pass, id string, state store.WriteCacheState, msg string) {
+	if _, err := r.store.MutateDisk(id, func(cur *store.Disk) error {
+		if cur.WriteCache == state && cur.WriteCacheError == msg {
+			return store.ErrSkipWrite
 		}
+		cur.WriteCache, cur.WriteCacheError = state, msg
+		return nil
+	}); err != nil {
+		p.errs = append(p.errs, fmt.Sprintf("record write cache of %s: %v", id, err))
 	}
 }
 

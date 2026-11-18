@@ -420,7 +420,7 @@ function smartCell(d) {
 // Write cache and durability (TODO.md P0-4): SPDK doesn't pass flushes through volumes, so a
 // drive caching writes in volatile memory can lose acknowledged writes on power failure.
 function durabilityCell(d) {
-  const notes = [d.write_cache_policy === "DISABLED" && "kept off by Velocor", d.power_loss_protected && "declared power-loss protected"].filter(Boolean).join(", ");
+  const notes = [d.write_cache_policy === "DISABLED" && (d.write_cache_error ? "can't be turned off: " + d.write_cache_error : "kept off by Velocor"), d.power_loss_protected && "declared power-loss protected"].filter(Boolean).join(", ");
   const cache = { WRITE_BACK: "Cache on", WRITE_THROUGH: "No volatile cache" }[d.write_cache] || "Cache unknown";
   const p = { DURABLE: pill("Durable", "ok"), AT_RISK: pill("At risk", "warn"), UNKNOWN: pill("Unknown", "quiet") }[d.durability] || "-";
   return [p, el("span", { class: "sub" }, notes ? `${cache}; ${notes}` : cache)];

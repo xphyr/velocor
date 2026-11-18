@@ -274,7 +274,7 @@ See [hack/vm-lab/README.md](hack/vm-lab/README.md) for environment overrides and
 - **Bootstrap Credentials**:
   - **Username**: `admin`
   - **Password**: generated randomly on first boot and written to `/var/lib/velocor/initial-admin-password` (root-only), unless `VELOCOR_INIT_PASSWORD` is set on first boot. There is no shared default password.
-  - The bootstrap password must be changed at first login; until then the API only allows changing it. Delete the file afterwards.
+  - The bootstrap password must be changed at first login; until then the API only allows changing it. velod deletes the file once the password has been changed.
 
 Authenticate via `veloctl` (session token is saved to `~/.config/velocor/token`):
 

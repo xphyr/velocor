@@ -62,9 +62,31 @@ func WithInsecureHTTP(insecure bool) Option {
 	return func(s *Server) { s.insecureHTTP = insecure }
 }
 
-// WithBootstrapPasswordFile lets status warn while the generated bootstrap password file exists.
+// WithBootstrapPasswordFile names the file the generated bootstrap password was written to:
+// velod deletes it once the admin password has been changed, and status warns while it exists.
 func WithBootstrapPasswordFile(path string) Option {
 	return func(s *Server) { s.bootstrapFile = path }
+}
+
+// removeStaleBootstrapFile deletes the bootstrap password file once the password in it no
+// longer opens the admin account (it was changed, also before velod learnt to do this).
+func (s *Server) removeStaleBootstrapFile() {
+	if s.bootstrapFile == "" || s.store == nil {
+		return
+	}
+	data, err := os.ReadFile(s.bootstrapFile)
+	if err != nil {
+		return // gone already, or unreadable: status still warns while it exists
+	}
+	admin, err := s.store.GetAdminUser(auth.DefaultAdminUsername)
+	if err != nil || auth.VerifyPassword(strings.TrimSpace(string(data)), admin.PasswordHash) {
+		return
+	}
+	if err := os.Remove(s.bootstrapFile); err != nil {
+		s.logger.Warn("cannot delete the initial admin password file", "path", s.bootstrapFile, "err", err)
+		return
+	}
+	s.logger.Info("deleted the initial admin password file: the password has been changed", "path", s.bootstrapFile)
 }
 
 // warnings lists configuration problems an operator should fix, for every UI screen.
@@ -72,7 +94,7 @@ func (s *Server) warnings() []string {
 	out := []string{}
 	if s.bootstrapFile != "" {
 		if _, err := os.Stat(s.bootstrapFile); err == nil {
-			out = append(out, "The initial admin password file "+s.bootstrapFile+" still exists. Delete it once the password has been changed.")
+			out = append(out, "The initial admin password file "+s.bootstrapFile+" still exists. It is deleted when the admin password is changed.")
 		}
 	}
 	if s.insecureHTTP {
@@ -125,6 +147,7 @@ func New(
 	for _, o := range opts {
 		o(s)
 	}
+	s.removeStaleBootstrapFile()
 	s.registerRoutes()
 	return s
 }
@@ -368,6 +391,7 @@ func (s *Server) handleChangePassword(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
+	s.removeStaleBootstrapFile()
 	// All earlier sessions (including the caller's) were revoked; hand back a fresh one.
 	writeJSON(w, http.StatusOK, map[string]any{
 		"access_token": sess.Token,

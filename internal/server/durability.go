@@ -57,6 +57,7 @@ func (s *Server) handleUpdateDisk(w http.ResponseWriter, r *http.Request) {
 		if req.WriteCachePolicy != nil {
 			cur.WriteCachePolicy = *req.WriteCachePolicy
 			cur.WriteCache = d.WriteCache
+			cur.WriteCacheError = "" // applied (or LEAVE): nothing outstanding
 		}
 		return nil
 	})
@@ -85,19 +86,30 @@ func (s *Server) durabilityWarnings() []string {
 	if err != nil {
 		return nil
 	}
-	var atRisk, unknown []string
+	var atRisk, refused, unknown []string
+	refusal := ""
 	for _, d := range disks {
 		if !d.Claimed && d.PoolID == "" {
 			continue
 		}
 		switch d.Durability() {
 		case store.DurabilityAtRisk:
+			if d.WriteCacheError != "" {
+				refused = append(refused, d.Name)
+				if refusal == "" {
+					refusal = d.WriteCacheError
+				}
+				continue
+			}
 			atRisk = append(atRisk, d.Name)
 		case store.DurabilityUnknown:
 			unknown = append(unknown, d.Name)
 		}
 	}
 	var out []string
+	if len(refused) > 0 {
+		out = append(out, fmt.Sprintf("The write cache of %s can't be turned off (%s), so power loss can lose acknowledged writes. Declare the disks power-loss protected if they are (e.g. a virtual disk whose host protects its cache), or set their write-cache policy to leave the drive alone.", strings.Join(refused, ", "), refusal))
+	}
 	if len(atRisk) > 0 {
 		out = append(out, fmt.Sprintf("Power loss can lose acknowledged writes on %s: the volatile write cache is on and the disk isn't declared power-loss protected. Disable the cache, or declare the disk protected if it is.", strings.Join(atRisk, ", ")))
 	}

@@ -57,3 +57,24 @@ func TestDiskDurabilityAPI(t *testing.T) {
 		t.Errorf("unknown disk: %d, want 404", code)
 	}
 }
+
+// A disk whose drive refused to turn its cache off gets one warning that says so.
+func TestRefusedWriteCacheWarning(t *testing.T) {
+	h := newHarness(t)
+	for _, n := range []string{"sdb", "sdc"} {
+		if err := h.st.UpsertDisk(&store.Disk{ID: "ssd-" + n, Name: n, Type: store.DiskTypeSSD, Claimed: true, WriteCache: store.WriteCacheWriteBack,
+			WriteCachePolicy: store.WriteCachePolicyDisabled, WriteCacheError: n + ` refused "write through": invalid argument`}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_, st := h.do("GET", "/api/v1/system/status", h.admin, nil)
+	var got []string
+	for _, w := range st["warnings"].([]any) {
+		if strings.Contains(w.(string), "sdb") {
+			got = append(got, w.(string))
+		}
+	}
+	if len(got) != 1 || !strings.Contains(got[0], "write cache of sdb, sdc can't be turned off") {
+		t.Fatalf("warnings about sdb: %q", got)
+	}
+}
