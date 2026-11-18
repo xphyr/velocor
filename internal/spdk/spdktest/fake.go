@@ -17,6 +17,7 @@ package spdktest
 import (
 	"bufio"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -86,6 +87,7 @@ type Fake struct {
 
 	// Physical media present in the machine. key = PCI address or filename.
 	nvmeMedia  map[string]bool
+	nvmeCache  map[string]NVMeCache // PCI address -> the drive's volatile write cache
 	fileMedia  map[string]bool
 	superblock map[string]*raidSuperblock // media key -> superblock
 	lvsMedia   map[string]*mediaLvstore   // raid media key -> persisted lvstore
@@ -120,6 +122,7 @@ func New(t testing.TB) *Fake {
 		t:            t,
 		sockPath:     filepath.Join(t.TempDir(), "spdk.sock"),
 		nvmeMedia:    map[string]bool{},
+		nvmeCache:    map[string]NVMeCache{},
 		fileMedia:    map[string]bool{},
 		superblock:   map[string]*raidSuperblock{},
 		lvsMedia:     map[string]*mediaLvstore{},
@@ -145,6 +148,31 @@ func (f *Fake) AddNVMe(pci string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.nvmeMedia[pci] = true
+}
+
+// NVMeCache is an NVMe drive's volatile write cache, as its admin commands report it.
+type NVMeCache struct {
+	Present  bool // Identify Controller VWC
+	Saveable bool // ONCS bit 4: Set Features can save
+	// NotSaveable: saving this feature is refused although ONCS says saving is supported.
+	NotSaveable bool
+	Enabled     bool // feature 06h WCE
+	Refuse      bool // Set Features 06h fails (Invalid Field)
+	Saved       bool // the last Set Features asked to save the value
+}
+
+// SetNVMeCache sets the write cache of the drive at pci (drives have none by default).
+func (f *Fake) SetNVMeCache(pci string, c NVMeCache) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.nvmeCache[pci] = c
+}
+
+// NVMeCacheOf returns the write cache of the drive at pci.
+func (f *Fake) NVMeCacheOf(pci string) NVMeCache {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.nvmeCache[pci]
 }
 
 // AddFile registers a physical kernel block device path usable with bdev_uring.
@@ -604,6 +632,61 @@ var handlers = map[string]handler{
 			return nil, errf(codeENODEV, "No such device")
 		}
 		return spdk.NvmeHealthInfo{TemperatureCelsius: 35, AvailableSpare: 100}, nil
+	},
+	"bdev_nvme_send_cmd": func(f *Fake, p map[string]any) (any, *rpcErr) {
+		pci, ok := f.nvmeCtrls[str(p, "name")]
+		if !ok || str(p, "cmd_type") != "admin" || str(p, "data_direction") != "c2h" {
+			return nil, errf(codeInvalidParams, "Invalid parameters")
+		}
+		cmd, err := base64.RawURLEncoding.DecodeString(strings.TrimRight(str(p, "cmdbuf"), "="))
+		if err != nil || len(cmd) != 64 {
+			return nil, errf(codeInvalidParams, "Invalid parameters")
+		}
+		le := binary.LittleEndian
+		cdw10, cdw11 := le.Uint32(cmd[40:]), le.Uint32(cmd[44:])
+		cache := f.nvmeCache[pci]
+		var cdw0 uint32
+		var sct, sc uint16
+		var data []byte
+		switch {
+		case cmd[0] == 0x06 && cdw10&0xff == 1: // Identify Controller
+			if num(p, "data_len") != 4096 {
+				return nil, errf(codeInvalidParams, "Invalid parameters")
+			}
+			data = make([]byte, 4096)
+			if cache.Present {
+				data[525] = 1
+			}
+			if cache.Saveable {
+				data[520] = 1 << 4
+			}
+		case cmd[0] == 0x0a && cdw10&0xff == 0x06: // Get Features, volatile write cache
+			if !cache.Present {
+				sc = 0x02 // Invalid Field in Command
+			} else if cache.Enabled {
+				cdw0 = 1
+			}
+		case cmd[0] == 0x09 && cdw10&0xff == 0x06: // Set Features, volatile write cache
+			switch {
+			case !cache.Present || cache.Refuse:
+				sc = 0x02
+			case cdw10&(1<<31) != 0 && (!cache.Saveable || cache.NotSaveable):
+				sct, sc = 1, 0x0d // Feature Identifier Not Saveable
+			default:
+				cache.Enabled, cache.Saved = cdw11&1 != 0, cdw10&(1<<31) != 0
+				f.nvmeCache[pci] = cache
+			}
+		default:
+			sc = 0x01 // Invalid Command Opcode
+		}
+		cpl := make([]byte, 16)
+		le.PutUint32(cpl[0:], cdw0)
+		le.PutUint16(cpl[14:], sc<<1|sct<<9)
+		out := map[string]any{"cpl": base64.URLEncoding.EncodeToString(cpl)}
+		if data != nil {
+			out["data"] = base64.URLEncoding.EncodeToString(data)
+		}
+		return out, nil
 	},
 	"bdev_uring_create": func(f *Fake, p map[string]any) (any, *rpcErr) {
 		name, file := str(p, "name"), str(p, "filename")

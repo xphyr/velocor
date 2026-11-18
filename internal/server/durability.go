@@ -1,8 +1,10 @@
 package server
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"github.com/velocor/velocor/internal/dataplane"
 	"net/http"
 	"slices"
 	"strings"
@@ -43,7 +45,7 @@ func (s *Server) handleUpdateDisk(w http.ResponseWriter, r *http.Request) {
 		if *req.WriteCachePolicy != d.WriteCachePolicy {
 			target := *d
 			target.WriteCachePolicy = *req.WriteCachePolicy
-			state, err := s.applyWriteCachePolicy(&target)
+			state, err := s.applyWriteCachePolicy(r.Context(), &target)
 			if err != nil {
 				writeError(w, err)
 				return
@@ -70,7 +72,22 @@ func (s *Server) handleUpdateDisk(w http.ResponseWriter, r *http.Request) {
 }
 
 // applyWriteCachePolicy makes the drive match d.WriteCachePolicy and returns its cache state.
-func (s *Server) applyWriteCachePolicy(d *store.Disk) (store.WriteCacheState, error) {
+// An NVMe drive is switched through SPDK once SPDK owns it; before that its policy is only
+// recorded, and applied when it is claimed.
+func (s *Server) applyWriteCachePolicy(ctx context.Context, d *store.Disk) (store.WriteCacheState, error) {
+	if d.Type == store.DiskTypeNVMe {
+		if !d.Claimed || d.SPDKBdevName == "" {
+			return d.WriteCache, nil
+		}
+		if err := s.requireSPDK(); err != nil {
+			return d.WriteCache, err
+		}
+		state, err := dataplane.SetNVMeWriteCache(ctx, s.spdk, dataplane.NVMeControllerFromBdev(d.SPDKBdevName), d.WriteCachePolicy != store.WriteCachePolicyDisabled)
+		if err != nil {
+			return state, fmt.Errorf("%w: %v", store.ErrInvalidArgument, err)
+		}
+		return state, nil
+	}
 	if s.hw == nil {
 		return d.WriteCache, errors.New("hardware access is not available")
 	}

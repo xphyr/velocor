@@ -144,6 +144,7 @@ func (r *Reconciler) ReconcileOnce(ctx context.Context) (State, error) {
 	}
 
 	r.reconcileDisks(ctx, p)
+	r.nvmeWriteCache(ctx, p)
 	r.applySettings(ctx, p)
 
 	// Let SPDK finish examining every base bdev (RAID superblock assembly, lvstore load)
@@ -452,8 +453,10 @@ func (r *Reconciler) reconcilePools(ctx context.Context, p *pass, examined bool)
 		}
 		reasons = append(reasons, p.notes[pool.ID]...)
 		msg := strings.Join(reasons, "; ")
+		durability := poolDurability(pool, disks)
 		_, err := r.store.MutatePool(pool.ID, func(cur *store.Pool) error {
-			changed := cur.HealthStatus != health || cur.StatusMessage != msg
+			changed := cur.HealthStatus != health || cur.StatusMessage != msg || cur.Durability != durability
+			cur.Durability = durability
 			if !membersEqual(store.PoolMembers(cur), members) || len(cur.Members) == 0 {
 				changed = true
 				store.SetPoolMembers(cur, members)
@@ -477,6 +480,24 @@ func (r *Reconciler) reconcilePools(ctx context.Context, p *pass, examined bool)
 		}
 	}
 	return online
+}
+
+// poolDurability is the weakest durability of the pool's member disks.
+func poolDurability(pool *store.Pool, disks []*store.Disk) store.Durability {
+	out := store.DurabilityDurable
+	for _, id := range pool.DiskIDs {
+		i := slices.IndexFunc(disks, func(d *store.Disk) bool { return d.ID == id })
+		if i < 0 {
+			return store.DurabilityUnknown
+		}
+		switch disks[i].Durability() {
+		case store.DurabilityAtRisk:
+			return store.DurabilityAtRisk
+		case store.DurabilityUnknown:
+			out = store.DurabilityUnknown
+		}
+	}
+	return out
 }
 
 // leftPool returns the pool a disk is bound to but no longer a member of, or nil: its slot

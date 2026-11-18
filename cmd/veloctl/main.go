@@ -612,17 +612,17 @@ func runPool(cfg *cliConfig, args []string) error {
 			return printJSON(resp)
 		}
 		tw := newTabWriter()
-		fmt.Fprintln(tw, "ID\tNAME\tRAID\tSIZE\tUSED\tCOMMITTED\tAVAILABLE\tSPACE\tHEALTH\tDETAILS")
+		fmt.Fprintln(tw, "ID\tNAME\tRAID\tSIZE\tUSED\tCOMMITTED\tAVAILABLE\tSPACE\tDURABILITY\tHEALTH\tDETAILS")
 		for _, p := range sliceOfMaps(resp["pools"]) {
 			total, free := uint64FromAny(p["total_bytes"]), uint64FromAny(p["free_bytes"])
 			used := "-"
 			if total > 0 {
 				used = fmt.Sprintf("%.0f%%", 100*float64(total-min(free, total))/float64(total))
 			}
-			fmt.Fprintf(tw, "%v\t%v\t%v\t%s\t%s\t%s\t%s\t%v\t%v\t%v\n",
+			fmt.Fprintf(tw, "%v\t%v\t%v\t%s\t%s\t%s\t%s\t%v\t%v\t%v\t%v\n",
 				p["id"], p["name"], p["raid_level"], humanBytes(total), used,
 				humanBytes(uint64FromAny(p["committed_bytes"])), humanBytes(uint64FromAny(p["available_bytes"])),
-				strOrDash(p["space_state"]), p["health_status"], strOrEmpty(p["status_message"]))
+				strOrDash(p["space_state"]), strOrDash(p["durability"]), p["health_status"], strOrEmpty(p["status_message"]))
 		}
 		return tw.Flush()
 

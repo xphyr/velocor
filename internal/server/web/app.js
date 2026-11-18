@@ -508,12 +508,21 @@ function deletePoolDialog(p) {
   });
 }
 
+// A pool's durability: whether a power cut can lose writes its member disks acknowledged.
+const DURABILITY = {
+  DURABLE: ["durable", "ok", "Every member disk writes to durable media (no volatile write cache, or it is off, or the disk is power-loss protected)."],
+  AT_RISK: ["writes at risk", "warn", "A member disk has its volatile write cache on and isn't declared power-loss protected: a power cut can lose acknowledged writes. Turn the disk's cache off or declare it protected on its disk page."],
+  UNKNOWN: ["unknown", "", "The write cache of a member disk could not be determined."],
+};
+const durabilityPill = (p) => DURABILITY[p.durability] && pill(DURABILITY[p.durability][0], DURABILITY[p.durability][1]);
+
 function poolTable(items, volumes, options = {}) {
   const count = (id) => volumes.filter((v) => v.pool_id === id).length;
   return table([
     { title: "Name", cell: (p) => el("strong", {}, link(p.name, "pool", p.id)), text: (p) => p.name },
     { title: "Health", cell: health, text: (p) => p.health_status },
     { title: "RAID", cell: (p) => [p.raid_level, el("span", { class: "sub" }, `${(p.disk_ids || []).length} disks`)], text: (p) => p.raid_level },
+    { title: "Durability", cell: (p) => durabilityPill(p) || "", text: (p) => p.durability || "" },
     { title: "Space", cell: (p) => [spacePill(p), poolBar(p)], text: (p) => p.space_state || "" },
     { title: "Committed", num: true, cell: (p) => [humanSize(p.committed_bytes || 0), el("span", { class: "sub" }, `${humanSize(p.available_bytes || 0)} more accepted`)] },
     { title: "Volumes", num: true, cell: (p) => link(String(count(p.id)), "volumes", p.id) },
@@ -678,6 +687,7 @@ async function pool(id) {
         `Overcommit up to ${policyOf(p).max_overcommit}×, ${policyOf(p).reserve_percent}% reserved; warning at ${policyOf(p).warning_percent}%, critical at ${policyOf(p).critical_percent}%`,
         can.admin && el("button", { id: "edit-space-policy", onclick: () => spacePolicyDialog(p) }, "Change")]),
       fact("RAID", `${p.raid_level}${p.raid_level !== "RAID1" ? `, ${p.strip_size_kb} KiB strips` : ""}`),
+      DURABILITY[p.durability] && fact("Durability", [durabilityPill(p), el("span", { class: "sub" }, DURABILITY[p.durability][2])]),
       fact("Cluster size", humanSize(p.cluster_size_bytes)),
       fact("RAID bdev", mono(p.base_bdev_name)),
       fact("Volume store", [mono(p.lvs_name), el("span", { class: "sub mono" }, p.lvs_uuid)]),

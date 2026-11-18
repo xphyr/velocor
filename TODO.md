@@ -282,9 +282,21 @@ work still open, ranked by risk to data, how fixes are verified, and what has be
     which only change the kernel's view), at claim and on every reconciler pass (drives can
     re-enable it after a power cycle). Verified on velocor-1's emulated SATA disks (kernel logs
     "Write cache: disabled" from the drive).
-  - [ ] Step 1 + 4 for NVMe owned by SPDK: Get/Set Features 06h through `bdev_nvme_send_cmd`
-    (admin passthrough); until then the policy is refused for NVMe.
-  - [ ] Pool-level flag in the pool API/UI (today: per-disk durability plus the status warning).
+  - [x] Step 1 + 4 for NVMe owned by SPDK (2026-11-18): admin commands through
+    `bdev_nvme_send_cmd` (`spdk.BdevNvmeAdminCmd`): Identify Controller for VWC and ONCS save
+    support, Get / Set Features 06h for WCE (`dataplane.NVMeWriteCache`, `SetNVMeWriteCache`;
+    saved across power cycles when the drive supports it, falling back to unsaved when the
+    feature isn't saveable). The reconciler reads every claimed NVMe drive's cache each pass,
+    switches it off where the policy says so (again after a drive re-enables it), and handles a
+    refusal like an SSD's. `PATCH /disks/{id}` applies the policy through SPDK for a claimed
+    drive (refusal: 400 with the drive's status); for an unclaimed drive it is recorded and
+    applied at claim, before anything is written. `TestNVMeWriteCacheThroughSPDK`,
+    `TestNVMeWriteCacheKeptOffAndPoolDurability`, `TestNVMeWriteCachePolicyAPI` (fake SPDK
+    modelling the admin commands). *To check on the lab:* QEMU NVMe drives on the P0-1 VM (real
+    SPDK, real admin commands).
+  - [x] Pool-level flag (2026-11-18): pools carry `durability` (the weakest member's: DURABLE,
+    AT_RISK, UNKNOWN), maintained by the reconciler; shown in the pool list and detail of the UI
+    with what to do, and in `veloctl pool list`.
   - [ ] Step 5: power-pull test on real hardware.
   - [x] **Disks whose cache can't be turned off.** Lab, 2026-11-18: virtio-scsi disks of a
     Synology VM ("SYNOLOGY Storage", LIO behind them) report "write back" and refuse the change
@@ -675,18 +687,18 @@ Everything here was written by Gemini and is in scope to rewrite.
 **Release gate (agreed 2026-11-17):** no first release until items 1–5 are done; work them in
 this order and keep this file current as each moves.
 
-1. **P0-1 + P1-8 redundancy** (in progress): replace a failed disk with rebuild progress
+1. **P0-1 + P1-8 redundancy** (done; real-hardware hot-swap tests open): replace a failed disk with rebuild progress
    (`REBUILDING n%`), and a supported degraded start. Starts with a design note on SPDK's raid
    rebuild API and its behaviour across restarts; tested with real SPDK (fail, replace,
    rebuild, restart during rebuild, second failure) on the serenity VM lab, where disks can be
    hot-unplugged.
-2. **P0-2 capacity**: overcommit limit, reserve for snapshots/metadata, thresholds,
+2. **P0-2 capacity** (done): overcommit limit, reserve for snapshots/metadata, thresholds,
    per-volume/snapshot allocated space.
-3. **P0-3 metadata**: on-pool metadata copy, scheduled backups + `veloctl` backup/restore,
+3. **P0-3 metadata** (done): on-pool metadata copy, scheduled backups + `veloctl` backup/restore,
    recovery from SPDK and the on-pool copy.
-4. **P0-4 durability, remaining**: NVMe write-cache detection/disable through SPDK admin
-   passthrough, pool-level flag; power-pull test on real hardware (user). The SPDK FLUSH patch
-   stays L-1.
+4. **P0-4 durability, remaining** (in progress): NVMe write cache through SPDK and the pool
+   flag are done, pending the lab check on QEMU NVMe; power-pull test on real hardware (user).
+   The SPDK FLUSH patch stays L-1.
 5. **P1-4 deletion protection** (recycle period / per-volume protection); fold in **P0-6**
    (probe io_uring, fall back to AIO).
 

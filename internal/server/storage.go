@@ -128,14 +128,27 @@ func (s *Server) attachAndClaim(ctx context.Context, d *store.Disk, force bool) 
 			return nil, err
 		}
 	}
-	if d.WriteCachePolicy == store.WriteCachePolicyDisabled && s.hw != nil {
-		if _, err := s.applyWriteCachePolicy(d); err != nil {
+	if d.WriteCachePolicy == store.WriteCachePolicyDisabled && s.hw != nil && d.Type != store.DiskTypeNVMe {
+		if _, err := s.applyWriteCachePolicy(ctx, d); err != nil {
 			return nil, err
 		}
 	}
 	bdev, drv, err := dataplane.AttachDisk(ctx, s.spdk, s.hw, d)
 	if err != nil {
 		return nil, err
+	}
+	if d.WriteCachePolicy == store.WriteCachePolicyDisabled && d.Type == store.DiskTypeNVMe {
+		// The kernel no longer sees the drive: switch its cache off through SPDK before
+		// anything is written to it.
+		if _, err := dataplane.SetNVMeWriteCache(ctx, s.spdk, dataplane.NVMeControllerFromBdev(bdev), false); err != nil {
+			attached := *d
+			attached.SPDKBdevName = bdev
+			_ = dataplane.DetachDisk(context.WithoutCancel(ctx), s.spdk, &attached)
+			if s.hw != nil {
+				_ = s.hw.BindNVMeToKernel(d.PCIAddress)
+			}
+			return nil, fmt.Errorf("%w: %v", store.ErrInvalidArgument, err)
+		}
 	}
 	updated, err := s.store.ClaimDisk(d.ID, drv, bdev)
 	if err != nil {

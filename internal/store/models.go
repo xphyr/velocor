@@ -268,6 +268,9 @@ type Pool struct {
 	RaidLevel RaidLevel `json:"raid_level"`
 	// DiskIDs are the disks in the pool's RAID slots (ACTIVE or REBUILDING), in slot order.
 	DiskIDs []string `json:"disk_ids"`
+	// Durability is the weakest of the member disks' (maintained by the reconciler): AT_RISK
+	// when any member can lose acknowledged writes on power loss (TODO.md P0-4).
+	Durability Durability `json:"durability,omitempty"`
 	// Members is the state of every RAID slot (maintained by the reconciler from SPDK).
 	Members []PoolMember `json:"members,omitempty"`
 	// DetachedDiskIDs are disks that left the RAID (failed, removed or replaced) but stay
