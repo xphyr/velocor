@@ -390,6 +390,24 @@ work still open, ranked by risk to data, how fixes are verified, and what has be
   the parameter; the export gets every listed portal and the node connects to each (NVMe
   native multipath, dm-multipath for iSCSI; the node side can follow later); deprecate
   `portalOverride`.
+- [ ] **P1-14. A pool whose disks come back under new IDs stays UNAVAILABLE, with no way to
+  recover it. (Verified)** Lab, 2026-11-18: velocor-1's six pool disks moved from emulated SATA
+  to virtio-scsi (same disks, same data). Their IDs changed (`ssd-t10.ATA_QEMU_HARDDISK_QM00003`
+  became `ssd-naa.6001405…`), because velod records members by disk ID, and all three pools came
+  up UNAVAILABLE ("0/2 member bdevs present"). velod knows where the data is: `GET
+  /pool-imports` lists each pool's RAID superblock on the new disks with the right pool ID, but
+  refuses to import ("a pool with this ID already exists"), and replacing members would mean a
+  rebuild with no source. The same happens after moving drives to another HBA or changing the
+  controller mode. Also seen:
+  - the old disk records stay listed, DEGRADED and `URING_CLAIMED`, under kernel names (`sdb`…)
+    that now belong to the new disks;
+  - the import candidates mark every disk `stale` although all carry the newest sequence number;
+  - the new disks' serials end in a NUL byte (`…-e2ca277e5875\u0000`): `readSysfsString` trims
+    whitespace only.
+  *Needed:* when a member's disk is missing, find it by its RAID superblock (RAID UUID and
+  member slot) among unclaimed disks and reattach it: update the member's disk ID, claim the disk
+  (write cache off as usual), and mark the old disk record as gone. Do it at startup and on a
+  disk scan, log it, and report it as an event. Trim NULs from sysfs strings.
 - [ ] **P2-11. velod reports ONLINE before a restarted data plane is restored.** After an SPDK
   restart, status said ONLINE within ~10 s while volume stores, the iSCSI portal and target came
   back about a minute later.
