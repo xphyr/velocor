@@ -144,7 +144,7 @@ work still open, ranked by risk to data, how fixes are verified, and what has be
     volume intact and writable.
   P0-2 is done, apart from L-6 (ENOSPC instead of EIO).
 
-- [ ] **P0-3. The metadata database is a single point of failure, with no backup or recovery.**
+- [x] **P0-3. The metadata database is a single point of failure, with no backup or recovery.**
   `/var/lib/velocor/velocor.db` is the only record of which volume is which, who may access it,
   snapshot lineage and CBT order. If it is lost, the data is still on the pool disks but
   nothing can name or export it.
@@ -229,8 +229,14 @@ work still open, ranked by risk to data, how fixes are verified, and what has be
     changed (`PATCH /exports/{id} {portal_ids}`, `veloctl export access --portals`, UI) and NVMe
     listeners of dropped portals are removed; an import now restores the member disks'
     power-loss-protected / write-cache-policy settings; UI header showed "false" for token
-    sessions. To re-check on the next lab image: no kernel I/O errors and no SPDK errors per
-    write.
+    sessions.
+  - [x] Recheck on dev-085d5ed (2026-11-18, same lab VM upgraded with `POST /system/upgrade`:
+    pre-upgrade backup taken, pools kept): ublk target created once at boot; 12 metadata writes
+    over both pools (snapshot create/delete) with no kernel messages and no SPDK ublk errors;
+    spdk_tgt killed with the metadata device open and a read waiting: recovered on velod's first
+    pass ("recover done successfully", no END_USER_RECOVERY error), and the waiting read now
+    **completes** (exit 0) instead of failing; record cleared; 64 MiB on both volumes identical.
+  P0-3 is done. Found on the way: P2-12.
 
 - [ ] **P0-4. Hosts are told writes are durable when they may only be in a disk's volatile cache. (Verified)**
   In SPDK v26.09 the lvol module does not support FLUSH (`vbdev_lvol_io_type_supported`), and
@@ -373,6 +379,13 @@ work still open, ranked by risk to data, how fixes are verified, and what has be
 - [ ] **P2-11. velod reports ONLINE before a restarted data plane is restored.** After an SPDK
   restart, status said ONLINE within ~10 s while volume stores, the iSCSI portal and target came
   back about a minute later.
+- [ ] **P2-12. An enabled export on a portal whose address is gone retries forever with SPDK's
+  error.** Lab, 2026-11-18: after a reboot removed 10.77.0.1, the export on that portal was
+  DEGRADED with "add listener 10.77.0.1:4420 ...: spdk rpc error (code -32602): Invalid
+  parameters", and each reconcile pass (15 s) logged four SPDK `*ERROR*` lines. *Fix:* check
+  portal addresses against the local interfaces (the import already does) before adding
+  listeners; report the portal ("address 10.77.0.1 isn't on this appliance") and the export
+  DEGRADED without calling SPDK, and add the listener when the address appears.
 
 ### P2: hardening
 
