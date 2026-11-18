@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/velocor/velocor/internal/store"
 )
@@ -592,7 +593,8 @@ func readSysfsString(path string) string {
 	if err != nil {
 		return ""
 	}
-	return strings.TrimSpace(string(data))
+	// Some devices pad their identity strings with NULs (virtio-scsi serials, found on the lab).
+	return strings.TrimFunc(string(data), func(r rune) bool { return unicode.IsSpace(r) || r == 0 })
 }
 
 func readSysfsInt(path string, defaultVal int) int {

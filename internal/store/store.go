@@ -67,6 +67,8 @@ type Store interface {
 	ReplacePoolMember(poolID string, slot int, newDiskID string) (*Pool, error)
 	// ReleasePoolDisk unbinds a detached disk from its pool.
 	ReleasePoolDisk(poolID, diskID string) (*Pool, error)
+	// RelinkPoolMember moves a member to the record of the same disk under a new ID.
+	RelinkPoolMember(poolID, oldDiskID, newDiskID, bdevUUID string) (*Pool, error)
 	GetSettings() (*Settings, error)
 	SaveSettings(st *Settings) error
 

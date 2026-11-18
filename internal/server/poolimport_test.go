@@ -35,7 +35,12 @@ func appliance(t *testing.T, f *spdktest.Fake, dev meta.Device) *harness {
 		rec.SetMetaDevice(dev, "node-1", "test")
 	}
 	srv := New(st, f.Client(), nil, authMgr, rec, nil, WithMetaDevice(dev))
-	srv.sbReader = func(d *store.Disk) (*hardware.RaidSuperblock, error) { return f.SuperblockOf(d.PCIAddress), nil }
+	srv.sbReader = func(d *store.Disk) (*hardware.RaidSuperblock, error) {
+		if d.PCIAddress == "" {
+			return f.SuperblockOf(d.DevicePath), nil
+		}
+		return f.SuperblockOf(d.PCIAddress), nil
+	}
 	h := &harness{t: t, st: st, fake: f, ts: httptest.NewServer(srv.Handler())}
 	t.Cleanup(h.ts.Close)
 	_, resp := h.do("POST", "/api/v1/auth/login", "", map[string]any{"username": "admin", "password": "admin-pass-123"})
@@ -160,6 +165,54 @@ func TestImportFromManifestAfterLosingTheDatabase(t *testing.T) {
 	// Nothing left to import.
 	if list := h.expect(h.do("GET", "/api/v1/pool-imports", h.admin, nil))(http.StatusOK)["candidates"].([]any); len(list) != 0 {
 		t.Fatalf("candidates after import: %v", list)
+	}
+}
+
+// ssd records an unclaimed SSD at path, as a hardware scan would.
+func (h *harness) ssd(id, path string) {
+	h.t.Helper()
+	h.fake.AddFile(path)
+	if err := h.st.UpsertDisk(&store.Disk{ID: id, Name: id, Type: store.DiskTypeSSD, DevicePath: path, SizeBytes: 1 << 40, BlockSize: 512, DriverState: store.DiskDriverStateKernel}); err != nil {
+		h.t.Fatal(err)
+	}
+}
+
+// TODO.md P1-14: disks moved to another appliance and to another controller on the way (new
+// IDs) are imported, keeping the member UUIDs their RAID knows them by.
+func TestImportMirrorUnderNewDiskIDs(t *testing.T) {
+	f := spdktest.New(t)
+	dev := &meta.MemDevice{}
+	old := appliance(t, f, dev)
+	old.ssd("ssd-ata-1", "/dev/disk/by-id/ata-1")
+	old.ssd("ssd-ata-2", "/dev/disk/by-id/ata-2")
+	poolID := old.pool("tank", "RAID1", "ssd-ata-1", "ssd-ata-2")
+	old.volume(poolID, "db", 1<<30)
+	old.reconcile()
+
+	f.Restart()
+	f.MoveMedia("/dev/disk/by-id/ata-1", "/dev/disk/by-id/wwn-1")
+	f.MoveMedia("/dev/disk/by-id/ata-2", "/dev/disk/by-id/wwn-2")
+	h := appliance(t, f, dev)
+	for _, n := range []string{"1", "2"} {
+		if err := h.st.UpsertDisk(&store.Disk{ID: "ssd-wwn-" + n, Name: "sd", Type: store.DiskTypeSSD, DevicePath: "/dev/disk/by-id/wwn-" + n, SizeBytes: 1 << 40, BlockSize: 512, DriverState: store.DiskDriverStateKernel}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	c := h.expect(h.do("GET", "/api/v1/pool-imports", h.admin, nil))(http.StatusOK)["candidates"].([]any)[0].(map[string]any)
+	if c["complete"] != true || c["importable"] != true || c["present"] != float64(2) {
+		t.Fatalf("candidate: %v", c)
+	}
+	h.expect(h.do("POST", "/api/v1/pool-imports", h.admin, map[string]any{"pool_id": poolID}))(http.StatusCreated)
+	h.reconcile()
+	if p := h.getPool(poolID); p["health_status"] != "ONLINE" {
+		t.Fatalf("imported pool: %v %v", p["health_status"], p["status_message"])
+	}
+	// The kept UUIDs survive a restart.
+	f.Restart()
+	h.reconcile()
+	h.reconcile()
+	if p := h.getPool(poolID); p["health_status"] != "ONLINE" {
+		t.Fatalf("after a restart: %v %v", p["health_status"], p["status_message"])
 	}
 }
 

@@ -162,6 +162,25 @@ func (f *Fake) RemoveMedia(key string) {
 	delete(f.fileMedia, key)
 }
 
+// MoveMedia simulates a kernel block device reappearing under another path (the disk moved
+// to another controller): its contents, RAID superblock included, go with it.
+func (f *Fake) MoveMedia(from, to string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.fileMedia[from] {
+		delete(f.fileMedia, from)
+		f.fileMedia[to] = true
+	}
+	if sb, ok := f.superblock[from]; ok {
+		delete(f.superblock, from)
+		f.superblock[to] = sb
+	}
+	if lvs, ok := f.lvsMedia[from]; ok {
+		delete(f.lvsMedia, from)
+		f.lvsMedia[to] = lvs
+	}
+}
+
 // Restart simulates spdk_tgt restarting with no saved configuration.
 func (f *Fake) Restart() {
 	f.mu.Lock()

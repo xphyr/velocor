@@ -151,6 +151,34 @@ func (s *Server) importCandidates() ([]ImportCandidate, map[string][]foundSB, er
 				configured[m.BdevUUID] = m.Slot
 			}
 		}
+		// Disks under new IDs (TODO.md P1-14): their bdev UUID no longer matches a member, so
+		// match the members nobody claims to the current disks that match none.
+		var moved []dataplane.MovedDisk
+		var unmatched []string
+		matched := map[string]bool{}
+		for _, f := range found {
+			if f.disk.Type != store.DiskTypeSSD {
+				continue
+			}
+			if _, ok := configured[dataplane.DiskBdevUUID(f.disk)]; ok {
+				matched[dataplane.DiskBdevUUID(f.disk)] = true
+			} else if !f.disk.Claimed {
+				moved = append(moved, dataplane.MovedDisk{Disk: f.disk, SB: f.sb})
+			}
+		}
+		for u := range configured {
+			if !matched[u] {
+				unmatched = append(unmatched, u)
+			}
+		}
+		relinked, merr := dataplane.MatchMovedMembers(newest, unmatched, moved)
+		for i, f := range found {
+			if u, ok := relinked[f.disk.ID]; ok {
+				d := *f.disk
+				d.BdevUUID = u
+				found[i].disk = &d
+			}
+		}
 		for _, f := range found {
 			m := ImportMember{DiskID: f.disk.ID, Serial: f.disk.SerialNumber, Stale: f.sb.SeqNumber < newest.SeqNumber && !f.disk.Claimed}
 			if f.disk.Type == store.DiskTypeSSD {
@@ -180,6 +208,8 @@ func (s *Server) importCandidates() ([]ImportCandidate, map[string][]foundSB, er
 		}
 		if _, err := s.store.GetPool(c.PoolID); err == nil {
 			c.Importable, c.Reason = false, "a pool with this ID already exists"
+		} else if merr != nil && c.Importable {
+			c.Reason = strings.TrimPrefix(c.Reason+"; ", "; ") + merr.Error()
 		}
 		out = append(out, c)
 	}
@@ -305,6 +335,16 @@ func (s *Server) importPool(ctx context.Context, poolID, rename string, allowDeg
 		if f.disk.Claimed { // claimed by an earlier attempt
 			claimed = append(claimed, f.disk)
 			continue
+		}
+		if f.disk.BdevUUID != "" {
+			// A member under a new disk ID keeps its old bdev UUID, and must keep it after
+			// restarts: record it before SPDK sees the disk.
+			if _, merr := s.store.MutateDisk(f.disk.ID, func(cur *store.Disk) error {
+				cur.BdevUUID = f.disk.BdevUUID
+				return nil
+			}); merr != nil {
+				return nil, fmt.Errorf("record the bdev UUID of disk %s: %w", f.disk.ID, merr)
+			}
 		}
 		d, cerr := s.attachAndClaim(ctx, f.disk, true)
 		if cerr != nil {

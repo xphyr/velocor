@@ -390,7 +390,7 @@ work still open, ranked by risk to data, how fixes are verified, and what has be
   the parameter; the export gets every listed portal and the node connects to each (NVMe
   native multipath, dm-multipath for iSCSI; the node side can follow later); deprecate
   `portalOverride`.
-- [ ] **P1-14. A pool whose disks come back under new IDs stays UNAVAILABLE, with no way to
+- [x] **P1-14. A pool whose disks come back under new IDs stays UNAVAILABLE, with no way to
   recover it. (Verified)** Lab, 2026-11-18: velocor-1's six pool disks moved from emulated SATA
   to virtio-scsi (same disks, same data). Their IDs changed (`ssd-t10.ATA_QEMU_HARDDISK_QM00003`
   became `ssd-naa.6001405…`), because velod records members by disk ID, and all three pools came
@@ -404,10 +404,24 @@ work still open, ranked by risk to data, how fixes are verified, and what has be
   - the import candidates mark every disk `stale` although all carry the newest sequence number;
   - the new disks' serials end in a NUL byte (`…-e2ca277e5875\u0000`): `readSysfsString` trims
     whitespace only.
-  *Needed:* when a member's disk is missing, find it by its RAID superblock (RAID UUID and
-  member slot) among unclaimed disks and reattach it: update the member's disk ID, claim the disk
-  (write cache off as usual), and mark the old disk record as gone. Do it at startup and on a
-  disk scan, log it, and report it as an event. Trim NULs from sysfs strings.
+  *Fixed:* a member's SSD bdev UUID can now be kept on its disk record (`Disk.BdevUUID`,
+  used by `dataplane.DiskBdevUUID` instead of the ID-derived one). Each reconcile pass looks
+  at pools whose RAID isn't online and members whose disk the scan no longer finds, reads the
+  superblocks on the unclaimed SSDs, and `dataplane.MatchMovedMembers` assigns the missing
+  members' UUIDs to the disks carrying the array's current superblock. The new record takes
+  the old one's slot, UUID and disk settings (write-cache policy, PLP) in one transaction
+  (`RelinkPoolMember`), the old record is deleted, and SPDK examine then assembles the array.
+  It matches only when certain: every member the current superblock lists as configured must
+  be back with that superblock's sequence number (a single returning disk could be an
+  out-of-date copy whose current counterpart is still away), and several members only for a
+  RAID1 whose members share one data layout (interchangeable); a stripe is never guessed and
+  the pool says why. Pool import uses the same matching, so disks that changed ID on the way to
+  a new appliance import too. sysfs strings lose NUL padding; released disks drop a kept UUID.
+  `TestMirrorUnderNewDiskIDsComesBack`, `TestOneMovedMirrorMemberComesBack`,
+  `TestMovedStripeIsNotGuessed`, `TestMovedMirrorWaitsForEveryMember`,
+  `TestImportMirrorUnderNewDiskIDs`, `TestMatchMovedMembers`.
+  *Still open:* NVMe drives moved to another PCIe slot (their ID is the PCI address) aren't
+  relinked yet; no event is raised (velod logs a warning per relinked disk). Lab check pending.
 - [ ] **P2-11. velod reports ONLINE before a restarted data plane is restored.** After an SPDK
   restart, status said ONLINE within ~10 s while volume stores, the iSCSI portal and target came
   back about a minute later.

@@ -460,6 +460,9 @@ func (s *BoltStore) upsertDisk(disk *Disk, syncBoot bool) error {
 			// write-cache state survives while SPDK owns the device and the kernel can't see it.
 			cp.PowerLossProtected = existing.PowerLossProtected
 			cp.WriteCachePolicy = existing.WriteCachePolicy
+			if cp.BdevUUID == "" {
+				cp.BdevUUID = existing.BdevUUID
+			}
 			if cp.WriteCache == WriteCacheUnknown {
 				cp.WriteCache = existing.WriteCache
 			}
@@ -549,6 +552,7 @@ func (s *BoltStore) ReleaseDisk(id string) (*Disk, error) {
 		updated.Claimed = false
 		updated.DriverState = DiskDriverStateKernel
 		updated.SPDKBdevName = ""
+		updated.BdevUUID = "" // a kept member UUID only matters while the disk is in its pool
 		updated.UpdatedAt = time.Now().UTC()
 		return putJSON(b, []byte(id), &updated)
 	})

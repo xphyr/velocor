@@ -43,6 +43,10 @@ type Reconciler struct {
 
 	passMu sync.Mutex // serialises passes
 	meta   *metaSync  // on-pool metadata copies (nil: disabled)
+	// sbReader and discover replace reading RAID superblocks from disks and the hardware
+	// scan (tests).
+	sbReader func(*store.Disk) (*hardware.RaidSuperblock, error)
+	discover func() ([]*store.Disk, error)
 
 	mu    sync.Mutex
 	state State
@@ -95,6 +99,16 @@ type pass struct {
 	repaired uint64
 	degraded []string
 	errs     []string
+	notes    map[string][]string // pool ID -> extra reasons for its status message
+}
+
+// notePool adds a reason to a pool's status message (and the pass's degraded resources).
+func (p *pass) notePool(poolID, reason string) {
+	if p.notes == nil {
+		p.notes = map[string][]string{}
+	}
+	p.notes[poolID] = append(p.notes[poolID], reason)
+	p.degrade("pool:"+poolID, reason)
 }
 
 func (p *pass) degrade(resource, reason string) {
@@ -112,12 +126,16 @@ func (r *Reconciler) ReconcileOnce(ctx context.Context) (State, error) {
 	r.mu.Unlock()
 
 	p := &pass{}
-	r.syncHardware(p)
+	discovered := r.syncHardware(p)
 	r.enforceWriteCache(p)
 
 	if _, err := r.spdk.GetVersion(ctx); err != nil {
 		r.finishPass(0, []string{"spdk_tgt"}, fmt.Sprintf("spdk_tgt unreachable: %v", err))
 		return r.State(), err
+	}
+
+	if r.relinkMovedMembers(ctx, p, discovered) {
+		r.enforceWriteCache(p) // the relinked disks inherit their policy: apply it before SPDK writes
 	}
 
 	r.reconcileDisks(ctx, p)
@@ -145,23 +163,29 @@ func (r *Reconciler) ReconcileOnce(ctx context.Context) (State, error) {
 	return r.State(), nil
 }
 
-func (r *Reconciler) syncHardware(p *pass) {
-	if r.hw == nil {
-		return
+// syncHardware records the disks a hardware scan finds and returns them (nil: no scan).
+func (r *Reconciler) syncHardware(p *pass) []*store.Disk {
+	discover := r.discover
+	if discover == nil {
+		if r.hw == nil {
+			return nil
+		}
+		if err := r.hw.RefreshBootGuard(); err != nil {
+			p.errs = append(p.errs, fmt.Sprintf("boot guard: %v", err))
+		}
+		discover = r.hw.DiscoverDisks
 	}
-	if err := r.hw.RefreshBootGuard(); err != nil {
-		p.errs = append(p.errs, fmt.Sprintf("boot guard: %v", err))
-	}
-	discovered, err := r.hw.DiscoverDisks()
+	discovered, err := discover()
 	if err != nil {
 		p.errs = append(p.errs, fmt.Sprintf("hardware scan: %v", err))
-		return
+		return nil
 	}
 	for _, d := range discovered {
 		if err := r.store.SyncDiscoveredDisk(d); err != nil {
 			p.errs = append(p.errs, fmt.Sprintf("sync disk %s: %v", d.ID, err))
 		}
 	}
+	return discovered
 }
 
 // enforceWriteCache keeps the volatile write cache off on disks whose policy says so (TODO.md
@@ -401,6 +425,7 @@ func (r *Reconciler) reconcilePools(ctx context.Context, p *pass, examined bool)
 				online[pool.ID] = true
 			}
 		}
+		reasons = append(reasons, p.notes[pool.ID]...)
 		msg := strings.Join(reasons, "; ")
 		_, err := r.store.MutatePool(pool.ID, func(cur *store.Pool) error {
 			changed := cur.HealthStatus != health || cur.StatusMessage != msg

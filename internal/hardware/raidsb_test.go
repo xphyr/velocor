@@ -23,6 +23,8 @@ func superblock() []byte {
 	for i := range 2 {
 		m := b[raidSBHeaderBytes+i*raidSBBaseBdevBytes:]
 		m[0] = byte(i + 1)
+		le.PutUint64(m[16:], 2048)
+		le.PutUint64(m[24:], 997952)
 		le.PutUint32(m[32:], RaidSBMemberConfigured)
 		m[40] = byte(i)
 	}
@@ -37,7 +39,8 @@ func TestParseRaidSuperblock(t *testing.T) {
 	}
 	if sb.Name != "raid_pool-0123456789ab" || sb.UUID != "11223344-5566-7788-99aa-bbccddeeff00" || sb.Level != 1 ||
 		sb.SeqNumber != 7 || sb.NumMembers != 2 || len(sb.Members) != 2 || sb.Members[1].Slot != 1 ||
-		sb.Members[1].State != RaidSBMemberConfigured || sb.RaidBlocks*uint64(sb.BlockSize) != 512000 {
+		sb.Members[1].State != RaidSBMemberConfigured || sb.RaidBlocks*uint64(sb.BlockSize) != 512000 ||
+		sb.Members[1].DataOffset != 2048 || sb.Members[1].DataSize != 997952 {
 		t.Fatalf("parsed: %+v", sb)
 	}
 

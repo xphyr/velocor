@@ -188,8 +188,12 @@ type Disk struct {
 	Claimed          bool            `json:"claimed"`
 	PoolID           string          `json:"pool_id,omitempty"`
 	SPDKBdevName     string          `json:"spdk_bdev_name,omitempty"`
-	HealthStatus     HealthStatus    `json:"health_status"`
-	Smart            SmartHealth     `json:"smart"`
+	// BdevUUID is the UUID of the disk's SPDK base bdev when it differs from the one derived
+	// from the disk ID: a pool member that came back under a new ID keeps the UUID its RAID
+	// superblock knows it by (TODO.md P1-14). Empty: derived from the ID.
+	BdevUUID     string       `json:"bdev_uuid,omitempty"`
+	HealthStatus HealthStatus `json:"health_status"`
+	Smart        SmartHealth  `json:"smart"`
 	// WriteCache is what the hardware reports (refreshed by every scan; the last known value is
 	// kept while SPDK owns the device and the kernel can't see it).
 	WriteCache WriteCacheState `json:"write_cache"`

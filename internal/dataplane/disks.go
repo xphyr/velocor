@@ -34,7 +34,11 @@ var SSDBackend = "uring"
 // restart, and recomputable without the metadata database. SPDK re-assembles a superblock RAID
 // only when each member's bdev UUID matches the superblock: a random UUID per restart would
 // leave every SSD pool offline after spdk_tgt restarts (found by the integration harness).
+// A member that came back under a new ID keeps its old UUID in BdevUUID (MatchMovedMembers).
 func DiskBdevUUID(d *store.Disk) string {
+	if d.BdevUUID != "" {
+		return d.BdevUUID
+	}
 	sum := sha1.Sum([]byte("velocor/disk-bdev/" + d.ID))
 	sum[6] = (sum[6] & 0x0f) | 0x50
 	sum[8] = (sum[8] & 0x3f) | 0x80

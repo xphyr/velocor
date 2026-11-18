@@ -80,6 +80,67 @@ func (s *BoltStore) ReplacePoolMember(poolID string, slot int, newDiskID string)
 	return &out, nil
 }
 
+// RelinkPoolMember moves a pool member to the record of the same disk under a new ID (TODO.md
+// P1-14): newDiskID takes oldDiskID's place in the pool's slots, keeps the bdev UUID the RAID
+// superblock knows the member by, and inherits the operator's settings for the disk. It is
+// claimed (the reconciler attaches it to SPDK). The old record, of a disk that is no longer
+// there under that ID, is deleted.
+func (s *BoltStore) RelinkPoolMember(poolID, oldDiskID, newDiskID, bdevUUID string) (*Pool, error) {
+	var out Pool
+	err := s.db.Update(func(tx *bolt.Tx) error {
+		poolsB, disksB := tx.Bucket(bucketPools), tx.Bucket(bucketDisks)
+		if err := getJSON(poolsB, []byte(poolID), &out); err != nil {
+			return err
+		}
+		var old, d Disk
+		if err := getJSON(disksB, []byte(oldDiskID), &old); err != nil {
+			return fmt.Errorf("disk %s: %w", oldDiskID, err)
+		}
+		if err := getJSON(disksB, []byte(newDiskID), &d); err != nil {
+			return fmt.Errorf("disk %s: %w", newDiskID, err)
+		}
+		switch {
+		case bdevUUID == "":
+			return fmt.Errorf("%w: a bdev UUID is required", ErrInvalidArgument)
+		case old.PoolID != poolID:
+			return fmt.Errorf("%w: disk %s is not in pool %s", ErrInvalidArgument, oldDiskID, poolID)
+		case d.IsBootDevice:
+			return fmt.Errorf("disk %s: %w", newDiskID, ErrBootDeviceProtected)
+		case d.Claimed || d.PoolID != "":
+			return fmt.Errorf("%w: disk %s is already in use", ErrInUse, newDiskID)
+		}
+		members := PoolMembers(&out)
+		found := false
+		for i := range members {
+			if members[i].DiskID == oldDiskID {
+				members[i].DiskID, found = newDiskID, true
+			}
+		}
+		if !found {
+			return fmt.Errorf("%w: disk %s holds no slot of pool %s", ErrInvalidArgument, oldDiskID, poolID)
+		}
+		SetPoolMembers(&out, members)
+		if i := slices.Index(out.DetachedDiskIDs, oldDiskID); i >= 0 {
+			out.DetachedDiskIDs[i] = newDiskID
+		}
+		d.Claimed, d.PoolID, d.BdevUUID = true, poolID, bdevUUID
+		d.DriverState, d.SPDKBdevName, d.HealthStatus = DiskDriverStateUnspecified, "", HealthStatusOnline
+		d.WriteCachePolicy, d.PowerLossProtected = old.WriteCachePolicy, old.PowerLossProtected
+		d.UpdatedAt = time.Now().UTC()
+		if err := putJSON(disksB, []byte(d.ID), &d); err != nil {
+			return err
+		}
+		if err := disksB.Delete([]byte(oldDiskID)); err != nil {
+			return err
+		}
+		return putJSON(poolsB, []byte(poolID), &out)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
 // ReleasePoolDisk unbinds a detached disk (one that left the pool's RAID) from the pool.
 func (s *BoltStore) ReleasePoolDisk(poolID, diskID string) (*Pool, error) {
 	var out Pool

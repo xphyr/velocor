@@ -45,6 +45,9 @@ type RaidSBMember struct {
 	Slot     int
 	BdevUUID string
 	State    uint32
+	// DataOffset and DataSize locate the member's data on its disk, in RAID blocks.
+	DataOffset uint64
+	DataSize   uint64
 }
 
 var errNoRaidSB = errors.New("no SPDK RAID superblock")
@@ -84,7 +87,10 @@ func ParseRaidSuperblock(b []byte) (*RaidSuperblock, error) {
 	}
 	for i := range n {
 		m := b[raidSBHeaderBytes+i*raidSBBaseBdevBytes:]
-		s.Members = append(s.Members, RaidSBMember{BdevUUID: formatUUID(m[0:16]), State: le.Uint32(m[32:]), Slot: int(m[40])})
+		s.Members = append(s.Members, RaidSBMember{
+			BdevUUID: formatUUID(m[0:16]), DataOffset: le.Uint64(m[16:]), DataSize: le.Uint64(m[24:]),
+			State: le.Uint32(m[32:]), Slot: int(m[40]),
+		})
 	}
 	return s, nil
 }
