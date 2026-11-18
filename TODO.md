@@ -420,7 +420,26 @@ work still open, ranked by risk to data, how fixes are verified, and what has be
 - [ ] **P2-3. Reconciler cost.** `EnsureExport` lists subsystems/target nodes per export
   (O(n²) RPCs); prefetch once per pass (was F5).
 - [ ] **P2-4. SPDK sizing.** One core and 1 GiB of memory; sizing isn't documented or
-  validated against the number of exports and connections.
+  validated against the number of exports and connections. Lab, 2026-11-18
+  ([docs/performance.md](docs/performance.md)): on a VM with emulated SATA disks the disks were
+  the limit (92–97% busy) and a second core (`-m 0x3`) changed nothing. With 2 cores the
+  NVMe/TCP queues spread over both reactors, but an iSCSI volume (one connection) stays on one,
+  and `app_thread` was 40–56% busy during deep NVMe/TCP I/O (find out what runs there). Measure
+  again on NVMe drives, where one reactor will be the limit.
+- [ ] **P2-13. virtio-blk disks are invisible.** Hardware discovery keeps a `vdX` device only
+  if it reports `rotational=0` or a virtual model name. virtio-blk reports `rotational=1` and
+  has no `device/model` (checked on the lab VM), so it never shows up and can't be put in a
+  pool. Without a QEMU `serial=` it also has no `/dev/disk/by-id` link and no serial, so its
+  disk ID would be the kernel name (`ssd-vda`), which can change between boots. *Needed:* treat
+  virtio-blk (`device/driver` is `virtio_blk`) as an SSD candidate; require a serial for a pool
+  member and tell the user why a disk without one can't be used. Also check that a pool still
+  assembles when its disks move to another controller (SATA to virtio-scsi), which changes
+  their IDs.
+- [ ] **P2-14. iSCSI writes are split into 64K disk writes.** 128K sequential writes reach
+  177–209 MB/s over iSCSI against 300 MB/s over NVMe/TCP on the same pool
+  ([docs/performance.md](docs/performance.md)), and the appliance sampler showed two 64K disk
+  writes for each 128K request. Find where SPDK's iSCSI target splits them (data segment or
+  buffer size) and whether a larger `MaxRecvDataSegmentLength` or iobuf size avoids it.
 - [ ] **P2-5. Slow test suites.** Auth/server tests take ~50–100 s under `-race` because every
   login runs 600k PBKDF2 iterations; consider a test-only iteration override (was F7).
 - [ ] **P2-7. The CSI driver logs nothing per request.** Stage/publish failures are only
