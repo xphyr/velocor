@@ -376,6 +376,20 @@ work still open, ranked by risk to data, how fixes are verified, and what has be
   new pools. Lab: Fedora initiator VM on serenity (`~/.cache/iscsi-lab`); on velocor-1 volume
   `iscsi-lab` (mirror250a), portals `lab-iscsi-mgmt` / `lab-nvme-mgmt`, host `lab-initiator`,
   group `lab-initiators`.
+- [ ] **P1-13. The CSI driver picks a volume's portal by chance.** `ControllerPublishVolume`
+  exports a volume on the first portal of its protocol in velod's list, which is in portal-ID
+  order, and IDs are random. On velocor-1 (2026-11-18) the SAN portals happened to sort before
+  the lab's management-network portals; with other IDs every CSI volume would silently have
+  gone over the 1500-MTU management network. Adding a portal can change where new volumes go.
+  `portalOverride` (`VELOCOR_PORTAL_OVERRIDE`) can't fix it: it only changes the address the
+  node connects to (the export still listens on the chosen portal only), and it is one
+  `host:port` for both protocols (4420 / 3260). Each export also gets exactly one portal, so no
+  multipath across SAN NICs, and a wildcard (0.0.0.0) portal isn't connectable as it is.
+  *Fix:* a StorageClass parameter `portals` (names or IDs), validated at provisioning (exists,
+  right protocol); without it, the protocol's only portal, else refuse with a message naming
+  the parameter; the export gets every listed portal and the node connects to each (NVMe
+  native multipath, dm-multipath for iSCSI; the node side can follow later); deprecate
+  `portalOverride`.
 - [ ] **P2-11. velod reports ONLINE before a restarted data plane is restored.** After an SPDK
   restart, status said ONLINE within ~10 s while volume stores, the iSCSI portal and target came
   back about a minute later.
