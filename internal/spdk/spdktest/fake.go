@@ -638,7 +638,8 @@ var handlers = map[string]handler{
 		if !ok || str(p, "cmd_type") != "admin" || str(p, "data_direction") != "c2h" {
 			return nil, errf(codeInvalidParams, "Invalid parameters")
 		}
-		cmd, err := base64.RawURLEncoding.DecodeString(strings.TrimRight(str(p, "cmdbuf"), "="))
+		// Like SPDK's spdk_base64_urlsafe_decode: padded URL-safe base64 only.
+		cmd, err := base64.URLEncoding.DecodeString(str(p, "cmdbuf"))
 		if err != nil || len(cmd) != 64 {
 			return nil, errf(codeInvalidParams, "Invalid parameters")
 		}

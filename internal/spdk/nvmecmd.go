@@ -66,8 +66,9 @@ func (c *Client) BdevNvmeAdminCmd(ctx context.Context, ctrl string, cmd NvmeCmd,
 		"name":           ctrl,
 		"cmd_type":       "admin",
 		"data_direction": "c2h",
-		"cmdbuf":         base64.RawURLEncoding.EncodeToString(cmd.bytes()),
-		"timeout_ms":     5000,
+		// SPDK's decoder wants padded URL-safe base64 (a length of 4n; found on the lab).
+		"cmdbuf":     base64.URLEncoding.EncodeToString(cmd.bytes()),
+		"timeout_ms": 5000,
 	}
 	if dataLen > 0 {
 		params["data_len"] = dataLen
