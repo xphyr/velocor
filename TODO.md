@@ -379,13 +379,19 @@ work still open, ranked by risk to data, how fixes are verified, and what has be
 - [ ] **P2-11. velod reports ONLINE before a restarted data plane is restored.** After an SPDK
   restart, status said ONLINE within ~10 s while volume stores, the iSCSI portal and target came
   back about a minute later.
-- [ ] **P2-12. An enabled export on a portal whose address is gone retries forever with SPDK's
+- [x] **P2-12. An enabled export on a portal whose address is gone retries forever with SPDK's
   error.** Lab, 2026-11-18: after a reboot removed 10.77.0.1, the export on that portal was
   DEGRADED with "add listener 10.77.0.1:4420 ...: spdk rpc error (code -32602): Invalid
-  parameters", and each reconcile pass (15 s) logged four SPDK `*ERROR*` lines. *Fix:* check
-  portal addresses against the local interfaces (the import already does) before adding
-  listeners; report the portal ("address 10.77.0.1 isn't on this appliance") and the export
-  DEGRADED without calling SPDK, and add the listener when the address appears.
+  parameters", and each reconcile pass (15 s) logged four SPDK `*ERROR*` lines. *Fixed:* the
+  data plane checks a portal's address against the appliance's interfaces (wildcards count;
+  `dataplane.AddressPresent`, also used by the pool import) before adding an NVMe listener or
+  creating an iSCSI portal group. A missing one is skipped without calling SPDK, the export is
+  served on its other portals and reported DEGRADED with "portal NAME (ID) has address A,
+  which isn't on this appliance; add the address or give the export another portal", and the
+  next pass after the address appears serves it. Existing listeners are kept (a brief flap
+  doesn't tear them down). Creating an export, adding such a portal or enabling the export is
+  refused with that message; other changes to an export that already had the portal apply.
+  `TestPortalWithoutItsAddress`.
 
 ### P2: hardening
 

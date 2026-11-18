@@ -3,7 +3,6 @@ package server
 import (
 	"context"
 	"fmt"
-	"net"
 	"net/http"
 	"slices"
 	"strings"
@@ -675,10 +674,9 @@ func (s *Server) importAccess(plan *meta.Manifest, vols []*store.Volume, res *Im
 			return fmt.Errorf("record initiator group %s: %w", g.ID, err)
 		}
 	}
-	local := localAddresses()
 	portalOK := map[string]bool{}
 	for _, p := range plan.Portals {
-		portalOK[p.ID] = local[p.IPAddress] || p.IPAddress == "0.0.0.0" || p.IPAddress == "::"
+		portalOK[p.ID] = dataplane.AddressPresent(p.IPAddress)
 		if _, err := s.store.GetPortal(p.ID); err == nil {
 			continue
 		}
@@ -720,21 +718,6 @@ func (s *Server) importAccess(plan *meta.Manifest, vols []*store.Volume, res *Im
 		}
 	}
 	return nil
-}
-
-// localAddresses are the IP addresses configured on this appliance.
-func localAddresses() map[string]bool {
-	out := map[string]bool{}
-	addrs, err := net.InterfaceAddrs()
-	if err != nil {
-		return out
-	}
-	for _, a := range addrs {
-		if n, ok := a.(*net.IPNet); ok {
-			out[n.IP.String()] = true
-		}
-	}
-	return out
 }
 
 // importSkeleton rebuilds a pool from what SPDK knows when the pool has no readable copy:

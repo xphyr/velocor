@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/velocor/velocor/internal/auth"
+	"github.com/velocor/velocor/internal/dataplane"
 	"github.com/velocor/velocor/internal/hardware"
 	"github.com/velocor/velocor/internal/meta"
 	"github.com/velocor/velocor/internal/reconciler"
@@ -54,6 +55,7 @@ func (h *harness) discover(pcis map[string]string) {
 // buildPool makes a RAID1 pool with one volume, a served export and one whose portal
 // address isn't local, and writes its metadata copy.
 func buildPool(t *testing.T, f *spdktest.Fake, dev meta.Device) (poolID, volID string) {
+	defer dataplane.SetAddressCheck(func(string) bool { return true })() // the old appliance had 203.0.113.9
 	h := appliance(t, f, dev)
 	h.addDisk("d1", "0000:01:00.0")
 	h.addDisk("d2", "0000:02:00.0")
