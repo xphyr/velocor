@@ -4,7 +4,9 @@ import (
 	"context"
 	"crypto/sha1"
 	"fmt"
+	"log/slog"
 	"strings"
+	"sync"
 
 	"github.com/velocor/velocor/internal/hardware"
 	"github.com/velocor/velocor/internal/spdk"
@@ -24,17 +26,58 @@ func NVMeControllerFromBdev(bdev string) string {
 	return bdev
 }
 
-// SSDBackend selects how SATA/SAS/virtio SSDs are handed to SPDK: "uring" (io_uring, the
-// default and fastest) or "aio" (Linux AIO with O_DIRECT). AIO is for hosts where io_uring
-// is unavailable: a failed io_uring setup crashes spdk_tgt instead of returning an error.
-var SSDBackend = "uring"
+// SSDBackend selects how SATA/SAS/virtio SSDs are handed to SPDK: "auto" (the default:
+// io_uring when ProbeIOURing finds it usable, else AIO), "uring" (io_uring, the fastest,
+// regardless of the probe) or "aio" (Linux AIO with O_DIRECT). A failed io_uring setup crashes
+// spdk_tgt instead of returning an error (TODO.md P0-6), so "auto" checks before every attach.
+var SSDBackend = "auto"
+
+// ProbeIOURing checks whether io_uring is usable (replaced in tests).
+var ProbeIOURing = hardware.ProbeIOURing
+
+// Logger receives the backend choice when "auto" changes its mind.
+var Logger = slog.Default()
+
+var (
+	backendMu   sync.Mutex
+	lastBackend string
+)
+
+// ssdBackend resolves SSDBackend to "uring" or "aio".
+func ssdBackend() string {
+	switch SSDBackend {
+	case "uring", "aio":
+		return SSDBackend
+	}
+	probe := ProbeIOURing()
+	backend := "aio"
+	if probe.Usable {
+		backend = "uring"
+	}
+	backendMu.Lock()
+	changed := backend != lastBackend
+	lastBackend = backend
+	backendMu.Unlock()
+	if changed {
+		if probe.Usable {
+			Logger.Info("SSDs are attached to SPDK with io_uring")
+		} else {
+			Logger.Warn("SSDs are attached to SPDK with AIO, because io_uring may not work for spdk_tgt (a failed io_uring setup crashes it)", "reason", probe.Reason)
+		}
+	}
+	return backend
+}
 
 // DiskBdevUUID returns the UUID given to a disk's io_uring/AIO bdev. It is derived from the
 // disk's stable hardware ID (a name-based, version-5-style UUID), so it is the same on every
 // restart, and recomputable without the metadata database. SPDK re-assembles a superblock RAID
 // only when each member's bdev UUID matches the superblock: a random UUID per restart would
 // leave every SSD pool offline after spdk_tgt restarts (found by the integration harness).
+// A member that came back under a new ID keeps its old UUID in BdevUUID (MatchMovedMembers).
 func DiskBdevUUID(d *store.Disk) string {
+	if d.BdevUUID != "" {
+		return d.BdevUUID
+	}
 	sum := sha1.Sum([]byte("velocor/disk-bdev/" + d.ID))
 	sum[6] = (sum[6] & 0x0f) | 0x50
 	sum[8] = (sum[8] & 0x3f) | 0x80
@@ -92,7 +135,7 @@ func AttachDisk(ctx context.Context, c *spdk.Client, hw *hardware.Manager, d *st
 		if d.DevicePath == "" {
 			return "", "", fmt.Errorf("%w: disk %s has no device path", store.ErrInvalidArgument, d.ID)
 		}
-		if SSDBackend == "aio" {
+		if ssdBackend() == "aio" {
 			name, err := c.BdevAioCreate(ctx, UringBdevName(d), d.DevicePath, d.BlockSize, DiskBdevUUID(d))
 			if err != nil {
 				return "", "", fmt.Errorf("create aio bdev for %s: %w", d.DevicePath, err)

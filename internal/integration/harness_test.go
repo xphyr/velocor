@@ -102,7 +102,10 @@ func (tg *target) start() {
 	tg.t.Helper()
 	_, _ = podman(tg.t, "rm", "-f", "-t", "0", tg.name)
 	_ = os.Remove(tg.socket())
+	// Unconfined like the appliance's quadlet (SecurityLabelDisable=true), so SELinux hosts run
+	// the same SSD backend (io_uring) as the appliance and CI runners (TODO.md P0-6).
 	out, err := podman(tg.t, "run", "-d", "--name", tg.name, "--network", "host", "--security-opt", "seccomp=unconfined",
+		"--security-opt", "label=disable",
 		"-v", tg.dir+":"+tg.dir+":z", "--entrypoint", "spdk_tgt", image(),
 		"-r", tg.socket(), "-m", "0x1", "-s", "1024", "--no-huge", "--no-pci", "--interrupt-mode", "--json", "/etc/velocor/spdk.json")
 	if err != nil {
@@ -174,7 +177,10 @@ type appliance struct {
 
 func newAppliance(t *testing.T, tg *target) *appliance {
 	t.Helper()
-	dataplane.SSDBackend = "aio" // rootless containers can't set up io_uring (see TODO.md P0-6)
+	// The test containers run confined (SELinux container_t), where io_uring_setup fails and
+	// spdk_tgt would crash on the first io_uring bdev (TODO.md P0-6). "auto" must see that and
+	// use AIO; if it didn't, every test here would lose its spdk_tgt.
+	dataplane.SSDBackend = "auto"
 	st, err := store.OpenBoltStore(filepath.Join(t.TempDir(), "velocor.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -189,6 +195,7 @@ func newAppliance(t *testing.T, tg *target) *appliance {
 		t.Fatal(err)
 	}
 	rec := reconciler.New(st, tg.client(), nil, nil)
+	rec.SetUnmanagedGrace(0) // report unaccounted SPDK objects at once, so tests can assert there are none
 	ts := httptest.NewServer(server.New(st, tg.client(), nil, authMgr, rec, nil).Handler())
 	t.Cleanup(ts.Close)
 	return &appliance{t: t, tg: tg, st: st, rec: rec, ts: ts, token: tok, port: freePort(t)}
@@ -281,6 +288,8 @@ func (a *appliance) initiator(nqn, hostNQN string) *initiator {
 func (in *initiator) dd(args ...string) error {
 	in.t.Helper()
 	cfg := map[string]any{"subsystems": []any{map[string]any{"subsystem": "bdev", "config": []any{
+		// Don't retry failed I/O (a full pool fails writes; retries only make the test wait).
+		map[string]any{"method": "bdev_nvme_set_options", "params": map[string]any{"bdev_retry_count": 0}},
 		map[string]any{"method": "bdev_nvme_attach_controller", "params": map[string]any{
 			"name": "r", "trtype": "tcp", "adrfam": "ipv4", "traddr": "127.0.0.1", "trsvcid": strconv.Itoa(in.port),
 			"subnqn": in.nqn, "hostnqn": in.hostNQN,
@@ -291,9 +300,9 @@ func (in *initiator) dd(args ...string) error {
 	if err := os.WriteFile(cfgPath, b, 0o644); err != nil {
 		in.t.Fatal(err)
 	}
-	full := append([]string{"run", "--rm", "--network", "host", "--security-opt", "seccomp=unconfined",
+	full := append([]string{"run", "--rm", "--timeout", "120", "--network", "host", "--security-opt", "seccomp=unconfined",
 		"-v", in.tg.dir + ":" + in.tg.dir + ":z", "--entrypoint", "spdk_dd", image(),
-		"--no-huge", "--no-pci", "-s", "1024", "--aio", "--json", cfgPath}, args...)
+		"--no-huge", "--no-pci", "-s", "1024", "--aio", "--qd", "32", "--json", cfgPath}, args...)
 	out, err := exec.Command("podman", full...).CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("spdk_dd %v: %v\n%s", args, err, lastLines(string(out), 15))
@@ -316,8 +325,20 @@ func (in *initiator) write(blockOffset int, data []byte) error {
 	if err := os.WriteFile(src, data, 0o644); err != nil {
 		in.t.Fatal(err)
 	}
-	return in.dd("--if", src, "--ob", "rn1", "--bs", strconv.Itoa(blockSize),
-		"--count", strconv.Itoa(len(data)/blockSize), "--seek", strconv.Itoa(blockOffset))
+	if err := in.dd("--if", src, "--ob", "rn1", "--bs", strconv.Itoa(blockSize),
+		"--count", strconv.Itoa(len(data)/blockSize), "--seek", strconv.Itoa(blockOffset)); err != nil {
+		return err
+	}
+	// spdk_dd exits 0 even when writes fail (found measuring a full pool, P0-2): read back to
+	// know the write landed.
+	got, err := in.read(blockOffset, len(data))
+	if err != nil {
+		return fmt.Errorf("read back after write: %w", err)
+	}
+	if !bytes.Equal(got, data) {
+		return fmt.Errorf("write at block %d did not land: read back differs from byte %d (spdk_dd reported success)", blockOffset, firstDiff(got, data))
+	}
+	return nil
 }
 
 // read returns n bytes at block offset of the namespace.

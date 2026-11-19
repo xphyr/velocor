@@ -22,13 +22,17 @@ func (s *Server) handleUpdateExport(w http.ResponseWriter, r *http.Request) {
 		AllowAnyHost      *bool     `json:"allow_any_host"`
 		// node_ids: the CSI nodes of a shared export, changed together with their groups.
 		NodeIDs *[]string `json:"node_ids"`
+		// enabled: serve (true) or stop serving (false) the export.
+		Enabled *bool `json:"enabled"`
+		// portal_ids: the portals it's served on (replaces the list).
+		PortalIDs *[]string `json:"portal_ids"`
 	}
 	if err := decodeJSON(r, &req); err != nil {
 		writeError(w, err)
 		return
 	}
-	if req.InitiatorGroupIDs == nil && req.AllowAnyHost == nil && req.NodeIDs == nil {
-		writeError(w, fmt.Errorf("%w: nothing to change; set initiator_group_ids and/or allow_any_host", store.ErrInvalidArgument))
+	if req.InitiatorGroupIDs == nil && req.AllowAnyHost == nil && req.NodeIDs == nil && req.Enabled == nil && req.PortalIDs == nil {
+		writeError(w, fmt.Errorf("%w: nothing to change; set initiator_group_ids, allow_any_host, portal_ids or enabled", store.ErrInvalidArgument))
 		return
 	}
 	exp, err := s.store.GetExport(id)
@@ -58,6 +62,29 @@ func (s *Server) handleUpdateExport(w http.ResponseWriter, r *http.Request) {
 		}
 		if req.AllowAnyHost != nil {
 			e.AllowAnyHost = *req.AllowAnyHost
+		}
+		if req.PortalIDs != nil {
+			ids := slices.Compact(slices.Sorted(slices.Values(*req.PortalIDs)))
+			if len(ids) == 0 {
+				return fmt.Errorf("%w: an export needs at least one portal", store.ErrInvalidArgument)
+			}
+			for _, id := range ids {
+				p, err := s.store.GetPortal(id)
+				if err != nil {
+					return fmt.Errorf("%w: portal %s: %v", store.ErrInvalidArgument, id, err)
+				}
+				if p.Protocol != e.Protocol {
+					return fmt.Errorf("%w: portal %s is %s, the export is %s", store.ErrInvalidArgument, id, p.Protocol, e.Protocol)
+				}
+			}
+			e.PortalIDs = ids
+		}
+		if req.Enabled != nil {
+			e.Disabled = !*req.Enabled
+			e.DisabledReason = ""
+			if e.Disabled {
+				e.DisabledReason = "disabled by an administrator"
+			}
 		}
 		acl, err := dataplane.ResolveACL(s.store, e.InitiatorGroupIDs)
 		if err != nil {
@@ -220,7 +247,7 @@ func (s *Server) resolveWithOverride(groupIDs []string, override *store.Initiato
 
 // handleVolumeUsage reports how much of a volume is actually allocated in its pool.
 func (s *Server) handleVolumeUsage(w http.ResponseWriter, r *http.Request) {
-	vol, err := s.store.GetVolume(r.PathValue("id"))
+	vol, err := s.liveVolume(r.PathValue("id"))
 	if err != nil {
 		writeError(w, err)
 		return

@@ -87,7 +87,7 @@ func TestHardwareDiscoveryBootGuardAndVFIOBinding(t *testing.T) {
 	}
 
 	mustWriteFile(t, filepath.Join(sdbTarget, "model"), "Samsung Enterprise SSD\n")
-	mustWriteFile(t, filepath.Join(sdbTarget, "serial"), "SSD-SDB-01\n")
+	mustWriteFile(t, filepath.Join(sdbTarget, "serial"), "SSD-SDB-01\x00\x00\n") // NUL padding, as virtio-scsi disks report
 	mustWriteFile(t, filepath.Join(sysfs, "block", "sdb", "queue", "rotational"), "0\n")
 	mustWriteFile(t, filepath.Join(sysfs, "block", "sdb", "size"), "419430400\n")
 	mustWriteFile(t, filepath.Join(sysfs, "block", "sdb", "queue", "logical_block_size"), "4096\n")
@@ -157,7 +157,7 @@ func TestHardwareDiscoveryBootGuardAndVFIOBinding(t *testing.T) {
 	if !byID["ssd-sda"].IsBootDevice {
 		t.Fatalf("expected ssd-sda IsBootDevice=true")
 	}
-	if byID["ssd-SSD-SDB-01"].IsBootDevice || byID["ssd-SSD-SDB-01"].BlockSize != 4096 {
+	if byID["ssd-SSD-SDB-01"].IsBootDevice || byID["ssd-SSD-SDB-01"].BlockSize != 4096 || byID["ssd-SSD-SDB-01"].SerialNumber != "SSD-SDB-01" {
 		t.Fatalf("unexpected data SSD disk: %+v", byID["ssd-SSD-SDB-01"])
 	}
 	if byID["ssd-sdd"] == nil || byID["ssd-sdd"].IsBootDevice {

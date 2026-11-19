@@ -215,17 +215,39 @@ func UpdateExport(ctx context.Context, c *spdk.Client, st store.Store, id string
 	if err := mutate(&next); err != nil {
 		return nil, err
 	}
-	if err := ensureLocked(ctx, c, st, &next, vol); err != nil {
+	if err := ensureLocked(ctx, c, st, &next, vol); err != nil && !keepsMissing(old, &next, err) {
 		_ = ensureLocked(context.WithoutCancel(ctx), c, st, old, vol)
 		return nil, err
 	}
 	return st.MutateExport(id, func(e *store.Export) error {
 		e.InitiatorGroupIDs, e.AllowAnyHost, e.NodeIDs = next.InitiatorGroupIDs, next.AllowAnyHost, next.NodeIDs
+		e.Disabled, e.DisabledReason = next.Disabled, next.DisabledReason
+		e.PortalIDs = next.PortalIDs
 		return nil
 	})
 }
 
+// keepsMissing: the change can be applied although err reports portals without their
+// address, because those portals were already on the enabled export: an unrelated change
+// (its hosts, say) must not fail because an address is gone. A change that enables the
+// export or adds such a portal is refused.
+func keepsMissing(old, next *store.Export, err error) bool {
+	ids, only := missingPortals(err)
+	if !only || old.Disabled {
+		return false
+	}
+	for _, id := range ids {
+		if !slices.Contains(old.PortalIDs, id) {
+			return false
+		}
+	}
+	return true
+}
+
 func ensureLocked(ctx context.Context, c *spdk.Client, st store.Store, exp *store.Export, vol *store.Volume) error {
+	if exp.Disabled {
+		return removeLocked(ctx, c, exp)
+	}
 	acl, err := ResolveACL(st, exp.InitiatorGroupIDs)
 	if err != nil {
 		return err
@@ -290,6 +312,10 @@ func Connections(ctx context.Context, c *spdk.Client, exp *store.Export) ([]Conn
 // RemoveExport tears down the SPDK objects owned by exp. Missing objects are not an error.
 func RemoveExport(ctx context.Context, c *spdk.Client, exp *store.Export) error {
 	defer lockExport(exp.ID)()
+	return removeLocked(ctx, c, exp)
+}
+
+func removeLocked(ctx context.Context, c *spdk.Client, exp *store.Export) error {
 	switch {
 	case IsNVMe(exp.Protocol):
 		if err := c.NvmfDeleteSubsystem(ctx, exp.SubsystemNQN); err != nil && !spdk.IsNotFound(err) {
@@ -387,18 +413,35 @@ func ensureNVMe(ctx context.Context, c *spdk.Client, exp *store.Export, vol *sto
 		}
 	}
 
+	same := func(a, b spdk.NvmfListenAddress) bool {
+		return strings.EqualFold(a.Trtype, b.Trtype) && a.Traddr == b.Traddr && a.Trsvcid == b.Trsvcid
+	}
+	var want []spdk.NvmfListenAddress
+	var missing []error
 	for _, p := range portals {
 		la := spdk.NvmfListenAddress{Trtype: trtype, Adrfam: AddressFamily(p.IPAddress), Traddr: p.IPAddress, Trsvcid: strconv.Itoa(int(p.Port))}
-		if slices.ContainsFunc(sub.ListenAddresses, func(l spdk.NvmfListenAddress) bool {
-			return strings.EqualFold(l.Trtype, la.Trtype) && l.Traddr == la.Traddr && l.Trsvcid == la.Trsvcid
-		}) {
+		want = append(want, la)
+		if slices.ContainsFunc(sub.ListenAddresses, func(l spdk.NvmfListenAddress) bool { return same(l, la) }) {
+			continue // kept even if its address went away for a moment: it serves again when it's back
+		}
+		if !AddressPresent(p.IPAddress) {
+			missing = append(missing, errAddressMissing(p)) // served on the other portals meanwhile
 			continue
 		}
 		if err := c.NvmfSubsystemAddListener(ctx, exp.SubsystemNQN, la.Trtype, la.Adrfam, la.Traddr, la.Trsvcid); err != nil {
 			return fmt.Errorf("add listener %s:%s to %s: %w", la.Traddr, la.Trsvcid, exp.SubsystemNQN, err)
 		}
 	}
-	return nil
+	// Listeners of portals the export no longer uses (its portals were changed).
+	for _, l := range sub.ListenAddresses {
+		if slices.ContainsFunc(want, func(w spdk.NvmfListenAddress) bool { return same(l, w) }) {
+			continue
+		}
+		if err := c.NvmfSubsystemRemoveListener(ctx, exp.SubsystemNQN, l.Trtype, l.Adrfam, l.Traddr, l.Trsvcid); err != nil && !spdk.IsNotFound(err) {
+			return fmt.Errorf("remove listener %s:%s from %s: %w", l.Traddr, l.Trsvcid, exp.SubsystemNQN, err)
+		}
+	}
+	return errors.Join(missing...)
 }
 
 func iscsiPortalHost(ip string) string {
@@ -451,6 +494,7 @@ func ensureIscsi(ctx context.Context, c *spdk.Client, exp *store.Export, vol *st
 		return fmt.Errorf("list iscsi portal groups: %w", err)
 	}
 	var maps []spdk.IscsiPgIgMap
+	var missing []error
 	for _, p := range portals {
 		if p.IscsiPgTag == 0 {
 			return fmt.Errorf("portal %s has no iscsi portal group tag", p.ID)
@@ -460,6 +504,9 @@ func ensureIscsi(ctx context.Context, c *spdk.Client, exp *store.Export, vol *st
 			if !slices.Contains(pgs[i].Portals, want) {
 				return fmt.Errorf("iscsi portal group %d does not contain %s:%s", p.IscsiPgTag, want.Host, want.Port)
 			}
+		} else if !AddressPresent(p.IPAddress) {
+			missing = append(missing, errAddressMissing(p)) // served on the other portals meanwhile
+			continue
 		} else if err := c.IscsiCreatePortalGroup(ctx, p.IscsiPgTag, []spdk.IscsiPortal{want}); err != nil {
 			return fmt.Errorf("create iscsi portal group %d for %s:%s: %w",
 				p.IscsiPgTag, want.Host, want.Port, err)
@@ -467,6 +514,9 @@ func ensureIscsi(ctx context.Context, c *spdk.Client, exp *store.Export, vol *st
 			pgs = append(pgs, spdk.IscsiPortalGroup{Tag: p.IscsiPgTag, Portals: []spdk.IscsiPortal{want}})
 		}
 		maps = append(maps, spdk.IscsiPgIgMap{PgTag: p.IscsiPgTag, IgTag: exp.IscsiIgTag})
+	}
+	if len(maps) == 0 { // no portal can be served yet (a target node needs at least one)
+		return errors.Join(missing...)
 	}
 
 	// 2. Initiator group owned exclusively by this export.
@@ -505,7 +555,7 @@ func ensureIscsi(ctx context.Context, c *spdk.Client, exp *store.Export, vol *st
 			maps, 64, true, false, false, 0); err != nil {
 			return fmt.Errorf("create iscsi target %s: %w", exp.TargetIQN, err)
 		}
-		return nil
+		return errors.Join(missing...)
 	}
 	node := nodes[i]
 	if !slices.ContainsFunc(node.Luns, func(l spdk.IscsiLun) bool { return l.LunID == int(exp.LUNID) && bdevMatches(l.BdevName, vol) }) {
@@ -532,5 +582,5 @@ func ensureIscsi(ctx context.Context, c *spdk.Client, exp *store.Export, vol *st
 			return fmt.Errorf("add ACL mappings to %s: %w", exp.TargetIQN, err)
 		}
 	}
-	return nil
+	return errors.Join(missing...)
 }

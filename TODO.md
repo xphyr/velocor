@@ -86,10 +86,16 @@ work still open, ranked by risk to data, how fixes are verified, and what has be
     namespaces now have fixed UUIDs, like real drives.
   - [x] **Intel IOMMU off by default on Fedora**: velod refused every NVMe claim on Intel
     servers ("no IOMMU is available"). The OS image's kargs.d now adds `intel_iommu=on iommu=pt`.
-  - [ ] Re-run the NVMe reboot test on an image with these fixes; real hardware (hot-swap bays,
-    consumer NVMe without NGUID) before release.
+  - [x] NVMe re-run on dev-fe45c4d (fresh VM; IOMMU now from the image's kargs.d): clean reboot
+    -> pool ONLINE, data intact; member hot-unplugged under writes (0 errors) -> replace ->
+    rebuilt -> reboot -> ONLINE with the new member, the returning failed drive stays on the
+    kernel driver (detached), data intact; rebooted without a member -> UNAVAILABLE ->
+    start-degraded -> data intact.
+  - [ ] Real hardware before release: hot-swap bays (SATA/SAS and NVMe surprise removal),
+    consumer NVMe without NGUID/UUID (generate_uuids path), a drive failing with I/O errors
+    rather than disappearing.
 
-- [ ] **P0-2. Thin pools can be overcommitted without limit or warning.**
+- [x] **P0-2. Thin pools can be overcommitted without limit or warning.**
   Volume and clone creation never check pool capacity. When the pool fills, every thin and
   snapshot-backed volume in it starts failing writes at once, which typically corrupts host
   filesystems and databases. Snapshots keep old clusters alive, and nothing shows how much
@@ -97,8 +103,48 @@ work still open, ranked by risk to data, how fixes are verified, and what has be
   *Needed:* an overcommit ratio per pool (refuse creation beyond it), a reserve so snapshots
   and metadata can't take the last free space, warning/critical thresholds as pool health and
   metrics, and per-volume/snapshot allocated space.
+  **In progress (2026-11-17):** measured on the lab appliance and real SPDK: 12 GiB of thin
+  volumes accepted on an 8 GiB pool; once full, every write needing a new cluster fails in all
+  thin volumes at once with NVMe Internal Error (EIO on Linux: filesystems shut down); data
+  already written stays intact and writes resume once space is freed. Also found: the
+  integration harness's `spdk_dd` reports success for failed writes. Design:
+  `docs/design/p0-2-capacity.md` (accounting incl. snapshots, admission control on every growth
+  path, per-pool max_overcommit/reserve/thresholds, space state separate from RAID health).
+  Decisions (2026-11-17): default max_overcommit 1.0, reserve 5%, warning 80%, critical 90%;
+  the ENOSPC SPDK patch is a follow-up (L-6).
+  - [x] Store: `SpacePolicy` per pool, committed/available bytes, space state OK / WARNING /
+    CRITICAL / FULL (pure functions in `store/capacity.go`); `ErrInsufficientCapacity` = 507.
+  - [x] Reconciler: per-volume/snapshot allocated bytes refreshed each pass (one read-only
+    `bdev_lvol_get_lvols`), pool committed/available/state, state changes logged, non-OK
+    pools flagged in system status; RAID health untouched.
+  - [x] API admission on create, clone, expand, snapshot and group snapshot (per-object
+    reservations, so concurrent requests can't overcommit together; race-tested), space
+    policy at pool creation and `PATCH /pools/{id}` (merges), metrics
+    (`velocor_pool_committed_bytes`, `_available_bytes`, `_used_ratio`, `_space_state`,
+    `velocor_volume_allocated_bytes`, `velocor_snapshot_allocated_bytes`).
+  - [x] CSI picks pools by available bytes (falls back to free bytes from a velod without
+    accounting) and skips pools that don't serve I/O; 507 -> RESOURCE_EXHAUSTED.
+  - [x] CLI (`pool list/get` space columns, `pool create`/`pool set-space` policy flags,
+    `volume list` allocated) and UI (space pill, committed/available, policy dialog).
+  - [x] Integration harness: writes are verified by reading back (spdk_dd reports success
+    for failed writes).
+  - [x] Real-SPDK integration test (`TestPoolSpaceLifecycle`): a volume over the default
+    limit refused (507); with 3x overcommit, filled through exports: OK 6% -> WARNING 83% ->
+    CRITICAL 95% (new volume and snapshot refused) -> the write to new space fails (FULL);
+    everything written before is intact; after deleting a volume the pool recovers and writes
+    work again. Harness: spdk_dd now runs with queue depth 32, no I/O retries and a 120 s
+    limit.
+  - [x] Lab test on the appliance (dev-b083815, 8 GiB SSD mirror, kernel NVMe/TCP host,
+    2026-11-17): at the default policy a 6 GiB volume is accepted and a further 2 GiB refused
+    (507, "6.0 GiB committed of 7.6 GiB allowed"); with 2x overcommit and 12 GiB of thin
+    volumes filled through the kernel host: OK -> WARNING at 82% -> CRITICAL at 91% (new
+    volume and snapshot refused) -> FULL at 100% (the next write gets EIO); every transition
+    logged, system status DEGRADED naming the pool, metrics and UI correct (full pill, Create
+    volume disabled); deleting a volume brings the pool back to OK, all 6 GiB of the other
+    volume intact and writable.
+  P0-2 is done, apart from L-6 (ENOSPC instead of EIO).
 
-- [ ] **P0-3. The metadata database is a single point of failure, with no backup or recovery.**
+- [x] **P0-3. The metadata database is a single point of failure, with no backup or recovery.**
   `/var/lib/velocor/velocor.db` is the only record of which volume is which, who may access it,
   snapshot lineage and CBT order. If it is lost, the data is still on the pool disks but
   nothing can name or export it.
@@ -109,6 +155,88 @@ work still open, ranked by risk to data, how fixes are verified, and what has be
   3. A recovery command that rebuilds pools/volumes/snapshots from SPDK (lvol names are
      resource IDs and SSD bdev UUIDs are derived from disk IDs, so the skeleton is
      recoverable) and from the on-pool copy.
+  **In progress (2026-11-17):** today a lost database leaves the data intact (the reconciler
+  never deletes unknown SPDK objects; exports even serve until spdk_tgt restarts) but nothing
+  comes back after a restart and there is no recovery path. SPDK has no RPC to write into a
+  bdev. Decisions: accounts stay out of pool copies (DB backups carry them); **ublk only** (no NBD
+  fallback); exports restored enabled when their portals exist on the appliance; backups hourly
+  x24, daily x7, before upgrade/restore. ublk tested on the lab appliance with a
+  `--with-ublk` spdk_tgt: direct-I/O data persists across devices and SPDK restarts; if spdk_tgt
+  dies with a ublk device open, its I/O hangs (D state) until a restarted SPDK runs
+  `ublk_recover_disk`, which worked; so the device I/O runs in a helper process and velod
+  recovers stale devices. Design: `docs/design/p0-3-metadata-recovery.md` (per-pool
+  `velocor-meta` lvol with an A/B-slot manifest written through ublk, local bbolt backups +
+  download/restore, pool import from the manifest or the SPDK skeleton, importable-pool
+  detection from RAID superblocks).
+  - [x] SPDK built `--with-ublk` (Containerfile.spdk).
+  - [x] Manifest format (`internal/meta`): A/B slots with header + SHA-256, generation, digest
+    that ignores live figures; no accounts, tokens or CHAP secrets (CHAP secrets stripped: an
+    import disables exports whose groups use CHAP until they are set again).
+  - [x] ublk writer (`meta.UblkDevice`): I/O in the `velod meta-io` helper (O_DIRECT + fsync),
+    ublk ID 100 reserved, in-flight record in `/run/velocor/meta-ublk.json`, stale devices
+    recovered (`ublk_recover_disk`) and stopped before each use and every reconcile pass.
+    `--meta-copies=false` / `VELOCOR_META_COPIES=false` turns it off.
+  - [x] Reconciler sync: thick 8 MiB `velocor-meta` lvol per pool (created by the reconciler,
+    excluded from the commit limit), a new generation written whenever the manifest's digest
+    changes; never below the generation already on the pool (a restored older database
+    carries on above it); a failed write flags the pool ("out of date") and is retried.
+  - [x] Local backups (`internal/backup`): hourly x24, daily x7, before upgrade (`POST
+    /system/upgrade`) and restore, manual x5, in `/var/lib/velocor/backups/`; `GET
+    /system/backup[?name=]`, `GET|POST /system/backups`, `POST /system/restore` (validated,
+    current DB backed up, staged as `velocor.db.restore`, applied at the next velod start;
+    velod exits to be restarted). veloctl `system backup|backups|restore`; UI section.
+  - [x] Pool import: `GET /pool-imports` reads SPDK RAID superblocks of unclaimed disks
+    through the kernel (parser checked against real SPDK superblocks, CRC-32C included) and
+    lists arrays not in the database; `POST /pool-imports {pool_id, name?, allow_degraded?}`
+    claims without wiping, waits for assembly (starts a RAID1 degraded if asked), reads the
+    manifest (else the SPDK skeleton: volumes/snapshots by ID with sizes and parentage, no
+    exports; a snapshot shared by a volume and its clones is assigned with a warning, since
+    SPDK keeps no creation order), checks name/ID conflicts, records everything with the
+    original IDs in dependency order, restores exports disabled when a portal address isn't
+    on the appliance. A failure undoes only the database records: the disks stay claimed and
+    the array assembled (detaching RAID1 members one by one would mark the first failed in
+    the others' superblocks), and a retry resumes. Exports gained `disabled` /
+    `disabled_reason` (`PATCH {enabled}`; `veloctl export enable|disable`). veloctl `pool
+    importable|import`; UI Import dialog, configuration-copy status on the pool page.
+  - [x] Tests: unit (manifest, helper I/O, reconciler sync incl. torn write, failing device,
+    generation floor; backups schedule/retention/restore; import from manifest, skeleton,
+    conflict + resume; CLI), integration with real SPDK (skeleton import after losing the
+    database, superblocks read from the disk files, data read back).
+  - [x] Lab test on the appliance (dev-497a397, serenity VM, 2026-11-17), RAID1 pools on
+    virtio-SCSI SSDs (io_uring) and on NVMe:
+    - copies written through real ublk (gen 3 / 2 after setup), no errors;
+    - spdk_tgt killed with the metadata device open and I/O waiting on it (D state): on velod's
+      first pass after spdk_tgt came back (~10 s) the device was recovered
+      ("Recovering ublk 100 ... recover done successfully") and stopped, the waiting I/O
+      ended (EIO; the next pass rewrites), the in-flight record was cleared;
+    - database, backups and bootstrap file deleted + reboot: both pools listed as importable
+      from their superblocks (SSD slots identified), imported from the manifests (latest
+      generations), names / labels / snapshots / host / group / portals back, exports served,
+      the export on a portal address gone after the reboot restored disabled; 64 MiB on
+      each volume read back identical through NVMe/TCP;
+    - restore of a manual backup: change undone, pre-restore backup taken, velod restarted;
+      pools held newer generations (6 / 4 vs 5 / 3): logged, and writes went on at 7 / 5;
+    - disks moved to a fresh install (new node ID): imported through the UI, data identical;
+      enabling the disabled export failed cleanly until its address existed, then ONLINE;
+    - UI: import dialog and result, configuration-copy fact, backups section.
+  - [x] Lab follow-ups (fixed after the run): SPDK logged an error on every write
+    (`ublk_create_target` on an existing target: now created once per spdk_tgt); the kernel
+    logged "I/O error, dev ublkb100" per write (its probe of the new device was still running
+    when velod stopped it: velod now waits until the device is idle, >= 300 ms, and a udev
+    rule keeps udev from probing it); stopping right after `ublk_recover_disk` made SPDK fail
+    END_USER_RECOVERY (now waits for the recovery); the disabled-export message told
+    operators to change a portal's address, which no API allows: exports' portals can now be
+    changed (`PATCH /exports/{id} {portal_ids}`, `veloctl export access --portals`, UI) and NVMe
+    listeners of dropped portals are removed; an import now restores the member disks'
+    power-loss-protected / write-cache-policy settings; UI header showed "false" for token
+    sessions.
+  - [x] Recheck on dev-085d5ed (2026-11-18, same lab VM upgraded with `POST /system/upgrade`:
+    pre-upgrade backup taken, pools kept): ublk target created once at boot; 12 metadata writes
+    over both pools (snapshot create/delete) with no kernel messages and no SPDK ublk errors;
+    spdk_tgt killed with the metadata device open and a read waiting: recovered on velod's first
+    pass ("recover done successfully", no END_USER_RECOVERY error), and the waiting read now
+    **completes** (exit 0) instead of failing; record cleared; 64 MiB on both volumes identical.
+  P0-3 is done. Found on the way: P2-12.
 
 - [ ] **P0-4. Hosts are told writes are durable when they may only be in a disk's volatile cache. (Verified)**
   In SPDK v26.09 the lvol module does not support FLUSH (`vbdev_lvol_io_type_supported`), and
@@ -154,18 +282,65 @@ work still open, ranked by risk to data, how fixes are verified, and what has be
     which only change the kernel's view), at claim and on every reconciler pass (drives can
     re-enable it after a power cycle). Verified on velocor-1's emulated SATA disks (kernel logs
     "Write cache: disabled" from the drive).
-  - [ ] Step 1 + 4 for NVMe owned by SPDK: Get/Set Features 06h through `bdev_nvme_send_cmd`
-    (admin passthrough); until then the policy is refused for NVMe.
-  - [ ] Pool-level flag in the pool API/UI (today: per-disk durability plus the status warning).
-  - [ ] Step 5: power-pull test on real hardware.
+  - [x] Step 1 + 4 for NVMe owned by SPDK (2026-11-18): admin commands through
+    `bdev_nvme_send_cmd` (`spdk.BdevNvmeAdminCmd`): Identify Controller for VWC and ONCS save
+    support, Get / Set Features 06h for WCE (`dataplane.NVMeWriteCache`, `SetNVMeWriteCache`;
+    saved across power cycles when the drive supports it, falling back to unsaved when the
+    feature isn't saveable). The reconciler reads every claimed NVMe drive's cache each pass,
+    switches it off where the policy says so (again after a drive re-enables it), and handles a
+    refusal like an SSD's. `PATCH /disks/{id}` applies the policy through SPDK for a claimed
+    drive (refusal: 400 with the drive's status); for an unclaimed drive it is recorded and
+    applied at claim, before anything is written. `TestNVMeWriteCacheThroughSPDK`,
+    `TestNVMeWriteCacheKeptOffAndPoolDurability`, `TestNVMeWriteCachePolicyAPI` (fake SPDK
+    modelling the admin commands). Lab (P0-1 VM, QEMU NVMe, dev-dfa39a5, 2026-11-18): the first
+    lab run found every admin command refused ("Invalid parameters": SPDK's base64 decoder wants
+    padding; fixed in dfa39a5, the fake now decodes as strictly). Then: the drives report VWC 1,
+    saveable, WCE 1; `PATCH` DISABLED on both `nvmepool` members switched them off (saved value
+    0, read back from the drives) and the pool went from AT_RISK to DURABLE; a cache switched
+    back on behind velod's back was off again after one pass; a policy set on an unclaimed drive
+    was applied by its claim; the drive was then restored (policy left, cache on, released).
+  - [x] Pool-level flag (2026-11-18): pools carry `durability` (the weakest member's: DURABLE,
+    AT_RISK, UNKNOWN), maintained by the reconciler; shown in the pool list and detail of the UI
+    with what to do, and in `veloctl pool list`.
+  - [ ] Step 5: power-pull test on real hardware. *Deferred (2026-11-18):* no suitable hardware
+    for now.
+  - [x] **Disks whose cache can't be turned off.** Lab, 2026-11-18: virtio-scsi disks of a
+    Synology VM ("SYNOLOGY Storage", LIO behind them) report "write back" and refuse the change
+    (`cache_type` write: EINVAL). velod retried every pass and listed all six disks under the
+    reconciler's degraded resources and last error, half the dashboard. *Fixed:* a refusal is
+    recorded on the disk (`write_cache_error`, shown on the disk), logged once, and retried only
+    after velod restarts or the operator sets the policy again; the pass stays clean. The
+    status warnings carry one line naming such disks and what to do (declare PLP if the host
+    protects the cache, or leave the policy). Setting the policy through the API was already
+    refused when the drive refuses. `TestRefusedWriteCacheIsRecordedNotRetried`,
+    `TestRefusedWriteCacheWarning`.
 
-- [ ] **P0-6. A failed io_uring setup crashes `spdk_tgt`. (Verified)**
+- [x] **P0-6. A failed io_uring setup crashes `spdk_tgt`. (Verified)**
   Claiming an SSD with the io_uring backend where io_uring can't be set up (locked-memory
   limits, seccomp, `kernel.io_uring_disabled`) makes `spdk_tgt` segfault instead of returning an
   error, taking every export down. The production quadlet sets `memlock=-1`, which avoids the
   known cause, but nothing checks it. *Done:* an `aio` backend (`--ssd-bdev aio` /
   `VELOCOR_SSD_BDEV=aio`). *Needed:* velod should probe io_uring before using it and fall back
   to AIO; report the SPDK crash upstream.
+  *Done (2026-11-18):*
+  - **Cause, reproduced** with the SPDK test image (v26.09) under rootless Podman on Fedora:
+    `bdev_uring_create` → "uring I/O context setup failure" (EPERM) → exit 139. Not memlock (8 MiB
+    is fine on current kernels, which no longer charge rings to it) and not seccomp (unconfined):
+    **SELinux** (`container_t` may not use io_uring). The same container as `spc_t`
+    (`label=disable`, what the appliance quadlets use) works. In SPDK, `bdev_uring_create_cb`
+    uses `spdk_get_io_channel(&uring_if)` without a NULL check; report and one-line fix in
+    [docs/upstream/spdk-uring-channel-crash.md](docs/upstream/spdk-uring-channel-crash.md).
+  - **Probe.** `--ssd-bdev auto` is the new default: before every SSD attach (claims, and
+    re-attaches after an `spdk_tgt` restart, where a crash would repeat on every restart) velod
+    checks `kernel.io_uring_disabled`, sets up a ring itself, and checks each visible `spdk_tgt`
+    process (host PID namespace): SELinux type when enforcing (spc_t/unconfined only), no
+    seccomp filter, and an unlimited memlock on kernels before 5.12. Unsure means AIO, logged
+    with the reason when the choice changes. `uring` still forces io_uring (with a warning at
+    start if the probe disagrees), `aio` forces AIO. `TestProbeIOURing`, `TestKernelBefore`;
+    checked live against the confined and unconfined containers; the integration suite now runs
+    with `auto` (it used to force AIO), so a wrong verdict would crash its `spdk_tgt`.
+  - *Open:* send the report upstream (user), and carry the fix as an SPDK patch once
+    `spdk-patch-unit-tests.sh` can accept a module without unit tests (bdev_uring has none).
 
 ### P1: outages, lock-outs, things operators can't see
 
@@ -180,14 +355,59 @@ work still open, ranked by risk to data, how fixes are verified, and what has be
   *Needed:* apply, then confirm from a new connection within ~120 s or roll back automatically;
   refuse or warn about interfaces that host portals.
 
-- [ ] **P1-4. Deletion is immediate and irreversible.** With CSI automation and API tokens, one
+- [x] **P1-4. Deletion is immediate and irreversible.** With CSI automation and API tokens, one
   mistake is unrecoverable. *Needed:* per-volume deletion protection and/or a recycle period in
   which a deleted volume is unexported and hidden but kept for N hours.
+  *Done (2026-11-18), both:*
+  - **Retention.** `DELETE /volumes/{id}` (UI, veloctl, CSI) marks the volume deleted
+    (`deleted_at`, `purge_at`, `deleted_by`) and leaves its lvol alone. It is then hidden from
+    the volume API (404, not listed, CSI sees it gone), can't be exported, attached, snapshotted
+    or resized, and its name is free again. The reconciler purges it (lvol, then record) once
+    `purge_at` has passed, only while its pool is online. Default 24 h;
+    `GET|PUT /system/volume-retention {hours}` (0 = delete at once, at most 720), on the System
+    page and `veloctl system volume-retention`. Admin only: `GET /deleted-volumes`,
+    `POST /deleted-volumes/{id}/restore {name?}` (a new name if the old one was reused),
+    `DELETE /deleted-volumes/{id}` (purge now); veloctl `volume deleted | restore | purge --yes`,
+    and a Deleted volumes section on the Volumes page. A purge marks the volume `purging` in the
+    same transaction that checks it is due, so a concurrent restore can't bring back a volume
+    whose lvol is being deleted.
+  - **Space.** A deleted volume counts as committed by its allocated bytes (it can't grow), and
+    a capacity refusal says how much deleted volumes still hold. A pool holding deleted volumes
+    can't be deleted (the refusal says so).
+  - **Deletion protection.** `deletion_protection` on create, `PUT /volumes/{id}/protection`
+    (admin; veloctl `volume protect [--off]`, UI Protect/Unprotect). Deletes are refused (409;
+    CSI `FailedPrecondition`, so the provisioner retries) until an administrator turns it off.
+  - **Snapshots with clones.** Deleting a snapshot that volumes were cloned from used to be
+    refused, which with retention would have kept a deleted PVC's VolumeSnapshot stuck for a
+    day (and was already wrong for Kubernetes, which allows deleting a VolumeSnapshot after
+    restoring from it). It is now hidden at once and the reconciler deletes it when no volume,
+    live or deleted, depends on it. Snapshots with no clones are still deleted at once.
+  - Tests: `TestDeletedVolumeIsKeptAndRestorable`, `TestDeletedVolumeIsPurgedWhenRetentionEnds`,
+    `TestDeletionProtection`, `TestVolumeRetentionSetting`, `TestSnapshotDeleteWaitsForItsClones`,
+    `TestDeleteVolumeProtectionAndRetention` (CSI); real SPDK: `TestSnapshotsAndClones` (purge,
+    deferred snapshot delete, lvols gone afterwards), `TestPoolDeleteThenReuseDisks`,
+    `TestPoolSpaceLifecycle`.
+  - *Not done:* a `deletionProtection` StorageClass parameter (clones made from snapshots take
+    another API path, so both would need it); a retention period for snapshots without clones.
 
-- [ ] **P1-5. Orphaned SPDK objects are invisible.** Lvols, RAIDs or lvstores in SPDK but not
+- [x] **P1-5. Orphaned SPDK objects are invisible.** Lvols, RAIDs or lvstores in SPDK but not
   in the store (failed rollback, crash between SPDK and store writes, manual changes) consume
   space silently, and after metadata loss they're the only copy of the data. *Needed:* the
   reconciler reports unmanaged objects (never deletes them).
+  *Done (2026-11-18):* every pass (after SPDK has examined its bdevs) compares lvstores, lvols in
+  managed lvstores (volumes, snapshots, deleted ones, the metadata lvol), RAIDs, other bdevs
+  (claimed disks', pools', volumes'), NVMe-oF subsystems and iSCSI targets (exports') with the
+  store. Anything unaccounted for a minute (the API creates in SPDK first and records right
+  after) is reported: reconciler state `unmanaged_objects` (kind, name, UUID, detail, first
+  seen) in `/system/status`, one status warning with counts and what to do, a list on the
+  System page and in `veloctl system status`, `velocor_spdk_unmanaged_objects{kind}` for
+  alerting, and a log line when first reported. Lvols of an unmanaged lvstore are covered by
+  its line (a lost database reports each pool once). Unmanaged subsystems and targets are
+  called out as access no export controls. Nothing is deleted or degraded; a failed listing
+  keeps the previous report. `TestUnmanagedSPDKObjectsAreReportedNotDeleted`,
+  `TestUnmanagedLvstoreAfterDatabaseLoss`; real SPDK: the integration suite asserts nothing
+  managed is reported after crash/clean restarts and the snapshot/clone/purge scenario, and
+  that a stray lvol is reported and kept.
 
 - [ ] **P1-6. Single node, no high availability.** One appliance, one copy of each pool; ANA
   states are modelled but unused. A legitimate first-version scope, but it should be stated in
@@ -248,9 +468,85 @@ work still open, ranked by risk to data, how fixes are verified, and what has be
   new pools. Lab: Fedora initiator VM on serenity (`~/.cache/iscsi-lab`); on velocor-1 volume
   `iscsi-lab` (mirror250a), portals `lab-iscsi-mgmt` / `lab-nvme-mgmt`, host `lab-initiator`,
   group `lab-initiators`.
+- [x] **P1-13. The CSI driver picks a volume's portal by chance.** `ControllerPublishVolume`
+  exports a volume on the first portal of its protocol in velod's list, which is in portal-ID
+  order, and IDs are random. On velocor-1 (2026-11-18) the SAN portals happened to sort before
+  the lab's management-network portals; with other IDs every CSI volume would silently have
+  gone over the 1500-MTU management network. Adding a portal can change where new volumes go.
+  `portalOverride` (`VELOCOR_PORTAL_OVERRIDE`) can't fix it: it only changes the address the
+  node connects to (the export still listens on the chosen portal only), and it is one
+  `host:port` for both protocols (4420 / 3260). Each export also gets exactly one portal, so no
+  multipath across SAN NICs, and a wildcard (0.0.0.0) portal isn't connectable as it is.
+  *Fix:* a StorageClass parameter `portals` (names or IDs), validated at provisioning (exists,
+  right protocol); without it, the protocol's only portal, else refuse with a message naming
+  the parameter; the export gets every listed portal and the node connects to each (NVMe
+  native multipath, dm-multipath for iSCSI; the node side can follow later); deprecate
+  `portalOverride`.
+  **Done (2026-11-19):** StorageClass parameter `portals` (names or IDs) and the chart's
+  `defaultPortals` (`--default-portals`, both protocols, applies at each attach so volumes from
+  before the parameter can be given portals). Checked at provisioning (exists, right
+  protocol); several portals and no choice is refused with a message listing them; a wildcard
+  portal is refused unless the deprecated `portalOverride` is set. Exports get every listed
+  portal; the publish context adds `portals` (`portal_ip`/`portal_port` stay, for older node
+  plugins). Nodes: NVMe/TCP connects every path when native multipath is on (else the first
+  that answers); iSCSI logs in to one portal (an existing session first, else the first that
+  answers) and logs out of all. Unit tests: `internal/csi/portals_test.go`.
+  *Left:* iSCSI multipath (dm-multipath on the node) and a lab check with two SAN paths.
+- [x] **P1-14. A pool whose disks come back under new IDs stays UNAVAILABLE, with no way to
+  recover it. (Verified)** Lab, 2026-11-18: velocor-1's six pool disks moved from emulated SATA
+  to virtio-scsi (same disks, same data). Their IDs changed (`ssd-t10.ATA_QEMU_HARDDISK_QM00003`
+  became `ssd-naa.6001405…`), because velod records members by disk ID, and all three pools came
+  up UNAVAILABLE ("0/2 member bdevs present"). velod knows where the data is: `GET
+  /pool-imports` lists each pool's RAID superblock on the new disks with the right pool ID, but
+  refuses to import ("a pool with this ID already exists"), and replacing members would mean a
+  rebuild with no source. The same happens after moving drives to another HBA or changing the
+  controller mode. Also seen:
+  - the old disk records stay listed, DEGRADED and `URING_CLAIMED`, under kernel names (`sdb`…)
+    that now belong to the new disks;
+  - the import candidates mark every disk `stale` although all carry the newest sequence number;
+  - the new disks' serials end in a NUL byte (`…-e2ca277e5875\u0000`): `readSysfsString` trims
+    whitespace only.
+  *Fixed:* a member's SSD bdev UUID can now be kept on its disk record (`Disk.BdevUUID`,
+  used by `dataplane.DiskBdevUUID` instead of the ID-derived one). Each reconcile pass looks
+  at pools whose RAID isn't online and members whose disk the scan no longer finds, reads the
+  superblocks on the unclaimed SSDs, and `dataplane.MatchMovedMembers` assigns the missing
+  members' UUIDs to the disks carrying the array's current superblock. The new record takes
+  the old one's slot, UUID and disk settings (write-cache policy, PLP) in one transaction
+  (`RelinkPoolMember`), the old record is deleted, and SPDK examine then assembles the array.
+  It matches only when certain: every member the current superblock lists as configured must
+  be back with that superblock's sequence number (a single returning disk could be an
+  out-of-date copy whose current counterpart is still away), and several members only for a
+  RAID1 whose members share one data layout (interchangeable); a stripe is never guessed and
+  the pool says why. Pool import uses the same matching, so disks that changed ID on the way to
+  a new appliance import too. sysfs strings lose NUL padding; released disks drop a kept UUID.
+  `TestMirrorUnderNewDiskIDsComesBack`, `TestOneMovedMirrorMemberComesBack`,
+  `TestMovedStripeIsNotGuessed`, `TestMovedMirrorWaitsForEveryMember`,
+  `TestImportMirrorUnderNewDiskIDs`, `TestMatchMovedMembers`.
+  *Still open:* NVMe drives moved to another PCIe slot (their ID is the PCI address) aren't
+  relinked yet; no event is raised (velod logs a warning per relinked disk).
+  Lab (dev-a548637, 2026-11-18): velocor-1's three RAID1 pools, UNAVAILABLE after its six disks
+  moved from emulated SATA to virtio-scsi, came back ONLINE on the first boot of the upgrade
+  without any operator step; the members now have the new IDs and keep their old bdev UUIDs,
+  the old records are gone, serials no longer end in NUL, and the volume on `mirror250a` is
+  ONLINE. The new disks can't have their write cache switched off (see P0-4).
 - [ ] **P2-11. velod reports ONLINE before a restarted data plane is restored.** After an SPDK
   restart, status said ONLINE within ~10 s while volume stores, the iSCSI portal and target came
   back about a minute later.
+- [x] **P2-12. An enabled export on a portal whose address is gone retries forever with SPDK's
+  error.** Lab, 2026-11-18: after a reboot removed 10.77.0.1, the export on that portal was
+  DEGRADED with "add listener 10.77.0.1:4420 ...: spdk rpc error (code -32602): Invalid
+  parameters", and each reconcile pass (15 s) logged four SPDK `*ERROR*` lines. *Fixed:* the
+  data plane checks a portal's address against the appliance's interfaces (wildcards count;
+  `dataplane.AddressPresent`, also used by the pool import) before adding an NVMe listener or
+  creating an iSCSI portal group. A missing one is skipped without calling SPDK, the export is
+  served on its other portals and reported DEGRADED with "portal NAME (ID) has address A,
+  which isn't on this appliance; add the address or give the export another portal", and the
+  next pass after the address appears serves it. Existing listeners are kept (a brief flap
+  doesn't tear them down). Creating an export, adding such a portal or enabling the export is
+  refused with that message; other changes to an export that already had the portal apply.
+  `TestPortalWithoutItsAddress`. Lab (dev-91f9415, 2026-11-18): after the reboot the export
+  was DEGRADED with that message and SPDK logged no errors; adding 10.77.0.1 made it ONLINE on
+  the next pass (data read over it); removing the address again kept the listener, no errors.
 
 ### P2: hardening
 
@@ -263,7 +559,37 @@ work still open, ranked by risk to data, how fixes are verified, and what has be
 - [ ] **P2-3. Reconciler cost.** `EnsureExport` lists subsystems/target nodes per export
   (O(n²) RPCs); prefetch once per pass (was F5).
 - [ ] **P2-4. SPDK sizing.** One core and 1 GiB of memory; sizing isn't documented or
-  validated against the number of exports and connections.
+  validated against the number of exports and connections. Lab, 2026-11-18
+  ([docs/performance.md](docs/performance.md)): on a VM with emulated SATA disks the disks were
+  the limit (92–97% busy) and a second core (`-m 0x3`) changed nothing. With 2 cores the
+  NVMe/TCP queues spread over both reactors, but an iSCSI volume (one connection) stays on one,
+  and `app_thread` was 40–56% busy during deep NVMe/TCP I/O (find out what runs there). Measure
+  again on NVMe drives, where one reactor will be the limit.
+  **Plan (agreed 2026-11-19; after the release gate, tuned on real hardware):** SPDK fixes its
+  core mask at start and reactors poll at 100%, so "auto" means sizing at boot, not all cores.
+  On virtio-scsi a second core gained nothing; on emulated SATA, writes were about 20% slower.
+  1. A boot step picks the count and writes it to a file the SPDK unit reads (replacing the
+     hardcoded `-m 0x1`): 1 core on a VM; on hardware about a quarter of the cores (at least 1,
+     capped), never CPU 0, preferring the NUMA node of the NICs and NVMe drives. The quarter
+     and the cap are guesses until measured on NVMe hardware.
+  2. An operator override (API, UI, `veloctl`) for a fixed count, applied at the next boot or
+     an explicit SPDK restart, with a warning that the restart interrupts I/O.
+  3. Later, maybe: SPDK's dynamic scheduler (idle cores sleep); test it with NVMe/TCP, iSCSI
+     and io_uring first.
+- [ ] **P2-13. virtio-blk disks are invisible.** Hardware discovery keeps a `vdX` device only
+  if it reports `rotational=0` or a virtual model name. virtio-blk reports `rotational=1` and
+  has no `device/model` (checked on the lab VM), so it never shows up and can't be put in a
+  pool. Without a QEMU `serial=` it also has no `/dev/disk/by-id` link and no serial, so its
+  disk ID would be the kernel name (`ssd-vda`), which can change between boots. *Needed:* treat
+  virtio-blk (`device/driver` is `virtio_blk`) as an SSD candidate; require a serial for a pool
+  member and tell the user why a disk without one can't be used. Also check that a pool still
+  assembles when its disks move to another controller (SATA to virtio-scsi), which changes
+  their IDs.
+- [ ] **P2-14. iSCSI writes are split into 64K disk writes.** 128K sequential writes reach
+  177–209 MB/s over iSCSI against 300 MB/s over NVMe/TCP on the same pool
+  ([docs/performance.md](docs/performance.md)), and the appliance sampler showed two 64K disk
+  writes for each 128K request. Find where SPDK's iSCSI target splits them (data segment or
+  buffer size) and whether a larger `MaxRecvDataSegmentLength` or iobuf size avoids it.
 - [ ] **P2-5. Slow test suites.** Auth/server tests take ~50–100 s under `-race` because every
   login runs 600k PBKDF2 iterations; consider a test-only iteration override (was F7).
 - [ ] **P2-7. The CSI driver logs nothing per request.** Stage/publish failures are only
@@ -282,9 +608,10 @@ work still open, ranked by risk to data, how fixes are verified, and what has be
 
 Everything here was written by Gemini and is in scope to rewrite.
 
-- [ ] **B8 (rest). Publish a qcow2 with releases?** `make qcow2` now runs `hack/build-qcow2.sh`
-  (rootless, KVM only; bootc-image-builder and its sudo are gone). Undecided whether CI should
-  attach a qcow2 to releases (GitHub runners have KVM).
+- [x] **B8 (rest). Publish a qcow2 with releases?** `make qcow2` now runs `hack/build-qcow2.sh`
+  (rootless, KVM only; bootc-image-builder and its sudo are gone). **Decision (2026-11-19): no
+  qcow2 with releases for now.** The README's install Option 2 explains how to build one from
+  the published `velocor-os` image with `hack/build-qcow2.sh`.
 - [x] **B17. Pinned Fedora base digests disappear from quay.io.** `quay.io/fedora/fedora`
   deletes superseded `:45` builds: the pinned `sha256:e203b417…` now returns "manifest unknown"
   (found 2026-11-17 when a test pod couldn't pull it; local builds only work from cache). Clean CI
@@ -337,6 +664,9 @@ Everything here was written by Gemini and is in scope to rewrite.
   build and push of every image (incl. the OS image, so B21 works) and cosign signing passed.
   The attest steps now run only when the repository is public; until then images are only
   cosign-signed. The chart push and the release job are still unexercised.
+- [x] **First fully green `main` run** (44132095413, 8d828a4, 2026-11-17, repository now
+  public): integration tests, all images built, pushed (incl. the `main` tags), cosign-signed and
+  attested, Helm chart pushed to ghcr.io. Only the release job (v* tags) is still unexercised.
 - [ ] **B16. The new CI workflow has not fully run yet.** First run (PR #1, 2026-11-17, run
   44102090198, aa8411d): lint (incl. actionlint and the CDI hook render), unit tests, SPDK
   patch unit tests, images (integration tests on the runner, rootless podman, arm64 CSI via
@@ -428,6 +758,11 @@ Everything here was written by Gemini and is in scope to rewrite.
   velocor-1, 2026-11-16; the fake accepted it). Refused by the API, UI and CLI for now. *Needed:*
   build it as raid0 over raid1 pairs, each with a superblock, and handle assembly after restart,
   a degraded pair, rebuild and deletion of the nested layers; real-SPDK tests for all of those.
+- [ ] **L-6. Report a full pool as "capacity exceeded" (ENOSPC) instead of an I/O error.**
+  When a thin pool is full SPDK fails writes with NVMe Internal Error, which Linux reports as
+  EIO (filesystems shut down). An SPDK patch completing lvol ENOSPC with NVMe Capacity Exceeded
+  (status 0x81) would give hosts ENOSPC, which filesystems and applications handle far better.
+  Agreed follow-up to P0-2 (2026-11-17); test with ext4/XFS hosts.
 - [ ] **L-5. Delta upgrades for the OS image.** Requested 2026-11-17 (back burner). A
   `bootc upgrade` pulls every changed layer of `velocor-os` in full; with the rolling Fedora base
   (B17) that is most of the image on every release. Goal: publish much smaller upgrade packages,
@@ -444,23 +779,27 @@ Everything here was written by Gemini and is in scope to rewrite.
 **Release gate (agreed 2026-11-17):** no first release until items 1–5 are done; work them in
 this order and keep this file current as each moves.
 
-1. **P0-1 + P1-8 redundancy** (in progress): replace a failed disk with rebuild progress
+1. **P0-1 + P1-8 redundancy** (done; real-hardware hot-swap tests open): replace a failed disk with rebuild progress
    (`REBUILDING n%`), and a supported degraded start. Starts with a design note on SPDK's raid
    rebuild API and its behaviour across restarts; tested with real SPDK (fail, replace,
    rebuild, restart during rebuild, second failure) on the serenity VM lab, where disks can be
    hot-unplugged.
-2. **P0-2 capacity**: overcommit limit, reserve for snapshots/metadata, thresholds,
+2. **P0-2 capacity** (done): overcommit limit, reserve for snapshots/metadata, thresholds,
    per-volume/snapshot allocated space.
-3. **P0-3 metadata**: on-pool metadata copy, scheduled backups + `veloctl` backup/restore,
+3. **P0-3 metadata** (done): on-pool metadata copy, scheduled backups + `veloctl` backup/restore,
    recovery from SPDK and the on-pool copy.
-4. **P0-4 durability, remaining**: NVMe write-cache detection/disable through SPDK admin
-   passthrough, pool-level flag; power-pull test on real hardware (user). The SPDK FLUSH patch
-   stays L-1.
-5. **P1-4 deletion protection** (recycle period / per-volume protection); fold in **P0-6**
-   (probe io_uring, fall back to AIO).
+4. **P0-4 durability, remaining**: NVMe write cache through SPDK and the pool flag are done and
+   checked on QEMU NVMe. The power-pull test on real hardware is deferred (no hardware for it
+   yet, 2026-11-18). The SPDK FLUSH patch stays L-1.
+5. **P1-4 deletion protection** (done: retention period, per-volume protection) and **P0-6**
+   (done: io_uring probe, AIO fallback; upstream report drafted).
 
-After the release gate: P1-1 alerting, P1-3 network rollback, P1-5 orphan reporting, P2-2
-scrub, P2-11.
+Before tagging the first release (agreed 2026-11-19): P1-13 portal choice (done), then a test
+tag to prove the release pipeline (B16). B8: no qcow2 with releases (the README explains how to
+build one). The real-hardware tests of P0-1 and P0-4 stay open.
+
+After the release gate: P1-1 alerting, P1-3 network rollback, P2-2 scrub, P2-11 (P1-5 orphan
+reporting done 2026-11-18).
 
 ---
 
@@ -506,14 +845,19 @@ everything deleted cleanly (no PVs, snapshots, volumes or exports left). **iSCSI
 d60e9ec + the SPDK WRITE SAME patch (P1-10, dev-559ea38): write, cross-node re-attach, verify. Not covered: RWX / live migration
 (P1-12), Kasten.
 
-**Not yet covered:** real NVMe drives (`bdev_nvme`, vfio), io_uring (needs a host where it
-works, see P0-6), iSCSI data paths (needs an iSCSI initiator in the test image), power-loss
+**Not yet covered:** real NVMe drives (`bdev_nvme`, vfio), io_uring (the test containers
+run confined, where the probe picks AIO, see P0-6; covered on the lab appliances), iSCSI data paths (needs an iSCSI initiator in the test image), power-loss
 tests on real hardware, killing SPDK *during* a multi-step API operation, and hardware checks
 of the boot-disk guard and CSI device resolution on NVMe native multipath.
 
 ---
 
 ## Done
+
+- [x] **The initial admin password file stayed on disk** after the password was changed, with
+  a permanent dashboard warning until someone deleted it by hand. velod now deletes it once
+  the admin password no longer matches it: after a password change, and at startup (for
+  appliances changed before). `TestBootstrapPasswordFileDeletedAfterChange`.
 
 ### Found by testing against real SPDK (second review)
 

@@ -48,6 +48,10 @@ type Settings struct {
 	// RebuildMaxMBps limits RAID rebuild bandwidth (SPDK applies it to every array); 0 means
 	// unlimited.
 	RebuildMaxMBps uint32 `json:"rebuild_max_mbps"`
+	// VolumeRetentionHours is how long a deleted volume is kept (unexported, hidden, its data
+	// intact) before the reconciler purges it; nil means DefaultVolumeRetention, 0 deletes at
+	// once.
+	VolumeRetentionHours *uint32 `json:"volume_retention_hours,omitempty"`
 }
 
 // DiskType categorizes physical flash media tiers.
@@ -188,8 +192,12 @@ type Disk struct {
 	Claimed          bool            `json:"claimed"`
 	PoolID           string          `json:"pool_id,omitempty"`
 	SPDKBdevName     string          `json:"spdk_bdev_name,omitempty"`
-	HealthStatus     HealthStatus    `json:"health_status"`
-	Smart            SmartHealth     `json:"smart"`
+	// BdevUUID is the UUID of the disk's SPDK base bdev when it differs from the one derived
+	// from the disk ID: a pool member that came back under a new ID keeps the UUID its RAID
+	// superblock knows it by (TODO.md P1-14). Empty: derived from the ID.
+	BdevUUID     string       `json:"bdev_uuid,omitempty"`
+	HealthStatus HealthStatus `json:"health_status"`
+	Smart        SmartHealth  `json:"smart"`
 	// WriteCache is what the hardware reports (refreshed by every scan; the last known value is
 	// kept while SPDK owns the device and the kernel can't see it).
 	WriteCache WriteCacheState `json:"write_cache"`
@@ -199,7 +207,10 @@ type Disk struct {
 	// WriteCachePolicy is the operator's choice; DISABLED makes velod switch the drive's
 	// volatile write cache off and keep it off.
 	WriteCachePolicy WriteCachePolicy `json:"write_cache_policy,omitempty"`
-	UpdatedAt        time.Time        `json:"updated_at"`
+	// WriteCacheError says why the DISABLED policy couldn't be applied (the drive refused);
+	// the disk is reported once in the durability warnings instead of on every pass.
+	WriteCacheError string    `json:"write_cache_error,omitempty"`
+	UpdatedAt       time.Time `json:"updated_at"`
 }
 
 // WriteCacheState is a disk's volatile write cache as reported by the hardware.
@@ -261,24 +272,39 @@ type Pool struct {
 	RaidLevel RaidLevel `json:"raid_level"`
 	// DiskIDs are the disks in the pool's RAID slots (ACTIVE or REBUILDING), in slot order.
 	DiskIDs []string `json:"disk_ids"`
+	// Durability is the weakest of the member disks' (maintained by the reconciler): AT_RISK
+	// when any member can lose acknowledged writes on power loss (TODO.md P0-4).
+	Durability Durability `json:"durability,omitempty"`
 	// Members is the state of every RAID slot (maintained by the reconciler from SPDK).
 	Members []PoolMember `json:"members,omitempty"`
 	// DetachedDiskIDs are disks that left the RAID (failed, removed or replaced) but stay
 	// bound to the pool until an operator releases them, so they can't be reused by accident.
-	DetachedDiskIDs   []string     `json:"detached_disk_ids,omitempty"`
-	StripSizeKB       uint32       `json:"strip_size_kb"`
-	ClusterSizeBytes  uint32       `json:"cluster_size_bytes"`
-	BaseBdevName      string       `json:"base_bdev_name"`
-	EffectiveBdevName string       `json:"effective_bdev_name"`
-	LVSUUID           string       `json:"lvs_uuid"`
-	LVSName           string       `json:"lvs_name"`
-	TotalBytes        uint64       `json:"total_bytes"`
-	FreeBytes         uint64       `json:"free_bytes"`
-	AllocatedBytes    uint64       `json:"allocated_bytes"`
-	FilterPolicy      FilterPolicy `json:"filter_policy"`
-	HealthStatus      HealthStatus `json:"health_status"`
-	StatusMessage     string       `json:"status_message,omitempty"`
-	CreatedAt         time.Time    `json:"created_at"`
+	DetachedDiskIDs   []string `json:"detached_disk_ids,omitempty"`
+	StripSizeKB       uint32   `json:"strip_size_kb"`
+	ClusterSizeBytes  uint32   `json:"cluster_size_bytes"`
+	BaseBdevName      string   `json:"base_bdev_name"`
+	EffectiveBdevName string   `json:"effective_bdev_name"`
+	LVSUUID           string   `json:"lvs_uuid"`
+	LVSName           string   `json:"lvs_name"`
+	TotalBytes        uint64   `json:"total_bytes"`
+	FreeBytes         uint64   `json:"free_bytes"`
+	AllocatedBytes    uint64   `json:"allocated_bytes"`
+	// Space accounting (P0-2), maintained by the reconciler: CommittedBytes is every volume's
+	// full size plus what snapshots hold; AvailableBytes is how much more the pool accepts.
+	SpacePolicy    SpacePolicy `json:"space_policy"`
+	CommittedBytes uint64      `json:"committed_bytes"`
+	AvailableBytes uint64      `json:"available_bytes"`
+	SpaceState     SpaceState  `json:"space_state,omitempty"`
+	// On-pool metadata copy (P0-3): the velocor-meta lvol and the last manifest written to it.
+	MetaLvolUUID   string       `json:"meta_lvol_uuid,omitempty"`
+	MetaGeneration uint64       `json:"meta_generation,omitempty"`
+	MetaHash       string       `json:"meta_hash,omitempty"`
+	MetaWrittenAt  time.Time    `json:"meta_written_at,omitempty"`
+	MetaError      string       `json:"meta_error,omitempty"`
+	FilterPolicy   FilterPolicy `json:"filter_policy"`
+	HealthStatus   HealthStatus `json:"health_status"`
+	StatusMessage  string       `json:"status_message,omitempty"`
+	CreatedAt      time.Time    `json:"created_at"`
 }
 
 // Volume represents a logical volume (SPDK bdev_lvol) inside a Pool.
@@ -301,7 +327,21 @@ type Volume struct {
 	StatusMessage     string            `json:"status_message,omitempty"`
 	Labels            map[string]string `json:"labels,omitempty"`
 	CreatedAt         time.Time         `json:"created_at"`
+	// DeletionProtection refuses deletion until an administrator turns it off.
+	DeletionProtection bool `json:"deletion_protection,omitempty"`
+	// DeletedAt is set while a deleted volume waits for its retention period to end: it is
+	// hidden from the API and can't be exported, but its data is intact and it can be restored.
+	DeletedAt *time.Time `json:"deleted_at,omitempty"`
+	// PurgeAt is when the reconciler deletes a deleted volume's data for good.
+	PurgeAt *time.Time `json:"purge_at,omitempty"`
+	// DeletedBy is the API subject that deleted the volume.
+	DeletedBy string `json:"deleted_by,omitempty"`
+	// Purging is set once the purge of a deleted volume has started; it can't be restored then.
+	Purging bool `json:"purging,omitempty"`
 }
+
+// Deleted reports whether the volume is deleted and waiting to be purged.
+func (v *Volume) Deleted() bool { return v.DeletedAt != nil }
 
 // Snapshot represents an immutable point-in-time SPDK bdev_lvol_snapshot.
 type Snapshot struct {
@@ -316,7 +356,15 @@ type Snapshot struct {
 	ParentSnapshotID string    `json:"parent_snapshot_id,omitempty"`
 	SequenceNumber   uint64    `json:"sequence_number"`
 	CreatedAt        time.Time `json:"created_at"`
+	// DeletedAt is set when a snapshot was deleted while volumes cloned from it still depend
+	// on it (live ones, or deleted ones waiting to be purged): it is hidden from the API and
+	// the reconciler deletes it once nothing depends on it.
+	DeletedAt *time.Time `json:"deleted_at,omitempty"`
+	DeletedBy string     `json:"deleted_by,omitempty"`
 }
+
+// Deleted reports whether the snapshot is deleted and waiting for its clones to go.
+func (s *Snapshot) Deleted() bool { return s.DeletedAt != nil }
 
 // VolumeGroupSnapshot represents a point-in-time consistent group of snapshots across multiple volumes.
 type VolumeGroupSnapshot struct {
@@ -387,6 +435,11 @@ type Export struct {
 	// NodeIDs lists the nodes it's published to, each allowed in through its initiator group.
 	Shared  bool     `json:"shared,omitempty"`
 	NodeIDs []string `json:"node_ids,omitempty"`
+	// Disabled exports are not served (SPDK objects removed). A pool import restores an export
+	// disabled when it can't be served as recorded (its portal addresses aren't on this
+	// appliance, or its CHAP secrets must be set again); DisabledReason says why.
+	Disabled       bool   `json:"disabled,omitempty"`
+	DisabledReason string `json:"disabled_reason,omitempty"`
 	// IscsiIgTag is the SPDK iSCSI initiator group tag owned by this export (unique, allocated by the store).
 	IscsiIgTag    int          `json:"iscsi_ig_tag,omitempty"`
 	HealthStatus  HealthStatus `json:"health_status"`

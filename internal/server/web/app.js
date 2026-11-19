@@ -39,6 +39,35 @@ async function request(method, path, body) {
 
 const api = (path) => request("GET", path);
 const send = (method, path, body) => request(method, path, body);
+
+// raw sends a file as the request body (database restore).
+async function raw(method, path, file) {
+  const headers = { Accept: "application/json", "Content-Type": "application/octet-stream" };
+  const t = token();
+  if (t) headers.Authorization = "Bearer " + t;
+  const resp = await fetch(API + path, { method, headers, cache: "no-store", body: file });
+  if (resp.status === 401) throw new Unauthorized();
+  const answer = await resp.json().catch(() => ({}));
+  if (!resp.ok) throw new Error(answer.error || `The API answered with status ${resp.status}`);
+  return answer;
+}
+
+// download saves what path returns as a file (it needs the session token, so not a plain link).
+async function download(path, filename) {
+  const t = token();
+  const resp = await fetch(API + path, { headers: t ? { Authorization: "Bearer " + t } : {}, cache: "no-store" });
+  if (resp.status === 401) throw new Unauthorized();
+  if (!resp.ok) {
+    const answer = await resp.json().catch(() => ({}));
+    throw new Error(answer.error || `The API answered with status ${resp.status}`);
+  }
+  const url = URL.createObjectURL(await resp.blob());
+  const a = el("a", { href: url, download: filename });
+  document.body.append(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 10000);
+}
 // list returns the array the API wraps under key.
 const list = async (path, key) => (await api(path))[key] || [];
 
@@ -103,6 +132,15 @@ function bar(used, total) {
     `${humanSize(used)} of ${humanSize(total)} (${percent < 1 && percent > 0 ? "under 1" : percent.toFixed(0)}%)`,
     el("div", { class: "bar " + kind, role: "img", "aria-label": `${percent.toFixed(0)} percent used` }, fill));
 }
+
+const SPACE_KIND = { OK: "ok", WARNING: "warn", CRITICAL: "bad", FULL: "bad" };
+const SPACE_HINT = {
+  WARNING: "Getting full.",
+  CRITICAL: "New volumes, snapshots, clones and expansions are refused until space is freed.",
+  FULL: "Writes to new space are failing now. Free space immediately.",
+};
+const spacePill = (p) => (p.space_state ? pill(p.space_state.toLowerCase(), SPACE_KIND[p.space_state]) : el("span", { class: "muted" }, "-"));
+const policyOf = (p) => ({ max_overcommit: 1, reserve_percent: 5, warning_percent: 80, critical_percent: 90, ...(p.space_policy || {}) });
 
 const poolBar = (p) => (p.total_bytes ? bar(p.allocated_bytes || (p.total_bytes - p.free_bytes), p.total_bytes) : el("span", { class: "muted" }, "unknown"));
 
@@ -220,6 +258,11 @@ function radioField(field) {
   };
 }
 
+function fileField(field) {
+  const input = el("input", { type: "file", id: "field-" + field.name, required: field.required });
+  return { node: input, focus: input, value: () => input.files[0] };
+}
+
 // A list typed one per line (or comma separated).
 function linesField(field) {
   const area = el("textarea", { id: "field-" + field.name, placeholder: field.placeholder, spellcheck: "false" }, (field.value || []).join("\n"));
@@ -238,7 +281,7 @@ function plainField(field) {
 // openDialog asks for something, and stays open showing the API's answer if it's refused, with what was typed still there.
 // Without submit it only shows something, with a Close button.
 function openDialog({ title, intro, warning, fields = [], submit, danger, confirmText, action, done }) {
-  const makers = { checks: checksField, tick: tickField, radio: radioField, lines: linesField };
+  const makers = { checks: checksField, tick: tickField, radio: radioField, lines: linesField, file: fileField };
   const built = fields.map((field) => ({ field, ...(field.size ? sizeField(field) : (makers[field.kind] || plainField)(field)) }));
   const notice = el("div", {});
   const go = submit && el("button", { type: "submit", class: danger ? "danger" : "primary", id: "dialog-submit" }, submit);
@@ -377,7 +420,7 @@ function smartCell(d) {
 // Write cache and durability (TODO.md P0-4): SPDK doesn't pass flushes through volumes, so a
 // drive caching writes in volatile memory can lose acknowledged writes on power failure.
 function durabilityCell(d) {
-  const notes = [d.write_cache_policy === "DISABLED" && "kept off by Velocor", d.power_loss_protected && "declared power-loss protected"].filter(Boolean).join(", ");
+  const notes = [d.write_cache_policy === "DISABLED" && (d.write_cache_error ? "can't be turned off: " + d.write_cache_error : "kept off by Velocor"), d.power_loss_protected && "declared power-loss protected"].filter(Boolean).join(", ");
   const cache = { WRITE_BACK: "Cache on", WRITE_THROUGH: "No volatile cache" }[d.write_cache] || "Cache unknown";
   const p = { DURABLE: pill("Durable", "ok"), AT_RISK: pill("At risk", "warn"), UNKNOWN: pill("Unknown", "quiet") }[d.durability] || "-";
   return [p, el("span", { class: "sub" }, notes ? `${cache}; ${notes}` : cache)];
@@ -465,13 +508,23 @@ function deletePoolDialog(p) {
   });
 }
 
+// A pool's durability: whether a power cut can lose writes its member disks acknowledged.
+const DURABILITY = {
+  DURABLE: ["durable", "ok", "Every member disk writes to durable media (no volatile write cache, or it is off, or the disk is power-loss protected)."],
+  AT_RISK: ["writes at risk", "warn", "A member disk has its volatile write cache on and isn't declared power-loss protected: a power cut can lose acknowledged writes. Turn the disk's cache off or declare it protected on its disk page."],
+  UNKNOWN: ["unknown", "", "The write cache of a member disk could not be determined."],
+};
+const durabilityPill = (p) => DURABILITY[p.durability] && pill(DURABILITY[p.durability][0], DURABILITY[p.durability][1]);
+
 function poolTable(items, volumes, options = {}) {
   const count = (id) => volumes.filter((v) => v.pool_id === id).length;
   return table([
     { title: "Name", cell: (p) => el("strong", {}, link(p.name, "pool", p.id)), text: (p) => p.name },
     { title: "Health", cell: health, text: (p) => p.health_status },
     { title: "RAID", cell: (p) => [p.raid_level, el("span", { class: "sub" }, `${(p.disk_ids || []).length} disks`)], text: (p) => p.raid_level },
-    { title: "Space", cell: poolBar },
+    { title: "Durability", cell: (p) => durabilityPill(p) || "", text: (p) => p.durability || "" },
+    { title: "Space", cell: (p) => [spacePill(p), poolBar(p)], text: (p) => p.space_state || "" },
+    { title: "Committed", num: true, cell: (p) => [humanSize(p.committed_bytes || 0), el("span", { class: "sub" }, `${humanSize(p.available_bytes || 0)} more accepted`)] },
     { title: "Volumes", num: true, cell: (p) => link(String(count(p.id)), "volumes", p.id) },
   ], items, { empty: "No pools yet.", state: stateOf("pools"), ...options });
 }
@@ -480,9 +533,49 @@ async function pools() {
   const [items, volumes] = await Promise.all([list("/pools", "pools"), list("/volumes", "volumes")]);
   return [
     el("h1", {}, "Pools"),
-    el("div", { class: "toolbar" }, action(can.admin, { class: "primary", id: "create-pool", onclick: createPoolDialog }, "Create pool")),
+    el("div", { class: "toolbar" },
+      action(can.admin, { class: "primary", id: "create-pool", onclick: createPoolDialog }, "Create pool"),
+      action(can.admin, { id: "import-pool", onclick: importPoolDialog }, "Import pool")),
     poolTable(items, volumes),
   ];
+}
+
+async function importPoolDialog() {
+  const found = (await api("/pool-imports")).candidates || [];
+  if (!found.length) {
+    notify("No pools found on the unclaimed disks.");
+    return;
+  }
+  const label = (c) => `${c.pool_id}: ${c.raid_level}, ${c.present} of ${c.members} disks, ${humanSize(c.size_bytes)}${c.reason ? ` (${c.reason})` : ""}`;
+  const first = found.find((c) => c.importable);
+  openDialog({
+    title: "Import a pool",
+    intro: "These disks carry a Velocor pool this appliance doesn't know: after a reinstall, a lost boot disk, or disks moved from another appliance. Importing claims them without wiping and brings the pool back from the copy of its configuration kept on it. Users and API tokens aren't on the pool; they stay as they are here.",
+    submit: "Import",
+    fields: [
+      { name: "pool", kind: "radio", label: "Pool", value: first && first.pool_id, options: found.map((c) => ({ value: c.pool_id, label: label(c), disabled: !c.importable })) },
+      { name: "name", label: "New name (only if its name is taken here)", placeholder: "keep its name" },
+      { name: "degraded", kind: "tick", text: "Start it without its missing disks (RAID1 only; replace them afterwards)",
+        when: (v) => { const c = found.find((x) => x.pool_id === v.pool); return c && !c.complete; } },
+    ],
+    action: (v) => {
+      if (!v.pool) throw new Error("Choose a pool.");
+      return send("POST", "/pool-imports", { pool_id: v.pool, name: v.name || undefined, allow_degraded: !!v.degraded });
+    },
+    done: importResult,
+  });
+}
+
+function importResult(r) {
+  const from = r.source === "manifest"
+    ? `from the copy on the pool (generation ${r.generation}, written ${humanTime(r.written_at)})`
+    : "from SPDK only: the pool had no readable copy of its configuration";
+  openDialog({
+    title: `Imported ${r.pool.name}`,
+    intro: `Recovered ${from}: ${r.volumes} volumes, ${r.snapshots} snapshots; ${r.exports_enabled} exports served, ${r.exports_disabled} restored disabled.`,
+    warning: (r.warnings || []).length > 0 && el("div", { class: "panel-notice warn" }, el("ul", {}, r.warnings.map((w) => el("li", {}, w)))),
+  });
+  location.hash = hash("pool", r.pool.id);
 }
 
 const MEMBER_KIND = { ACTIVE: "ok", REBUILDING: "warn", FAILED: "bad", MISSING: "bad" };
@@ -545,6 +638,28 @@ function releasePoolDiskDialog(p, did) {
   });
 }
 
+function spacePolicyDialog(p) {
+  const cur = policyOf(p);
+  openDialog({
+    title: `Space policy of ${p.name}`,
+    intro: "Velocor refuses new volumes, snapshots, clones and expansions that would commit more than the pool may hold. Committed counts every volume as if fully written, plus the space snapshots hold.",
+    warning: el("div", { class: "panel-notice warn" }, "Overcommit above 1× lets thin volumes promise more than the pool holds. If they really fill it, every thin volume in the pool gets write errors at the same time."),
+    submit: "Save",
+    fields: [
+      { name: "overcommit", label: "Overcommit limit (× usable capacity)", value: String(cur.max_overcommit), required: true, hint: "1 means everything committed fits." },
+      { name: "reserve", label: "Reserve (% never committed)", value: String(cur.reserve_percent), required: true },
+      { name: "warning", label: "Warning at (% used)", value: String(cur.warning_percent), required: true },
+      { name: "critical", label: "Critical at (% used); growth refused", value: String(cur.critical_percent), required: true },
+    ],
+    action: (v) => {
+      const n = (x) => { const f = Number(x); if (!Number.isFinite(f)) throw new Error("Enter numbers."); return f; };
+      return send("PATCH", "/pools/" + encodeURIComponent(p.id), { space_policy: {
+        max_overcommit: n(v.overcommit), reserve_percent: n(v.reserve), warning_percent: n(v.warning), critical_percent: n(v.critical) } });
+    },
+    done: () => { notify("Saved."); rerender(); },
+  });
+}
+
 async function pool(id) {
   const [p, disksAll, volumes] = await Promise.all([
     api("/pools/" + encodeURIComponent(id)).then((r) => r.pool), list("/disks", "disks"), list("/volumes?pool_id=" + encodeURIComponent(id), "volumes"),
@@ -559,17 +674,28 @@ async function pool(id) {
     el("p", { class: "crumb" }, el("a", { href: "#/pools" }, "Pools")),
     el("h1", {}, p.name),
     el("div", { class: "toolbar" },
-      action(can.provision, { class: "primary", disabled: p.health_status === "UNAVAILABLE", onclick: () => createVolumeDialog(p.id) }, "Create volume"),
+      action(can.provision, { class: "primary", disabled: p.health_status === "UNAVAILABLE" || p.space_state === "CRITICAL" || p.space_state === "FULL", onclick: () => createVolumeDialog(p.id) }, "Create volume"),
       p.health_status === "UNAVAILABLE" && action(can.admin, { class: "danger", id: "start-degraded", onclick: () => startDegradedDialog(p) }, "Start degraded"),
       action(can.admin, { class: "danger-quiet", id: "delete-pool", disabled: volumes.length > 0, onclick: () => deletePoolDialog(p) }, "Delete"),
       volumes.length > 0 && can.admin && el("span", { class: "muted" }, "It can't be deleted while it has volumes.")),
     el("dl", { class: "facts" },
       fact("Health", health(p)),
-      fact("Space", poolBar(p)),
+      fact("Space", [spacePill(p), poolBar(p), SPACE_HINT[p.space_state] && el("span", { class: "sub" }, SPACE_HINT[p.space_state])]),
+      fact("Committed", [`${humanSize(p.committed_bytes || 0)} promised`, el("span", { class: "sub" },
+        `${humanSize(p.available_bytes || 0)} more accepted. Committed counts every volume as if fully written, plus what snapshots hold.`)]),
+      fact("Space policy", [
+        `Overcommit up to ${policyOf(p).max_overcommit}×, ${policyOf(p).reserve_percent}% reserved; warning at ${policyOf(p).warning_percent}%, critical at ${policyOf(p).critical_percent}%`,
+        can.admin && el("button", { id: "edit-space-policy", onclick: () => spacePolicyDialog(p) }, "Change")]),
       fact("RAID", `${p.raid_level}${p.raid_level !== "RAID1" ? `, ${p.strip_size_kb} KiB strips` : ""}`),
+      DURABILITY[p.durability] && fact("Durability", [durabilityPill(p), el("span", { class: "sub" }, DURABILITY[p.durability][2])]),
       fact("Cluster size", humanSize(p.cluster_size_bytes)),
       fact("RAID bdev", mono(p.base_bdev_name)),
       fact("Volume store", [mono(p.lvs_name), el("span", { class: "sub mono" }, p.lvs_uuid)]),
+      fact("Configuration copy", p.meta_error
+        ? [pill("out of date", "warn"), el("span", { class: "sub" }, p.meta_error)]
+        : p.meta_generation
+          ? [pill("current", "ok"), el("span", { class: "sub" }, `Generation ${p.meta_generation}, written ${humanTime(p.meta_written_at)}. Kept on the pool, so it can be imported if this appliance's database is lost.`)]
+          : el("span", { class: "muted" }, "not written yet")),
       fact("Created", humanTime(p.created_at)),
       fact("ID", mono(p.id))),
     el("h2", {}, "Disks"),
@@ -608,8 +734,9 @@ async function createVolumeDialog(poolId) {
       ...(items.length > 1 || !poolId ? [{ name: "pool", label: "Pool", value: poolId || (items[0] || {}).id, options: items.map((p) => ({ value: p.id, label: `${p.name} (${humanSize(p.free_bytes)} free)` })) }] : []),
       { name: "size", label: "Size", size: true, required: true, value: 10 * 2 ** 30 },
       { name: "thin", kind: "tick", value: true, text: "Thin provisioned: space is only allocated as it's written" },
+      { name: "protect", kind: "tick", value: false, text: "Deletion protection: refuse deletes until an administrator turns it off" },
     ],
-    action: (v) => send("POST", "/volumes", { name: v.name, pool_id: v.pool || poolId, size_bytes: v.size, thin_provision: v.thin }),
+    action: (v) => send("POST", "/volumes", { name: v.name, pool_id: v.pool || poolId, size_bytes: v.size, thin_provision: v.thin, deletion_protection: v.protect }),
     done: (r) => { notify(`Created ${r.volume.name}.`); location.hash = hash("volume", r.volume.id); },
   });
 }
@@ -667,15 +794,72 @@ function cloneDialog(s) {
   });
 }
 
-function deleteVolumeDialog(v) {
+async function deleteVolumeDialog(v) {
+  const hours = ((await api("/system/volume-retention").catch(() => null)) || { hours: 24 }).hours;
   confirmDialog({
     title: `Delete ${v.name}`,
-    intro: "This destroys its data, and can't be undone. Its snapshots are kept, and can be cloned later.",
+    intro: hours
+      ? `Its data is kept for ${retentionText(hours)}: until then an administrator can restore it from Deleted volumes, and it still takes up its space in the pool. After that it's destroyed. Its snapshots are kept either way.`
+      : "This destroys its data at once, and can't be undone (deleted volumes aren't kept on this appliance). Its snapshots are kept, and can be cloned later.",
     submit: "Delete volume",
     confirmText: v.name,
     action: () => send("DELETE", "/volumes/" + encodeURIComponent(v.id)),
-    done: () => { notify(`Deleted ${v.name}.`); location.hash = "#/volumes"; },
+    done: () => { notify(hours ? `Deleted ${v.name}; it can be restored for ${retentionText(hours)}.` : `Deleted ${v.name}.`); location.hash = "#/volumes"; },
   });
+}
+
+function retentionText(hours) {
+  return hours % 24 === 0 && hours >= 48 ? `${hours / 24} days` : hours === 1 ? "1 hour" : `${hours} hours`;
+}
+
+function protectionDialog(v) {
+  const on = !v.deletion_protection;
+  openDialog({
+    title: on ? `Protect ${v.name}` : `Remove protection from ${v.name}`,
+    intro: on
+      ? "Deletes are refused, from this page and from the CSI driver, until an administrator turns protection off."
+      : "It can be deleted again, including by the CSI driver when its claim is deleted.",
+    submit: on ? "Protect" : "Remove protection",
+    danger: !on,
+    action: () => send("PUT", `/volumes/${encodeURIComponent(v.id)}/protection`, { deletion_protection: on }),
+    done: () => { notify(on ? `${v.name} is protected.` : `${v.name} is no longer protected.`); rerender(); },
+  });
+}
+
+function restoreVolumeDialog(v) {
+  openDialog({
+    title: `Restore ${v.name}`,
+    intro: "It comes back as it was deleted, with its data, not exported. If a volume with its name exists now, give it another name.",
+    submit: "Restore",
+    fields: [{ name: "name", label: "Name", required: true, value: v.name }],
+    action: (x) => send("POST", `/deleted-volumes/${encodeURIComponent(v.id)}/restore`, x.name === v.name ? {} : { name: x.name }),
+    done: (r) => { notify(`Restored ${r.volume.name}.`); location.hash = hash("volume", r.volume.id); },
+  });
+}
+
+function purgeVolumeDialog(v) {
+  confirmDialog({
+    title: `Purge ${v.name}`,
+    intro: `This destroys its data now rather than at ${humanTime(v.purge_at)}, and frees its space. It can't be undone.`,
+    submit: "Purge",
+    confirmText: v.name,
+    action: () => send("DELETE", "/deleted-volumes/" + encodeURIComponent(v.id)),
+    done: () => { notify(`Purged ${v.name}.`); rerender(); },
+  });
+}
+
+function deletedVolumeTable(items, poolList) {
+  const poolsById = byId(poolList);
+  return table([
+    { title: "Name", cell: (v) => [el("strong", {}, v.name), el("span", { class: "sub mono" }, v.id)], text: (v) => `${v.name} ${v.id}` },
+    { title: "Pool", cell: (v) => (poolsById[v.pool_id] ? link(poolsById[v.pool_id].name, "pool", v.pool_id) : mono(v.pool_id)) },
+    { title: "Size", num: true, cell: (v) => [humanSize(v.size_bytes), el("span", { class: "sub" }, `${humanSize(v.allocated_bytes || 0)} held`)] },
+    { title: "Deleted", cell: (v) => [humanTime(v.deleted_at), v.deleted_by && el("span", { class: "sub" }, `by ${v.deleted_by}`)] },
+    { title: "Purged", cell: (v) => (v.purging ? pill("Purging", "warn") : humanTime(v.purge_at)) },
+    { title: "", cell: (v) => el("div", { class: "row-actions" },
+      action(can.admin && !v.purging, { onclick: () => restoreVolumeDialog(v) }, "Restore"),
+      action(can.admin, { class: "danger-quiet", onclick: () => purgeVolumeDialog(v) }, "Purge")) },
+  ], items, { empty: "No deleted volumes.", state: stateOf("deleted-volumes") });
 }
 
 function volumeTable(items, poolList, options = {}) {
@@ -685,6 +869,7 @@ function volumeTable(items, poolList, options = {}) {
     { title: "Health", cell: health, text: (v) => v.health_status },
     { title: "Pool", cell: (v) => (poolsById[v.pool_id] ? link(poolsById[v.pool_id].name, "pool", v.pool_id) : mono(v.pool_id)), text: (v) => (poolsById[v.pool_id] || {}).name || "" },
     { title: "Size", num: true, cell: (v) => [humanSize(v.size_bytes), el("span", { class: "sub" }, v.thin_provision ? "thin" : "thick")] },
+    { title: "Allocated", num: true, cell: (v) => humanSize(v.allocated_bytes || 0) },
     { title: "Exported", cell: (v) => (v.attachment_state === "BLOCK_EXPORT" ? pill("Exported", "ok") : pill("Not exported", "quiet")), text: (v) => v.attachment_state },
     { title: "Labels", cell: (v) => labelsText(v.labels) || "-" },
   ], items, { empty: "No volumes yet.", state: stateOf("volumes-table"), ...options });
@@ -699,7 +884,8 @@ function poolPicker(poolList, current) {
 }
 
 async function volumes(poolId) {
-  const [items, poolList] = await Promise.all([list("/volumes" + (poolId ? "?pool_id=" + encodeURIComponent(poolId) : ""), "volumes"), list("/pools", "pools")]);
+  const q = poolId ? "?pool_id=" + encodeURIComponent(poolId) : "";
+  const [items, poolList, deleted] = await Promise.all([list("/volumes" + q, "volumes"), list("/pools", "pools"), list("/deleted-volumes" + q, "volumes")]);
   const exported = items.filter((v) => v.attachment_state === "BLOCK_EXPORT").length;
   return [
     el("h1", {}, poolId ? `Volumes in ${(poolList.find((p) => p.id === poolId) || {}).name || poolId}` : "Volumes"),
@@ -709,6 +895,11 @@ async function volumes(poolId) {
         : el("span", { class: "muted" }, ["Create a pool to make volumes: see ", el("a", { href: "#/pools" }, "Pools")])),
     volumeTable(items, poolList),
     items.length > 0 && el("p", { class: "count" }, `${exported} of ${items.length} are exported.`),
+    deleted.length > 0 && [
+      el("h2", { id: "deleted-volumes" }, "Deleted volumes"),
+      el("p", { class: "muted" }, "Deleted volumes keep their data, and their space in the pool, until they're purged. An administrator can restore one until then, or purge it now to free the space."),
+      deletedVolumeTable(deleted, poolList),
+    ],
   ];
 }
 
@@ -736,8 +927,10 @@ async function volume(id) {
       action(can.provision, { id: "take-snapshot", onclick: () => snapshotDialog(v) }, "Take snapshot"),
       action(can.provision, { id: "grow-volume", onclick: () => growDialog(v) }, "Grow"),
       action(can.provision, { id: "qos-volume", onclick: () => qosDialog(v) }, "Limits"),
-      action(can.provision, { class: "danger-quiet", id: "delete-volume", disabled: exps.length > 0, onclick: () => deleteVolumeDialog(v) }, "Delete"),
-      exps.length > 0 && can.provision && el("span", { class: "muted" }, "It can't be deleted while it's exported.")),
+      action(can.admin, { id: "protect-volume", onclick: () => protectionDialog(v) }, v.deletion_protection ? "Unprotect" : "Protect"),
+      action(can.provision, { class: "danger-quiet", id: "delete-volume", disabled: exps.length > 0 || v.deletion_protection, onclick: () => deleteVolumeDialog(v) }, "Delete"),
+      exps.length > 0 && can.provision && el("span", { class: "muted" }, "It can't be deleted while it's exported."),
+      !exps.length && v.deletion_protection && can.provision && el("span", { class: "muted" }, "It can't be deleted while it's protected.")),
     el("dl", { class: "facts" },
       fact("Health", health(v)),
       fact("Space", usage ? [bar(usage.allocated_bytes, usage.size_bytes), el("span", { class: "sub" }, "Includes what it shares with its snapshots.")] : el("span", { class: "muted" }, "SPDK can't say at the moment.")),
@@ -746,6 +939,7 @@ async function volume(id) {
       fact("Exported", exps.length ? exps.map((e) => el("div", {}, link(e.name, "export", e.id), ` (${protoName(e.protocol)})`)) : pill("Not exported", "quiet")),
       v.parent_snapshot_id && fact("Cloned from", `snapshot ${v.parent_snapshot_id}`),
       fact("Limits", qos || "None"),
+      fact("Deletion protection", v.deletion_protection ? pill("On", "ok") : "Off"),
       fact("UUID", mono(v.uuid)),
       fact("SPDK bdev", mono(v.lvol_bdev_name)),
       fact("Created", humanTime(v.created_at)),
@@ -776,7 +970,7 @@ function groupBySnapshot(vgs) {
 function deleteSnapshotDialog(s) {
   confirmDialog({
     title: `Delete snapshot ${s.name}`,
-    intro: "This can't be undone. A snapshot that volumes were cloned from is refused.",
+    intro: "This can't be undone. If volumes were cloned from it, it disappears now and its data goes once they've been deleted and purged.",
     submit: "Delete snapshot",
     action: () => send("DELETE", "/snapshots/" + encodeURIComponent(s.id)),
     done: () => { notify(`Deleted snapshot ${s.name}.`); rerender(); },
@@ -952,6 +1146,23 @@ async function accessDialog(e) {
   });
 }
 
+function portalsDialog(e, portalList) {
+  const usable = portalList.filter((p) => p.protocol === e.protocol);
+  openDialog({
+    title: `Portals of ${e.name}`,
+    intro: "The addresses hosts reach the export on. Hosts connected through a portal you remove are cut off.",
+    submit: "Save",
+    danger: true,
+    fields: [{ name: "portals", kind: "checks", label: "Portals", value: e.portal_ids || [],
+      options: usable.map((p) => ({ value: p.id, label: `${p.name} (${p.ip_address}:${p.port})` })), empty: "No portals for this protocol. Add one on the Portals screen." }],
+    action: (x) => {
+      if (!x.portals.length) throw new Error("Choose at least one portal.");
+      return send("PATCH", "/exports/" + encodeURIComponent(e.id), { portal_ids: x.portals });
+    },
+    done: () => { notify("Portals saved."); rerender(); },
+  });
+}
+
 function connectCommand(e, p) {
   const addr = p.ip_address.includes(":") ? `[${p.ip_address}]` : p.ip_address;
   if (e.protocol === "ISCSI") {
@@ -971,6 +1182,21 @@ async function exportsScreen() {
   ];
 }
 
+function setExportEnabled(e, enabled) {
+  const go = () => send("PATCH", "/exports/" + encodeURIComponent(e.id), { enabled });
+  if (enabled) {
+    go().then(() => { notify(`Enabled ${e.name}.`); rerender(); }).catch((err) => notify(err.message));
+    return;
+  }
+  confirmDialog({
+    title: `Disable ${e.name}`,
+    intro: "Hosts are disconnected and can't reach the volume through this export until you enable it again. The volume and its data are not touched.",
+    submit: "Disable",
+    action: go,
+    done: () => { notify(`Disabled ${e.name}.`); rerender(); },
+  });
+}
+
 async function exportScreen(id) {
   const e = (await api("/exports/" + encodeURIComponent(id))).export;
   const [vol, portalList, groups, hostList, conns] = await Promise.all([
@@ -983,7 +1209,12 @@ async function exportScreen(id) {
   return [
     el("p", { class: "crumb" }, el("a", { href: "#/exports" }, "Exports")),
     el("h1", {}, e.name),
-    el("div", { class: "toolbar" }, action(can.provision, { class: "danger-quiet", id: "delete-export", onclick: () => deleteExportDialog(e) }, "Delete")),
+    el("div", { class: "toolbar" },
+      e.disabled
+        ? action(can.provision, { class: "primary", id: "enable-export", onclick: () => setExportEnabled(e, true) }, "Enable")
+        : action(can.provision, { id: "disable-export", onclick: () => setExportEnabled(e, false) }, "Disable"),
+      action(can.provision, { class: "danger-quiet", id: "delete-export", onclick: () => deleteExportDialog(e) }, "Delete")),
+    e.disabled && el("div", { class: "panel-notice warn" }, `Not served: ${e.disabled_reason || "disabled"}.`),
     el("dl", { class: "facts" },
       fact("Health", health(e)),
       fact("Volume", vol ? link(vol.name, "volume", vol.id) : mono(e.volume_id)),
@@ -1001,7 +1232,9 @@ async function exportScreen(id) {
         { title: "Initiator group", cell: (g) => el("strong", {}, g.name) },
         { title: "Members", cell: (g) => groupMembers(g, hostsById) },
       ], mine, { filter: false, empty: "Nobody, so no host can connect.", state: stateOf("export-groups") }),
-    el("h2", {}, "Portals"),
+    el("div", { class: "section-head" },
+      el("h2", {}, "Portals"),
+      action(can.admin, { id: "change-portals", onclick: () => portalsDialog(e, portalList) }, "Change")),
     table([
       { title: "Portal", cell: (p) => [el("strong", {}, p.name), el("span", { class: "sub mono" }, `${p.ip_address}:${p.port}`)] },
       { title: "To connect", cell: (p) => el("code", { class: "command" }, connectCommand(e, p)) },
@@ -1250,7 +1483,8 @@ function rebootDialog(hostname) {
 
 async function system() {
   const soft = (err) => { if (err instanceof Unauthorized) throw err; return null; };
-  const [st, os, containers, rebuild] = await Promise.all([api("/system/status"), api("/system/os").catch(soft), api("/system/containers").catch(soft), api("/system/rebuild").catch(soft)]);
+  const [st, os, containers, rebuild, backups, retention] = await Promise.all([api("/system/status"), api("/system/os").catch(soft), api("/system/containers").catch(soft), api("/system/rebuild").catch(soft),
+    can.admin ? api("/system/backups").catch(soft) : null, api("/system/volume-retention").catch(soft)]);
   const ctr = containers || { available: false };
   const rec = st.reconciler || {};
   const dep = (d) => (d ? [mono(d.image || "-"), el("span", { class: "sub" }, [d.version, d.timestamp && humanTime(d.timestamp)].filter(Boolean).join(", "))] : "-");
@@ -1276,12 +1510,29 @@ async function system() {
         os && os.available
           ? el("dl", { class: "facts" }, fact("Booted", dep(os.booted)), fact("Staged", dep(os.staged)), fact("Rollback", dep(os.rollback)))
           : el("div", { class: "panel-notice" }, (os && os.message) || "bootc isn't available on this host."))),
+    (rec.unmanaged_objects || []).length > 0 && [
+      el("div", { class: "section-head" }, el("h2", { id: "unmanaged" }, "Not managed by Velocor")),
+      el("div", { class: "panel-notice warn" }, "spdk_tgt holds these, but no Velocor record accounts for them. Velocor leaves them alone. They may be leftovers of a failed operation, or, after the database was lost, the only copy of data: import the pool or restore a database backup if they're yours. Subsystems and targets may give hosts access that no export controls."),
+      table([
+        { title: "Kind", cell: (o) => o.kind },
+        { title: "Name", cell: (o) => [mono(o.name), o.uuid && el("span", { class: "sub mono" }, o.uuid)], text: (o) => `${o.name} ${o.uuid || ""}` },
+        { title: "Details", cell: (o) => o.detail || "-" },
+        { title: "Since", cell: (o) => humanTime(o.first_seen) },
+      ], rec.unmanaged_objects, { empty: "", state: stateOf("unmanaged") }),
+    ],
     rebuild && [
       el("div", { class: "section-head" }, el("h2", {}, "Rebuild speed"),
         action(can.admin, { id: "rebuild-speed", onclick: () => rebuildSpeedDialog(rebuild.max_mb_per_sec) }, "Change")),
       el("p", {}, rebuild.max_mb_per_sec ? `Each rebuilding pool uses at most ${rebuild.max_mb_per_sec} MB/s.` : "Unlimited: rebuilds run as fast as the disks allow."),
       el("p", { class: "muted" }, "A limit leaves more bandwidth for hosts while a disk is rebuilt, but the pool stays without full redundancy for longer. A change applies to rebuilds that start after it; one already running keeps its speed."),
     ],
+    retention && [
+      el("div", { class: "section-head" }, el("h2", {}, "Deleted volumes"),
+        action(can.admin, { id: "volume-retention", onclick: () => retentionDialog(retention.hours) }, "Change")),
+      el("p", {}, retention.hours ? `A deleted volume is kept for ${retentionText(retention.hours)}, then purged.` : "Deleted volumes are destroyed at once."),
+      el("p", { class: "muted" }, "While kept, a deleted volume can be restored by an administrator, and it still takes up its space in the pool. A change applies to volumes deleted after it."),
+    ],
+    backups && backupSection(backups),
     el("div", { class: "section-head" }, el("h2", {}, "Containers")),
     el("p", { class: "muted" }, "The containers are part of the operating system image, pinned to exact versions. They change only when you upgrade the operating system."),
     !ctr.available
@@ -1291,6 +1542,79 @@ async function system() {
         { title: "Running", cell: (c) => c.running_status || "-" },
       ], ctr.containers || [], { filter: false, empty: "No containers found." }),
   ];
+}
+
+const BACKUP_KIND = { hourly: "Hourly", daily: "Daily", "pre-upgrade": "Before an upgrade", "pre-restore": "Before a restore", manual: "Taken by hand" };
+
+function backupSection(b) {
+  const stamp = () => new Date().toISOString().replace(/[-:]/g, "").slice(0, 15) + "Z";
+  return [
+    el("div", { class: "section-head" }, el("h2", {}, "Configuration backups"),
+      el("div", { class: "row-actions" },
+        el("button", { id: "backup-now", onclick: async () => {
+          try { const r = await send("POST", "/system/backups"); notify(`Backed up as ${r.backup.name}.`); rerender(); } catch (err) { notify(err.message); }
+        } }, "Back up now"),
+        el("button", { id: "backup-download", onclick: () => download("/system/backup", `velocor-${stamp()}.db`).catch((err) => notify(err.message)) }, "Download"),
+        el("button", { class: "danger-quiet", id: "restore-file", onclick: restoreFileDialog }, "Restore from a file"))),
+    el("p", { class: "muted" }, `Copies of the appliance's database: hourly for a day, daily for a week, and before every upgrade and restore, in ${b.directory} on the boot disk. Each pool also keeps a copy of its own configuration, for when the boot disk is lost. A backup holds password hashes and secrets: keep downloads safe.`),
+    table([
+      { title: "Taken", cell: (x) => [humanTime(x.created_at), el("span", { class: "sub mono" }, x.name)], text: (x) => x.name },
+      { title: "Kind", cell: (x) => BACKUP_KIND[x.kind] || x.kind },
+      { title: "Size", num: true, cell: (x) => humanSize(x.size_bytes) },
+      { title: "", cell: (x) => el("div", { class: "row-actions" },
+        el("button", { onclick: () => download("/system/backup?name=" + encodeURIComponent(x.name), x.name).catch((err) => notify(err.message)) }, "Download"),
+        el("button", { class: "danger-quiet", onclick: () => restoreDialog(x) }, "Restore")) },
+    ], b.backups || [], { empty: "No backups yet; the first is taken within minutes of velod starting.", state: stateOf("backups") }),
+  ];
+}
+
+const RESTORE_WARNING = "This replaces the whole configuration (pools, volumes, exports, access control, users and tokens) with the backup's, then restarts the control plane: sign in again afterwards. The current database is backed up first. Data on the pools isn't touched, but objects created after the backup are no longer known.";
+
+function afterRestore() {
+  notify("Restoring: the control plane restarts. Sign in again in a few seconds.");
+  setTimeout(() => { saveToken(""); location.reload(); }, 4000);
+}
+
+function restoreDialog(x) {
+  confirmDialog({
+    title: `Restore the backup of ${humanTime(x.created_at)}`,
+    intro: RESTORE_WARNING,
+    submit: "Restore",
+    confirmText: "restore",
+    action: () => send("POST", "/system/restore?name=" + encodeURIComponent(x.name)),
+    done: afterRestore,
+  });
+}
+
+function restoreFileDialog() {
+  openDialog({
+    title: "Restore from a file",
+    intro: RESTORE_WARNING,
+    danger: true,
+    submit: "Restore",
+    confirmText: "restore",
+    fields: [{ name: "file", kind: "file", label: "Database file", required: true }],
+    action: (v) => {
+      if (!v.file) throw new Error("Choose the file.");
+      return raw("POST", "/system/restore", v.file);
+    },
+    done: afterRestore,
+  });
+}
+
+function retentionDialog(current) {
+  openDialog({
+    title: "Keep deleted volumes",
+    intro: "How long a deleted volume's data is kept, so it can be restored, before it is destroyed. 0 destroys it at once.",
+    submit: "Save",
+    fields: [{ name: "hours", label: "Hours (0 to 720)", value: String(current ?? 24), required: true }],
+    action: (v) => {
+      const n = Number(v.hours);
+      if (!Number.isInteger(n) || n < 0 || n > 720) throw new Error("Enter a whole number of hours from 0 to 720.");
+      return send("PUT", "/system/volume-retention", { hours: n });
+    },
+    done: () => { notify("Saved."); rerender(); },
+  });
 }
 
 function rebuildSpeedDialog(current) {
@@ -1656,11 +1980,12 @@ function signOut() {
 }
 
 function drawAccount() {
-  account.replaceChildren(
+  // replaceChildren, unlike el, would show a skipped (false) child as the text "false".
+  account.replaceChildren(...[
     el("span", { class: "who" }, me.username.replace(/^token:/, "")),
     el("span", { class: "role" }, me.role.toLowerCase().replace("_", " ")),
     !me.username.startsWith("token:") && el("button", { id: "change-password", onclick: passwordDialog }, "Password"),
-    el("button", { id: "signout", onclick: signOut }, "Sign out"));
+    el("button", { id: "signout", onclick: signOut }, "Sign out")].filter(Boolean));
 }
 
 async function rerender() {

@@ -13,8 +13,9 @@ Velocor decouples the user-space block data plane (`spdk_tgt`) from the control 
 - [Building from Source](#building-from-source)
 - [Installing the Velocor Storage Appliance](#installing-the-velocor-storage-appliance)
   - [Option 1: Bare-Metal / VM Installation via Fedora Image Mode (`bootc`)](#option-1-bare-metal--vm-installation-via-fedora-image-mode-bootc)
-  - [Option 2: Podman Quadlet Deployment on an Existing Linux Host](#option-2-podman-quadlet-deployment-on-an-existing-linux-host)
-  - [Option 3: Local 2-Node QEMU/KVM Test Lab](#option-3-local-2-node-qemukvm-test-lab)
+  - [Option 2: Virtual Machine Disk Image (`qcow2`)](#option-2-virtual-machine-disk-image-qcow2)
+  - [Option 3: Podman Quadlet Deployment on an Existing Linux Host](#option-3-podman-quadlet-deployment-on-an-existing-linux-host)
+  - [Option 4: Local 2-Node QEMU/KVM Test Lab](#option-4-local-2-node-qemukvm-test-lab)
 - [Appliance Quickstart (`veloctl` & Web UI)](#appliance-quickstart-veloctl--web-ui)
 - [Installing the Kubernetes CSI Driver (`csi.velocor.io`)](#installing-the-kubernetes-csi-driver-csivelocorio)
   - [1. Kubernetes Worker Node Prerequisites](#1-kubernetes-worker-node-prerequisites)
@@ -107,16 +108,9 @@ that digest and records it in the image's `org.opencontainers.image.base.name` /
 
 ### Build a Local `qcow2` VM Image
 
-`hack/build-qcow2.sh` turns a published `velocor-os` image into a bootable qcow2 without root on
-the build host (it only needs KVM): a throwaway Fedora Cloud VM runs `bootc install to-disk`
-onto a second virtual disk. Nothing from the build host goes into the image.
-
-```bash
-hack/build-qcow2.sh \
-  --image registry.example.com/velocor/velocor-os:dev-<sha> \
-  --output velocor-os.qcow2 --size 32G \
-  --authorized-keys ~/.ssh/id_ed25519.pub   # repeatable
-```
+To try a build of your own, push it (above) and turn its OS image into a disk image:
+`make qcow2 IMAGE_PREFIX=... QCOW2_KEYS="a.pub b.pub"` runs `hack/build-qcow2.sh` (see
+[Option 2](#option-2-virtual-machine-disk-image-qcow2)) for the OS image of the current commit.
 
 ### Logging in to the appliance
 
@@ -130,9 +124,6 @@ the repository contains keys or passwords; give `velocor-admin` keys in one of t
   `velocor-admin`.
 - After installing with `bootc install to-disk` (below), add the file
   `/etc/ssh/authorized_keys.d/velocor-admin` (mode 0644, owned by root) to the installed system.
-
-`make qcow2 IMAGE_PREFIX=... QCOW2_KEYS="a.pub b.pub"` runs the same script for the OS image of
-the current commit.
 
 ---
 
@@ -194,7 +185,42 @@ The recommended production deployment installs the immutable `velocor-os` image 
 
 ---
 
-### Option 2: Podman Quadlet Deployment on an Existing Linux Host
+### Option 2: Virtual Machine Disk Image (`qcow2`)
+
+Releases don't include a disk image. Build one from the published `velocor-os` image with
+`hack/build-qcow2.sh` from this repository (check out the release's tag). The script needs no
+root: it starts a throwaway Fedora Cloud VM under KVM, which pulls the image and runs
+`bootc install to-disk` onto a second virtual disk; that disk becomes the qcow2. Nothing from
+the build host goes into the image.
+
+**Requirements on the build host:** x86_64 Linux with access to `/dev/kvm`, `qemu-system-x86_64`,
+`qemu-img`, `genisoimage`, `ssh` and `curl`, and about 10 GB free in `~/.cache/velocor-qcow2`
+(the builder's Fedora Cloud image is downloaded there once and reused).
+
+```bash
+git checkout <version>
+hack/build-qcow2.sh \
+  --image ghcr.io/xphyr/velocor-os:<version> \
+  --output velocor-os-<version>.qcow2 \
+  --size 32G \
+  --authorized-keys ~/.ssh/id_ed25519.pub   # optional, repeatable
+```
+
+- `--image` takes a tag or a digest (`ghcr.io/xphyr/velocor-os@sha256:…`); pin a digest to
+  build exactly the release you verified.
+- `--size` is the boot disk's virtual size (thin; at least 32G leaves room for OS upgrades).
+- `--authorized-keys` gives `velocor-admin` SSH keys (see
+  [Logging in to the appliance](#logging-in-to-the-appliance)). Without it, supply keys with
+  cloud-init, which the image includes.
+
+Create the VM from a copy of the qcow2: UEFI firmware, a Q35 machine type, at least 4 vCPUs and
+6 GiB of memory (SPDK reserves 1 GiB of hugepages), the qcow2 as the boot disk, the data disks
+as separate virtio-scsi or NVMe devices, and a separate NIC for the SAN if you have one. On first
+boot, read the initial admin password as described in the
+[Appliance Quickstart](#appliance-quickstart-veloctl--web-ui). Later OS upgrades come from the
+registry (`veloctl system upgrade`); there is no need to rebuild the qcow2.
+
+### Option 3: Podman Quadlet Deployment on an Existing Linux Host
 
 You can run Velocor on an existing **Fedora 45+**, **RHEL / CentOS Stream 9/10**, or compatible Linux host with Podman `4.8+`:
 
@@ -247,7 +273,7 @@ You can run Velocor on an existing **Fedora 45+**, **RHEL / CentOS Stream 9/10**
 
 ---
 
-### Option 3: Local 2-Node QEMU/KVM Test Lab
+### Option 4: Local 2-Node QEMU/KVM Test Lab
 
 For local development and end-to-end testing, `hack/vm-lab/lab.sh` provisions a 2-node QEMU/KVM lab (3 GiB total RAM) consisting of `velocor-san` (with 2 emulated PCIe NVMe drives + 2 VirtIO-SCSI SSDs) and `velocor-initiator`:
 
@@ -274,7 +300,7 @@ See [hack/vm-lab/README.md](hack/vm-lab/README.md) for environment overrides and
 - **Bootstrap Credentials**:
   - **Username**: `admin`
   - **Password**: generated randomly on first boot and written to `/var/lib/velocor/initial-admin-password` (root-only), unless `VELOCOR_INIT_PASSWORD` is set on first boot. There is no shared default password.
-  - The bootstrap password must be changed at first login; until then the API only allows changing it. Delete the file afterwards.
+  - The bootstrap password must be changed at first login; until then the API only allows changing it. velod deletes the file once the password has been changed.
 
 Authenticate via `veloctl` (session token is saved to `~/.config/velocor/token`):
 
@@ -354,6 +380,31 @@ veloctl volume usage <volume-id>
 ```
 
 Exports with no initiator groups are refused unless `--allow-any-host` is given explicitly, which lets anyone who can reach the portal connect.
+
+#### Deleting volumes
+
+A deleted volume isn't destroyed at once. It disappears from the API, the UI and Kubernetes, and
+can't be exported, but its data is kept for **24 hours** by default. Until then an administrator
+can bring it back, or purge it early. This applies to deletes from the CSI driver too, so a
+deleted PVC can be recovered. A deleted volume keeps holding the space it used, and a pool
+can't be deleted while it holds deleted volumes.
+
+```bash
+veloctl volume deleted                              # deleted volumes and when they'll be purged
+veloctl volume restore [--name new-name] <volume-id>
+veloctl volume purge --yes <volume-id>              # destroy its data now
+veloctl system volume-retention --hours 72          # 0 = destroy volumes at once; at most 720
+veloctl volume protect <volume-id>                  # refuse deletes; --off to allow them again
+```
+
+Volumes with deletion protection (`veloctl volume create --protect`, or **Protect** on the
+volume's page) can't be deleted, by anyone, until an administrator turns protection off. A CSI
+`DeleteVolume` for one fails with `FailedPrecondition`, and the provisioner keeps retrying.
+Restoring, purging, protection and the retention period need an administrator; a CSI token can
+only delete.
+
+A snapshot that volumes were cloned from can be deleted too. It disappears at once, and its
+data goes when the last of those volumes has been deleted and purged.
 
 ---
 
@@ -504,9 +555,32 @@ kubectl get storageclass
 | `protocol` | `NVMEOF_TCP`, `ISCSI` | `NVMEOF_TCP` | SAN transport protocol used to export the volume to Kubernetes nodes. |
 | `pool` | Pool ID or Pool Name | Auto-selected | Target Velocor storage pool. If omitted, selects the first online pool with sufficient free space. |
 | `thin` | `"true"`, `"false"` | `"true"` | Provision thin (`true`) or thick (`false`) SPDK logical volumes. |
+| `portals` | Portal names or IDs, comma-separated | The chart's `defaultPortals`, else the protocol's only portal | Portals the class's volumes are exported on, all of the class's protocol. See below. |
 | `csi.storage.k8s.io/fstype` | `ext4`, `xfs` | `ext4` | Filesystem formatted onto mounted volumes by the CSI node plugin. |
 
-Example custom `StorageClass` pinning to a specific pool with XFS:
+**Choosing portals.** An appliance often has portals on more than one network, for example a
+management network and one or two SAN networks. The driver never guesses which one Kubernetes
+should use: if the appliance has more than one portal of a class's protocol, set `portals` on
+the class (or `defaultPortals` in the Helm values, which covers every class without its own
+list and may name portals of both protocols). Otherwise provisioning fails with a message
+listing the portals. Portals that don't exist, or of the wrong protocol, are refused when a
+volume is provisioned.
+
+Each volume is exported on every listed portal, in the listed order:
+
+- **NVMe/TCP:** nodes connect to every portal, and the kernel's native NVMe multipath (on by
+  default on Fedora, RHEL and RHCOS) merges the paths into one device. With native multipath
+  off, nodes use only the first portal that answers.
+- **iSCSI:** nodes log in to the first portal that answers. The others are a fallback for the
+  next attach, not active paths (that needs dm-multipath, which the driver doesn't set up yet).
+
+A volume keeps its class's list for its lifetime (Kubernetes doesn't let StorageClass
+parameters change), while `defaultPortals` can be changed and applies at each volume's next
+attach. A portal listening on every address (`0.0.0.0`) can't be used: nodes need an address
+to connect to, so create a portal for each SAN address. The older `auth.portalOverride` value
+(one `IP:port` for every volume) still works but is deprecated.
+
+Example custom `StorageClass` pinning to a specific pool, exported on two SAN portals, with XFS:
 
 ```yaml
 apiVersion: storage.k8s.io/v1
@@ -520,6 +594,7 @@ volumeBindingMode: Immediate
 parameters:
   protocol: NVMEOF_TCP
   pool: flash-pool-0
+  portals: san-a,san-b
   thin: "true"
   csi.storage.k8s.io/fstype: xfs
 ```

@@ -6,6 +6,8 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -102,9 +104,14 @@ func iscsiIface(ctx context.Context, initiatorIQN string) (string, error) {
 	}
 	sum := sha256.Sum256([]byte(initiatorIQN))
 	name := "velocor-" + hex.EncodeToString(sum[:4])
-	if out, err := iscsiadm(ctx, "-m", "iface", "-I", name, "-o", "new").CombinedOutput(); err != nil &&
-		!strings.Contains(strings.ToLower(string(out)), "exists") {
-		return "", fmt.Errorf("iscsiadm iface new %s: %w (%s)", name, err, strings.TrimSpace(string(out)))
+	// Create it only if it's missing: for an existing iface, `-o new` fails with exit 15 and
+	// "Could not create new interface" (iscsi-initiator-utils 6.2.1.11, RHCOS 9.8), which made
+	// every attach after the node's first fail.
+	if iscsiadm(ctx, "-m", "iface", "-I", name).Run() != nil {
+		if out, err := iscsiadm(ctx, "-m", "iface", "-I", name, "-o", "new").CombinedOutput(); err != nil &&
+			!strings.Contains(strings.ToLower(string(out)), "exists") {
+			return "", fmt.Errorf("iscsiadm iface new %s: %w (%s)", name, err, strings.TrimSpace(string(out)))
+		}
 	}
 	if out, err := iscsiadm(ctx, "-m", "iface", "-I", name, "-o", "update",
 		"-n", "iface.initiatorname", "-v", initiatorIQN).CombinedOutput(); err != nil {
@@ -113,17 +120,45 @@ func iscsiIface(ctx context.Context, initiatorIQN string) (string, error) {
 	return name, nil
 }
 
-func (m *LinuxMounter) ConnectTarget(ctx context.Context, publishCtx map[string]string, hostNQN, initiatorIQN string) (string, error) {
-	proto := normalizeProtocol(publishCtx["protocol"])
-	ip := publishCtx["portal_ip"]
-	port := publishCtx["portal_port"]
+// targetAddr is one portal address a volume can be reached at.
+type targetAddr struct{ ip, port string }
+
+// targetAddrs lists where a volume can be reached, in the controller's order:
+// VELOCOR_PORTAL_OVERRIDE (one address, deprecated), else the publish context's "portals",
+// else portal_ip/portal_port (controllers from before "portals", TODO.md P1-13).
+func targetAddrs(publishCtx map[string]string) ([]targetAddr, error) {
 	if override := strings.TrimSpace(os.Getenv("VELOCOR_PORTAL_OVERRIDE")); override != "" {
 		if h, p, ok := strings.Cut(override, ":"); ok && h != "" && p != "" {
-			ip, port = h, p
+			return []targetAddr{{h, p}}, nil
 		}
 	}
-	if ip == "" || port == "" {
-		return "", fmt.Errorf("missing portal_ip or portal_port in publish_context")
+	var out []targetAddr
+	for _, a := range strings.Split(publishCtx["portals"], ",") {
+		if a = strings.TrimSpace(a); a == "" {
+			continue
+		}
+		h, p, err := net.SplitHostPort(a)
+		if err != nil {
+			return nil, fmt.Errorf("bad portal %q in publish_context: %w", a, err)
+		}
+		out = append(out, targetAddr{h, p})
+	}
+	if len(out) == 0 {
+		if ip, port := publishCtx["portal_ip"], publishCtx["portal_port"]; ip != "" && port != "" {
+			out = append(out, targetAddr{ip, port})
+		}
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("missing portal_ip or portal_port in publish_context")
+	}
+	return out, nil
+}
+
+func (m *LinuxMounter) ConnectTarget(ctx context.Context, publishCtx map[string]string, hostNQN, initiatorIQN string) (string, error) {
+	proto := normalizeProtocol(publishCtx["protocol"])
+	addrs, err := targetAddrs(publishCtx)
+	if err != nil {
+		return "", err
 	}
 
 	switch string(proto) {
@@ -136,27 +171,30 @@ func (m *LinuxMounter) ConnectTarget(ctx context.Context, publishCtx map[string]
 		if iqn == "" {
 			return "", fmt.Errorf("missing target_iqn in publish_context")
 		}
+		byPath := func(a targetAddr) string {
+			return fmt.Sprintf("/dev/disk/by-path/ip-%s-iscsi-%s-lun-%s", iscsiPortalAddr(a.ip, a.port), iqn, lun)
+		}
+		// One session only: without dm-multipath, sessions on two portals would give the node
+		// two separate disks for one volume. Keep a session that already exists (a restage,
+		// or an earlier failover), else log in to the first portal that answers.
+		for _, a := range addrs {
+			if dev, err := filepath.EvalSymlinks(byPath(a)); err == nil {
+				return dev, nil
+			}
+		}
 		iface, err := iscsiIface(ctx, initiatorIQN)
 		if err != nil {
 			return "", err
 		}
-		portal := iscsiPortalAddr(ip, port)
-		if out, err := iscsiadm(ctx, "-m", "discovery", "-t", "sendtargets", "-p", portal, "-I", iface).CombinedOutput(); err != nil {
-			return "", fmt.Errorf("iscsiadm discovery %s: %w (%s)", portal, err, strings.TrimSpace(string(out)))
+		var errs []error
+		for _, a := range addrs {
+			if err := iscsiLogin(ctx, iscsiPortalAddr(a.ip, a.port), iqn, iface); err != nil {
+				errs = append(errs, err)
+				continue
+			}
+			return waitForDevice(ctx, byPath(a))
 		}
-		// Kubernetes decides when this node uses the volume: iscsid must never log in on its own
-		// at boot (node.startup defaults to automatic for discovered records).
-		if out, err := iscsiadm(ctx, "-m", "node", "-T", iqn, "-p", portal, "-I", iface, "-o", "update",
-			"-n", "node.startup", "-v", "manual").CombinedOutput(); err != nil {
-			return "", fmt.Errorf("iscsiadm set node.startup for %s: %w (%s)", iqn, err, strings.TrimSpace(string(out)))
-		}
-		// Ignore error if already logged in (exit code 15).
-		out, err := iscsiadm(ctx, "-m", "node", "-T", iqn, "-p", portal, "-I", iface, "--login").CombinedOutput()
-		if err != nil && !strings.Contains(string(out), "already present") {
-			return "", fmt.Errorf("iscsiadm login %s: %w (%s)", iqn, err, strings.TrimSpace(string(out)))
-		}
-		byPath := fmt.Sprintf("/dev/disk/by-path/ip-%s-iscsi-%s-lun-%s", portal, iqn, lun)
-		return waitForDevice(ctx, byPath)
+		return "", errors.Join(errs...)
 
 	default:
 		nqn := publishCtx["target_nqn"]
@@ -167,19 +205,58 @@ func (m *LinuxMounter) ConnectTarget(ctx context.Context, publishCtx map[string]
 		if proto == "NVMEOF_RDMA" {
 			trtype = "rdma"
 		}
-		// Keep reconnecting for as long as it takes: an appliance or data-plane restart (which
-		// can include volume-store recovery) must stall I/O, not fail it. With the kernel's
-		// default ctrl_loss_tmo (600 s) pods got I/O errors during a 16-minute recovery.
-		args := []string{"connect", "-t", trtype, "-a", ip, "-s", port, "-n", nqn, "--ctrl-loss-tmo=-1", "--reconnect-delay=5"}
-		if hostNQN != "" {
-			args = append(args, "-q", hostNQN, "-I", deterministicHostID(hostNQN))
+		// Every portal is a path to the same namespace; the kernel's native NVMe multipath
+		// merges them into one device. Without it each path would be a separate device, so
+		// only one is connected.
+		multipath := readTrim(m.sys("module", "nvme_core", "parameters", "multipath")) == "Y"
+		connected := 0
+		var errs []error
+		for _, a := range addrs {
+			if connected > 0 && !multipath {
+				break
+			}
+			// Keep reconnecting for as long as it takes: an appliance or data-plane restart
+			// (which can include volume-store recovery) must stall I/O, not fail it. With the
+			// kernel's default ctrl_loss_tmo (600 s) pods got I/O errors during a 16-minute
+			// recovery.
+			args := []string{"connect", "-t", trtype, "-a", a.ip, "-s", a.port, "-n", nqn, "--ctrl-loss-tmo=-1", "--reconnect-delay=5"}
+			if hostNQN != "" {
+				args = append(args, "-q", hostNQN, "-I", deterministicHostID(hostNQN))
+			}
+			out, err := exec.CommandContext(ctx, "nvme", args...).CombinedOutput()
+			if err != nil && !strings.Contains(strings.ToLower(string(out)), "already connected") {
+				errs = append(errs, fmt.Errorf("nvme connect %s at %s: %w (%s)", nqn, net.JoinHostPort(a.ip, a.port), err, strings.TrimSpace(string(out))))
+				continue
+			}
+			connected++
 		}
-		out, err := exec.CommandContext(ctx, "nvme", args...).CombinedOutput()
-		if err != nil && !strings.Contains(strings.ToLower(string(out)), "already connected") {
-			return "", fmt.Errorf("nvme connect %s: %w (%s)", nqn, err, strings.TrimSpace(string(out)))
+		if connected == 0 {
+			return "", errors.Join(errs...)
+		}
+		if len(errs) > 0 {
+			log.Printf("volume %s: connected on %d of %d paths: %v", nqn, connected, len(addrs), errors.Join(errs...))
 		}
 		return m.waitForNVMeDevice(ctx, nqn, publishCtx["namespace_id"], publishCtx["volume_uuid"])
 	}
+}
+
+// iscsiLogin discovers iqn at portal and logs in through iface.
+func iscsiLogin(ctx context.Context, portal, iqn, iface string) error {
+	if out, err := iscsiadm(ctx, "-m", "discovery", "-t", "sendtargets", "-p", portal, "-I", iface).CombinedOutput(); err != nil {
+		return fmt.Errorf("iscsiadm discovery %s: %w (%s)", portal, err, strings.TrimSpace(string(out)))
+	}
+	// Kubernetes decides when this node uses the volume: iscsid must never log in on its own
+	// at boot (node.startup defaults to automatic for discovered records).
+	if out, err := iscsiadm(ctx, "-m", "node", "-T", iqn, "-p", portal, "-I", iface, "-o", "update",
+		"-n", "node.startup", "-v", "manual").CombinedOutput(); err != nil {
+		return fmt.Errorf("iscsiadm set node.startup for %s at %s: %w (%s)", iqn, portal, err, strings.TrimSpace(string(out)))
+	}
+	// Ignore error if already logged in (exit code 15).
+	out, err := iscsiadm(ctx, "-m", "node", "-T", iqn, "-p", portal, "-I", iface, "--login").CombinedOutput()
+	if err != nil && !strings.Contains(string(out), "already present") {
+		return fmt.Errorf("iscsiadm login %s at %s: %w (%s)", iqn, portal, err, strings.TrimSpace(string(out)))
+	}
+	return nil
 }
 
 func (m *LinuxMounter) DisconnectTarget(ctx context.Context, publishCtx map[string]string) error {
@@ -187,22 +264,28 @@ func (m *LinuxMounter) DisconnectTarget(ctx context.Context, publishCtx map[stri
 	switch string(proto) {
 	case "ISCSI":
 		iqn := publishCtx["target_iqn"]
-		ip := publishCtx["portal_ip"]
-		port := publishCtx["portal_port"]
-		if iqn != "" && ip != "" && port != "" {
-			portal := iscsiPortalAddr(ip, port)
-			// Exit status 21: no matching session (already logged out), which is fine.
+		addrs, err := targetAddrs(publishCtx)
+		if iqn == "" || err != nil {
+			return nil
+		}
+		var errs []error
+		for _, a := range addrs {
+			portal := iscsiPortalAddr(a.ip, a.port)
+			// Exit status 21: no matching session (already logged out, or never logged in on
+			// this portal), which is fine.
 			if out, err := iscsiadm(ctx, "-m", "node", "-T", iqn, "-p", portal, "--logout").CombinedOutput(); err != nil && exitCode(err) != 21 {
-				return fmt.Errorf("iscsiadm logout %s: %w (%s)", iqn, err, strings.TrimSpace(string(out)))
+				errs = append(errs, fmt.Errorf("iscsiadm logout %s at %s: %w (%s)", iqn, portal, err, strings.TrimSpace(string(out))))
+				continue
 			}
 			// Forget the target too, so the node keeps no record of volumes it no longer uses
 			// (and iscsid doesn't keep retrying a target that's gone).
 			_ = iscsiadm(ctx, "-m", "node", "-T", iqn, "-p", portal, "-o", "delete").Run()
 		}
-		return nil
+		return errors.Join(errs...)
 	default:
 		nqn := publishCtx["target_nqn"]
 		if nqn != "" {
+			// Disconnects every path (controller) of the subsystem.
 			out, err := exec.CommandContext(ctx, "nvme", "disconnect", "-n", nqn).CombinedOutput()
 			if err != nil && !strings.Contains(string(out), "disconnected 0 controller") {
 				return fmt.Errorf("nvme disconnect %s: %w (%s)", nqn, err, strings.TrimSpace(string(out)))

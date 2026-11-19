@@ -67,6 +67,8 @@ type Store interface {
 	ReplacePoolMember(poolID string, slot int, newDiskID string) (*Pool, error)
 	// ReleasePoolDisk unbinds a detached disk from its pool.
 	ReleasePoolDisk(poolID, diskID string) (*Pool, error)
+	// RelinkPoolMember moves a member to the record of the same disk under a new ID.
+	RelinkPoolMember(poolID, oldDiskID, newDiskID, bdevUUID string) (*Pool, error)
 	GetSettings() (*Settings, error)
 	SaveSettings(st *Settings) error
 
@@ -81,12 +83,23 @@ type Store interface {
 	SetVolumeAttachmentState(id string, state AttachmentState) (*Volume, error)
 	ListVolumes(poolID string) ([]*Volume, error)
 	DeleteVolume(id string) error
+	// TrashVolume marks a volume deleted but keeps it (and its data) until purgeAt.
+	TrashVolume(id string, now, purgeAt time.Time, by string) (*Volume, error)
+	// RestoreVolume undoes TrashVolume, optionally under a new name.
+	RestoreVolume(id, newName string) (*Volume, error)
+	// DeferSnapshotDelete marks a snapshot that clones depend on as deleted (true); false
+	// means nothing depends on it and the caller deletes it now.
+	DeferSnapshotDelete(id string, now time.Time, by string) (bool, error)
+	// PurgeableSnapshot reports whether a deleted snapshot no longer has dependent clones.
+	PurgeableSnapshot(id string) (bool, error)
 
 	// Snapshots
 	CreateSnapshot(snap *Snapshot) error
 	GetSnapshot(id string) (*Snapshot, error)
 	GetSnapshotByName(volumeID, name string) (*Snapshot, error)
 	ListSnapshots(poolID, volumeID string) ([]*Snapshot, error)
+	// MutateSnapshot atomically applies fn to the current Snapshot record.
+	MutateSnapshot(id string, fn func(*Snapshot) error) (*Snapshot, error)
 	DeleteSnapshot(id string) error
 	// CheckSnapshotDeletable returns nil if DeleteSnapshot(id) would currently succeed.
 	CheckSnapshotDeletable(id string) error

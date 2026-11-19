@@ -17,10 +17,12 @@ package spdktest
 import (
 	"bufio"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"net"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -85,6 +87,7 @@ type Fake struct {
 
 	// Physical media present in the machine. key = PCI address or filename.
 	nvmeMedia  map[string]bool
+	nvmeCache  map[string]NVMeCache // PCI address -> the drive's volatile write cache
 	fileMedia  map[string]bool
 	superblock map[string]*raidSuperblock // media key -> superblock
 	lvsMedia   map[string]*mediaLvstore   // raid media key -> persisted lvstore
@@ -119,6 +122,7 @@ func New(t testing.TB) *Fake {
 		t:            t,
 		sockPath:     filepath.Join(t.TempDir(), "spdk.sock"),
 		nvmeMedia:    map[string]bool{},
+		nvmeCache:    map[string]NVMeCache{},
 		fileMedia:    map[string]bool{},
 		superblock:   map[string]*raidSuperblock{},
 		lvsMedia:     map[string]*mediaLvstore{},
@@ -146,6 +150,31 @@ func (f *Fake) AddNVMe(pci string) {
 	f.nvmeMedia[pci] = true
 }
 
+// NVMeCache is an NVMe drive's volatile write cache, as its admin commands report it.
+type NVMeCache struct {
+	Present  bool // Identify Controller VWC
+	Saveable bool // ONCS bit 4: Set Features can save
+	// NotSaveable: saving this feature is refused although ONCS says saving is supported.
+	NotSaveable bool
+	Enabled     bool // feature 06h WCE
+	Refuse      bool // Set Features 06h fails (Invalid Field)
+	Saved       bool // the last Set Features asked to save the value
+}
+
+// SetNVMeCache sets the write cache of the drive at pci (drives have none by default).
+func (f *Fake) SetNVMeCache(pci string, c NVMeCache) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.nvmeCache[pci] = c
+}
+
+// NVMeCacheOf returns the write cache of the drive at pci.
+func (f *Fake) NVMeCacheOf(pci string) NVMeCache {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.nvmeCache[pci]
+}
+
 // AddFile registers a physical kernel block device path usable with bdev_uring.
 func (f *Fake) AddFile(path string) {
 	f.mu.Lock()
@@ -159,6 +188,25 @@ func (f *Fake) RemoveMedia(key string) {
 	defer f.mu.Unlock()
 	delete(f.nvmeMedia, key)
 	delete(f.fileMedia, key)
+}
+
+// MoveMedia simulates a kernel block device reappearing under another path (the disk moved
+// to another controller): its contents, RAID superblock included, go with it.
+func (f *Fake) MoveMedia(from, to string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.fileMedia[from] {
+		delete(f.fileMedia, from)
+		f.fileMedia[to] = true
+	}
+	if sb, ok := f.superblock[from]; ok {
+		delete(f.superblock, from)
+		f.superblock[to] = sb
+	}
+	if lvs, ok := f.lvsMedia[from]; ok {
+		delete(f.lvsMedia, from)
+		f.lvsMedia[to] = lvs
+	}
 }
 
 // Restart simulates spdk_tgt restarting with no saved configuration.
@@ -278,6 +326,20 @@ func (f *Fake) WriteCluster(ref string, idx uint64) {
 		l.Clusters[idx] = true
 		l.Allocated++
 	}
+}
+
+// SetLvstoreClusters sets the number of data clusters of the lvstore named lvsName, to test a
+// pool filling up.
+func (f *Fake) SetLvstoreClusters(lvsName string, n uint64) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, lvs := range f.lvsMedia {
+		if lvs.Name == lvsName {
+			lvs.TotalClust = n
+			return
+		}
+	}
+	f.t.Fatalf("spdktest: SetLvstoreClusters: lvstore %s not found", lvsName)
 }
 
 // LvolSizeMiB returns the size of the lvol with alias or UUID ref.
@@ -570,6 +632,62 @@ var handlers = map[string]handler{
 			return nil, errf(codeENODEV, "No such device")
 		}
 		return spdk.NvmeHealthInfo{TemperatureCelsius: 35, AvailableSpare: 100}, nil
+	},
+	"bdev_nvme_send_cmd": func(f *Fake, p map[string]any) (any, *rpcErr) {
+		pci, ok := f.nvmeCtrls[str(p, "name")]
+		if !ok || str(p, "cmd_type") != "admin" || str(p, "data_direction") != "c2h" {
+			return nil, errf(codeInvalidParams, "Invalid parameters")
+		}
+		// Like SPDK's spdk_base64_urlsafe_decode: padded URL-safe base64 only.
+		cmd, err := base64.URLEncoding.DecodeString(str(p, "cmdbuf"))
+		if err != nil || len(cmd) != 64 {
+			return nil, errf(codeInvalidParams, "Invalid parameters")
+		}
+		le := binary.LittleEndian
+		cdw10, cdw11 := le.Uint32(cmd[40:]), le.Uint32(cmd[44:])
+		cache := f.nvmeCache[pci]
+		var cdw0 uint32
+		var sct, sc uint16
+		var data []byte
+		switch {
+		case cmd[0] == 0x06 && cdw10&0xff == 1: // Identify Controller
+			if num(p, "data_len") != 4096 {
+				return nil, errf(codeInvalidParams, "Invalid parameters")
+			}
+			data = make([]byte, 4096)
+			if cache.Present {
+				data[525] = 1
+			}
+			if cache.Saveable {
+				data[520] = 1 << 4
+			}
+		case cmd[0] == 0x0a && cdw10&0xff == 0x06: // Get Features, volatile write cache
+			if !cache.Present {
+				sc = 0x02 // Invalid Field in Command
+			} else if cache.Enabled {
+				cdw0 = 1
+			}
+		case cmd[0] == 0x09 && cdw10&0xff == 0x06: // Set Features, volatile write cache
+			switch {
+			case !cache.Present || cache.Refuse:
+				sc = 0x02
+			case cdw10&(1<<31) != 0 && (!cache.Saveable || cache.NotSaveable):
+				sct, sc = 1, 0x0d // Feature Identifier Not Saveable
+			default:
+				cache.Enabled, cache.Saved = cdw11&1 != 0, cdw10&(1<<31) != 0
+				f.nvmeCache[pci] = cache
+			}
+		default:
+			sc = 0x01 // Invalid Command Opcode
+		}
+		cpl := make([]byte, 16)
+		le.PutUint32(cpl[0:], cdw0)
+		le.PutUint16(cpl[14:], sc<<1|sct<<9)
+		out := map[string]any{"cpl": base64.URLEncoding.EncodeToString(cpl)}
+		if data != nil {
+			out["data"] = base64.URLEncoding.EncodeToString(data)
+		}
+		return out, nil
 	},
 	"bdev_uring_create": func(f *Fake, p map[string]any) (any, *rpcErr) {
 		name, file := str(p, "name"), str(p, "filename")
@@ -899,6 +1017,21 @@ var handlers = map[string]handler{
 		}
 		s.ListenAddresses = append(s.ListenAddresses, la)
 		return true, nil
+	},
+	"nvmf_subsystem_remove_listener": func(f *Fake, p map[string]any) (any, *rpcErr) {
+		s, ok := f.subsystems[str(p, "nqn")]
+		if !ok {
+			return nil, errf(codeInvalidParams, "Unable to find subsystem")
+		}
+		var la spdk.NvmfListenAddress
+		remarshal(p["listen_address"], &la)
+		for i, l := range s.ListenAddresses {
+			if strings.EqualFold(l.Trtype, la.Trtype) && l.Traddr == la.Traddr && l.Trsvcid == la.Trsvcid {
+				s.ListenAddresses = slices.Delete(s.ListenAddresses, i, i+1)
+				return true, nil
+			}
+		}
+		return nil, errf(codeInvalidParams, "Unable to find listener")
 	},
 	"nvmf_subsystem_add_host": func(f *Fake, p map[string]any) (any, *rpcErr) {
 		s, ok := f.subsystems[str(p, "nqn")]

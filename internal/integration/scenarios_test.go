@@ -5,8 +5,10 @@ package integration
 import (
 	"context"
 	"os"
+	"slices"
 	"testing"
 
+	"github.com/velocor/velocor/internal/spdk"
 	"github.com/velocor/velocor/internal/store"
 )
 
@@ -61,7 +63,23 @@ func TestDataSurvivesCrashAndRestart(t *testing.T) {
 					how, p.HealthStatus, p.StatusMessage, p.LVSUUID, v.HealthStatus, v.StatusMessage, st)
 			}
 			in.mustRead(0, data)
+			if len(st.Unmanaged) != 0 {
+				t.Fatalf("after %s restart, managed objects reported as unmanaged: %+v", how, st.Unmanaged)
+			}
 		})
+	}
+
+	// Something created behind Velocor's back is reported, and left alone (P1-5).
+	stray, err := a.tg.client().BdevLvolCreate(context.Background(), pool["lvs_name"].(string), "stray", 4<<20, true, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	st := a.reconcile()
+	if len(st.Unmanaged) != 1 || st.Unmanaged[0].Kind != "LVOL" || st.Unmanaged[0].UUID != stray {
+		t.Fatalf("want the stray lvol reported: %+v", st.Unmanaged)
+	}
+	if lvols, _ := a.tg.client().BdevLvolGetLvols(context.Background()); !slices.ContainsFunc(lvols, func(l spdk.LvolInfo) bool { return l.UUID == stray }) {
+		t.Fatal("the reconciler deleted the stray lvol")
 	}
 }
 
@@ -115,12 +133,44 @@ func TestSnapshotsAndClones(t *testing.T) {
 	}
 	a.must("DELETE", "/volumes/"+vol["id"].(string), nil, "")
 	cin.mustRead(0, first)
+	a.must("DELETE", "/deleted-volumes/"+vol["id"].(string), nil, "") // purge: the lvol goes from SPDK
+	cin.mustRead(0, first)
 
 	// SPDK v26.09 has no bdev_lvol_get_fragmap, so changed-block tracking must say so
 	// clearly rather than return made-up extents (TODO.md P1-9).
 	code, out := a.do("GET", "/snapshots/"+s2["id"].(string)+"/blocks:changed?base_snapshot_id="+s1["id"].(string), nil)
 	if code != 501 {
 		t.Fatalf("changed blocks on SPDK without fragmap support: want 501, got %d %v", code, out)
+	}
+
+	// A snapshot with a clone can be deleted: it disappears, and SPDK deletes it once the clone
+	// is gone (P1-4).
+	a.must("DELETE", "/snapshots/"+s1["id"].(string), nil, "")
+	if code, _ := a.do("GET", "/snapshots/"+s1["id"].(string), nil); code != 404 {
+		t.Fatalf("deleted snapshot still visible: HTTP %d", code)
+	}
+	cin.mustRead(0, first)
+
+	for _, e := range a.must("GET", "/exports?volume_id="+clone["id"].(string), nil, "")["exports"].([]any) {
+		a.must("DELETE", "/exports/"+e.(map[string]any)["id"].(string), nil, "")
+	}
+	a.must("DELETE", "/volumes/"+clone["id"].(string), nil, "")
+	a.must("DELETE", "/deleted-volumes/"+clone["id"].(string), nil, "")
+	a.must("POST", "/system/reconcile", nil, "")
+	lvols, err := a.tg.client().BdevLvolGetLvols(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, l := range lvols {
+		if l.UUID == s1["uuid"] || l.UUID == clone["uuid"] || l.UUID == vol["uuid"] {
+			t.Fatalf("lvol %s (%s) still in SPDK after the purge", l.Name, l.UUID)
+		}
+	}
+	if code, _ := a.do("GET", "/snapshots/"+s2["id"].(string), nil); code != 200 {
+		t.Fatalf("snapshot s2 lost: HTTP %d", code)
+	}
+	if st := a.reconcile(); len(st.Unmanaged) != 0 {
+		t.Fatalf("managed objects reported as unmanaged: %+v", st.Unmanaged)
 	}
 }
 
@@ -191,6 +241,7 @@ func TestPoolDeleteThenReuseDisks(t *testing.T) {
 		a.must("DELETE", "/exports/"+e.(map[string]any)["id"].(string), nil, "")
 	}
 	a.must("DELETE", "/volumes/"+vol["id"].(string), nil, "")
+	a.must("DELETE", "/deleted-volumes/"+vol["id"].(string), nil, "") // deleted volumes are kept until purged (P1-4)
 	a.must("DELETE", "/pools/"+pool["id"].(string), nil, "")
 	for _, d := range []string{"diska", "diskb"} {
 		a.must("POST", "/disks/"+d+":release", nil, "")

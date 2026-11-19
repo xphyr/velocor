@@ -1,9 +1,12 @@
 package server
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"github.com/velocor/velocor/internal/dataplane"
 	"net/http"
+	"slices"
 	"strings"
 
 	"github.com/velocor/velocor/internal/hardware"
@@ -42,7 +45,7 @@ func (s *Server) handleUpdateDisk(w http.ResponseWriter, r *http.Request) {
 		if *req.WriteCachePolicy != d.WriteCachePolicy {
 			target := *d
 			target.WriteCachePolicy = *req.WriteCachePolicy
-			state, err := s.applyWriteCachePolicy(&target)
+			state, err := s.applyWriteCachePolicy(r.Context(), &target)
 			if err != nil {
 				writeError(w, err)
 				return
@@ -57,6 +60,7 @@ func (s *Server) handleUpdateDisk(w http.ResponseWriter, r *http.Request) {
 		if req.WriteCachePolicy != nil {
 			cur.WriteCachePolicy = *req.WriteCachePolicy
 			cur.WriteCache = d.WriteCache
+			cur.WriteCacheError = "" // applied (or LEAVE): nothing outstanding
 		}
 		return nil
 	})
@@ -68,7 +72,22 @@ func (s *Server) handleUpdateDisk(w http.ResponseWriter, r *http.Request) {
 }
 
 // applyWriteCachePolicy makes the drive match d.WriteCachePolicy and returns its cache state.
-func (s *Server) applyWriteCachePolicy(d *store.Disk) (store.WriteCacheState, error) {
+// An NVMe drive is switched through SPDK once SPDK owns it; before that its policy is only
+// recorded, and applied when it is claimed.
+func (s *Server) applyWriteCachePolicy(ctx context.Context, d *store.Disk) (store.WriteCacheState, error) {
+	if d.Type == store.DiskTypeNVMe {
+		if !d.Claimed || d.SPDKBdevName == "" {
+			return d.WriteCache, nil
+		}
+		if err := s.requireSPDK(); err != nil {
+			return d.WriteCache, err
+		}
+		state, err := dataplane.SetNVMeWriteCache(ctx, s.spdk, dataplane.NVMeControllerFromBdev(d.SPDKBdevName), d.WriteCachePolicy != store.WriteCachePolicyDisabled)
+		if err != nil {
+			return state, fmt.Errorf("%w: %v", store.ErrInvalidArgument, err)
+		}
+		return state, nil
+	}
 	if s.hw == nil {
 		return d.WriteCache, errors.New("hardware access is not available")
 	}
@@ -85,19 +104,33 @@ func (s *Server) durabilityWarnings() []string {
 	if err != nil {
 		return nil
 	}
-	var atRisk, unknown []string
+	var atRisk, refused, unknown []string
+	refusal := ""
 	for _, d := range disks {
 		if !d.Claimed && d.PoolID == "" {
 			continue
 		}
 		switch d.Durability() {
 		case store.DurabilityAtRisk:
+			if d.WriteCacheError != "" {
+				refused = append(refused, d.Name)
+				if refusal == "" {
+					refusal = d.WriteCacheError
+				}
+				continue
+			}
 			atRisk = append(atRisk, d.Name)
 		case store.DurabilityUnknown:
 			unknown = append(unknown, d.Name)
 		}
 	}
 	var out []string
+	slices.Sort(refused)
+	slices.Sort(atRisk)
+	slices.Sort(unknown)
+	if len(refused) > 0 {
+		out = append(out, fmt.Sprintf("The write cache of %s can't be turned off (%s), so power loss can lose acknowledged writes. Declare the disks power-loss protected if they are (e.g. a virtual disk whose host protects its cache), or set their write-cache policy to leave the drive alone.", strings.Join(refused, ", "), refusal))
+	}
 	if len(atRisk) > 0 {
 		out = append(out, fmt.Sprintf("Power loss can lose acknowledged writes on %s: the volatile write cache is on and the disk isn't declared power-loss protected. Disable the cache, or declare the disk protected if it is.", strings.Join(atRisk, ", ")))
 	}

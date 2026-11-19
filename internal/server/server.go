@@ -24,8 +24,10 @@ import (
 	"time"
 
 	"github.com/velocor/velocor/internal/auth"
+	"github.com/velocor/velocor/internal/backup"
 	"github.com/velocor/velocor/internal/dataplane"
 	"github.com/velocor/velocor/internal/hardware"
+	"github.com/velocor/velocor/internal/meta"
 	"github.com/velocor/velocor/internal/reconciler"
 	"github.com/velocor/velocor/internal/spdk"
 	"github.com/velocor/velocor/internal/store"
@@ -41,6 +43,7 @@ type Server struct {
 	auth       *auth.Manager
 	reconciler *reconciler.Reconciler
 	logger     *slog.Logger
+	space      spaceReservations
 	startedAt  time.Time
 	mux        *http.ServeMux
 
@@ -48,6 +51,10 @@ type Server struct {
 	metricsPublic bool
 	insecureHTTP  bool
 	bootstrapFile string
+	backups       *backup.Manager
+	restart       func()
+	metaDev       meta.Device
+	sbReader      func(*store.Disk) (*hardware.RaidSuperblock, error) // tests
 }
 
 // WithInsecureHTTP records that the API is served over plain HTTP, so status can warn about it.
@@ -55,9 +62,31 @@ func WithInsecureHTTP(insecure bool) Option {
 	return func(s *Server) { s.insecureHTTP = insecure }
 }
 
-// WithBootstrapPasswordFile lets status warn while the generated bootstrap password file exists.
+// WithBootstrapPasswordFile names the file the generated bootstrap password was written to:
+// velod deletes it once the admin password has been changed, and status warns while it exists.
 func WithBootstrapPasswordFile(path string) Option {
 	return func(s *Server) { s.bootstrapFile = path }
+}
+
+// removeStaleBootstrapFile deletes the bootstrap password file once the password in it no
+// longer opens the admin account (it was changed, also before velod learnt to do this).
+func (s *Server) removeStaleBootstrapFile() {
+	if s.bootstrapFile == "" || s.store == nil {
+		return
+	}
+	data, err := os.ReadFile(s.bootstrapFile)
+	if err != nil {
+		return // gone already, or unreadable: status still warns while it exists
+	}
+	admin, err := s.store.GetAdminUser(auth.DefaultAdminUsername)
+	if err != nil || auth.VerifyPassword(strings.TrimSpace(string(data)), admin.PasswordHash) {
+		return
+	}
+	if err := os.Remove(s.bootstrapFile); err != nil {
+		s.logger.Warn("cannot delete the initial admin password file", "path", s.bootstrapFile, "err", err)
+		return
+	}
+	s.logger.Info("deleted the initial admin password file: the password has been changed", "path", s.bootstrapFile)
 }
 
 // warnings lists configuration problems an operator should fix, for every UI screen.
@@ -65,7 +94,7 @@ func (s *Server) warnings() []string {
 	out := []string{}
 	if s.bootstrapFile != "" {
 		if _, err := os.Stat(s.bootstrapFile); err == nil {
-			out = append(out, "The initial admin password file "+s.bootstrapFile+" still exists. Delete it once the password has been changed.")
+			out = append(out, "The initial admin password file "+s.bootstrapFile+" still exists. It is deleted when the admin password is changed.")
 		}
 	}
 	if s.insecureHTTP {
@@ -75,6 +104,13 @@ func (s *Server) warnings() []string {
 		out = append(out, "/metrics is served without authentication.")
 	}
 	out = append(out, s.durabilityWarnings()...)
+	if s.reconciler != nil {
+		if sum := reconciler.UnmanagedSummary(s.reconciler.State().Unmanaged); sum != "" {
+			out = append(out, "spdk_tgt holds objects that Velocor doesn't manage ("+sum+"), listed on the System page. "+
+				"They are left alone: they may be leftovers of a failed operation, or the only copy of data after the database was lost. "+
+				"Import the pool or restore a database backup if they are yours; remove them by hand only once you know what they are.")
+		}
+	}
 	if s.hw != nil && s.hw.UnsafeNoIOMMUAllowed() {
 		out = append(out, "Unsafe no-IOMMU mode is allowed: SPDK can DMA anywhere in host memory. Use this only in lab VMs.")
 	}
@@ -118,6 +154,7 @@ func New(
 	for _, o := range opts {
 		o(s)
 	}
+	s.removeStaleBootstrapFile()
 	s.registerRoutes()
 	return s
 }
@@ -128,7 +165,11 @@ const maxRequestBodyBytes = 1 << 20
 // Handler returns the root http.Handler for the server.
 func (s *Server) Handler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
+		limit := int64(maxRequestBodyBytes)
+		if r.URL.Path == restorePath {
+			limit = maxRestoreBytes
+		}
+		r.Body = http.MaxBytesReader(w, r.Body, limit)
 		if r.Method != http.MethodGet && r.Method != http.MethodHead {
 			// A client that disconnects or times out must not abort a change halfway: SPDK
 			// finishes what it was asked to do regardless, and a rollback based on a cancelled
@@ -174,6 +215,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("POST /api/v1/pools", s.withAuth(store.RoleAdmin, s.handleCreatePool))
 	s.mux.HandleFunc("GET /api/v1/pools/{id}", s.withAuth(store.RoleReadOnly, s.handleGetPool))
 	s.mux.HandleFunc("DELETE /api/v1/pools/{id}", s.withAuth(store.RoleAdmin, s.handleDeletePool))
+	s.mux.HandleFunc("PATCH /api/v1/pools/{id}", s.withAuth(store.RoleAdmin, s.handleUpdatePool))
 	s.mux.HandleFunc("POST /api/v1/pools/{id}/replace", s.withAuth(store.RoleAdmin, s.handleReplacePoolDisk))
 	s.mux.HandleFunc("POST /api/v1/pools/{id}/start-degraded", s.withAuth(store.RoleAdmin, s.handleStartPoolDegraded))
 	s.mux.HandleFunc("DELETE /api/v1/pools/{id}/disks/{disk_id}", s.withAuth(store.RoleAdmin, s.handleReleasePoolDisk))
@@ -186,6 +228,12 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("POST /api/v1/volumes/{volume_id}/snapshots", s.withAuth(store.RoleCSIProvisioner, s.handleCreateSnapshot))
 	s.mux.HandleFunc("POST /api/v1/volumes/", s.withAuth(store.RoleCSIProvisioner, s.handleVolumeAction))
 	s.mux.HandleFunc("DELETE /api/v1/volumes/{id}", s.withAuth(store.RoleCSIProvisioner, s.handleDeleteVolume))
+	s.mux.HandleFunc("PUT /api/v1/volumes/{id}/protection", s.withAuth(store.RoleAdmin, s.handleSetVolumeProtection))
+	s.mux.HandleFunc("GET /api/v1/deleted-volumes", s.withAuth(store.RoleReadOnly, s.handleListDeletedVolumes))
+	s.mux.HandleFunc("POST /api/v1/deleted-volumes/{id}/restore", s.withAuth(store.RoleAdmin, s.handleRestoreVolume))
+	s.mux.HandleFunc("DELETE /api/v1/deleted-volumes/{id}", s.withAuth(store.RoleAdmin, s.handlePurgeVolume))
+	s.mux.HandleFunc("GET /api/v1/system/volume-retention", s.withAuth(store.RoleReadOnly, s.handleGetVolumeRetention))
+	s.mux.HandleFunc("PUT /api/v1/system/volume-retention", s.withAuth(store.RoleAdmin, s.handlePutVolumeRetention))
 
 	s.mux.HandleFunc("GET /api/v1/snapshots", s.withAuth(store.RoleReadOnly, s.handleListSnapshots))
 	s.mux.HandleFunc("GET /api/v1/snapshots/", s.withAuth(store.RoleReadOnly, s.handleSnapshotGetOrBlocks))
@@ -229,6 +277,12 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("PUT /api/v1/system/rebuild", s.withAuth(store.RoleAdmin, s.handlePutRebuildSettings))
 	s.mux.HandleFunc("GET /api/v1/system/iostats", s.withAuth(store.RoleReadOnly, s.handleGetIoStats))
 	s.mux.HandleFunc("GET /api/v1/system/os", s.withAuth(store.RoleReadOnly, s.handleGetOSStatus))
+	s.mux.HandleFunc("GET /api/v1/pool-imports", s.withAuth(store.RoleAdmin, s.handleListImportCandidates))
+	s.mux.HandleFunc("POST /api/v1/pool-imports", s.withAuth(store.RoleAdmin, s.handleImportPool))
+	s.mux.HandleFunc("GET /api/v1/system/backup", s.withAuth(store.RoleAdmin, s.handleDownloadBackup))
+	s.mux.HandleFunc("GET /api/v1/system/backups", s.withAuth(store.RoleAdmin, s.handleListBackups))
+	s.mux.HandleFunc("POST /api/v1/system/backups", s.withAuth(store.RoleAdmin, s.handleTakeBackup))
+	s.mux.HandleFunc("POST "+restorePath, s.withAuth(store.RoleAdmin, s.handleRestore))
 	s.mux.HandleFunc("POST /api/v1/system/upgrade", s.withAuth(store.RoleAdmin, s.handleStageUpgrade))
 	s.mux.HandleFunc("POST /api/v1/system/rollback", s.withAuth(store.RoleAdmin, s.handleRollbackUpgrade))
 	s.mux.HandleFunc("POST /api/v1/system/reboot", s.withAuth(store.RoleAdmin, s.handleRebootSystem))
@@ -350,6 +404,7 @@ func (s *Server) handleChangePassword(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
+	s.removeStaleBootstrapFile()
 	// All earlier sessions (including the caller's) were revoked; hand back a fresh one.
 	writeJSON(w, http.StatusOK, map[string]any{
 		"access_token": sess.Token,
@@ -550,16 +605,22 @@ func (s *Server) handleGetPool(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleListVolumes(w http.ResponseWriter, r *http.Request) {
 	poolID := r.URL.Query().Get("pool_id")
-	vols, err := s.store.ListVolumes(poolID)
+	all, err := s.store.ListVolumes(poolID)
 	if err != nil {
 		writeError(w, err)
 		return
+	}
+	vols := make([]*store.Volume, 0, len(all))
+	for _, v := range all {
+		if !v.Deleted() {
+			vols = append(vols, v)
+		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"volumes": vols})
 }
 
 func (s *Server) handleGetVolume(w http.ResponseWriter, r *http.Request) {
-	vol, err := s.store.GetVolume(r.PathValue("id"))
+	vol, err := s.liveVolume(r.PathValue("id"))
 	if err != nil {
 		writeError(w, err)
 		return
@@ -570,10 +631,16 @@ func (s *Server) handleGetVolume(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleListSnapshots(w http.ResponseWriter, r *http.Request) {
 	poolID := r.URL.Query().Get("pool_id")
 	volID := r.URL.Query().Get("volume_id")
-	snaps, err := s.store.ListSnapshots(poolID, volID)
+	all, err := s.store.ListSnapshots(poolID, volID)
 	if err != nil {
 		writeError(w, err)
 		return
+	}
+	snaps := make([]*store.Snapshot, 0, len(all))
+	for _, sn := range all {
+		if !sn.Deleted() {
+			snaps = append(snaps, sn)
+		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"snapshots": snaps})
 }
@@ -634,7 +701,7 @@ func (s *Server) handleGetVolumeGroupSnapshot(w http.ResponseWriter, r *http.Req
 func (s *Server) resolveGroupSnapshots(snapIDs []string) []*store.Snapshot {
 	snaps := make([]*store.Snapshot, 0, len(snapIDs))
 	for _, snapID := range snapIDs {
-		if snap, err := s.store.GetSnapshot(snapID); err == nil {
+		if snap, err := s.liveSnapshot(snapID); err == nil {
 			snaps = append(snaps, snap)
 		}
 	}
@@ -957,6 +1024,15 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		sb.WriteString("# HELP velocor_reconciler_degraded_resources Number of currently degraded resources.\n")
 		sb.WriteString("# TYPE velocor_reconciler_degraded_resources gauge\n")
 		fmt.Fprintf(&sb, "velocor_reconciler_degraded_resources %d\n", len(st.DegradedResources))
+		sb.WriteString("# HELP velocor_spdk_unmanaged_objects Objects in spdk_tgt that no Velocor record accounts for, by kind.\n")
+		sb.WriteString("# TYPE velocor_spdk_unmanaged_objects gauge\n")
+		counts := map[string]int{}
+		for _, o := range st.Unmanaged {
+			counts[o.Kind]++
+		}
+		for _, k := range []string{"BDEV", "ISCSI_TARGET", "LVOL", "LVSTORE", "NVMF_SUBSYSTEM", "RAID"} {
+			fmt.Fprintf(&sb, "velocor_spdk_unmanaged_objects{kind=%q} %d\n", k, counts[k])
+		}
 	}
 
 	if pools, err := s.store.ListPools(); err == nil {
@@ -967,6 +1043,44 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		for _, p := range pools {
 			fmt.Fprintf(&sb, "velocor_pool_total_bytes{pool=%q,raid=%q} %d\n", p.Name, p.RaidLevel, p.TotalBytes)
 			fmt.Fprintf(&sb, "velocor_pool_free_bytes{pool=%q,raid=%q} %d\n", p.Name, p.RaidLevel, p.FreeBytes)
+		}
+		sb.WriteString("# HELP velocor_pool_committed_bytes Space promised by a pool: every volume fully written plus what snapshots hold.\n")
+		sb.WriteString("# TYPE velocor_pool_committed_bytes gauge\n")
+		sb.WriteString("# HELP velocor_pool_available_bytes How much more a pool accepts under its space policy (0 at CRITICAL or FULL).\n")
+		sb.WriteString("# TYPE velocor_pool_available_bytes gauge\n")
+		sb.WriteString("# HELP velocor_pool_used_ratio Fraction of a pool's volume store that is allocated.\n")
+		sb.WriteString("# TYPE velocor_pool_used_ratio gauge\n")
+		sb.WriteString("# HELP velocor_pool_space_state Pool space state: 0 OK, 1 WARNING, 2 CRITICAL (growth refused), 3 FULL (writes to new space fail).\n")
+		sb.WriteString("# TYPE velocor_pool_space_state gauge\n")
+		for _, p := range pools {
+			fmt.Fprintf(&sb, "velocor_pool_committed_bytes{pool=%q} %d\n", p.Name, p.CommittedBytes)
+			fmt.Fprintf(&sb, "velocor_pool_available_bytes{pool=%q} %d\n", p.Name, p.AvailableBytes)
+			fmt.Fprintf(&sb, "velocor_pool_used_ratio{pool=%q} %.4f\n", p.Name, store.UsedPercent(p)/100)
+			fmt.Fprintf(&sb, "velocor_pool_space_state{pool=%q,state=%q} %d\n", p.Name, p.SpaceState, spaceStateValue(p.SpaceState))
+		}
+		poolName := map[string]string{}
+		for _, p := range pools {
+			poolName[p.ID] = p.Name
+		}
+		if vols, err := s.store.ListVolumes(""); err == nil {
+			sb.WriteString("# HELP velocor_volume_size_bytes Provisioned size of a volume.\n")
+			sb.WriteString("# TYPE velocor_volume_size_bytes gauge\n")
+			sb.WriteString("# HELP velocor_volume_allocated_bytes Space a volume holds in its pool.\n")
+			sb.WriteString("# TYPE velocor_volume_allocated_bytes gauge\n")
+			for _, v := range vols {
+				if v.Deleted() {
+					continue // its space shows in the pool's figures
+				}
+				fmt.Fprintf(&sb, "velocor_volume_size_bytes{volume=%q,pool=%q} %d\n", v.Name, poolName[v.PoolID], v.SizeBytes)
+				fmt.Fprintf(&sb, "velocor_volume_allocated_bytes{volume=%q,pool=%q} %d\n", v.Name, poolName[v.PoolID], v.AllocatedBytes)
+			}
+		}
+		if snaps, err := s.store.ListSnapshots("", ""); err == nil {
+			sb.WriteString("# HELP velocor_snapshot_allocated_bytes Space a snapshot holds in its pool.\n")
+			sb.WriteString("# TYPE velocor_snapshot_allocated_bytes gauge\n")
+			for _, sn := range snaps {
+				fmt.Fprintf(&sb, "velocor_snapshot_allocated_bytes{snapshot=%q,pool=%q} %d\n", sn.Name, poolName[sn.PoolID], sn.AllocatedBytes)
+			}
 		}
 	}
 
@@ -1128,6 +1242,8 @@ func writeError(w http.ResponseWriter, err error) {
 		status = http.StatusConflict
 	case errors.Is(err, store.ErrInvalidArgument):
 		status = http.StatusBadRequest
+	case errors.Is(err, store.ErrInsufficientCapacity):
+		status = http.StatusInsufficientStorage
 	case errors.Is(err, errDataPlaneUnavailable):
 		status = http.StatusServiceUnavailable
 	case errors.Is(err, spdk.ErrCBTUnsupported):
@@ -1142,4 +1258,16 @@ func newResourceID(prefix string) string {
 	var b [6]byte
 	_, _ = rand.Read(b[:])
 	return prefix + "-" + hex.EncodeToString(b[:])
+}
+
+func spaceStateValue(st store.SpaceState) int {
+	switch st {
+	case store.SpaceStateWarning:
+		return 1
+	case store.SpaceStateCritical:
+		return 2
+	case store.SpaceStateFull:
+		return 3
+	}
+	return 0
 }

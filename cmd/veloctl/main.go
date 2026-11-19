@@ -340,9 +340,11 @@ func runToken(cfg *cliConfig, args []string) error {
 
 func runSystem(cfg *cliConfig, args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("subcommand required: status | os | reconcile | iostats | upgrade | rollback | reboot | containers | rebuild")
+		return fmt.Errorf("subcommand required: status | os | reconcile | iostats | upgrade | rollback | reboot | containers | rebuild | volume-retention | backup | backups | restore")
 	}
 	switch args[0] {
+	case "backup", "backups", "restore":
+		return runSystemBackup(cfg, args)
 	case "rebuild":
 		fs := flag.NewFlagSet("system rebuild", flag.ExitOnError)
 		limit := fs.Int("max-mb-per-sec", -1, "Limit RAID rebuild bandwidth for every pool (0 = unlimited); applies to rebuilds that start afterwards. Omit to show the current limit")
@@ -364,6 +366,30 @@ func runSystem(cfg *cliConfig, args []string) error {
 			fmt.Println("Rebuild speed: unlimited")
 		} else {
 			fmt.Printf("Rebuild speed: at most %d MB/s per pool\n", v)
+		}
+		return nil
+
+	case "volume-retention":
+		fs := flag.NewFlagSet("system volume-retention", flag.ExitOnError)
+		hours := fs.Int("hours", -1, "Keep deleted volumes this many hours before purging them (0 = delete at once); applies to volumes deleted afterwards. Omit to show the current setting")
+		_ = fs.Parse(args[1:])
+		var resp map[string]any
+		var err error
+		if *hours < 0 {
+			resp, err = cfg.request("GET", "/api/v1/system/volume-retention", nil)
+		} else {
+			resp, err = cfg.request("PUT", "/api/v1/system/volume-retention", map[string]any{"hours": *hours})
+		}
+		if err != nil {
+			return err
+		}
+		if cfg.jsonOutput {
+			return printJSON(resp)
+		}
+		if h := uint64FromAny(resp["hours"]); h == 0 {
+			fmt.Println("Deleted volumes: deleted at once")
+		} else {
+			fmt.Printf("Deleted volumes: kept %d hours before they are purged\n", h)
 		}
 		return nil
 
@@ -389,6 +415,15 @@ func runSystem(cfg *cliConfig, args []string) error {
 		}
 		for _, w := range sliceOfAny(resp["warnings"]) {
 			fmt.Printf("WARNING: %v\n", w)
+		}
+		if objs := sliceOfMaps(recSt["unmanaged_objects"]); len(objs) > 0 {
+			fmt.Println("\nIn spdk_tgt, not managed by Velocor (left alone):")
+			tw := newTabWriter()
+			fmt.Fprintln(tw, "KIND\tNAME\tUUID\tDETAILS\tSINCE")
+			for _, o := range objs {
+				fmt.Fprintf(tw, "%v\t%v\t%v\t%v\t%v\n", o["kind"], o["name"], strOrDash(o["uuid"]), strOrDash(o["detail"]), o["first_seen"])
+			}
+			return tw.Flush()
 		}
 		return nil
 
@@ -596,9 +631,11 @@ func runDisk(cfg *cliConfig, args []string) error {
 
 func runPool(cfg *cliConfig, args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("subcommand required: list | get | create | replace | start-degraded | release-disk | delete")
+		return fmt.Errorf("subcommand required: list | get | create | set-space | replace | start-degraded | release-disk | importable | import | delete")
 	}
 	switch args[0] {
+	case "importable", "import":
+		return runPoolImport(cfg, args)
 	case "list":
 		resp, err := cfg.request("GET", "/api/v1/pools", nil)
 		if err != nil {
@@ -608,13 +645,17 @@ func runPool(cfg *cliConfig, args []string) error {
 			return printJSON(resp)
 		}
 		tw := newTabWriter()
-		fmt.Fprintln(tw, "ID\tNAME\tRAID\tCLUSTER(B)\tTOTAL(GiB)\tFREE(GiB)\tLVS\tHEALTH\tDETAILS")
+		fmt.Fprintln(tw, "ID\tNAME\tRAID\tSIZE\tUSED\tCOMMITTED\tAVAILABLE\tSPACE\tDURABILITY\tHEALTH\tDETAILS")
 		for _, p := range sliceOfMaps(resp["pools"]) {
-			totGiB := uint64FromAny(p["total_bytes"]) / (1024 * 1024 * 1024)
-			freeGiB := uint64FromAny(p["free_bytes"]) / (1024 * 1024 * 1024)
-			fmt.Fprintf(tw, "%v\t%v\t%v\t%d\t%d\t%d\t%v\t%v\t%v\n",
-				p["id"], p["name"], p["raid_level"], uint64FromAny(p["cluster_size_bytes"]),
-				totGiB, freeGiB, p["lvs_name"], p["health_status"], strOrEmpty(p["status_message"]))
+			total, free := uint64FromAny(p["total_bytes"]), uint64FromAny(p["free_bytes"])
+			used := "-"
+			if total > 0 {
+				used = fmt.Sprintf("%.0f%%", 100*float64(total-min(free, total))/float64(total))
+			}
+			fmt.Fprintf(tw, "%v\t%v\t%v\t%s\t%s\t%s\t%s\t%v\t%v\t%v\t%v\n",
+				p["id"], p["name"], p["raid_level"], humanBytes(total), used,
+				humanBytes(uint64FromAny(p["committed_bytes"])), humanBytes(uint64FromAny(p["available_bytes"])),
+				strOrDash(p["space_state"]), strOrDash(p["durability"]), p["health_status"], strOrEmpty(p["status_message"]))
 		}
 		return tw.Flush()
 
@@ -624,6 +665,7 @@ func runPool(cfg *cliConfig, args []string) error {
 		raid := fs.String("raid", "RAID0", "RAID level: RAID0 | RAID1 (RAID10 is not supported yet)")
 		disksCSV := fs.String("disks", "", "Comma-separated disk IDs")
 		clusterSz := fs.Uint("cluster-size", 1<<20, "SPDK lvol_store cluster size in bytes (default 1 MiB; smaller clusters mean much more metadata and slower recovery)")
+		policy := spacePolicyFlags(fs)
 		_ = fs.Parse(args[1:])
 		if *name == "" || *disksCSV == "" {
 			return fmt.Errorf("--name and --disks are required")
@@ -633,6 +675,7 @@ func runPool(cfg *cliConfig, args []string) error {
 			"raid_level":         strings.ToUpper(*raid),
 			"disk_ids":           strings.Split(*disksCSV, ","),
 			"cluster_size_bytes": *clusterSz,
+			"space_policy":       policy(),
 		})
 		if err != nil {
 			return err
@@ -655,6 +698,11 @@ func runPool(cfg *cliConfig, args []string) error {
 		fmt.Printf("RAID:    %v on %v\n", p["raid_level"], p["base_bdev_name"])
 		fmt.Printf("Health:  %v %v\n", p["health_status"], strOrEmpty(p["status_message"]))
 		fmt.Printf("Size:    %s total, %s free\n", humanBytes(uint64FromAny(p["total_bytes"])), humanBytes(uint64FromAny(p["free_bytes"])))
+		sp, _ := p["space_policy"].(map[string]any)
+		fmt.Printf("Space:   %v; %s committed, %s more accepted\n", strOrDash(p["space_state"]),
+			humanBytes(uint64FromAny(p["committed_bytes"])), humanBytes(uint64FromAny(p["available_bytes"])))
+		fmt.Printf("Policy:  overcommit up to %vx, reserve %v%%, warning at %v%%, critical at %v%% (unset = default)\n",
+			orDefault(sp["max_overcommit"], 1.0), orDefault(sp["reserve_percent"], 5.0), orDefault(sp["warning_percent"], 80.0), orDefault(sp["critical_percent"], 90.0))
 		tw := newTabWriter()
 		fmt.Fprintln(tw, "\nSLOT\tDISK\tSTATE\tREBUILD")
 		for _, m := range sliceOfMaps(p["members"]) {
@@ -697,6 +745,24 @@ func runPool(cfg *cliConfig, args []string) error {
 		}
 		p, _ := resp["pool"].(map[string]any)
 		fmt.Printf("Rebuilding onto %s: pool %v is %v. Follow progress with `veloctl pool get %v`.\n", *newDisk, id, p["health_status"], id)
+		return nil
+
+	case "set-space":
+		fs := flag.NewFlagSet("pool set-space", flag.ExitOnError)
+		policy := spacePolicyFlags(fs)
+		id, err := parseWithID(fs, args[1:])
+		if err != nil {
+			return fmt.Errorf("usage: veloctl pool set-space <pool-id> [--max-overcommit X] [--reserve-percent N] [--warning-percent N] [--critical-percent N]")
+		}
+		resp, err := cfg.request("PATCH", "/api/v1/pools/"+id, map[string]any{"space_policy": policy()})
+		if err != nil {
+			return err
+		}
+		if cfg.jsonOutput {
+			return printJSON(resp)
+		}
+		p, _ := resp["pool"].(map[string]any)
+		fmt.Printf("Pool %v: %v, %s more accepted\n", p["name"], strOrDash(p["space_state"]), humanBytes(uint64FromAny(p["available_bytes"])))
 		return nil
 
 	case "start-degraded":
@@ -767,7 +833,7 @@ func runPool(cfg *cliConfig, args []string) error {
 
 func runVolume(cfg *cliConfig, args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("subcommand required: list | get | usage | create | resize | qos | delete")
+		return fmt.Errorf("subcommand required: list | get | usage | create | resize | qos | protect | delete | deleted | restore | purge")
 	}
 	switch args[0] {
 	case "get":
@@ -808,12 +874,11 @@ func runVolume(cfg *cliConfig, args []string) error {
 			return printJSON(resp)
 		}
 		tw := newTabWriter()
-		fmt.Fprintln(tw, "ID\tNAME\tPOOL\tSIZE(GiB)\tTHIN\tATTACHMENT\tBDEV\tHEALTH")
+		fmt.Fprintln(tw, "ID\tNAME\tPOOL\tSIZE\tALLOCATED\tTHIN\tATTACHMENT\tBDEV\tHEALTH")
 		for _, v := range sliceOfMaps(resp["volumes"]) {
-			szGiB := uint64FromAny(v["size_bytes"]) / (1024 * 1024 * 1024)
-			fmt.Fprintf(tw, "%v\t%v\t%v\t%d\t%v\t%v\t%v\t%v\n",
-				v["id"], v["name"], v["pool_id"], szGiB, v["thin_provision"],
-				v["attachment_state"], v["effective_bdev_name"], v["health_status"])
+			fmt.Fprintf(tw, "%v\t%v\t%v\t%s\t%s\t%v\t%v\t%v\t%v\n",
+				v["id"], v["name"], v["pool_id"], humanBytes(uint64FromAny(v["size_bytes"])), humanBytes(uint64FromAny(v["allocated_bytes"])),
+				v["thin_provision"], v["attachment_state"], v["effective_bdev_name"], v["health_status"])
 		}
 		return tw.Flush()
 
@@ -823,15 +888,17 @@ func runVolume(cfg *cliConfig, args []string) error {
 		poolID := fs.String("pool", "", "Pool ID")
 		sizeGiB := fs.Uint64("size-gib", 10, "Volume size in GiB")
 		thin := fs.Bool("thin", true, "Thin provision volume")
+		protect := fs.Bool("protect", false, "Refuse deletion until an administrator turns protection off")
 		_ = fs.Parse(args[1:])
 		if *name == "" || *poolID == "" {
 			return fmt.Errorf("--name and --pool are required")
 		}
 		resp, err := cfg.request("POST", "/api/v1/volumes", map[string]any{
-			"name":           *name,
-			"pool_id":        *poolID,
-			"size_bytes":     *sizeGiB * 1024 * 1024 * 1024,
-			"thin_provision": *thin,
+			"name":                *name,
+			"pool_id":             *poolID,
+			"size_bytes":          *sizeGiB * 1024 * 1024 * 1024,
+			"thin_provision":      *thin,
+			"deletion_protection": *protect,
 		})
 		if err != nil {
 			return err
@@ -878,11 +945,82 @@ func runVolume(cfg *cliConfig, args []string) error {
 		if len(args) < 2 {
 			return fmt.Errorf("usage: veloctl volume delete <volume-id>")
 		}
-		_, err := cfg.request("DELETE", "/api/v1/volumes/"+args[1], nil)
+		resp, err := cfg.request("DELETE", "/api/v1/volumes/"+url.PathEscape(args[1]), nil)
 		if err != nil {
 			return err
 		}
-		fmt.Printf("Deleted volume %s\n", args[1])
+		if cfg.jsonOutput {
+			return printJSON(resp)
+		}
+		if v, ok := resp["volume"].(map[string]any); ok && v["purge_at"] != nil {
+			fmt.Printf("Deleted volume %s; its data is kept until %v ('veloctl volume restore %s' brings it back)\n", args[1], v["purge_at"], args[1])
+		} else {
+			fmt.Printf("Deleted volume %s\n", args[1])
+		}
+		return nil
+
+	case "protect":
+		fs := flag.NewFlagSet("volume protect", flag.ExitOnError)
+		off := fs.Bool("off", false, "Turn deletion protection off instead of on")
+		_ = fs.Parse(args[1:])
+		if fs.NArg() != 1 {
+			return fmt.Errorf("usage: veloctl volume protect [--off] <volume-id>")
+		}
+		resp, err := cfg.request("PUT", "/api/v1/volumes/"+url.PathEscape(fs.Arg(0))+"/protection", map[string]any{"deletion_protection": !*off})
+		if err != nil {
+			return err
+		}
+		if cfg.jsonOutput {
+			return printJSON(resp)
+		}
+		fmt.Printf("Deletion protection of %s: %v\n", fs.Arg(0), !*off)
+		return nil
+
+	case "deleted":
+		resp, err := cfg.request("GET", "/api/v1/deleted-volumes", nil)
+		if err != nil {
+			return err
+		}
+		if cfg.jsonOutput {
+			return printJSON(resp)
+		}
+		tw := newTabWriter()
+		fmt.Fprintln(tw, "ID\tNAME\tPOOL\tSIZE\tALLOCATED\tDELETED\tBY\tPURGE AT")
+		for _, v := range sliceOfMaps(resp["volumes"]) {
+			fmt.Fprintf(tw, "%v\t%v\t%v\t%s\t%s\t%v\t%v\t%v\n",
+				v["id"], v["name"], v["pool_id"], humanBytes(uint64FromAny(v["size_bytes"])), humanBytes(uint64FromAny(v["allocated_bytes"])),
+				v["deleted_at"], v["deleted_by"], v["purge_at"])
+		}
+		return tw.Flush()
+
+	case "restore":
+		fs := flag.NewFlagSet("volume restore", flag.ExitOnError)
+		name := fs.String("name", "", "Restore under this name (if the old one has been reused)")
+		_ = fs.Parse(args[1:])
+		if fs.NArg() != 1 {
+			return fmt.Errorf("usage: veloctl volume restore [--name <new-name>] <volume-id>")
+		}
+		var body map[string]any
+		if *name != "" {
+			body = map[string]any{"name": *name}
+		}
+		resp, err := cfg.request("POST", "/api/v1/deleted-volumes/"+url.PathEscape(fs.Arg(0))+"/restore", body)
+		if err != nil {
+			return err
+		}
+		return printJSON(resp)
+
+	case "purge":
+		fs := flag.NewFlagSet("volume purge", flag.ExitOnError)
+		yes := fs.Bool("yes", false, "Confirm: the volume's data is destroyed and can't be recovered")
+		_ = fs.Parse(args[1:])
+		if fs.NArg() != 1 || !*yes {
+			return fmt.Errorf("usage: veloctl volume purge --yes <volume-id> (destroys a deleted volume's data now)")
+		}
+		if _, err := cfg.request("DELETE", "/api/v1/deleted-volumes/"+url.PathEscape(fs.Arg(0)), nil); err != nil {
+			return err
+		}
+		fmt.Printf("Purged volume %s\n", fs.Arg(0))
 		return nil
 
 	default:
@@ -1222,9 +1360,11 @@ func runInitiatorGroup(cfg *cliConfig, args []string) error {
 
 func runExport(cfg *cliConfig, args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("subcommand required: list | get | connections | access | create | delete")
+		return fmt.Errorf("subcommand required: list | get | connections | access | enable | disable | create | delete")
 	}
 	switch args[0] {
+	case "enable", "disable":
+		return runExportEnable(cfg, args)
 	case "get":
 		if len(args) < 2 {
 			return fmt.Errorf("usage: veloctl export get <export-id>")
@@ -1262,9 +1402,10 @@ func runExport(cfg *cliConfig, args []string) error {
 		fs := flag.NewFlagSet("export access", flag.ExitOnError)
 		igs := fs.String("initiator-groups", "", "Comma-separated InitiatorGroup IDs allowed to connect (replaces the current list; empty for none)")
 		allowAny := fs.Bool("allow-any-host", false, "Let any host connect, with no access control (--allow-any-host=false to require a list again)")
+		portals := fs.String("portals", "", "Comma-separated Portal IDs to serve the export on (replaces the current list)")
 		id, err := parseWithID(fs, args[1:])
 		if err != nil {
-			return fmt.Errorf("usage: veloctl export access <export-id> [--initiator-groups a,b] [--allow-any-host=true|false]")
+			return fmt.Errorf("usage: veloctl export access <export-id> [--initiator-groups a,b] [--allow-any-host=true|false] [--portals p1,p2]")
 		}
 		body := map[string]any{}
 		fs.Visit(func(f *flag.Flag) {
@@ -1273,10 +1414,12 @@ func runExport(cfg *cliConfig, args []string) error {
 				body["initiator_group_ids"] = splitList(*igs)
 			case "allow-any-host":
 				body["allow_any_host"] = *allowAny
+			case "portals":
+				body["portal_ids"] = splitList(*portals)
 			}
 		})
 		if len(body) == 0 {
-			return fmt.Errorf("nothing to change: give --initiator-groups and/or --allow-any-host")
+			return fmt.Errorf("nothing to change: give --initiator-groups, --allow-any-host and/or --portals")
 		}
 		resp, err := cfg.request("PATCH", "/api/v1/exports/"+url.PathEscape(id), body)
 		if err != nil {
@@ -1420,9 +1563,9 @@ Commands:
   passwd            Change your own password
   user              Manage local users (list, create, update, delete)
   token             Manage scoped service tokens (list, create, revoke)
-  system            Appliance status, containers, bootc upgrade/rollback
+  system            Appliance status, containers, bootc upgrade/rollback, database backup/restore
   disk              List, scan, claim, release drives; set write cache / power-loss protection
-  pool              Create, list, inspect or delete pools; replace a disk, start a pool degraded
+  pool              Create, list, inspect or delete pools; space policy; replace a disk, start a pool degraded; import a pool
   volume            Create, list, get, show usage, resize, set QoS, or delete volumes
   snapshot          Create, list, clone and delete snapshots
   group-snapshot    Create, list, get, or delete consistency group snapshots
@@ -1626,4 +1769,36 @@ func idLast(args []string) []string {
 		return append(append([]string{}, args[1:]...), args[0])
 	}
 	return args
+}
+
+// spacePolicyFlags registers the pool space policy flags; the returned func gives the policy
+// with only the flags that were set (unset ones keep the server's defaults).
+func spacePolicyFlags(fs *flag.FlagSet) func() map[string]any {
+	overcommit := fs.Float64("max-overcommit", 0, "Committed space (volumes fully written + snapshots) may reach this many times the usable capacity (default 1.0: everything fits)")
+	reserve := fs.Float64("reserve-percent", -1, "Percent of capacity never committed (default 5)")
+	warning := fs.Float64("warning-percent", 0, "Used percent at which the pool warns (default 80)")
+	critical := fs.Float64("critical-percent", 0, "Used percent at which all growth is refused (default 90)")
+	return func() map[string]any {
+		p := map[string]any{}
+		if *overcommit > 0 {
+			p["max_overcommit"] = *overcommit
+		}
+		if *reserve >= 0 {
+			p["reserve_percent"] = *reserve
+		}
+		if *warning > 0 {
+			p["warning_percent"] = *warning
+		}
+		if *critical > 0 {
+			p["critical_percent"] = *critical
+		}
+		return p
+	}
+}
+
+func orDefault(v any, def float64) any {
+	if v == nil {
+		return def
+	}
+	return v
 }

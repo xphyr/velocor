@@ -23,6 +23,8 @@ type State struct {
 	DriftRepairedCount uint64    `json:"drift_repaired_count"`
 	DegradedResources  []string  `json:"degraded_resources"`
 	LastError          string    `json:"last_error,omitempty"`
+	// Unmanaged lists what spdk_tgt holds that no store record accounts for (P1-5).
+	Unmanaged []UnmanagedObject `json:"unmanaged_objects,omitempty"`
 }
 
 // Reconciler continuously converges observed state in Linux sysfs and spdk_tgt
@@ -42,6 +44,24 @@ type Reconciler struct {
 	logger *slog.Logger
 
 	passMu sync.Mutex // serialises passes
+	meta   *metaSync  // on-pool metadata copies (nil: disabled)
+	// sbReader and discover replace reading RAID superblocks from disks and the hardware
+	// scan (tests).
+	sbReader func(*store.Disk) (*hardware.RaidSuperblock, error)
+	discover func() ([]*store.Disk, error)
+
+	// cacheRefused: disks whose drive refused to turn its write cache off since velod started.
+	// They are retried once per start, not every pass (the refusal is recorded on the disk and
+	// reported in the durability warnings).
+	cacheRefused map[string]bool
+
+	now func() time.Time // replaces time.Now (tests)
+
+	// unmanagedSeen: when each unaccounted SPDK object was first seen (reported after
+	// unmanagedGrace); unmanagedLogged: those already logged.
+	unmanagedSeen   map[string]time.Time
+	unmanagedLogged map[string]bool
+	unmanagedGrace  *time.Duration // nil: defaultUnmanagedGrace
 
 	mu    sync.Mutex
 	state State
@@ -66,6 +86,7 @@ func (r *Reconciler) State() State {
 	defer r.mu.Unlock()
 	cp := r.state
 	cp.DegradedResources = slices.Clone(r.state.DegradedResources)
+	cp.Unmanaged = slices.Clone(r.state.Unmanaged)
 	return cp
 }
 
@@ -94,6 +115,19 @@ type pass struct {
 	repaired uint64
 	degraded []string
 	errs     []string
+	notes    map[string][]string // pool ID -> extra reasons for its status message
+
+	unmanaged        []UnmanagedObject
+	unmanagedChecked bool // false: keep the last report
+}
+
+// notePool adds a reason to a pool's status message (and the pass's degraded resources).
+func (p *pass) notePool(poolID, reason string) {
+	if p.notes == nil {
+		p.notes = map[string][]string{}
+	}
+	p.notes[poolID] = append(p.notes[poolID], reason)
+	p.degrade("pool:"+poolID, reason)
 }
 
 func (p *pass) degrade(resource, reason string) {
@@ -111,7 +145,7 @@ func (r *Reconciler) ReconcileOnce(ctx context.Context) (State, error) {
 	r.mu.Unlock()
 
 	p := &pass{}
-	r.syncHardware(p)
+	discovered := r.syncHardware(p)
 	r.enforceWriteCache(p)
 
 	if _, err := r.spdk.GetVersion(ctx); err != nil {
@@ -119,7 +153,12 @@ func (r *Reconciler) ReconcileOnce(ctx context.Context) (State, error) {
 		return r.State(), err
 	}
 
+	if r.relinkMovedMembers(ctx, p, discovered) {
+		r.enforceWriteCache(p) // the relinked disks inherit their policy: apply it before SPDK writes
+	}
+
 	r.reconcileDisks(ctx, p)
+	r.nvmeWriteCache(ctx, p)
 	r.applySettings(ctx, p)
 
 	// Let SPDK finish examining every base bdev (RAID superblock assembly, lvstore load)
@@ -131,38 +170,56 @@ func (r *Reconciler) ReconcileOnce(ctx context.Context) (State, error) {
 	}
 
 	poolOnline := r.reconcilePools(ctx, p, examined)
+	r.purgeDeletedVolumes(ctx, p, poolOnline)
+	r.purgeDeletedSnapshots(ctx, p, poolOnline)
+	r.reconcileSpace(ctx, p, poolOnline)
 	volOnline := r.reconcileVolumes(ctx, p, poolOnline)
 	r.reconcileExports(ctx, p, volOnline)
+	r.reconcileMeta(ctx, p, poolOnline)
+	r.findUnmanaged(ctx, p, examined)
 
 	lastErr := strings.Join(p.errs, "; ")
 	r.finishPass(p.repaired, p.degraded, lastErr)
+	if p.unmanagedChecked {
+		r.mu.Lock()
+		r.state.Unmanaged = p.unmanaged
+		r.mu.Unlock()
+	}
 	if len(p.errs) > 0 {
 		return r.State(), fmt.Errorf("%s", lastErr)
 	}
 	return r.State(), nil
 }
 
-func (r *Reconciler) syncHardware(p *pass) {
-	if r.hw == nil {
-		return
+// syncHardware records the disks a hardware scan finds and returns them (nil: no scan).
+func (r *Reconciler) syncHardware(p *pass) []*store.Disk {
+	discover := r.discover
+	if discover == nil {
+		if r.hw == nil {
+			return nil
+		}
+		if err := r.hw.RefreshBootGuard(); err != nil {
+			p.errs = append(p.errs, fmt.Sprintf("boot guard: %v", err))
+		}
+		discover = r.hw.DiscoverDisks
 	}
-	if err := r.hw.RefreshBootGuard(); err != nil {
-		p.errs = append(p.errs, fmt.Sprintf("boot guard: %v", err))
-	}
-	discovered, err := r.hw.DiscoverDisks()
+	discovered, err := discover()
 	if err != nil {
 		p.errs = append(p.errs, fmt.Sprintf("hardware scan: %v", err))
-		return
+		return nil
 	}
 	for _, d := range discovered {
 		if err := r.store.SyncDiscoveredDisk(d); err != nil {
 			p.errs = append(p.errs, fmt.Sprintf("sync disk %s: %v", d.ID, err))
 		}
 	}
+	return discovered
 }
 
 // enforceWriteCache keeps the volatile write cache off on disks whose policy says so (TODO.md
-// P0-4): drives can turn it back on after a power cycle or reset.
+// P0-4): drives can turn it back on after a power cycle or reset. A drive that refuses is
+// recorded (Disk.WriteCacheError, shown in the durability warnings) and tried again only after
+// velod restarts or the operator sets the policy again, so it doesn't fill every pass's errors.
 func (r *Reconciler) enforceWriteCache(p *pass) {
 	if r.hw == nil {
 		return
@@ -174,22 +231,40 @@ func (r *Reconciler) enforceWriteCache(p *pass) {
 	}
 	for _, d := range disks {
 		if d.WriteCachePolicy != store.WriteCachePolicyDisabled || d.IsBootDevice || d.WriteCache == store.WriteCacheWriteThrough {
+			if d.WriteCacheError != "" {
+				r.recordWriteCache(p, d.ID, d.WriteCache, "")
+			}
+			continue
+		}
+		if d.WriteCacheError != "" && r.cacheRefused[d.ID] {
 			continue
 		}
 		state, err := r.hw.SetWriteCache(d, false)
+		msg := ""
 		if err != nil {
-			p.degrade("disk:"+d.ID, "cannot disable the write cache: "+err.Error())
+			msg = err.Error()
+			if r.cacheRefused == nil {
+				r.cacheRefused = map[string]bool{}
+			}
+			r.cacheRefused[d.ID] = true
+			r.logger.Warn("the drive refuses to turn its write cache off; it stays at risk on power loss", "disk", d.ID, "err", err)
 		} else {
+			delete(r.cacheRefused, d.ID)
 			p.repaired++
 		}
-		if state != d.WriteCache {
-			if _, err := r.store.MutateDisk(d.ID, func(cur *store.Disk) error {
-				cur.WriteCache = state
-				return nil
-			}); err != nil {
-				p.errs = append(p.errs, fmt.Sprintf("record write cache of %s: %v", d.ID, err))
-			}
+		r.recordWriteCache(p, d.ID, state, msg)
+	}
+}
+
+func (r *Reconciler) recordWriteCache(p *pass, id string, state store.WriteCacheState, msg string) {
+	if _, err := r.store.MutateDisk(id, func(cur *store.Disk) error {
+		if cur.WriteCache == state && cur.WriteCacheError == msg {
+			return store.ErrSkipWrite
 		}
+		cur.WriteCache, cur.WriteCacheError = state, msg
+		return nil
+	}); err != nil {
+		p.errs = append(p.errs, fmt.Sprintf("record write cache of %s: %v", id, err))
 	}
 }
 
@@ -398,9 +473,12 @@ func (r *Reconciler) reconcilePools(ctx context.Context, p *pass, examined bool)
 				online[pool.ID] = true
 			}
 		}
+		reasons = append(reasons, p.notes[pool.ID]...)
 		msg := strings.Join(reasons, "; ")
+		durability := poolDurability(pool, disks)
 		_, err := r.store.MutatePool(pool.ID, func(cur *store.Pool) error {
-			changed := cur.HealthStatus != health || cur.StatusMessage != msg
+			changed := cur.HealthStatus != health || cur.StatusMessage != msg || cur.Durability != durability
+			cur.Durability = durability
 			if !membersEqual(store.PoolMembers(cur), members) || len(cur.Members) == 0 {
 				changed = true
 				store.SetPoolMembers(cur, members)
@@ -424,6 +502,24 @@ func (r *Reconciler) reconcilePools(ctx context.Context, p *pass, examined bool)
 		}
 	}
 	return online
+}
+
+// poolDurability is the weakest durability of the pool's member disks.
+func poolDurability(pool *store.Pool, disks []*store.Disk) store.Durability {
+	out := store.DurabilityDurable
+	for _, id := range pool.DiskIDs {
+		i := slices.IndexFunc(disks, func(d *store.Disk) bool { return d.ID == id })
+		if i < 0 {
+			return store.DurabilityUnknown
+		}
+		switch disks[i].Durability() {
+		case store.DurabilityAtRisk:
+			return store.DurabilityAtRisk
+		case store.DurabilityUnknown:
+			out = store.DurabilityUnknown
+		}
+	}
+	return out
 }
 
 // leftPool returns the pool a disk is bound to but no longer a member of, or nil: its slot
@@ -555,7 +651,13 @@ func (r *Reconciler) reconcileExports(ctx context.Context, p *pass, volOnline ma
 	for _, exp := range exports {
 		res := "export:" + exp.ID
 		health, msg := store.HealthStatusOnline, ""
-		if vol, ok := volOnline[exp.VolumeID]; !ok {
+		if exp.Disabled {
+			health, msg = store.HealthStatusOffline, "disabled: "+exp.DisabledReason
+			if err := dataplane.RemoveExport(ctx, r.spdk, exp); err != nil {
+				msg += "; " + err.Error()
+			}
+			p.degrade(res, msg)
+		} else if vol, ok := volOnline[exp.VolumeID]; !ok {
 			health, msg = store.HealthStatusDegraded, "backing volume is not online"
 			p.degraded = append(p.degraded, res)
 		} else if err := dataplane.EnsureExport(ctx, r.spdk, r.store, exp, vol); err != nil {

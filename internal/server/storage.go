@@ -128,8 +128,8 @@ func (s *Server) attachAndClaim(ctx context.Context, d *store.Disk, force bool) 
 			return nil, err
 		}
 	}
-	if d.WriteCachePolicy == store.WriteCachePolicyDisabled && s.hw != nil {
-		if _, err := s.applyWriteCachePolicy(d); err != nil {
+	if d.WriteCachePolicy == store.WriteCachePolicyDisabled && s.hw != nil && d.Type != store.DiskTypeNVMe {
+		if _, err := s.applyWriteCachePolicy(ctx, d); err != nil {
 			return nil, err
 		}
 	}
@@ -137,7 +137,24 @@ func (s *Server) attachAndClaim(ctx context.Context, d *store.Disk, force bool) 
 	if err != nil {
 		return nil, err
 	}
+	cacheState := store.WriteCacheUnknown
+	if d.WriteCachePolicy == store.WriteCachePolicyDisabled && d.Type == store.DiskTypeNVMe {
+		// The kernel no longer sees the drive: switch its cache off through SPDK before
+		// anything is written to it.
+		if cacheState, err = dataplane.SetNVMeWriteCache(ctx, s.spdk, dataplane.NVMeControllerFromBdev(bdev), false); err != nil {
+			attached := *d
+			attached.SPDKBdevName = bdev
+			_ = dataplane.DetachDisk(context.WithoutCancel(ctx), s.spdk, &attached)
+			if s.hw != nil {
+				_ = s.hw.BindNVMeToKernel(d.PCIAddress)
+			}
+			return nil, fmt.Errorf("%w: %v", store.ErrInvalidArgument, err)
+		}
+	}
 	updated, err := s.store.ClaimDisk(d.ID, drv, bdev)
+	if err == nil && cacheState != store.WriteCacheUnknown {
+		updated, err = s.store.MutateDisk(d.ID, func(cur *store.Disk) error { cur.WriteCache = cacheState; return nil })
+	}
 	if err != nil {
 		attached := *d
 		attached.SPDKBdevName = bdev
@@ -218,8 +235,13 @@ func (s *Server) handleCreatePool(w http.ResponseWriter, r *http.Request) {
 		StripSizeKB      uint32             `json:"strip_size_kb"`
 		ClusterSizeBytes uint32             `json:"cluster_size_bytes"`
 		FilterPolicy     store.FilterPolicy `json:"filter_policy"`
+		SpacePolicy      store.SpacePolicy  `json:"space_policy"`
 	}
 	if err := decodeJSON(r, &req); err != nil {
+		writeError(w, err)
+		return
+	}
+	if err := req.SpacePolicy.Validate(); err != nil {
 		writeError(w, err)
 		return
 	}
@@ -274,6 +296,7 @@ func (s *Server) handleCreatePool(w http.ResponseWriter, r *http.Request) {
 		TotalBytes:        totalRaw,
 		FreeBytes:         totalRaw,
 		FilterPolicy:      req.FilterPolicy,
+		SpacePolicy:       req.SpacePolicy,
 		// The reconciler leaves RECONCILING pools without an lvstore UUID alone.
 		HealthStatus:  store.HealthStatusReconciling,
 		StatusMessage: "creating",
@@ -318,6 +341,8 @@ func (s *Server) handleCreatePool(w http.ResponseWriter, r *http.Request) {
 			p.TotalBytes, p.FreeBytes = stores[0].TotalDataClusters*cs, stores[0].FreeClusters*cs
 			p.AllocatedBytes = p.TotalBytes - p.FreeBytes
 		}
+		p.SpaceState = store.SpaceStateOf(p)
+		p.AvailableBytes = store.AvailableBytes(p, 0) // a new pool has nothing committed
 		return nil
 	})
 	if err != nil {
@@ -388,6 +413,8 @@ func (s *Server) handleCreateVolume(w http.ResponseWriter, r *http.Request) {
 		FilterPolicy  store.FilterPolicy `json:"filter_policy"`
 		QosPolicy     store.QosPolicy    `json:"qos_policy"`
 		Labels        map[string]string  `json:"labels"`
+		// DeletionProtection refuses deletion until an administrator turns it off.
+		DeletionProtection bool `json:"deletion_protection"`
 	}
 	if err := decodeJSON(r, &req); err != nil {
 		writeError(w, err)
@@ -431,6 +458,12 @@ func (s *Server) handleCreateVolume(w http.ResponseWriter, r *http.Request) {
 	}
 
 	id := newResourceID("vol")
+	release, err := s.reserveSpace(r.Context(), pool.ID, req.SizeBytes, volumeRecorded(id, req.SizeBytes))
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	defer release()
 	alias := pool.LVSName + "/" + id
 	uuid, err := s.spdk.BdevLvolCreate(r.Context(), pool.LVSName, id, req.SizeBytes, req.ThinProvision, "")
 	if err != nil {
@@ -438,19 +471,20 @@ func (s *Server) handleCreateVolume(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	vol := &store.Volume{
-		ID:                id,
-		Name:              req.Name,
-		PoolID:            req.PoolID,
-		UUID:              uuid,
-		LvolBdevName:      alias,
-		EffectiveBdevName: alias,
-		SizeBytes:         req.SizeBytes,
-		ThinProvision:     req.ThinProvision,
-		FilterPolicy:      req.FilterPolicy,
-		QosPolicy:         req.QosPolicy,
-		AttachmentState:   store.AttachmentStateUnattached,
-		HealthStatus:      store.HealthStatusOnline,
-		Labels:            req.Labels,
+		ID:                 id,
+		Name:               req.Name,
+		PoolID:             req.PoolID,
+		UUID:               uuid,
+		LvolBdevName:       alias,
+		EffectiveBdevName:  alias,
+		SizeBytes:          req.SizeBytes,
+		ThinProvision:      req.ThinProvision,
+		FilterPolicy:       req.FilterPolicy,
+		QosPolicy:          req.QosPolicy,
+		AttachmentState:    store.AttachmentStateUnattached,
+		HealthStatus:       store.HealthStatusOnline,
+		Labels:             req.Labels,
+		DeletionProtection: req.DeletionProtection,
 	}
 	s.finishVolumeCreate(w, r, vol, http.StatusCreated)
 }
@@ -493,7 +527,7 @@ func (s *Server) resizeVolume(w http.ResponseWriter, r *http.Request, id string)
 		writeError(w, err)
 		return
 	}
-	vol, err := s.store.GetVolume(id)
+	vol, err := s.liveVolume(id)
 	if err != nil {
 		writeError(w, err)
 		return
@@ -510,6 +544,12 @@ func (s *Server) resizeVolume(w http.ResponseWriter, r *http.Request, id string)
 		writeError(w, err)
 		return
 	}
+	release, err := s.reserveSpace(r.Context(), vol.PoolID, req.NewSizeBytes-vol.SizeBytes, volumeRecorded(vol.ID, req.NewSizeBytes))
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	defer release()
 	if err := s.spdk.BdevLvolResize(r.Context(), vol.UUID, req.NewSizeBytes); err != nil {
 		writeError(w, fmt.Errorf("resize lvol: %w", err))
 		return
@@ -534,7 +574,7 @@ func (s *Server) handleSetVolumeQoS(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
-	vol, err := s.store.GetVolume(id)
+	vol, err := s.liveVolume(id)
 	if err != nil {
 		writeError(w, err)
 		return
@@ -559,32 +599,6 @@ func (s *Server) handleSetVolumeQoS(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"volume": updated})
 }
 
-func (s *Server) handleDeleteVolume(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
-	vol, err := s.store.GetVolume(id)
-	if err != nil {
-		writeError(w, err)
-		return
-	}
-	if err := s.store.CheckVolumeDeletable(id); err != nil {
-		writeError(w, err)
-		return
-	}
-	if err := s.requireSPDK(); err != nil {
-		writeError(w, err)
-		return
-	}
-	if err := s.spdk.BdevLvolDelete(r.Context(), vol.UUID); err != nil && !spdk.IsNotFound(err) {
-		writeError(w, fmt.Errorf("delete lvol: %w", err))
-		return
-	}
-	if err := s.store.DeleteVolume(id); err != nil {
-		writeError(w, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{})
-}
-
 // --- Snapshots ---
 
 func (s *Server) handleCreateSnapshot(w http.ResponseWriter, r *http.Request) {
@@ -607,7 +621,7 @@ func (s *Server) handleCreateSnapshot(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	vol, err := s.store.GetVolume(volID)
+	vol, err := s.liveVolume(volID)
 	if err != nil {
 		writeError(w, err)
 		return
@@ -621,11 +635,12 @@ func (s *Server) handleCreateSnapshot(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
-	snap, err := s.takeSnapshot(r.Context(), vol, pool, req.Name)
+	snap, release, err := s.takeSnapshot(r.Context(), vol, pool, req.Name)
 	if err != nil {
 		writeError(w, err)
 		return
 	}
+	defer release()
 	if err := s.store.CreateSnapshot(snap); err != nil {
 		_ = s.spdk.BdevLvolDelete(context.WithoutCancel(r.Context()), snap.UUID)
 		writeError(w, err)
@@ -636,21 +651,35 @@ func (s *Server) handleCreateSnapshot(w http.ResponseWriter, r *http.Request) {
 
 // takeSnapshot creates the SPDK snapshot lvol (named after the new snapshot ID) and
 // returns an unsaved Snapshot record for it.
-func (s *Server) takeSnapshot(ctx context.Context, vol *store.Volume, pool *store.Pool, name string) (*store.Snapshot, error) {
+//
+// The snapshot takes over the clusters the volume holds, which then count as committed space:
+// the space is reserved first, and release must be called once the snapshot is in the store
+// (or was rolled back).
+func (s *Server) takeSnapshot(ctx context.Context, vol *store.Volume, pool *store.Pool, name string) (*store.Snapshot, func(), error) {
+	held, err := s.lvolHeldBytes(ctx, vol.UUID)
+	if err != nil {
+		return nil, nil, err
+	}
 	id := newResourceID("snap")
+	release, err := s.reserveSpace(ctx, pool.ID, held, snapshotRecorded(id))
+	if err != nil {
+		return nil, nil, err
+	}
 	uuid, err := s.spdk.BdevLvolSnapshot(ctx, vol.UUID, id)
 	if err != nil {
-		return nil, fmt.Errorf("snapshot volume %s: %w", vol.ID, err)
+		release()
+		return nil, nil, fmt.Errorf("snapshot volume %s: %w", vol.ID, err)
 	}
 	return &store.Snapshot{
-		ID:           id,
-		Name:         name,
-		VolumeID:     vol.ID,
-		PoolID:       pool.ID,
-		UUID:         uuid,
-		LvolBdevName: pool.LVSName + "/" + id,
-		SizeBytes:    vol.SizeBytes,
-	}, nil
+		ID:             id,
+		Name:           name,
+		VolumeID:       vol.ID,
+		PoolID:         pool.ID,
+		UUID:           uuid,
+		LvolBdevName:   pool.LVSName + "/" + id,
+		SizeBytes:      vol.SizeBytes,
+		AllocatedBytes: held,
+	}, release, nil
 }
 
 func (s *Server) handleSnapshotAction(w http.ResponseWriter, r *http.Request) {
@@ -681,7 +710,7 @@ func (s *Server) cloneSnapshot(w http.ResponseWriter, r *http.Request, snapID st
 		writeError(w, err)
 		return
 	}
-	snap, err := s.store.GetSnapshot(snapID)
+	snap, err := s.liveSnapshot(snapID)
 	if err != nil {
 		writeError(w, err)
 		return
@@ -709,6 +738,12 @@ func (s *Server) cloneSnapshot(w http.ResponseWriter, r *http.Request, snapID st
 	}
 
 	id := newResourceID("vol")
+	release, err := s.reserveSpace(r.Context(), pool.ID, snap.SizeBytes, volumeRecorded(id, snap.SizeBytes))
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	defer release()
 	alias := pool.LVSName + "/" + id
 	uuid, err := s.spdk.BdevLvolClone(r.Context(), snap.UUID, id)
 	if err != nil {
@@ -744,7 +779,7 @@ func (s *Server) handleSnapshotGetOrBlocks(w http.ResponseWriter, r *http.Reques
 		s.handleSnapshotBlocks(w, r, id, true)
 		return
 	}
-	snap, err := s.store.GetSnapshot(tail)
+	snap, err := s.liveSnapshot(tail)
 	if err != nil {
 		writeError(w, err)
 		return
@@ -753,7 +788,7 @@ func (s *Server) handleSnapshotGetOrBlocks(w http.ResponseWriter, r *http.Reques
 }
 
 func (s *Server) handleSnapshotBlocks(w http.ResponseWriter, r *http.Request, targetID string, changed bool) {
-	target, err := s.store.GetSnapshot(targetID)
+	target, err := s.liveSnapshot(targetID)
 	if err != nil {
 		writeError(w, err)
 		return
@@ -766,7 +801,7 @@ func (s *Server) handleSnapshotBlocks(w http.ResponseWriter, r *http.Request, ta
 			writeError(w, fmt.Errorf("%w: base_snapshot_id query parameter is required", store.ErrInvalidArgument))
 			return
 		}
-		if base, err = s.store.GetSnapshot(baseID); err != nil {
+		if base, err = s.liveSnapshot(baseID); err != nil {
 			writeError(w, err)
 			return
 		}
@@ -824,23 +859,31 @@ func (s *Server) handleDeleteSnapshot(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
-	if err := s.store.CheckSnapshotDeletable(id); err != nil {
-		writeError(w, err)
-		return
-	}
-	if err := s.requireSPDK(); err != nil {
-		writeError(w, err)
-		return
-	}
-	if err := s.spdk.BdevLvolDelete(r.Context(), snap.UUID); err != nil && !spdk.IsNotFound(err) {
-		writeError(w, fmt.Errorf("delete snapshot lvol: %w", err))
-		return
-	}
-	if err := s.store.DeleteSnapshot(id); err != nil {
+	if err := s.deleteSnapshot(r.Context(), snap); err != nil {
 		writeError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{})
+}
+
+// deleteSnapshot deletes a snapshot, or, while cloned volumes depend on it, hides it and
+// leaves its deletion to the reconciler once they are gone (TODO.md P1-4).
+func (s *Server) deleteSnapshot(ctx context.Context, snap *store.Snapshot) error {
+	deferred, err := s.store.DeferSnapshotDelete(snap.ID, time.Now(), subjectFromContext(ctx))
+	if err != nil || deferred {
+		return err
+	}
+	if err := s.requireSPDK(); err != nil {
+		return err
+	}
+	if err := s.spdk.BdevLvolDelete(ctx, snap.UUID); err != nil && !spdk.IsNotFound(err) {
+		return fmt.Errorf("delete snapshot lvol: %w", err)
+	}
+	if err := s.store.DeleteSnapshot(snap.ID); err != nil {
+		return err
+	}
+	s.updatePoolSpace(snap.PoolID)
+	return nil
 }
 
 // --- Volume group snapshots ---
@@ -895,7 +938,7 @@ func (s *Server) handleCreateVolumeGroupSnapshot(w http.ResponseWriter, r *http.
 	targets := make([]target, 0, len(volIDs))
 	var nqns []string
 	for _, volID := range volIDs {
-		vol, err := s.store.GetVolume(volID)
+		vol, err := s.liveVolume(volID)
 		if err != nil {
 			writeError(w, err)
 			return
@@ -944,6 +987,12 @@ func (s *Server) handleCreateVolumeGroupSnapshot(w http.ResponseWriter, r *http.
 	}
 
 	var snaps []*store.Snapshot
+	var releases []func()
+	defer func() {
+		for _, rel := range releases {
+			rel()
+		}
+	}()
 	rollback := func(err error) {
 		resume()
 		for _, sn := range snaps {
@@ -953,11 +1002,12 @@ func (s *Server) handleCreateVolumeGroupSnapshot(w http.ResponseWriter, r *http.
 		writeError(w, err)
 	}
 	for _, t := range targets {
-		snap, err := s.takeSnapshot(ctx, t.vol, t.pool, req.Name+"-"+t.vol.ID)
+		snap, release, err := s.takeSnapshot(ctx, t.vol, t.pool, req.Name+"-"+t.vol.ID)
 		if err != nil {
 			rollback(err)
 			return
 		}
+		releases = append(releases, release)
 		snaps = append(snaps, snap)
 	}
 	resume()
@@ -1010,33 +1060,16 @@ func (s *Server) handleDeleteVolumeGroupSnapshot(w http.ResponseWriter, r *http.
 		writeError(w, err)
 		return
 	}
-	var snaps []*store.Snapshot
 	for _, snapID := range vgs.SnapshotIDs {
 		snap, err := s.store.GetSnapshot(snapID)
 		if errors.Is(err, store.ErrNotFound) {
 			continue
 		}
+		if err == nil {
+			err = s.deleteSnapshot(r.Context(), snap)
+		}
 		if err != nil {
-			writeError(w, err)
-			return
-		}
-		if err := s.store.CheckSnapshotDeletable(snapID); err != nil {
-			writeError(w, err)
-			return
-		}
-		snaps = append(snaps, snap)
-	}
-	if err := s.requireSPDK(); err != nil {
-		writeError(w, err)
-		return
-	}
-	for _, snap := range snaps {
-		if err := s.spdk.BdevLvolDelete(r.Context(), snap.UUID); err != nil && !spdk.IsNotFound(err) {
-			writeError(w, fmt.Errorf("delete snapshot %s: %w", snap.ID, err))
-			return
-		}
-		if err := s.store.DeleteSnapshot(snap.ID); err != nil {
-			writeError(w, err)
+			writeError(w, fmt.Errorf("delete snapshot %s: %w", snapID, err))
 			return
 		}
 	}
@@ -1100,7 +1133,7 @@ func (s *Server) handleCreateExport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	vol, err := s.store.GetVolume(req.VolumeID)
+	vol, err := s.liveVolume(req.VolumeID)
 	if err != nil {
 		writeError(w, err)
 		return

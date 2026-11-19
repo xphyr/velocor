@@ -245,3 +245,56 @@ func TestPoolReplaceStartDegradedReleaseAndRebuildCommands(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestPoolSpaceCommands(t *testing.T) {
+	f := newFixture(t)
+	signedIn(t, f)
+	if err := f.run(t, "pool", "set-space", "p1", "--max-overcommit", "2", "--warning-percent", "75"); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.run(t, "pool", "set-space", "p1", "--critical-percent", "70"); err == nil {
+		t.Fatal("critical below warning must be refused")
+	}
+	p, _ := f.st.GetPool("p1")
+	if p.SpacePolicy.MaxOvercommit != 2 || p.SpacePolicy.WarningPercent != 75 {
+		t.Fatalf("policy not saved: %+v", p.SpacePolicy)
+	}
+	for _, args := range [][]string{{"pool", "get", "p1"}, {"pool", "list"}, {"volume", "list"}} {
+		if err := f.run(t, args...); err != nil {
+			t.Fatalf("%v: %v", args, err)
+		}
+	}
+}
+
+func TestRecoveryCommands(t *testing.T) {
+	f := newFixture(t)
+	signedIn(t, f)
+	out := filepath.Join(t.TempDir(), "velocor.db")
+	if err := f.run(t, "system", "backup", "-o", out); err != nil {
+		t.Fatal(err)
+	}
+	if fi, err := os.Stat(out); err != nil || fi.Size() < 4096 || fi.Mode().Perm() != 0o600 {
+		t.Fatalf("backup file: %+v %v", fi, err)
+	}
+	if err := store.ValidateBackup(out); err != nil {
+		t.Fatalf("downloaded backup: %v", err)
+	}
+	if err := f.run(t, "system", "backup", "-o", out); err == nil {
+		t.Fatal("an existing file must not be overwritten")
+	}
+	if err := f.run(t, "pool", "importable"); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.run(t, "export", "disable", f.exp.ID); err != nil {
+		t.Fatal(err)
+	}
+	if e, _ := f.st.GetExport(f.exp.ID); !e.Disabled {
+		t.Fatal("export not disabled")
+	}
+	if err := f.run(t, "export", "enable", f.exp.ID); err != nil {
+		t.Fatal(err)
+	}
+	if e, _ := f.st.GetExport(f.exp.ID); e.Disabled || e.DisabledReason != "" {
+		t.Fatalf("export not enabled: %+v", e)
+	}
+}
