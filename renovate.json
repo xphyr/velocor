@@ -21,7 +21,7 @@
       "groupName": "Go toolchain"
     },
     {
-      "description": "Fedora base images follow the rolling release tag (B17): no digest pins; Renovate only proposes the next Fedora release",
+      "description": "Fedora base images follow the rolling release tag (B17): no digest pins. A new release only on request (Dependency Dashboard): Fedora publishes the next number's tags months before its release, as Rawhide pre-releases (seen 2026-11-19: :46 was 'Rawhide Prerelease', kernel 7.4.0-rc3), which Renovate can't tell from a release",
       "matchPackageNames": [
         "/^quay\\.io/fedora//"
       ],
@@ -32,7 +32,8 @@
       ],
       "prBodyNotes": [
         "A new Fedora release under the appliance: build the images and run the integration suite and an install on the lab VM before merging."
-      ]
+      ],
+      "dependencyDashboardApproval": true
     },
     {
       "description": "Built-in monitoring (P1-1): Prometheus and Alertmanager move together",

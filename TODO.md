@@ -802,6 +802,12 @@ Everything here was written by Gemini and is in scope to rewrite.
   45 again and the PR would have changed nothing while claiming the move. The Makefile now reads
   the base images from the Containerfiles; `hack/check-pins.sh` fails if the Containerfiles use
   more than one Fedora release or the Makefile names one.
+  The real Fedora 46 build then passed the whole integration suite, and an upgrade of the lab
+  appliance from 45 worked (boot, SPDK, pools, data, monitoring), but `:46` is still Rawhide
+  ("46 (Rawhide Prerelease)", kernel 7.4.0-rc3, podman 6.2.0-rc1): the PR was closed, and
+  Renovate now proposes a Fedora release only when it's requested on the Dependency Dashboard.
+  Move once Fedora 46 is released; compare performance against the Fedora 45 baseline of
+  2026-11-19 (velocor-1, dev-cdf1064) then.
 - [x] **B1/B2.** The OS image now embeds the velod/spdk images built and pushed in the same run
   (`make push`; one CI job) as `oci-archive` and its quadlets reference them by digest, so an
   appliance runs exactly what it was built with, needs no registry at boot, and changes only via
