@@ -660,6 +660,7 @@ spec:
 ## Documentation
 
 - [Architecture Guide](docs/ARCHITECTURE.md) — Decoupled control/data planes, two-tier flash management, filter bdevs, snapshots, and unified API design.
+- [Monitoring and Alerts](docs/monitoring.md) — Prometheus metrics, the shipped alert rules, and how to scrape the appliance.
 - [Implementation Roadmap](docs/ROADMAP.md) — Phase-by-phase breakdown of completed subsystems.
 - [QEMU/KVM 2-Node Lab Guide](hack/vm-lab/README.md) — Local virtualized SAN + initiator testing instructions.
 

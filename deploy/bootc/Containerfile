@@ -13,6 +13,9 @@
 ARG VELOD_IMAGE
 ARG SPDK_IMAGE
 ARG BOOTC_BASE_IMAGE=quay.io/fedora/fedora-bootc:45
+# Built-in monitoring (TODO.md P1-1): embedded like spdk/velod, started only when turned on.
+ARG PROMETHEUS_IMAGE=quay.io/prometheus/prometheus:v3.15.1@sha256:fa3302279710be2f21a8301ec17a8b4f2301fd829bd113839b3b6b02b6f191a2
+ARG ALERTMANAGER_IMAGE=quay.io/prometheus/alertmanager:v0.34.2@sha256:39d8bb3966c694a124428a3a88fbcffd40bd069129ecd47c059f8a3f17c55f3b
 
 # veloctl for the host comes from the same velod image the appliance runs.
 FROM ${VELOD_IMAGE} AS velod-bin
@@ -21,6 +24,8 @@ FROM ${BOOTC_BASE_IMAGE}
 
 ARG VELOD_IMAGE
 ARG SPDK_IMAGE
+ARG PROMETHEUS_IMAGE
+ARG ALERTMANAGER_IMAGE
 ARG IMAGE_TAG=pinned
 # Only for CI builds of pull requests, whose images live in a throwaway local registry.
 ARG INSECURE_REGISTRY=false
@@ -53,7 +58,8 @@ RUN mkdir -p \
     printf "vfio\nvfio_iommu_type1\nvfio_pci\nuio_pci_generic\nnvme_tcp\nublk_drv\n" > /usr/lib/modules-load.d/velocor.conf && \
     printf "vm.nr_hugepages = 512\n" > /usr/lib/sysctl.d/90-velocor.conf && \
     printf "net.ipv4.tcp_autocorking = 0\n" >> /usr/lib/sysctl.d/90-velocor.conf && \
-    printf "d /var/lib/velocor 0700 root root -\nd /run/velocor 0755 root root -\n" > /usr/lib/tmpfiles.d/velocor.conf
+    printf "d /var/lib/velocor 0700 root root -\nd /run/velocor 0755 root root -\n" > /usr/lib/tmpfiles.d/velocor.conf && \
+    printf "d /var/lib/velocor-monitoring 0755 root root -\nd /var/lib/velocor-monitoring/config 0750 root 65534 -\nd /var/lib/velocor-monitoring/prometheus 0750 65534 65534 -\nd /var/lib/velocor-monitoring/alertmanager 0750 65534 65534 -\n" > /usr/lib/tmpfiles.d/velocor-monitoring.conf
 
 # Keep udev away from velod's short-lived metadata device (internal/meta)
 COPY deploy/bootc/59-velocor-ublk.rules /usr/lib/udev/rules.d/59-velocor-ublk.rules
@@ -64,6 +70,8 @@ COPY --from=velod-bin /usr/bin/veloctl /usr/bin/veloctl
 # Install Podman Quadlet units for decoupled data-plane and control-plane containers
 COPY deploy/quadlets/velocor-spdk.container /usr/share/containers/systemd/velocor-spdk.container
 COPY deploy/quadlets/velocor-velod.container /usr/share/containers/systemd/velocor-velod.container
+COPY deploy/quadlets/velocor-prometheus.container /usr/share/containers/systemd/velocor-prometheus.container
+COPY deploy/quadlets/velocor-alertmanager.container /usr/share/containers/systemd/velocor-alertmanager.container
 
 # Administrator account: velocor-admin, SSH keys only; root cannot log in over SSH.
 # No keys or passwords are ever baked into this (public) image: they are added to a disk image
@@ -113,16 +121,18 @@ RUN --mount=type=secret,id=registry-auth set -eu; \
     embed() { \
       ref="$1" name="$2"; \
       case "$ref" in */*@sha256:*) ;; *) echo "$name image '$ref' must be pinned by digest (repo@sha256:...)" >&2; exit 1 ;; esac; \
-      repo="${ref%@*}"; \
-      case "${repo##*/}" in *:*) echo "$name image '$ref': give repo@sha256:... without a tag" >&2; exit 1 ;; esac; \
+      repo="${ref%@*}" tag="${IMAGE_TAG}"; \
+      case "${repo##*/}" in *:*) tag="${repo##*:}"; repo="${repo%:*}" ;; esac; \
       archive="/usr/share/velocor/images/$name.oci.tar"; \
-      skopeo copy -q $tls $auth "docker://$ref" "oci-archive:$archive:$repo:${IMAGE_TAG}"; \
+      skopeo copy -q $tls $auth "docker://${repo}@${ref##*@}" "oci-archive:$archive:$repo:$tag"; \
       digest="$(skopeo inspect --format '{{.Digest}}' "oci-archive:$archive")"; \
-      sed -i "s|^Image=.*|# Built from $repo:${IMAGE_TAG}\nImage=${repo}@${digest}|" "/usr/share/containers/systemd/$name.container"; \
-      echo "$name: Image=${repo}@${digest} ($repo:${IMAGE_TAG})"; \
+      sed -i "s|^Image=.*|# Built from $repo:$tag\nImage=${repo}@${digest}|" "/usr/share/containers/systemd/$name.container"; \
+      echo "$name: Image=${repo}@${digest} ($repo:$tag)"; \
     }; \
     embed "${SPDK_IMAGE}" velocor-spdk; \
     embed "${VELOD_IMAGE}" velocor-velod; \
+    embed "${PROMETHEUS_IMAGE}" velocor-prometheus; \
+    embed "${ALERTMANAGER_IMAGE}" velocor-alertmanager; \
     ! grep -q '@VELOCOR_' /usr/share/containers/systemd/velocor-*.container
 
 RUN chmod 0755 /usr/libexec/velocor-console-banner /usr/libexec/velocor-preload-images /usr/lib/NetworkManager/dispatcher.d/90-velocor-banner && \

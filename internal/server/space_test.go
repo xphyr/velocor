@@ -84,7 +84,7 @@ func TestCriticalPoolRefusesAllGrowthButDeletes(t *testing.T) {
 		t.Fatalf("pool at 92%%: %v available %v", p["space_state"], p["available_bytes"])
 	}
 	metrics := h.metrics()
-	for _, want := range []string{`velocor_pool_space_state{pool="p1",state="CRITICAL"} 2`, `velocor_pool_used_ratio{pool="p1"} 0.9200`,
+	for _, want := range []string{`velocor_pool_space_state{pool="p1",state="CRITICAL"} 2`, `velocor_pool_used_ratio{pool="p1"} 0.92`,
 		`velocor_pool_available_bytes{pool="p1"} 0`, `velocor_volume_allocated_bytes{volume="v1",pool="p1"} 964689920`} {
 		if !strings.Contains(metrics, want) {
 			t.Errorf("metrics lack %s", want)

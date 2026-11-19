@@ -27,6 +27,27 @@
       ],
       "groupName": "Fedora base images",
       "pinDigests": false
+    },
+    {
+      "description": "Built-in monitoring (P1-1): Prometheus and Alertmanager move together",
+      "matchPackageNames": [
+        "quay.io/prometheus/prometheus",
+        "quay.io/prometheus/alertmanager"
+      ],
+      "groupName": "Built-in monitoring"
+    }
+  ],
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "Third-party images embedded in the OS image (ARG X_IMAGE=repo:tag@digest, not used in FROM)",
+      "managerFilePatterns": [
+        "/(^|/)Containerfile[^/]*$/"
+      ],
+      "matchStrings": [
+        "ARG [A-Z_]+_IMAGE=(?<depName>[^:@\\s]+):(?<currentValue>[^@\\s]+)@(?<currentDigest>sha256:[a-f0-9]{64})"
+      ],
+      "datasourceTemplate": "docker"
     }
   ]
 }

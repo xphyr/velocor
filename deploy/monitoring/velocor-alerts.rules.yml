@@ -1,0 +1,220 @@
+# Velocor alert rules (TODO.md P1-1), for Prometheus scraping a Velocor appliance's /metrics.
+#
+# The same file is used by an existing Prometheus (load it with rule_files) and by the
+# appliance's built-in Prometheus/Alertmanager. The rules expect the appliance's scrape job to
+# be named "velocor" (see prometheus-scrape.example.yml). Thresholds and delays are the
+# defaults; the built-in stack lets them be changed in the UI.
+#
+# Severities: critical = data at risk or not being served, act now; warning = needs attention
+# soon; none = the watchdog (an always-firing heartbeat for an external dead man's switch).
+groups:
+  - name: velocor-appliance
+    rules:
+      - alert: VelocorDown
+        expr: up{job="velocor"} == 0
+        for: 2m
+        labels: {severity: critical}
+        annotations:
+          summary: "Velocor appliance {{ $labels.instance }} doesn't answer"
+          description: "Prometheus can't scrape velod's /metrics. The appliance may be down, unreachable, or its API stopped. Hosts may still be served if only velod is down."
+
+      - alert: VelocorDataPlaneDown
+        expr: velocor_dataplane_up == 0
+        for: 2m
+        labels: {severity: critical}
+        annotations:
+          summary: "SPDK (the data plane) on {{ $labels.instance }} doesn't answer"
+          description: "spdk_tgt doesn't answer velod: volumes are probably not being served."
+
+      - alert: VelocorReconcilerStalled
+        expr: time() - velocor_reconciler_last_run_timestamp_seconds > 600
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "Velocor's reconciler hasn't completed a pass for {{ $value | humanizeDuration }}"
+          description: "The reconciler normally runs every few seconds. While it is stuck, failed disks, rebuilds and exports aren't being handled."
+
+      - alert: VelocorReconcilerFailing
+        expr: velocor_reconciler_last_run_failed == 1
+        for: 15m
+        labels: {severity: warning}
+        annotations:
+          summary: "Velocor's reconciler keeps failing on {{ $labels.instance }}"
+          description: "Its passes have ended with an error for 15 minutes; the error is on the appliance's status page and in velod's log."
+
+      - alert: VelocorUnmanagedSPDKObjects
+        expr: sum by (instance, kind) (velocor_spdk_unmanaged_objects) > 0
+        for: 15m
+        labels: {severity: warning}
+        annotations:
+          summary: "SPDK holds {{ $value }} {{ $labels.kind }} object(s) Velocor doesn't manage"
+          description: "Listed on the System page. Unmanaged NVMe-oF subsystems or iSCSI targets may give hosts access that no export controls. Velocor never removes them itself."
+
+      - alert: VelocorBackupMissing
+        expr: |
+          time() - velocor_backup_last_timestamp_seconds{kind="hourly"} > 3 * 3600
+          or
+          time() - velocor_backup_last_timestamp_seconds{kind="daily"} > 2 * 86400
+        labels: {severity: warning}
+        annotations:
+          summary: "No {{ $labels.kind }} database backup for {{ $value | humanizeDuration }}"
+          description: "Scheduled backups of Velocor's database aren't being taken. Check velod's log for 'scheduled database backup failed'."
+
+  - name: velocor-pools
+    rules:
+      - alert: VelocorPoolFaulted
+        expr: velocor_pool_health{status=~"FAULTED|OFFLINE|UNAVAILABLE"} == 1
+        for: 1m
+        labels: {severity: critical}
+        annotations:
+          summary: "Pool {{ $labels.pool }} is {{ $labels.status }}"
+          description: "The pool's volumes are not being served. See the pool's status message on the appliance."
+
+      - alert: VelocorPoolDegraded
+        expr: velocor_pool_health{status="DEGRADED"} == 1
+        for: 5m
+        labels: {severity: critical}
+        annotations:
+          summary: "Pool {{ $labels.pool }} is degraded: it has lost redundancy"
+          description: "A member is missing or failed; another failure can lose data. Replace the disk (Pools → Replace disk)."
+
+      - alert: VelocorPoolRebuilding
+        expr: velocor_pool_health{status="REBUILDING"} == 1
+        for: 1m
+        labels: {severity: warning}
+        annotations:
+          summary: "Pool {{ $labels.pool }} is rebuilding"
+          description: "Redundancy returns when the rebuild completes. Until then a further failure can lose data."
+
+      # Progress is reported in whole percent, so on a large disk 1% can take well over half an
+      # hour: two hours without any change, on a rebuild that was already running two hours ago.
+      - alert: VelocorRebuildStalled
+        expr: |
+          velocor_pool_member_rebuild_ratio < 1
+          and delta(velocor_pool_member_rebuild_ratio[2h]) <= 0
+          and velocor_pool_member_rebuild_ratio offset 2h
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "Rebuild of pool {{ $labels.pool }} (slot {{ $labels.slot }}) has made no progress for two hours"
+          description: "Rebuild progress is stuck at {{ $value | humanizePercentage }}."
+
+      - alert: VelocorPoolDurabilityAtRisk
+        expr: velocor_pool_durability{durability="AT_RISK"} == 1
+        for: 15m
+        labels: {severity: warning}
+        annotations:
+          summary: "Pool {{ $labels.pool }} may lose acknowledged writes on power loss"
+          description: "A member drive caches writes and has no power-loss protection, and its write cache couldn't be turned off. See the pool's durability on the appliance."
+
+      - alert: VelocorPoolMetadataCopyFailing
+        expr: velocor_pool_metadata_copy_failed == 1
+        for: 30m
+        labels: {severity: warning}
+        annotations:
+          summary: "Pool {{ $labels.pool }}'s metadata copy can't be written"
+          description: "The copy of Velocor's database kept on the pool is out of date; recovering the pool without the appliance's database would lose recent changes."
+
+      - alert: VelocorPoolSpaceWarning
+        expr: velocor_pool_space_state == 1
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "Pool {{ $labels.pool }} is filling up (WARNING)"
+          description: "Free space or delete data (deleted volumes still hold space until purged)."
+
+      - alert: VelocorPoolSpaceCritical
+        expr: velocor_pool_space_state == 2
+        for: 1m
+        labels: {severity: critical}
+        annotations:
+          summary: "Pool {{ $labels.pool }} is nearly full (CRITICAL): new volumes and growth are refused"
+          description: "Free space now: once FULL, writes to new space fail on hosts."
+
+      - alert: VelocorPoolFull
+        expr: velocor_pool_space_state == 3
+        labels: {severity: critical}
+        annotations:
+          summary: "Pool {{ $labels.pool }} is FULL: writes to new space fail"
+          description: "Hosts get write errors on thin volumes. Free space immediately (purge deleted volumes, delete snapshots)."
+
+      - alert: VelocorPoolFillsWithin24h
+        expr: velocor_pool_used_ratio > 0.5 and predict_linear(velocor_pool_used_ratio[6h], 24 * 3600) > 0.95
+        for: 1h
+        labels: {severity: warning}
+        annotations:
+          summary: "Pool {{ $labels.pool }} will be full within a day at the current rate"
+          description: "Used: {{ $value | humanizePercentage }}."
+
+  - name: velocor-disks
+    rules:
+      - alert: VelocorDiskFailed
+        expr: velocor_disk_health{pool!="",status=~"FAULTED|OFFLINE|UNAVAILABLE"} == 1
+        for: 1m
+        labels: {severity: critical}
+        annotations:
+          summary: "Disk {{ $labels.disk }} in pool {{ $labels.pool }} is {{ $labels.status }}"
+          description: "Replace it (Pools → Replace disk)."
+
+      - alert: VelocorDiskSmartCritical
+        expr: velocor_disk_smart_critical_warning == 1
+        labels: {severity: critical}
+        annotations:
+          summary: "Disk {{ $labels.disk }} reports a SMART critical warning"
+          description: "The drive itself reports trouble (spare exhausted, reliability degraded, read-only, or temperature). Plan to replace it."
+
+      - alert: VelocorDiskMediaErrors
+        expr: increase(velocor_disk_media_errors_total[1h]) > 0
+        labels: {severity: warning}
+        annotations:
+          summary: "Disk {{ $labels.disk }} reported new media errors"
+          description: "{{ $value }} new media/data-integrity errors in the last hour."
+
+      - alert: VelocorDiskSpareLow
+        expr: velocor_disk_available_spare_threshold_ratio > 0 and velocor_disk_available_spare_ratio <= velocor_disk_available_spare_threshold_ratio
+        labels: {severity: critical}
+        annotations:
+          summary: "Disk {{ $labels.disk }} has used up its spare capacity"
+          description: "Available spare is at or below the drive's own threshold; it may soon fail or turn read-only."
+
+      - alert: VelocorDiskWornOut
+        expr: velocor_disk_wear_ratio >= 0.9
+        labels: {severity: warning}
+        annotations:
+          summary: "Disk {{ $labels.disk }} is {{ $value | humanizePercentage }} worn"
+          description: "The drive is near the end of its rated endurance. Plan to replace it."
+
+      - alert: VelocorDiskHot
+        expr: velocor_disk_temperature_celsius > 70
+        for: 15m
+        labels: {severity: warning}
+        annotations:
+          summary: "Disk {{ $labels.disk }} is at {{ $value }} °C"
+          description: "Check the appliance's cooling."
+
+  - name: velocor-access
+    rules:
+      - alert: VelocorExportUnhealthy
+        expr: velocor_export_health{status!~"ONLINE|UNSPECIFIED"} == 1 unless on (instance, export) velocor_export_disabled == 1
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "Export {{ $labels.export }} (volume {{ $labels.volume }}) is {{ $labels.status }}"
+          description: "Hosts may not reach this volume. See the export's status message on the appliance."
+
+      - alert: VelocorVolumeUnhealthy
+        expr: velocor_volume_health{status!~"ONLINE|UNSPECIFIED"} == 1
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "Volume {{ $labels.volume }} in pool {{ $labels.pool }} is {{ $labels.status }}"
+          description: "See the volume's status on the appliance."
+
+  - name: velocor-watchdog
+    rules:
+      - alert: VelocorWatchdog
+        expr: vector(1)
+        labels: {severity: none}
+        annotations:
+          summary: "Always firing: proves alerts are delivered"
+          description: "Route this to an external dead man's switch (a heartbeat service). If it stops arriving, the alerting pipeline or the appliance itself is down."

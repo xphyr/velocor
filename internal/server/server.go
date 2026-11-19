@@ -28,6 +28,7 @@ import (
 	"github.com/velocor/velocor/internal/dataplane"
 	"github.com/velocor/velocor/internal/hardware"
 	"github.com/velocor/velocor/internal/meta"
+	"github.com/velocor/velocor/internal/monitoring"
 	"github.com/velocor/velocor/internal/reconciler"
 	"github.com/velocor/velocor/internal/spdk"
 	"github.com/velocor/velocor/internal/store"
@@ -55,6 +56,8 @@ type Server struct {
 	restart       func()
 	metaDev       meta.Device
 	sbReader      func(*store.Disk) (*hardware.RaidSuperblock, error) // tests
+	monitoring    *monitoring.Manager
+	mon           monitoringState
 }
 
 // WithInsecureHTTP records that the API is served over plain HTTP, so status can warn about it.
@@ -114,6 +117,9 @@ func (s *Server) warnings() []string {
 	if s.hw != nil && s.hw.UnsafeNoIOMMUAllowed() {
 		out = append(out, "Unsafe no-IOMMU mode is allowed: SPDK can DMA anywhere in host memory. Use this only in lab VMs.")
 	}
+	if w := s.monitoringWarning(); w != "" {
+		out = append(out, w)
+	}
 	return out
 }
 
@@ -153,6 +159,22 @@ func New(
 	}
 	for _, o := range opts {
 		o(s)
+	}
+	if m := s.monitoring; m != nil {
+		if m.NewToken == nil {
+			m.NewToken = s.rotateScrapeToken
+		}
+		if m.ReactorCPUs == nil {
+			m.ReactorCPUs = s.reactorCPUs
+		}
+		if m.Run == nil {
+			m.Run = func(ctx context.Context, name string, args ...string) ([]byte, error) {
+				return hostCommand(ctx, name, args...).CombinedOutput()
+			}
+		}
+		if m.Logger == nil {
+			m.Logger = s.logger
+		}
 	}
 	s.removeStaleBootstrapFile()
 	s.registerRoutes()
@@ -232,6 +254,16 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /api/v1/deleted-volumes", s.withAuth(store.RoleReadOnly, s.handleListDeletedVolumes))
 	s.mux.HandleFunc("POST /api/v1/deleted-volumes/{id}/restore", s.withAuth(store.RoleAdmin, s.handleRestoreVolume))
 	s.mux.HandleFunc("DELETE /api/v1/deleted-volumes/{id}", s.withAuth(store.RoleAdmin, s.handlePurgeVolume))
+	s.mux.HandleFunc("GET /api/v1/system/monitoring", s.withAuth(store.RoleReadOnly, s.handleGetMonitoring))
+	s.mux.HandleFunc("GET /api/v1/monitoring/alerts", s.withAuth(store.RoleReadOnly, s.handleListAlerts))
+	s.mux.HandleFunc("POST /api/v1/monitoring/silences", s.withAuth(store.RoleAdmin, s.handleCreateSilence))
+	s.mux.HandleFunc("DELETE /api/v1/monitoring/silences/{id}", s.withAuth(store.RoleAdmin, s.handleExpireSilence))
+	s.mux.HandleFunc("GET /api/v1/monitoring/graphs/{name}", s.withAuth(store.RoleReadOnly, s.handleGraph))
+	s.mux.HandleFunc("GET /api/v1/monitoring/settings", s.withAuth(store.RoleAdmin, s.handleGetAlerting))
+	s.mux.HandleFunc("PUT /api/v1/monitoring/settings", s.withAuth(store.RoleAdmin, s.handlePutAlerting))
+	s.mux.HandleFunc("GET /api/v1/monitoring/rules", s.withAuth(store.RoleReadOnly, s.handleListRules))
+	s.mux.HandleFunc("POST /api/v1/monitoring/test", s.withAuth(store.RoleAdmin, s.handleTestAlert))
+	s.mux.HandleFunc("PUT /api/v1/system/monitoring", s.withAuth(store.RoleAdmin, s.handlePutMonitoring))
 	s.mux.HandleFunc("GET /api/v1/system/volume-retention", s.withAuth(store.RoleReadOnly, s.handleGetVolumeRetention))
 	s.mux.HandleFunc("PUT /api/v1/system/volume-retention", s.withAuth(store.RoleAdmin, s.handlePutVolumeRetention))
 
@@ -1008,106 +1040,6 @@ func (s *Server) handleGetIoStats(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
-	var sb strings.Builder
-
-	sb.WriteString("# HELP velocor_up Whether the Velocor control plane is up.\n")
-	sb.WriteString("# TYPE velocor_up gauge\n")
-	sb.WriteString("velocor_up 1\n")
-
-	if s.reconciler != nil {
-		st := s.reconciler.State()
-		sb.WriteString("# HELP velocor_reconciler_drift_repaired_total Total resources repaired by reconciler.\n")
-		sb.WriteString("# TYPE velocor_reconciler_drift_repaired_total counter\n")
-		fmt.Fprintf(&sb, "velocor_reconciler_drift_repaired_total %d\n", st.DriftRepairedCount)
-		sb.WriteString("# HELP velocor_reconciler_degraded_resources Number of currently degraded resources.\n")
-		sb.WriteString("# TYPE velocor_reconciler_degraded_resources gauge\n")
-		fmt.Fprintf(&sb, "velocor_reconciler_degraded_resources %d\n", len(st.DegradedResources))
-		sb.WriteString("# HELP velocor_spdk_unmanaged_objects Objects in spdk_tgt that no Velocor record accounts for, by kind.\n")
-		sb.WriteString("# TYPE velocor_spdk_unmanaged_objects gauge\n")
-		counts := map[string]int{}
-		for _, o := range st.Unmanaged {
-			counts[o.Kind]++
-		}
-		for _, k := range []string{"BDEV", "ISCSI_TARGET", "LVOL", "LVSTORE", "NVMF_SUBSYSTEM", "RAID"} {
-			fmt.Fprintf(&sb, "velocor_spdk_unmanaged_objects{kind=%q} %d\n", k, counts[k])
-		}
-	}
-
-	if pools, err := s.store.ListPools(); err == nil {
-		sb.WriteString("# HELP velocor_pool_total_bytes Total capacity of storage pool in bytes.\n")
-		sb.WriteString("# TYPE velocor_pool_total_bytes gauge\n")
-		sb.WriteString("# HELP velocor_pool_free_bytes Free capacity of storage pool in bytes.\n")
-		sb.WriteString("# TYPE velocor_pool_free_bytes gauge\n")
-		for _, p := range pools {
-			fmt.Fprintf(&sb, "velocor_pool_total_bytes{pool=%q,raid=%q} %d\n", p.Name, p.RaidLevel, p.TotalBytes)
-			fmt.Fprintf(&sb, "velocor_pool_free_bytes{pool=%q,raid=%q} %d\n", p.Name, p.RaidLevel, p.FreeBytes)
-		}
-		sb.WriteString("# HELP velocor_pool_committed_bytes Space promised by a pool: every volume fully written plus what snapshots hold.\n")
-		sb.WriteString("# TYPE velocor_pool_committed_bytes gauge\n")
-		sb.WriteString("# HELP velocor_pool_available_bytes How much more a pool accepts under its space policy (0 at CRITICAL or FULL).\n")
-		sb.WriteString("# TYPE velocor_pool_available_bytes gauge\n")
-		sb.WriteString("# HELP velocor_pool_used_ratio Fraction of a pool's volume store that is allocated.\n")
-		sb.WriteString("# TYPE velocor_pool_used_ratio gauge\n")
-		sb.WriteString("# HELP velocor_pool_space_state Pool space state: 0 OK, 1 WARNING, 2 CRITICAL (growth refused), 3 FULL (writes to new space fail).\n")
-		sb.WriteString("# TYPE velocor_pool_space_state gauge\n")
-		for _, p := range pools {
-			fmt.Fprintf(&sb, "velocor_pool_committed_bytes{pool=%q} %d\n", p.Name, p.CommittedBytes)
-			fmt.Fprintf(&sb, "velocor_pool_available_bytes{pool=%q} %d\n", p.Name, p.AvailableBytes)
-			fmt.Fprintf(&sb, "velocor_pool_used_ratio{pool=%q} %.4f\n", p.Name, store.UsedPercent(p)/100)
-			fmt.Fprintf(&sb, "velocor_pool_space_state{pool=%q,state=%q} %d\n", p.Name, p.SpaceState, spaceStateValue(p.SpaceState))
-		}
-		poolName := map[string]string{}
-		for _, p := range pools {
-			poolName[p.ID] = p.Name
-		}
-		if vols, err := s.store.ListVolumes(""); err == nil {
-			sb.WriteString("# HELP velocor_volume_size_bytes Provisioned size of a volume.\n")
-			sb.WriteString("# TYPE velocor_volume_size_bytes gauge\n")
-			sb.WriteString("# HELP velocor_volume_allocated_bytes Space a volume holds in its pool.\n")
-			sb.WriteString("# TYPE velocor_volume_allocated_bytes gauge\n")
-			for _, v := range vols {
-				if v.Deleted() {
-					continue // its space shows in the pool's figures
-				}
-				fmt.Fprintf(&sb, "velocor_volume_size_bytes{volume=%q,pool=%q} %d\n", v.Name, poolName[v.PoolID], v.SizeBytes)
-				fmt.Fprintf(&sb, "velocor_volume_allocated_bytes{volume=%q,pool=%q} %d\n", v.Name, poolName[v.PoolID], v.AllocatedBytes)
-			}
-		}
-		if snaps, err := s.store.ListSnapshots("", ""); err == nil {
-			sb.WriteString("# HELP velocor_snapshot_allocated_bytes Space a snapshot holds in its pool.\n")
-			sb.WriteString("# TYPE velocor_snapshot_allocated_bytes gauge\n")
-			for _, sn := range snaps {
-				fmt.Fprintf(&sb, "velocor_snapshot_allocated_bytes{snapshot=%q,pool=%q} %d\n", sn.Name, poolName[sn.PoolID], sn.AllocatedBytes)
-			}
-		}
-	}
-
-	if disks, err := s.store.ListDisks(); err == nil {
-		sb.WriteString("# HELP velocor_disk_temperature_celsius NVMe/SSD SMART temperature in Celsius.\n")
-		sb.WriteString("# TYPE velocor_disk_temperature_celsius gauge\n")
-		for _, d := range disks {
-			fmt.Fprintf(&sb, "velocor_disk_temperature_celsius{disk=%q,type=%q} %d\n", d.ID, d.Type, d.Smart.TemperatureCelsius)
-		}
-	}
-
-	if s.spdk != nil {
-		if iostat, err := s.spdk.BdevGetIostat(r.Context(), ""); err == nil {
-			sb.WriteString("# HELP velocor_bdev_read_ops_total Total read operations on SPDK bdev.\n")
-			sb.WriteString("# TYPE velocor_bdev_read_ops_total counter\n")
-			sb.WriteString("# HELP velocor_bdev_write_ops_total Total write operations on SPDK bdev.\n")
-			sb.WriteString("# TYPE velocor_bdev_write_ops_total counter\n")
-			for _, b := range iostat.Bdevs {
-				fmt.Fprintf(&sb, "velocor_bdev_read_ops_total{bdev=%q} %d\n", b.Name, b.NumReadOps)
-				fmt.Fprintf(&sb, "velocor_bdev_write_ops_total{bdev=%q} %d\n", b.Name, b.NumWriteOps)
-			}
-		}
-	}
-
-	_, _ = w.Write([]byte(sb.String()))
-}
-
 // GenerateSelfSignedTLSConfig generates an ephemeral ECDSA P-256 TLS certificate in memory
 // when no external TLS certificate is configured.
 func GenerateSelfSignedTLSConfig() (*tls.Config, error) {
@@ -1222,9 +1154,17 @@ func LoadOrGenerateSelfSignedTLSConfig(certPath, keyPath string) (*tls.Config, e
 }
 
 func writeJSON(w http.ResponseWriter, status int, payload any) {
+	// Encode first: a value JSON can't carry (NaN, say) must not turn into a 200 with an
+	// empty body.
+	b, err := json.Marshal(payload)
+	if err != nil {
+		slog.Error("encoding a response failed", "err", err)
+		status = http.StatusInternalServerError
+		b, _ = json.Marshal(map[string]any{"error": "encoding the response failed: " + err.Error()})
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(payload)
+	_, _ = w.Write(append(b, '\n'))
 }
 
 func writeError(w http.ResponseWriter, err error) {

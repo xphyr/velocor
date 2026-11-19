@@ -1,0 +1,20 @@
+# Example Prometheus configuration for a Velocor appliance (docs/monitoring.md).
+# Merge into your prometheus.yml. The shipped rules expect the job to be named "velocor".
+rule_files:
+  - velocor-alerts.rules.yml
+
+scrape_configs:
+  - job_name: velocor
+    scheme: https
+    scrape_interval: 30s
+    # A READONLY token: veloctl token create --name prometheus --role READONLY
+    authorization:
+      credentials_file: /etc/prometheus/velocor.token
+    tls_config:
+      # The appliance's certificate (a copy of /var/lib/velocor/tls.crt for the self-signed one).
+      ca_file: /etc/prometheus/velocor-ca.crt
+      # The self-signed certificate names localhost and velocor.local: set server_name to
+      # match it, or install a certificate for the appliance's real name.
+      server_name: velocor.local
+    static_configs:
+      - targets: ["velocor-1.example.com:8443"]

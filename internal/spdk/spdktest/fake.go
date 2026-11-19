@@ -941,7 +941,26 @@ var handlers = map[string]handler{
 		return true, nil
 	},
 	"bdev_get_iostat": func(f *Fake, _ map[string]any) (any, *rpcErr) {
-		return spdk.BdevGetIostatResponse{TickRate: 1}, nil
+		// Fixed counters for every bdev, named as SPDK names them (lvols by UUID).
+		res := spdk.BdevGetIostatResponse{TickRate: 1000}
+		stat := func(name string) spdk.BdevIoStat {
+			return spdk.BdevIoStat{Name: name, NumReadOps: 10, BytesRead: 40960, NumWriteOps: 5, BytesWritten: 20480,
+				ReadLatencyTicks: 20, WriteLatencyTicks: 10}
+		}
+		for name := range f.baseBdevs {
+			res.Bdevs = append(res.Bdevs, stat(name))
+		}
+		for _, r := range f.raids {
+			if f.raidOnline(r) {
+				res.Bdevs = append(res.Bdevs, stat(r.Name))
+			}
+		}
+		for key := range f.loadedLvsByKey() {
+			for _, l := range f.lvsMedia[key].Lvols {
+				res.Bdevs = append(res.Bdevs, stat(l.UUID))
+			}
+		}
+		return res, nil
 	},
 	"nvmf_get_transports": func(f *Fake, _ map[string]any) (any, *rpcErr) {
 		var out []spdk.NvmfTransport

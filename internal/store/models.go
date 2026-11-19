@@ -52,6 +52,52 @@ type Settings struct {
 	// intact) before the reconciler purges it; nil means DefaultVolumeRetention, 0 deletes at
 	// once.
 	VolumeRetentionHours *uint32 `json:"volume_retention_hours,omitempty"`
+	// MonitoringEnabled runs the built-in Prometheus and Alertmanager (TODO.md P1-1).
+	MonitoringEnabled bool `json:"monitoring_enabled,omitempty"`
+	// Alerting configures where the built-in Alertmanager sends alerts and how the shipped
+	// rules are tuned. Its secrets stay in this database (and its backups), never in the pools'
+	// metadata copies, and the API never returns them.
+	Alerting AlertingSettings `json:"alerting,omitempty"`
+}
+
+// AlertingSettings are the built-in Alertmanager's receivers and the rules' tuning.
+type AlertingSettings struct {
+	Email   *EmailReceiver   `json:"email,omitempty"`
+	Webhook *WebhookReceiver `json:"webhook,omitempty"`
+	// HeartbeatURL receives the always-firing watchdog alert every few minutes (a dead man's
+	// switch service raises an alarm when it stops). Secret.
+	HeartbeatURL string `json:"heartbeat_url,omitempty"`
+	// Rules tunes shipped rules by alert name.
+	Rules map[string]RuleSetting `json:"rules,omitempty"`
+}
+
+// EmailReceiver sends alerts by SMTP.
+type EmailReceiver struct {
+	To       []string `json:"to"`
+	From     string   `json:"from"`
+	SMTPHost string   `json:"smtp_host"`
+	SMTPPort int      `json:"smtp_port"`
+	Username string   `json:"username,omitempty"`
+	Password string   `json:"password,omitempty"` // secret
+	// RequireTLS refuses to send unless the server offers STARTTLS (port 465 uses TLS anyway).
+	RequireTLS bool `json:"require_tls"`
+	// MinSeverity is "warning" (default) or "critical".
+	MinSeverity string `json:"min_severity,omitempty"`
+}
+
+// WebhookReceiver posts alerts in Alertmanager's webhook format.
+type WebhookReceiver struct {
+	URL         string `json:"url"` // secret: such URLs often embed a token
+	MinSeverity string `json:"min_severity,omitempty"`
+}
+
+// RuleSetting tunes one shipped rule.
+type RuleSetting struct {
+	Disabled bool `json:"disabled,omitempty"`
+	// For overrides how long the condition must hold ("5m", "1h"); empty keeps the default.
+	For string `json:"for,omitempty"`
+	// Threshold overrides the rule's tunable value, for the rules that have one.
+	Threshold *float64 `json:"threshold,omitempty"`
 }
 
 // DiskType categorizes physical flash media tiers.

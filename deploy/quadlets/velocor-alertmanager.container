@@ -1,0 +1,23 @@
+[Unit]
+Description=Velocor built-in Alertmanager (started by velod when monitoring is on)
+After=velocor-velod.service
+
+[Container]
+# Filled in by the OS image build with the embedded image, pinned by digest.
+Image=@VELOCOR_ALERTMANAGER_IMAGE@
+ContainerName=velocor-alertmanager
+Network=host
+Volume=/var/lib/velocor-monitoring/config:/etc/velocor-monitoring:ro,z
+Volume=/var/lib/velocor-monitoring/alertmanager:/alertmanager:Z
+# Loopback only, and no clustering (it would listen on every address for peers).
+Exec=--config.file=/etc/velocor-monitoring/alertmanager.yml \
+     --storage.path=/alertmanager \
+     --web.listen-address=127.0.0.1:19093 \
+     --cluster.listen-address=
+
+[Service]
+MemoryMax=256M
+CPUWeight=20
+Restart=on-failure
+RestartSec=10s
+# No [Install]: only velod starts it, when built-in monitoring is turned on.

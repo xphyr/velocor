@@ -1,0 +1,216 @@
+# promtool test rules deploy/monitoring/velocor-alerts.test.yml (hack/check-alerts.sh)
+rule_files:
+  - velocor-alerts.rules.yml
+evaluation_interval: 1m
+
+tests:
+  # Scrape failures and the data plane.
+  - interval: 1m
+    input_series:
+      - series: 'up{job="velocor",instance="a:8443"}'
+        values: '1 1 0 0 0 0'
+      - series: 'velocor_dataplane_up{job="velocor",instance="a:8443"}'
+        values: '1 0 0 0 0 0'
+    alert_rule_test:
+      - {eval_time: 3m, alertname: VelocorDown, exp_alerts: []}
+      - eval_time: 4m
+        alertname: VelocorDown
+        exp_alerts:
+          - exp_labels: {severity: critical, job: velocor, instance: "a:8443"}
+            exp_annotations:
+              summary: "Velocor appliance a:8443 doesn't answer"
+              description: "Prometheus can't scrape velod's /metrics. The appliance may be down, unreachable, or its API stopped. Hosts may still be served if only velod is down."
+      - eval_time: 3m
+        alertname: VelocorDataPlaneDown
+        exp_alerts:
+          - exp_labels: {severity: critical, job: velocor, instance: "a:8443"}
+            exp_annotations:
+              summary: "SPDK (the data plane) on a:8443 doesn't answer"
+              description: "spdk_tgt doesn't answer velod: volumes are probably not being served."
+
+  # A degraded pool pages after 5 minutes, not before; ONLINE pools and other states don't.
+  - interval: 1m
+    input_series:
+      - series: 'velocor_pool_health{instance="a",pool="p1",status="DEGRADED"}'
+        values: '1x10'
+      - series: 'velocor_pool_health{instance="a",pool="p2",status="ONLINE"}'
+        values: '1x10'
+      - series: 'velocor_pool_health{instance="a",pool="p3",status="FAULTED"}'
+        values: '1x10'
+    alert_rule_test:
+      - {eval_time: 4m, alertname: VelocorPoolDegraded, exp_alerts: []}
+      - eval_time: 5m
+        alertname: VelocorPoolDegraded
+        exp_alerts:
+          - exp_labels: {severity: critical, instance: a, pool: p1, status: DEGRADED}
+            exp_annotations:
+              summary: "Pool p1 is degraded: it has lost redundancy"
+              description: "A member is missing or failed; another failure can lose data. Replace the disk (Pools → Replace disk)."
+      - eval_time: 2m
+        alertname: VelocorPoolFaulted
+        exp_alerts:
+          - exp_labels: {severity: critical, instance: a, pool: p3, status: FAULTED}
+            exp_annotations:
+              summary: "Pool p3 is FAULTED"
+              description: "The pool's volumes are not being served. See the pool's status message on the appliance."
+
+  # Space states: each level its own alert.
+  - interval: 1m
+    input_series:
+      - series: 'velocor_pool_space_state{instance="a",pool="w",state="WARNING"}'
+        values: '1x20'
+      - series: 'velocor_pool_space_state{instance="a",pool="c",state="CRITICAL"}'
+        values: '2x20'
+      - series: 'velocor_pool_space_state{instance="a",pool="f",state="FULL"}'
+        values: '3x20'
+      - series: 'velocor_pool_space_state{instance="a",pool="ok",state="OK"}'
+        values: '0x20'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: VelocorPoolSpaceWarning
+        exp_alerts:
+          - exp_labels: {severity: warning, instance: a, pool: w, state: WARNING}
+            exp_annotations:
+              summary: "Pool w is filling up (WARNING)"
+              description: "Free space or delete data (deleted volumes still hold space until purged)."
+      - eval_time: 15m
+        alertname: VelocorPoolSpaceCritical
+        exp_alerts:
+          - exp_labels: {severity: critical, instance: a, pool: c, state: CRITICAL}
+            exp_annotations:
+              summary: "Pool c is nearly full (CRITICAL): new volumes and growth are refused"
+              description: "Free space now: once FULL, writes to new space fail on hosts."
+      - eval_time: 0m
+        alertname: VelocorPoolFull
+        exp_alerts:
+          - exp_labels: {severity: critical, instance: a, pool: f, state: FULL}
+            exp_annotations:
+              summary: "Pool f is FULL: writes to new space fail"
+              description: "Hosts get write errors on thin volumes. Free space immediately (purge deleted volumes, delete snapshots)."
+
+  # A pool growing 2% an hour from 60% fills within a day; a flat one doesn't.
+  - interval: 1m
+    input_series:
+      - series: 'velocor_pool_used_ratio{instance="a",pool="grow"}'
+        values: '0.6+0.000333x600'
+      - series: 'velocor_pool_used_ratio{instance="a",pool="flat"}'
+        values: '0.8x600'
+    alert_rule_test:
+      - eval_time: 8h
+        alertname: VelocorPoolFillsWithin24h
+        exp_alerts:
+          - exp_labels: {severity: warning, instance: a, pool: grow}
+            exp_annotations:
+              summary: "Pool grow will be full within a day at the current rate"
+              description: "Used: 75.98%."
+
+  # A rebuild stuck at 40% pages only after two hours without progress; a slow one that still
+  # moves (1% an hour) stays quiet.
+  - interval: 1m
+    input_series:
+      - series: 'velocor_pool_member_rebuild_ratio{instance="a",pool="stuck",slot="1",disk="d2"}'
+        values: '0.4x200'
+      - series: 'velocor_pool_member_rebuild_ratio{instance="a",pool="moving",slot="0",disk="d5"}'
+        values: '0.1+0.000167x200'
+    alert_rule_test:
+      - {eval_time: 2h, alertname: VelocorRebuildStalled, exp_alerts: []}
+      - eval_time: 2h15m
+        alertname: VelocorRebuildStalled
+        exp_alerts:
+          - exp_labels: {severity: warning, instance: a, pool: stuck, slot: "1", disk: d2}
+            exp_annotations:
+              summary: "Rebuild of pool stuck (slot 1) has made no progress for two hours"
+              description: "Rebuild progress is stuck at 40%."
+
+  # Disks: SMART critical warning, spare below the drive's threshold, new media errors; a
+  # failed disk outside any pool doesn't page.
+  - interval: 1m
+    input_series:
+      - series: 'velocor_disk_smart_critical_warning{instance="a",disk="n1",type="NVME",pool="p1"}'
+        values: '0 0 1 1'
+      - series: 'velocor_disk_available_spare_ratio{instance="a",disk="n1",type="NVME",pool="p1"}'
+        values: '0.2 0.1 0.05 0.05'
+      - series: 'velocor_disk_available_spare_threshold_ratio{instance="a",disk="n1",type="NVME",pool="p1"}'
+        values: '0.1 0.1 0.1 0.1'
+      - series: 'velocor_disk_media_errors_total{instance="a",disk="n1",type="NVME",pool="p1"}'
+        values: '0 0 2 2'
+      - series: 'velocor_disk_health{instance="a",disk="spare",type="SSD",pool="",status="FAULTED"}'
+        values: '1x5'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: VelocorDiskSmartCritical
+        exp_alerts:
+          - exp_labels: {severity: critical, instance: a, disk: n1, type: NVME, pool: p1}
+            exp_annotations:
+              summary: "Disk n1 reports a SMART critical warning"
+              description: "The drive itself reports trouble (spare exhausted, reliability degraded, read-only, or temperature). Plan to replace it."
+      - eval_time: 1m
+        alertname: VelocorDiskSpareLow
+        exp_alerts:
+          - exp_labels: {severity: critical, instance: a, disk: n1, type: NVME, pool: p1}
+            exp_annotations:
+              summary: "Disk n1 has used up its spare capacity"
+              description: "Available spare is at or below the drive's own threshold; it may soon fail or turn read-only."
+      - eval_time: 3m
+        alertname: VelocorDiskMediaErrors
+        exp_alerts:
+          - exp_labels: {severity: warning, instance: a, disk: n1, type: NVME, pool: p1}
+            exp_annotations:
+              summary: "Disk n1 reported new media errors"
+              description: "2 new media/data-integrity errors in the last hour."
+      - {eval_time: 4m, alertname: VelocorDiskFailed, exp_alerts: []}
+
+  # An unhealthy export pages unless an administrator disabled it.
+  - interval: 1m
+    input_series:
+      - series: 'velocor_export_health{instance="a",export="e1",volume="v1",protocol="ISCSI",status="DEGRADED"}'
+        values: '1x10'
+      - series: 'velocor_export_disabled{instance="a",export="e1",volume="v1",protocol="ISCSI"}'
+        values: '0x10'
+      - series: 'velocor_export_health{instance="a",export="e2",volume="v2",protocol="ISCSI",status="DEGRADED"}'
+        values: '1x10'
+      - series: 'velocor_export_disabled{instance="a",export="e2",volume="v2",protocol="ISCSI"}'
+        values: '1x10'
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: VelocorExportUnhealthy
+        exp_alerts:
+          - exp_labels: {severity: warning, instance: a, export: e1, volume: v1, protocol: ISCSI, status: DEGRADED}
+            exp_annotations:
+              summary: "Export e1 (volume v1) is DEGRADED"
+              description: "Hosts may not reach this volume. See the export's status message on the appliance."
+
+  # Backups and the reconciler.
+  - interval: 1m
+    input_series:
+      - series: 'velocor_backup_last_timestamp_seconds{instance="a",kind="hourly"}'
+        values: '0x300'
+      - series: 'velocor_reconciler_last_run_timestamp_seconds{instance="a"}'
+        values: '0x300'
+    alert_rule_test:
+      - {eval_time: 2h, alertname: VelocorBackupMissing, exp_alerts: []}
+      - eval_time: 4h
+        alertname: VelocorBackupMissing
+        exp_alerts:
+          - exp_labels: {severity: warning, instance: a, kind: hourly}
+            exp_annotations:
+              summary: "No hourly database backup for 4h 0m 0s"
+              description: "Scheduled backups of Velocor's database aren't being taken. Check velod's log for 'scheduled database backup failed'."
+      - eval_time: 2h
+        alertname: VelocorReconcilerStalled
+        exp_alerts:
+          - exp_labels: {severity: warning, instance: a}
+            exp_annotations:
+              summary: "Velocor's reconciler hasn't completed a pass for 2h 0m 0s"
+              description: "The reconciler normally runs every few seconds. While it is stuck, failed disks, rebuilds and exports aren't being handled."
+
+  # The watchdog always fires.
+  - interval: 1m
+    alert_rule_test:
+      - eval_time: 0m
+        alertname: VelocorWatchdog
+        exp_alerts:
+          - exp_labels: {severity: none}
+            exp_annotations:
+              summary: "Always firing: proves alerts are delivered"
+              description: "Route this to an external dead man's switch (a heartbeat service). If it stops arriving, the alerting pipeline or the appliance itself is down."

@@ -9,7 +9,7 @@ set -euo pipefail
 norm() { echo "${1#sha256:}"; }
 
 refs=()
-for name in velocor-spdk velocor-velod; do
+for name in velocor-spdk velocor-velod velocor-prometheus velocor-alertmanager; do
   ref="$(awk -F= '/^Image=/{print $2; exit}' "/usr/share/containers/systemd/${name}.container")"
   archive="/usr/share/velocor/images/${name}.oci.tar"
   [[ -n "$ref" && -f "$archive" ]] || { echo "no embedded image for ${name}" >&2; continue; }

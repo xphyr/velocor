@@ -344,7 +344,7 @@ work still open, ranked by risk to data, how fixes are verified, and what has be
 
 ### P1: outages, lock-outs, things operators can't see
 
-- [ ] **P1-1. Nothing alerts anyone.** Degraded or faulted pools, SMART critical warnings, a
+- [x] **P1-1. Nothing alerts anyone.** Degraded or faulted pools, SMART critical warnings, a
   filling pool or a stalled reconciler are visible only in the UI. `/metrics` exports capacity
   but no health. *Needed:* health gauges per disk/pool/volume/export (so Prometheus /
   Alertmanager can page), and optionally a webhook or e-mail notifier.
@@ -366,6 +366,32 @@ work still open, ranked by risk to data, how fixes are verified, and what has be
   4. **History graphs in the UI** (in scope, agreed 2026-11-19): pool space over time, IOPS
      and throughput per pool/volume, from the built-in Prometheus.
   Receiver secrets (SMTP password, webhook URLs) never go into the pools' metadata copies.
+  **Step 1 done (2026-11-19):** exporter rewritten (`internal/server/metrics.go`: grouped
+  families, Prometheus escaping; health, SMART, rebuild, durability, metadata copy, backups,
+  data plane, reconciler, per pool/volume/disk I/O); 25 rules in
+  `deploy/monitoring/velocor-alerts.rules.yml` with promtool unit tests (`make check-alerts`,
+  in lint and CI); a Go test ties rule metrics to the exporter; `docs/monitoring.md`.
+  **Step 2 code (2026-11-19, not yet lab-tested):** `internal/monitoring` (config, scrape-token
+  rotation, systemctl start/stop/restart, AllowedCPUs off SPDK's reactors, status);
+  `MonitoringEnabled` setting, `GET|PUT /system/monitoring`, `veloctl system monitoring`,
+  System page section; status warns when nothing scrapes /metrics and built-in is off;
+  quadlets `velocor-prometheus` / `velocor-alertmanager` (no [Install], loopback ports
+  19090/19093, memory limits); images quay.io/prometheus v3.15.1 / v0.34.2 embedded in the OS
+  image; Renovate regex manager for those ARGs.
+  **Step 2 lab check (velocor-1, dev-7ffea94, 2026-11-19):** turned on via the API; target up
+  (19 ms scrapes), 25 rules healthy, only the watchdog firing; loopback-only listeners;
+  AllowedCPUs=1-3 (SPDK on 0); 34 MB / 12 MB memory.
+  **Steps 3 and 4 code (2026-11-19):** receivers (email, webhook, heartbeat; secrets in files,
+  never returned by the API), per-rule on/off, delay and thresholds (disk temperature, wear),
+  test alert, silences, Alerts page; named history graphs (`/monitoring/graphs/{name}`, no
+  PromQL from browsers) as SVG charts on the overview, pool and volume pages.
+  **Done (2026-11-19), lab-checked on velocor-1 (dev-99eece0):** monitoring restarts with velod
+  after a reboot and keeps its history; test alert, silence round trip and a rule change
+  (reloaded into Prometheus) work through the API; graphs checked by the user with load from
+  snoarm. Found there: latency graphs are 0/0 = NaN while idle, which encoding/json refused
+  after a 200 (fixed in 99eece0: NaN dropped, writeJSON encodes before writing).
+  *Left:* delivery to a real email/webhook receiver isn't tested (no receiver in the lab);
+  Slack/PagerDuty-native receivers (webhook covers them through relays).
 
 - [ ] **P1-3. Network changes can lock the appliance out.** `PUT /system/network/interfaces/{name}`
   applies at once; a wrong static address or disabling the management interface cuts the
@@ -793,6 +819,19 @@ Everything here was written by Gemini and is in scope to rewrite.
   EIO (filesystems shut down). An SPDK patch completing lvol ENOSPC with NVMe Capacity Exceeded
   (status 0x81) would give hosts ENOSPC, which filesystems and applications handle far better.
   Agreed follow-up to P0-2 (2026-11-17); test with ext4/XFS hosts.
+- [ ] **L-7. Pools can't be expanded.** Requested 2026-11-19. A pool is one SPDK RAID (RAID0 or
+  RAID1) with one lvstore on it; member count and per-member size are fixed in the RAID
+  superblock. `bdev_raid_add_base_bdev` only fills an empty slot (disk replacement, P0-1), and
+  replacing every disk with a bigger one leaves the array at its old size. Today the only way to
+  add capacity is a second pool (volumes can't span pools).
+  *Options to evaluate:* (a) build pools as a concatenation of RAID1 pairs and grow by adding a
+  pair, then `bdev_lvol_grow_lvstore`; (b) after replacing every member with a larger disk, grow
+  the array, then the lvstore; (c) spread volumes across pools (no SPDK change, but not real
+  expansion). (a) and (b) depend on SPDK support that is unverified in v26.09: first read its
+  raid (concat, superblock, resize) and lvstore-grow code, then decide on a design and whether
+  it needs an SPDK patch (with unit tests, like 0002). Crash safety of an interrupted expansion
+  and the pool metadata copies (P0-3) must be part of the design.
+
 - [ ] **L-5. Delta upgrades for the OS image.** Requested 2026-11-17 (back burner). A
   `bootc upgrade` pulls every changed layer of `velocor-os` in full; with the rolling Fedora base
   (B17) that is most of the image on every release. Goal: publish much smaller upgrade packages,
@@ -828,7 +867,7 @@ Before tagging the first release (agreed 2026-11-19): P1-13 portal choice (done)
 tag to prove the release pipeline (B16). B8: no qcow2 with releases (the README explains how to
 build one). The real-hardware tests of P0-1 and P0-4 stay open.
 
-After the release gate: P1-1 alerting, P1-3 network rollback, P2-2 scrub, P2-11 (P1-5 orphan
+After the release gate: P1-1 alerting (done 2026-11-19), P1-3 network rollback, P2-2 scrub, P2-11 (P1-5 orphan
 reporting done 2026-11-18).
 
 ---
