@@ -44,4 +44,14 @@ for f in $(git ls-files '.github/workflows/*.yml' '.github/workflows/*.yaml'); d
   done < <(grep -E '^\s*(-\s+)?uses:' "$f" | grep -vE 'uses:\s*\./' | grep -vE '@[0-9a-f]{40}(\s|$)' || true)
 done
 
+# The static manifest (shipped with releases) must run the same CSI sidecars as the Helm chart,
+# whose values Renovate updates.
+chart_sidecars=$(grep -oE 'registry\.k8s\.io/sig-storage/[^[:space:]"]+' deploy/charts/velocor-csi/values.yaml | sort)
+manifest_sidecars=$(grep -oE 'registry\.k8s\.io/sig-storage/[^[:space:]"]+' deploy/k8s/csi/velocor-csi.yaml | sort)
+[[ "$chart_sidecars" == "$manifest_sidecars" ]] ||
+  bad "deploy/k8s/csi/velocor-csi.yaml's CSI sidecars differ from the chart's values.yaml: $(diff <(echo "$manifest_sidecars") <(echo "$chart_sidecars") | grep '^[<>]' | tr '\n' ' ')"
+while read -r ref; do
+  [[ "$ref" == *@sha256:* ]] || bad "chart sidecar $ref is not pinned by digest"
+done <<<"$chart_sidecars"
+
 exit $fail

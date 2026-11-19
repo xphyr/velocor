@@ -1,4 +1,6 @@
-apiVersion: groupsnapshot.storage.k8s.io/v1beta1
+# For clusters serving the GA VolumeGroupSnapshot API (OpenShift 5, external-snapshotter v8.5+
+# CRDs). On a cluster with only the older API, change the version to v1beta1.
+apiVersion: groupsnapshot.storage.k8s.io/v1
 kind: VolumeGroupSnapshotClass
 metadata:
   name: velocor-group-snapshots
