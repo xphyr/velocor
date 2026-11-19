@@ -348,6 +348,24 @@ work still open, ranked by risk to data, how fixes are verified, and what has be
   filling pool or a stalled reconciler are visible only in the UI. `/metrics` exports capacity
   but no health. *Needed:* health gauges per disk/pool/volume/export (so Prometheus /
   Alertmanager can page), and optionally a webhook or e-mail notifier.
+  **Design (agreed 2026-11-19):** alerts are Prometheus rules on velod's metrics, written once:
+  shipped for existing monitoring (rules file, OpenShift `PrometheusRule`) and run by an
+  optional built-in Prometheus + Alertmanager, off by default.
+  1. Metrics the rules need (health gauges per disk/pool/volume/export, rebuild progress, SMART,
+     write-cache refusals, data plane up, unmanaged objects), the rule set, and docs/files for
+     external Prometheus.
+  2. Built-in stack: Prometheus and Alertmanager images pinned by digest in the OS image;
+     quadlets on localhost only, on cores SPDK doesn't use, memory-limited; Prometheus data on
+     `/var` with 15 days' retention, capped at 2 GB; scrapes `/metrics` with a dedicated
+     read-only token. velod generates both configs and reloads them; on/off in the API, UI and
+     `veloctl`. While off, status warns that no alerting is configured.
+  3. UI: receivers (email and generic webhook first, then Slack and PagerDuty); each shipped
+     rule on/off with its threshold and delay (no free-form PromQL); active alerts and
+     silences through Alertmanager's API; an always-firing watchdog to an external heartbeat
+     service, plus docs that production sites should also monitor from outside.
+  4. **History graphs in the UI** (in scope, agreed 2026-11-19): pool space over time, IOPS
+     and throughput per pool/volume, from the built-in Prometheus.
+  Receiver secrets (SMTP password, webhook URLs) never go into the pools' metadata copies.
 
 - [ ] **P1-3. Network changes can lock the appliance out.** `PUT /system/network/interfaces/{name}`
   applies at once; a wrong static address or disabling the management interface cuts the
@@ -667,7 +685,7 @@ Everything here was written by Gemini and is in scope to rewrite.
 - [x] **First fully green `main` run** (44132095413, 8d828a4, 2026-11-17, repository now
   public): integration tests, all images built, pushed (incl. the `main` tags), cosign-signed and
   attested, Helm chart pushed to ghcr.io. Only the release job (v* tags) is still unexercised.
-- [ ] **B16. The new CI workflow has not fully run yet.** First run (PR #1, 2026-11-17, run
+- [x] **B16. The new CI workflow has not fully run yet.** First run (PR #1, 2026-11-17, run
   44102090198, aa8411d): lint (incl. actionlint and the CDI hook render), unit tests, SPDK
   patch unit tests, images (integration tests on the runner, rootless podman, arm64 CSI via
   QEMU, OS image build, push to the PR's throwaway registry; one base digest per run) and the
@@ -682,6 +700,14 @@ Everything here was written by Gemini and is in scope to rewrite.
   merged; the repository is now public, so the `main` run is the first with attestations.
   Pre-release tags (`v0.1.0-rc.1`) now push only their own image tag (not `0.1`/`latest`) and
   create a GitHub pre-release, so the release job can be proven with an rc tag first.
+  **Done (2026-11-19):** `main` run 44548529213 (ghcr push, cosign, attestations, chart push)
+  and the `v0.1.0-rc.1` release run 44553069247 both pass. Checked from outside: the release is
+  a pre-release with all assets; checksums, `cosign verify-blob` and `cosign verify` of the
+  images pass with cosign v3.1.4 (v2.4.1 can't read them: the release text now says v3);
+  `gh attestation verify` passes for binaries and images; the chart installs from ghcr at
+  0.1.0-rc.1 with the CSI image pinned by digest; packages are public. *Left:* enable
+  Renovate; the old `latest` tags on ghcr (pre-review build 977d4ae, 2026-11-14) until the
+  first final release replaces them.
 - [x] **B1/B2.** The OS image now embeds the velod/spdk images built and pushed in the same run
   (`make push`; one CI job) as `oci-archive` and its quadlets reference them by digest, so an
   appliance runs exactly what it was built with, needs no registry at boot, and changes only via

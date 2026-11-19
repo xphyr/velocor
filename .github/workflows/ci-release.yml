@@ -399,6 +399,9 @@ jobs:
 
             ## Verifying
 
+            Needs cosign v3 or later (v2 can't read these signatures). `gh attestation verify`
+            checks the SLSA provenance of the binaries, the chart and the images.
+
             ```bash
             cosign verify-blob --bundle checksums.txt.sigstore.json \
               --certificate-identity-regexp "https://github.com/${{ github.repository }}/" \
