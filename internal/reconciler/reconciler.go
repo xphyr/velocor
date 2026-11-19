@@ -25,6 +25,10 @@ type State struct {
 	LastError          string    `json:"last_error,omitempty"`
 	// Unmanaged lists what spdk_tgt holds that no store record accounts for (P1-5).
 	Unmanaged []UnmanagedObject `json:"unmanaged_objects,omitempty"`
+	// SPDKInstance is the spdk_tgt process the last completed pass reconciled
+	// (hardware.SPDKInstance; "" when unknown). When the running one differs, the data plane
+	// was restarted after that pass and isn't restored yet (TODO.md P2-11).
+	SPDKInstance string `json:"spdk_instance,omitempty"`
 }
 
 // Reconciler continuously converges observed state in Linux sysfs and spdk_tgt
@@ -57,6 +61,9 @@ type Reconciler struct {
 
 	now func() time.Time // replaces time.Now (tests)
 
+	// instance identifies the running spdk_tgt (hardware.SPDKInstance; replaceable in tests).
+	instance func() string
+
 	// unmanagedSeen: when each unaccounted SPDK object was first seen (reported after
 	// unmanagedGrace); unmanagedLogged: those already logged.
 	unmanagedSeen   map[string]time.Time
@@ -73,11 +80,36 @@ func New(st store.Store, spdkClient *spdk.Client, hwMgr *hardware.Manager, logge
 		logger = slog.Default()
 	}
 	return &Reconciler{
-		store:  st,
-		spdk:   spdkClient,
-		hw:     hwMgr,
-		logger: logger,
+		store:    st,
+		spdk:     spdkClient,
+		hw:       hwMgr,
+		logger:   logger,
+		instance: hardware.SPDKInstance,
 	}
+}
+
+// SPDKInstance identifies the running spdk_tgt process ("" when unknown).
+func (r *Reconciler) SPDKInstance() string {
+	if r.instance == nil {
+		return ""
+	}
+	return r.instance()
+}
+
+// SetSPDKInstance replaces how the running spdk_tgt is identified (tests).
+func (r *Reconciler) SetSPDKInstance(f func() string) {
+	r.passMu.Lock()
+	defer r.passMu.Unlock()
+	r.instance = f
+}
+
+// Restoring reports whether spdk_tgt was restarted since the last completed pass, so what
+// velod built in it (pools' RAIDs and volume stores, exports) isn't all back yet.
+func (r *Reconciler) Restoring() bool {
+	cur := r.SPDKInstance()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return cur != "" && cur != r.state.SPDKInstance
 }
 
 // State returns a snapshot of the reconciler's current status.
@@ -99,6 +131,10 @@ func (r *Reconciler) Start(ctx context.Context, interval time.Duration) {
 
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
+	// A restarted spdk_tgt has lost everything velod built in it: restore at once rather than
+	// at the next tick (TODO.md P2-11).
+	watch := time.NewTicker(2 * time.Second)
+	defer watch.Stop()
 
 	for {
 		select {
@@ -106,6 +142,12 @@ func (r *Reconciler) Start(ctx context.Context, interval time.Duration) {
 			return
 		case <-ticker.C:
 			_, _ = r.ReconcileOnce(ctx)
+		case <-watch.C:
+			if r.Restoring() {
+				r.logger.Warn("spdk_tgt was restarted: restoring pools, volumes and exports now", "instance", r.SPDKInstance())
+				_, _ = r.ReconcileOnce(ctx)
+				ticker.Reset(interval)
+			}
 		}
 	}
 }
@@ -145,6 +187,9 @@ func (r *Reconciler) ReconcileOnce(ctx context.Context) (State, error) {
 	r.mu.Unlock()
 
 	p := &pass{}
+	// The spdk_tgt this pass reconciles, read before talking to it: a restart during the pass
+	// then shows as a different instance afterwards.
+	instance := r.SPDKInstance()
 	discovered := r.syncHardware(p)
 	r.enforceWriteCache(p)
 
@@ -180,6 +225,9 @@ func (r *Reconciler) ReconcileOnce(ctx context.Context) (State, error) {
 
 	lastErr := strings.Join(p.errs, "; ")
 	r.finishPass(p.repaired, p.degraded, lastErr)
+	r.mu.Lock()
+	r.state.SPDKInstance = instance
+	r.mu.Unlock()
 	if p.unmanagedChecked {
 		r.mu.Lock()
 		r.state.Unmanaged = p.unmanaged

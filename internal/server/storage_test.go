@@ -23,6 +23,7 @@ type harness struct {
 	fake  *spdktest.Fake
 	ts    *httptest.Server
 	srv   *Server
+	rec   *reconciler.Reconciler
 	admin string
 }
 
@@ -39,8 +40,10 @@ func newHarness(t *testing.T) *harness {
 		t.Fatal(err)
 	}
 	clearMustChange(t, st)
-	srv := New(st, f.Client(), nil, authMgr, reconciler.New(st, f.Client(), nil, nil), nil)
-	h := &harness{t: t, st: st, fake: f, srv: srv, ts: httptest.NewServer(srv.Handler())}
+	rec := reconciler.New(st, f.Client(), nil, nil)
+	rec.SetSPDKInstance(func() string { return "" }) // not whatever spdk_tgt runs on this machine
+	srv := New(st, f.Client(), nil, authMgr, rec, nil)
+	h := &harness{t: t, st: st, fake: f, srv: srv, rec: rec, ts: httptest.NewServer(srv.Handler())}
 	t.Cleanup(h.ts.Close)
 	code, resp := h.do("POST", "/api/v1/auth/login", "", map[string]any{"username": "admin", "password": "admin-pass-123"})
 	if code != http.StatusOK {

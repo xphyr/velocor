@@ -988,13 +988,20 @@ func (s *Server) handleSystemStatus(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var recState reconciler.State
+	restoring := false
 	if s.reconciler != nil {
 		recState = s.reconciler.State()
+		restoring = spdkConnected && s.reconciler.Restoring()
 	}
 
 	overall := store.HealthStatusOnline
-	if !spdkConnected || len(recState.DegradedResources) > 0 {
+	switch {
+	case !spdkConnected || len(recState.DegradedResources) > 0:
 		overall = store.HealthStatusDegraded
+	case restoring:
+		// spdk_tgt answers, but it was (re)started after the last completed pass: pools,
+		// volumes and exports aren't back yet (TODO.md P2-11).
+		overall = store.HealthStatusReconciling
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -1010,6 +1017,7 @@ func (s *Server) handleSystemStatus(w http.ResponseWriter, r *http.Request) {
 		},
 		"spdk": map[string]any{
 			"connected":          spdkConnected,
+			"restoring":          restoring,
 			"socket_path":        socketPath,
 			"hugepages_total_mb": hpTotalMB,
 			"hugepages_free_mb":  hpFreeMB,

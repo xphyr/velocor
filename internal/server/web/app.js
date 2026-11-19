@@ -1865,6 +1865,7 @@ async function dashboard() {
   return [
     el("h1", {}, "Overview"),
     !spdk.connected && el("div", { class: "panel-notice bad" }, `spdk_tgt isn't reachable at ${spdk.socket_path || "its socket"}, so nothing is being served.`),
+    spdk.connected && spdk.restoring && el("div", { class: "panel-notice warn" }, "The data plane (spdk_tgt) has just started: velod is restoring pools, volumes and exports. Hosts reconnect once their exports are back."),
     el("div", { class: "cards" },
       card("Disks claimed", `${diskList.filter((d) => d.claimed).length} / ${diskList.length}`, "#/disks"),
       card("Pools", poolList.length, "#/pools"), card("Volumes", vols.length, "#/volumes"), card("Snapshots", snaps.length, "#/snapshots"),
