@@ -21,6 +21,14 @@ Volume=/dev:/dev:rslave
 # Lab VMs without a (v)IOMMU: uncomment to allow binding NVMe drives in unsafe no-IOMMU mode.
 # Never enable this on production hardware; it lets SPDK DMA anywhere in host memory.
 #Environment=VELOCOR_ALLOW_UNSAFE_NOIOMMU=true
+# A velod that stops answering (hung, deadlocked) is killed; systemd's Restart=always starts it
+# again. /healthz only says velod serves requests, so a missing SPDK doesn't restart it.
+HealthCmd=/usr/bin/velod healthcheck -listen :8443
+HealthInterval=30s
+HealthTimeout=10s
+HealthRetries=3
+HealthStartPeriod=2m
+HealthOnFailure=kill
 Exec=--listen :8443 --db /var/lib/velocor/velocor.db --spdk-socket /run/velocor/spdk.sock --hugepages-mb 1024
 
 [Service]

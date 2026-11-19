@@ -542,15 +542,64 @@ func runSystem(cfg *cliConfig, args []string) error {
 		return tw.Flush()
 
 	case "upgrade":
-		imageRef := ""
-		if len(args) >= 2 {
-			imageRef = args[1]
+		// veloctl system upgrade [image] [--no-wait] | --status | --dismiss-warning
+		fs := flag.NewFlagSet("system upgrade", flag.ExitOnError)
+		noWait := fs.Bool("no-wait", false, "Start the upgrade and return; follow it with --status")
+		statusOnly := fs.Bool("status", false, "Show the current or last upgrade")
+		dismiss := fs.Bool("dismiss-warning", false, "Clear the warning that a staged upgrade didn't take effect")
+		var imageRef string
+		rest := args[1:]
+		if len(rest) > 0 && !strings.HasPrefix(rest[0], "-") {
+			imageRef, rest = rest[0], rest[1:]
 		}
-		resp, err := cfg.request("POST", "/api/v1/system/upgrade", map[string]any{"image_ref": imageRef})
-		if err != nil {
+		_ = fs.Parse(rest)
+		if *dismiss {
+			_, err := cfg.request("DELETE", "/api/v1/system/upgrade/warning", nil)
 			return err
 		}
-		return printJSON(resp)
+		if !*statusOnly {
+			resp, err := cfg.request("POST", "/api/v1/system/upgrade", map[string]any{"image_ref": imageRef})
+			if err != nil {
+				return err
+			}
+			if *noWait || cfg.jsonOutput {
+				return printJSON(resp)
+			}
+		}
+		// Follow the job, printing its output as it grows.
+		printed := 0
+		for {
+			resp, err := cfg.request("GET", "/api/v1/system/upgrade", nil)
+			if err != nil {
+				return err
+			}
+			job, _ := resp["job"].(map[string]any)
+			if job == nil {
+				fmt.Println("No upgrade has run since velod started.")
+				return nil
+			}
+			out, _ := job["output"].(string)
+			if len(out) > printed {
+				fmt.Print(out[printed:], "\n")
+				printed = len(out) + 1
+			}
+			switch job["state"] {
+			case "SUCCEEDED":
+				if st, ok := job["staged"].(map[string]any); ok {
+					fmt.Printf("Staged %v (%v); it takes effect at the next reboot: veloctl system reboot\n", st["image"], st["version"])
+				} else {
+					fmt.Println("Nothing new to stage: already on the newest image.")
+				}
+				return nil
+			case "FAILED":
+				return fmt.Errorf("upgrade failed: %v", job["error"])
+			}
+			if *statusOnly {
+				fmt.Printf("Upgrade %v is %v (started %v by %v)\n", job["id"], job["state"], job["started_at"], job["by"])
+				return nil
+			}
+			time.Sleep(3 * time.Second)
+		}
 
 	case "rollback":
 		resp, err := cfg.request("POST", "/api/v1/system/rollback", map[string]any{})
@@ -579,7 +628,10 @@ func runSystem(cfg *cliConfig, args []string) error {
 		return nil
 
 	case "reboot":
-		resp, err := cfg.request("POST", "/api/v1/system/reboot", map[string]any{})
+		fs := flag.NewFlagSet("system reboot", flag.ExitOnError)
+		force := fs.Bool("force", false, "Reboot even though hosts are connected (they lose their storage until it's back)")
+		_ = fs.Parse(args[1:])
+		resp, err := cfg.request("POST", "/api/v1/system/reboot", map[string]any{"force": *force})
 		if err != nil {
 			return err
 		}

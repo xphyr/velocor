@@ -61,7 +61,7 @@ func NewDriver(cfg DriverConfig) (*Driver, error) {
 		cfg.Mounter = NewLinuxMounter()
 	}
 
-	srv := grpc.NewServer()
+	srv := grpc.NewServer(grpc.UnaryInterceptor(logCalls))
 	csi.RegisterIdentityServer(srv, NewIdentityServer(cfg.DriverName, cfg.Client))
 
 	switch cfg.Mode {

@@ -160,3 +160,8 @@ dialog input[type="number"] { font: inherit; color: inherit; padding: .35rem .55
 .chart-line { fill: none; stroke-width: 1.8; stroke-linejoin: round; vector-effect: non-scaling-stroke; }
 .chart-line-0 { stroke: var(--accent); }
 .chart-line-1 { stroke: var(--warn); }
+
+/* OS upgrade job */
+.upgrade-job { margin-top: .75rem; }
+.upgrade-job summary { cursor: pointer; }
+.job-output { max-height: 16rem; overflow: auto; padding: .5rem .75rem; background: var(--bg); border: 1px solid var(--line); border-radius: 6px; font-family: var(--mono); font-size: .8rem; white-space: pre-wrap; word-break: break-all; }

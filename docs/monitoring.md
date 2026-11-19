@@ -48,6 +48,13 @@ space) over 1 hour to 15 days, from the built-in Prometheus.
 Until monitoring is on, or something else scrapes `/metrics`, the status page warns that no
 alerts reach anyone (after velod has been up for 15 minutes).
 
+## Health endpoints
+
+`GET /healthz` (velod is serving) and `GET /readyz` (velod's database and spdk_tgt answer) need
+no token and answer only `ok` (200) or `not ready` (503), for load balancers, uptime checks and
+container health. The velod quadlet runs `velod healthcheck` every 30 seconds and restarts a
+velod that stops answering.
+
 ## Scraping
 
 `/metrics` needs a READONLY API token (unless velod runs with `--metrics-public`, which status
