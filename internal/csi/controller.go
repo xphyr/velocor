@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"slices"
 	"strconv"
@@ -30,7 +31,10 @@ type ControllerServer struct {
 	csi.UnimplementedControllerServer
 	client     VelocorClient
 	knownNodes map[string]bool
-	mu         sync.Mutex
+	// defaultPortals is used for volumes whose StorageClass sets no "portals" parameter
+	// (--default-portals; names or IDs, either protocol).
+	defaultPortals string
+	mu             sync.Mutex
 }
 
 // NewControllerServer creates a CSI ControllerServer.
@@ -91,6 +95,12 @@ func (s *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVolu
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	// Check the portals now, so a class that can't be published fails at provisioning with a
+	// message, not later on every node that tries to use the volume.
+	if err := s.checkPortals(ctx, req.GetParameters()); err != nil {
+		return nil, err
+	}
 
 	// Idempotency check by name.
 	existingVols, err := s.client.ListVolumes(ctx)
@@ -295,7 +305,7 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 			return nil, status.Errorf(codes.FailedPrecondition, "volume %s has a non-CSI export %s", vol.ID, exp.ID)
 		case exp.NodeID == req.GetNodeId() && !shared:
 			return &csi.ControllerPublishVolumeResponse{
-				PublishContext: buildPublishContext(exp, exportPortal(exp, portals), vol),
+				PublishContext: buildPublishContext(exp, exportPortals(exp, portals), vol),
 			}, nil
 		default:
 			return nil, status.Errorf(codes.FailedPrecondition, "volume %s is already published to node %q", vol.ID, exp.NodeID)
@@ -304,7 +314,7 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 	if sharedExp != nil {
 		if slices.Contains(sharedExp.NodeIDs, req.GetNodeId()) {
 			return &csi.ControllerPublishVolumeResponse{
-				PublishContext: buildPublishContext(sharedExp, exportPortal(sharedExp, portals), vol),
+				PublishContext: buildPublishContext(sharedExp, exportPortals(sharedExp, portals), vol),
 			}, nil
 		}
 		igID, err := s.ensureNodeInitiatorGroup(ctx, req.GetNodeId())
@@ -319,19 +329,19 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 			return nil, mapAPIError(err)
 		}
 		return &csi.ControllerPublishVolumeResponse{
-			PublishContext: buildPublishContext(updated, exportPortal(updated, portals), vol),
+			PublishContext: buildPublishContext(updated, exportPortals(updated, portals), vol),
 		}, nil
 	}
 
-	var portal *store.Portal
-	for _, p := range portals {
-		if p.Protocol == proto {
-			portal = p
-			break
-		}
+	// The volume context is fixed when the volume is provisioned, so a portal list that no
+	// longer resolves is a precondition failure, not a bad request.
+	chosen, err := s.resolvePortals(req.GetVolumeContext()[paramPortals], proto, portals)
+	if err != nil {
+		return nil, status.Error(codes.FailedPrecondition, err.Error())
 	}
-	if portal == nil {
-		return nil, status.Errorf(codes.FailedPrecondition, "no %s storage portal configured in Velocor", proto)
+	portalIDs := make([]string, len(chosen))
+	for i, p := range chosen {
+		portalIDs[i] = p.ID
 	}
 
 	igID, err := s.ensureNodeInitiatorGroup(ctx, req.GetNodeId())
@@ -343,7 +353,7 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 		Name:              exportNameFor(vol.ID, req.GetNodeId()),
 		VolumeID:          vol.ID,
 		Protocol:          proto,
-		PortalIDs:         []string{portal.ID},
+		PortalIDs:         portalIDs,
 		InitiatorGroupIDs: []string{igID},
 		AllowAnyHost:      false,
 		NodeID:            req.GetNodeId(),
@@ -357,7 +367,7 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 	}
 
 	return &csi.ControllerPublishVolumeResponse{
-		PublishContext: buildPublishContext(exp, portal, vol),
+		PublishContext: buildPublishContext(exp, chosen, vol),
 	}, nil
 }
 
@@ -368,15 +378,17 @@ func exportNameFor(volID, nodeID string) string {
 	return "csi-" + volID + "-" + hex.EncodeToString(sum[:6])
 }
 
-func exportPortal(exp *store.Export, portals []*store.Portal) *store.Portal {
+// exportPortals returns an export's portals in the export's order.
+func exportPortals(exp *store.Export, portals []*store.Portal) []*store.Portal {
+	var out []*store.Portal
 	for _, pid := range exp.PortalIDs {
 		for _, p := range portals {
 			if p.ID == pid {
-				return p
+				out = append(out, p)
 			}
 		}
 	}
-	return nil
+	return out
 }
 
 func (s *ControllerServer) ControllerUnpublishVolume(ctx context.Context, req *csi.ControllerUnpublishVolumeRequest) (*csi.ControllerUnpublishVolumeResponse, error) {
@@ -777,7 +789,7 @@ func normalizeProtocol(p string) store.ExportProtocol {
 	}
 }
 
-func buildPublishContext(exp *store.Export, portal *store.Portal, vol *store.Volume) map[string]string {
+func buildPublishContext(exp *store.Export, portals []*store.Portal, vol *store.Volume) map[string]string {
 	ctx := map[string]string{
 		"export_id": exp.ID,
 		"protocol":  string(exp.Protocol),
@@ -786,9 +798,15 @@ func buildPublishContext(exp *store.Export, portal *store.Portal, vol *store.Vol
 		// The node verifies the attached namespace carries this UUID before formatting/mounting.
 		ctx["volume_uuid"] = vol.UUID
 	}
-	if portal != nil {
-		ctx["portal_ip"] = portal.IPAddress
-		ctx["portal_port"] = strconv.FormatUint(uint64(portal.Port), 10)
+	if len(portals) > 0 {
+		// portal_ip/portal_port name the first portal, for node plugins older than "portals".
+		ctx["portal_ip"] = portals[0].IPAddress
+		ctx["portal_port"] = strconv.FormatUint(uint64(portals[0].Port), 10)
+		addrs := make([]string, len(portals))
+		for i, p := range portals {
+			addrs[i] = net.JoinHostPort(p.IPAddress, strconv.FormatUint(uint64(p.Port), 10))
+		}
+		ctx["portals"] = strings.Join(addrs, ",")
 	}
 	if exp.SubsystemNQN != "" {
 		ctx["target_nqn"] = exp.SubsystemNQN
@@ -810,11 +828,16 @@ func toCSIVolume(v *store.Volume, params map[string]string, src *csi.VolumeConte
 		VolumeId:      v.ID,
 		CapacityBytes: int64(v.SizeBytes),
 		ContentSource: src,
-		VolumeContext: map[string]string{
-			"pool_id":  v.PoolID,
-			"protocol": proto,
-		},
+		VolumeContext: volumeContext(v, params, proto),
 	}
+}
+
+func volumeContext(v *store.Volume, params map[string]string, proto string) map[string]string {
+	vc := map[string]string{"pool_id": v.PoolID, "protocol": proto}
+	if spec := strings.TrimSpace(params[paramPortals]); spec != "" {
+		vc[paramPortals] = spec
+	}
+	return vc
 }
 
 func toCSISnapshot(sn *store.Snapshot) *csi.Snapshot {

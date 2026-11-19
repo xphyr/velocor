@@ -31,6 +31,8 @@ type DriverConfig struct {
 	Mode       DriverMode
 	Client     VelocorClient
 	Mounter    Mounter
+	// DefaultPortals applies to StorageClasses without a "portals" parameter.
+	DefaultPortals string
 }
 
 // Driver hosts the CSI Identity, Controller, GroupController and Node gRPC services.
@@ -64,11 +66,15 @@ func NewDriver(cfg DriverConfig) (*Driver, error) {
 
 	switch cfg.Mode {
 	case ModeAll:
-		csi.RegisterControllerServer(srv, NewControllerServer(cfg.Client, cfg.NodeID))
+		cs := NewControllerServer(cfg.Client, cfg.NodeID)
+		cs.SetDefaultPortals(cfg.DefaultPortals)
+		csi.RegisterControllerServer(srv, cs)
 		csi.RegisterGroupControllerServer(srv, NewGroupControllerServer(cfg.Client))
 		csi.RegisterNodeServer(srv, NewNodeServer(cfg.NodeID, cfg.Mounter))
 	case ModeController:
-		csi.RegisterControllerServer(srv, NewControllerServer(cfg.Client))
+		cs := NewControllerServer(cfg.Client)
+		cs.SetDefaultPortals(cfg.DefaultPortals)
+		csi.RegisterControllerServer(srv, cs)
 		csi.RegisterGroupControllerServer(srv, NewGroupControllerServer(cfg.Client))
 	case ModeNode:
 		csi.RegisterNodeServer(srv, NewNodeServer(cfg.NodeID, cfg.Mounter))

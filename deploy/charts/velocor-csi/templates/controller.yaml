@@ -45,10 +45,16 @@ spec:
           envFrom:
             - secretRef:
                 name: {{ include "velocor-csi.secretName" . }}
-          {{- if .Values.auth.portalOverride }}
+          {{- if or .Values.auth.portalOverride .Values.defaultPortals }}
           env:
+            {{- if .Values.auth.portalOverride }}
             - name: VELOCOR_PORTAL_OVERRIDE
               value: {{ .Values.auth.portalOverride | quote }}
+            {{- end }}
+            {{- if .Values.defaultPortals }}
+            - name: VELOCOR_DEFAULT_PORTALS
+              value: {{ .Values.defaultPortals | quote }}
+            {{- end }}
           {{- end }}
           volumeMounts:
             - name: socket-dir

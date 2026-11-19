@@ -23,8 +23,17 @@ auth:
   caCert: ""
   # Skip TLS verification entirely. Exposes the API token to anyone on the path; lab use only.
   insecure: "false"
-  # Optional portal IP:port override (useful for NAT'd lab environments)
+  # Deprecated: one IP:port every node connects to instead of the portals' own addresses
+  # (NAT'd labs). Use portals / defaultPortals instead.
   portalOverride: ""
+
+# Velocor portals (names or IDs, comma-separated; either protocol) that volumes of classes
+# without their own "portals" are exported on. Nodes connect to every one (NVMe/TCP native
+# multipath; iSCSI uses the first that answers). If neither is set and the appliance has more
+# than one portal of a class's protocol, provisioning is refused rather than guessed.
+# Unlike a class's portals, this can be changed later and applies to existing volumes at
+# their next attach.
+defaultPortals: ""
 
 controller:
   replicas: 1
@@ -70,6 +79,10 @@ storageClasses:
     thin: "true"
     pool: ""
     fsType: ext4
+    # Portals for this class's volumes (names or IDs, comma-separated); empty uses
+    # defaultPortals. StorageClass parameters can't be changed in place: changing this on an
+    # existing class means deleting the class first (its volumes keep working).
+    portals: ""
   iscsi:
     enabled: true
     name: velocor-iscsi
@@ -80,6 +93,10 @@ storageClasses:
     thin: "true"
     pool: ""
     fsType: ext4
+    # Portals for this class's volumes (names or IDs, comma-separated); empty uses
+    # defaultPortals. StorageClass parameters can't be changed in place: changing this on an
+    # existing class means deleting the class first (its volumes keep working).
+    portals: ""
 
 snapshots:
   volumeSnapshotClass:

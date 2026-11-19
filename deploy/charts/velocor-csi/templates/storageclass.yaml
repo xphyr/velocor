@@ -20,6 +20,9 @@ parameters:
   {{- if .Values.storageClasses.nvmeTcp.pool }}
   pool: {{ .Values.storageClasses.nvmeTcp.pool | quote }}
   {{- end }}
+  {{- if .Values.storageClasses.nvmeTcp.portals }}
+  portals: {{ .Values.storageClasses.nvmeTcp.portals | quote }}
+  {{- end }}
 {{- end }}
 {{- if .Values.storageClasses.iscsi.enabled }}
 ---
@@ -43,5 +46,8 @@ parameters:
   csi.storage.k8s.io/fstype: {{ .Values.storageClasses.iscsi.fsType | quote }}
   {{- if .Values.storageClasses.iscsi.pool }}
   pool: {{ .Values.storageClasses.iscsi.pool | quote }}
+  {{- end }}
+  {{- if .Values.storageClasses.iscsi.portals }}
+  portals: {{ .Values.storageClasses.iscsi.portals | quote }}
   {{- end }}
 {{- end }}

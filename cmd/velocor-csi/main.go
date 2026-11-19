@@ -29,6 +29,8 @@ func main() {
 		token      = flag.String("velocor-token", os.Getenv("VELOCOR_TOKEN"), "Velocor API token (velo_pat_...)")
 		insecure   = flag.Bool("velocor-insecure", os.Getenv("VELOCOR_INSECURE") == "true", "Skip TLS verification for Velocor API (lab use only)")
 		caCert     = flag.String("velocor-ca-cert", os.Getenv("VELOCOR_CA_CERT"), "PEM CA/server certificate used to verify the Velocor API")
+		portals    = flag.String("default-portals", os.Getenv("VELOCOR_DEFAULT_PORTALS"),
+			"Velocor portals (names or IDs, comma-separated, either protocol) for StorageClasses without a \"portals\" parameter")
 	)
 	flag.Parse()
 
@@ -50,6 +52,8 @@ func main() {
 		NodeID:     *nodeID,
 		Mode:       csi.DriverMode(*mode),
 		Client:     client,
+
+		DefaultPortals: *portals,
 	})
 	if err != nil {
 		log.Fatalf("init velocor-csi: %v", err)

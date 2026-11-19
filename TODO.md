@@ -468,7 +468,7 @@ work still open, ranked by risk to data, how fixes are verified, and what has be
   new pools. Lab: Fedora initiator VM on serenity (`~/.cache/iscsi-lab`); on velocor-1 volume
   `iscsi-lab` (mirror250a), portals `lab-iscsi-mgmt` / `lab-nvme-mgmt`, host `lab-initiator`,
   group `lab-initiators`.
-- [ ] **P1-13. The CSI driver picks a volume's portal by chance.** `ControllerPublishVolume`
+- [x] **P1-13. The CSI driver picks a volume's portal by chance.** `ControllerPublishVolume`
   exports a volume on the first portal of its protocol in velod's list, which is in portal-ID
   order, and IDs are random. On velocor-1 (2026-11-18) the SAN portals happened to sort before
   the lab's management-network portals; with other IDs every CSI volume would silently have
@@ -482,6 +482,16 @@ work still open, ranked by risk to data, how fixes are verified, and what has be
   the parameter; the export gets every listed portal and the node connects to each (NVMe
   native multipath, dm-multipath for iSCSI; the node side can follow later); deprecate
   `portalOverride`.
+  **Done (2026-11-19):** StorageClass parameter `portals` (names or IDs) and the chart's
+  `defaultPortals` (`--default-portals`, both protocols, applies at each attach so volumes from
+  before the parameter can be given portals). Checked at provisioning (exists, right
+  protocol); several portals and no choice is refused with a message listing them; a wildcard
+  portal is refused unless the deprecated `portalOverride` is set. Exports get every listed
+  portal; the publish context adds `portals` (`portal_ip`/`portal_port` stay, for older node
+  plugins). Nodes: NVMe/TCP connects every path when native multipath is on (else the first
+  that answers); iSCSI logs in to one portal (an existing session first, else the first that
+  answers) and logs out of all. Unit tests: `internal/csi/portals_test.go`.
+  *Left:* iSCSI multipath (dm-multipath on the node) and a lab check with two SAN paths.
 - [x] **P1-14. A pool whose disks come back under new IDs stays UNAVAILABLE, with no way to
   recover it. (Verified)** Lab, 2026-11-18: velocor-1's six pool disks moved from emulated SATA
   to virtio-scsi (same disks, same data). Their IDs changed (`ssd-t10.ATA_QEMU_HARDDISK_QM00003`
@@ -555,6 +565,17 @@ work still open, ranked by risk to data, how fixes are verified, and what has be
   NVMe/TCP queues spread over both reactors, but an iSCSI volume (one connection) stays on one,
   and `app_thread` was 40–56% busy during deep NVMe/TCP I/O (find out what runs there). Measure
   again on NVMe drives, where one reactor will be the limit.
+  **Plan (agreed 2026-11-19; after the release gate, tuned on real hardware):** SPDK fixes its
+  core mask at start and reactors poll at 100%, so "auto" means sizing at boot, not all cores.
+  On virtio-scsi a second core gained nothing; on emulated SATA, writes were about 20% slower.
+  1. A boot step picks the count and writes it to a file the SPDK unit reads (replacing the
+     hardcoded `-m 0x1`): 1 core on a VM; on hardware about a quarter of the cores (at least 1,
+     capped), never CPU 0, preferring the NUMA node of the NICs and NVMe drives. The quarter
+     and the cap are guesses until measured on NVMe hardware.
+  2. An operator override (API, UI, `veloctl`) for a fixed count, applied at the next boot or
+     an explicit SPDK restart, with a warning that the restart interrupts I/O.
+  3. Later, maybe: SPDK's dynamic scheduler (idle cores sleep); test it with NVMe/TCP, iSCSI
+     and io_uring first.
 - [ ] **P2-13. virtio-blk disks are invisible.** Hardware discovery keeps a `vdX` device only
   if it reports `rotational=0` or a virtual model name. virtio-blk reports `rotational=1` and
   has no `device/model` (checked on the lab VM), so it never shows up and can't be put in a
@@ -587,9 +608,10 @@ work still open, ranked by risk to data, how fixes are verified, and what has be
 
 Everything here was written by Gemini and is in scope to rewrite.
 
-- [ ] **B8 (rest). Publish a qcow2 with releases?** `make qcow2` now runs `hack/build-qcow2.sh`
-  (rootless, KVM only; bootc-image-builder and its sudo are gone). Undecided whether CI should
-  attach a qcow2 to releases (GitHub runners have KVM).
+- [x] **B8 (rest). Publish a qcow2 with releases?** `make qcow2` now runs `hack/build-qcow2.sh`
+  (rootless, KVM only; bootc-image-builder and its sudo are gone). **Decision (2026-11-19): no
+  qcow2 with releases for now.** The README's install Option 2 explains how to build one from
+  the published `velocor-os` image with `hack/build-qcow2.sh`.
 - [x] **B17. Pinned Fedora base digests disappear from quay.io.** `quay.io/fedora/fedora`
   deletes superseded `:45` builds: the pinned `sha256:e203b417…` now returns "manifest unknown"
   (found 2026-11-17 when a test pod couldn't pull it; local builds only work from cache). Clean CI
@@ -771,6 +793,10 @@ this order and keep this file current as each moves.
    yet, 2026-11-18). The SPDK FLUSH patch stays L-1.
 5. **P1-4 deletion protection** (done: retention period, per-volume protection) and **P0-6**
    (done: io_uring probe, AIO fallback; upstream report drafted).
+
+Before tagging the first release (agreed 2026-11-19): P1-13 portal choice (done), then a test
+tag to prove the release pipeline (B16). B8: no qcow2 with releases (the README explains how to
+build one). The real-hardware tests of P0-1 and P0-4 stay open.
 
 After the release gate: P1-1 alerting, P1-3 network rollback, P2-2 scrub, P2-11 (P1-5 orphan
 reporting done 2026-11-18).
