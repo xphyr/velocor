@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"sort"
@@ -227,7 +228,9 @@ func (m *Manager) QueryRange(ctx context.Context, query string, start, end time.
 			ts, _ := v[0].(float64)
 			str, _ := v[1].(string)
 			f, err := strconv.ParseFloat(str, 64)
-			if err != nil {
+			// NaN (0/0: a latency while idle) and ±Inf have no place on a graph, and JSON can't
+			// carry them: leave a gap.
+			if err != nil || math.IsNaN(f) || math.IsInf(f, 0) {
 				continue
 			}
 			s.Points = append(s.Points, Point{T: int64(ts), V: f})

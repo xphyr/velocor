@@ -1954,6 +1954,7 @@ function graphPanel(specs, params = {}) {
       draw(results);
     } catch (err) {
       if (err instanceof Unauthorized) throw err;
+      if (hit) return; // keep the graphs already shown; the next refresh tries again
       body.replaceChildren(el("p", { class: "muted" },
         /off|isn't available/.test(err.message)
           ? ["History graphs need built-in monitoring: turn it on on the ", el("a", { href: "#/system" }, "System"), " page."]

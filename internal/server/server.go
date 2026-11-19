@@ -1154,9 +1154,17 @@ func LoadOrGenerateSelfSignedTLSConfig(certPath, keyPath string) (*tls.Config, e
 }
 
 func writeJSON(w http.ResponseWriter, status int, payload any) {
+	// Encode first: a value JSON can't carry (NaN, say) must not turn into a 200 with an
+	// empty body.
+	b, err := json.Marshal(payload)
+	if err != nil {
+		slog.Error("encoding a response failed", "err", err)
+		status = http.StatusInternalServerError
+		b, _ = json.Marshal(map[string]any{"error": "encoding the response failed: " + err.Error()})
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(payload)
+	_, _ = w.Write(append(b, '\n'))
 }
 
 func writeError(w http.ResponseWriter, err error) {

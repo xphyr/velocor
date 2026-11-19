@@ -138,7 +138,7 @@ func TestAlertsSilencesAndGraphs(t *testing.T) {
 		mu.Lock()
 		queries = append(queries, r.URL.Query().Get("query"))
 		mu.Unlock()
-		_, _ = w.Write([]byte(`{"status":"success","data":{"resultType":"matrix","result":[{"metric":{},"values":[[1795000000,"0.5"],[1795000030,"0.6"]]}]}}`))
+		_, _ = w.Write([]byte(`{"status":"success","data":{"resultType":"matrix","result":[{"metric":{},"values":[[1795000000,"0.5"],[1795000030,"NaN"],[1795000060,"+Inf"],[1795000090,"0.6"]]}]}}`))
 	}))
 	t.Cleanup(prom.Close)
 
@@ -182,6 +182,10 @@ func TestAlertsSilencesAndGraphs(t *testing.T) {
 	g := h.expect(h.do("GET", `/api/v1/monitoring/graphs/pool-latency?pool=we%22ird&range=24h`, h.admin, nil))(http.StatusOK)
 	if g["unit"] != "seconds" || len(g["lines"].([]any)) != 2 {
 		t.Fatalf("graph: %v", g)
+	}
+	// 0/0 (latency while idle) and Inf are gaps, not values JSON can't carry.
+	if pts := g["lines"].([]any)[0].(map[string]any)["points"].([]any); len(pts) != 2 {
+		t.Fatalf("points %v: NaN and Inf must be dropped", pts)
 	}
 	mu.Lock()
 	q := queries[0]

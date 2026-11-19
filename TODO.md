@@ -812,6 +812,19 @@ Everything here was written by Gemini and is in scope to rewrite.
   EIO (filesystems shut down). An SPDK patch completing lvol ENOSPC with NVMe Capacity Exceeded
   (status 0x81) would give hosts ENOSPC, which filesystems and applications handle far better.
   Agreed follow-up to P0-2 (2026-11-17); test with ext4/XFS hosts.
+- [ ] **L-7. Pools can't be expanded.** Requested 2026-11-19. A pool is one SPDK RAID (RAID0 or
+  RAID1) with one lvstore on it; member count and per-member size are fixed in the RAID
+  superblock. `bdev_raid_add_base_bdev` only fills an empty slot (disk replacement, P0-1), and
+  replacing every disk with a bigger one leaves the array at its old size. Today the only way to
+  add capacity is a second pool (volumes can't span pools).
+  *Options to evaluate:* (a) build pools as a concatenation of RAID1 pairs and grow by adding a
+  pair, then `bdev_lvol_grow_lvstore`; (b) after replacing every member with a larger disk, grow
+  the array, then the lvstore; (c) spread volumes across pools (no SPDK change, but not real
+  expansion). (a) and (b) depend on SPDK support that is unverified in v26.09: first read its
+  raid (concat, superblock, resize) and lvstore-grow code, then decide on a design and whether
+  it needs an SPDK patch (with unit tests, like 0002). Crash safety of an interrupted expansion
+  and the pool metadata copies (P0-3) must be part of the design.
+
 - [ ] **L-5. Delta upgrades for the OS image.** Requested 2026-11-17 (back burner). A
   `bootc upgrade` pulls every changed layer of `velocor-os` in full; with the rolling Fedora base
   (B17) that is most of the image on every release. Goal: publish much smaller upgrade packages,
