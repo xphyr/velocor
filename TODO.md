@@ -634,6 +634,20 @@ work still open, ranked by risk to data, how fixes are verified, and what has be
 
 ### P2: hardening
 
+- [x] **P2-15. iSCSI sessions could outlive their volumes on a node.** Found 2026-11-19: NVW
+  master-2 had kept a session (and node record) since 2026-11-16 to a volume deleted today; its
+  initiator then retried a missing target every 2 s. The session dates from an older driver,
+  but two weak spots remained: logout matched target, portal and (implicitly) iface, so a
+  session on a portal the publish context no longer named, or on another iface, gave "no
+  matching session" (exit 21), taken as success; and an unstage without its stage metadata
+  disconnected nothing and succeeded. **Fixed (branch csi-unstage-hardening):** logout by
+  session ID for every session of the target, records deleted on every portal/iface, and the
+  unstage fails if a session is still there (Kubernetes retries instead of detaching); without
+  metadata the unstage disconnects the volume's targets found by name (`:csi-<volume>-`). A
+  node without iscsiadm counts as having no sessions. Lab-checked 2026-11-19 on NVW (x86_64, 3
+  nodes) and snoarm (arm64) with dev-867ddaa: iSCSI raw-block attach, write/read and detach;
+  no Velocor sessions or node records left on any node afterwards (real iscsiadm: logout by
+  session ID and `-m node -T <iqn> -o delete` both work on RHCOS 9.8).
 - [ ] **P2-1. CHAP and real host identities** (was S10). Any host that can spoof an allowed NQN
   or IQN gets access. The API rejects `chap_user` rather than silently ignoring it. *Needed:*
   iSCSI CHAP auth groups and NVMe DH-HMAC-CHAP with encrypted secrets; the CSI node plugin

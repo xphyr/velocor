@@ -34,6 +34,9 @@ type VolumeStats struct {
 type Mounter interface {
 	ConnectTarget(ctx context.Context, publishCtx map[string]string, hostNQN, initiatorIQN string) (string, error)
 	DisconnectTarget(ctx context.Context, publishCtx map[string]string) error
+	// DisconnectVolume disconnects whatever this node still has of a volume, found by the
+	// volume ID in the target names: for an unstage that lost its stage metadata.
+	DisconnectVolume(ctx context.Context, volumeID string) error
 	// FlushDevice writes out what the node still caches for a raw block device.
 	FlushDevice(ctx context.Context, devicePath string) error
 	FormatAndMount(ctx context.Context, source, target, fsType string, mountOpts []string) error
@@ -264,35 +267,128 @@ func (m *LinuxMounter) DisconnectTarget(ctx context.Context, publishCtx map[stri
 	switch string(proto) {
 	case "ISCSI":
 		iqn := publishCtx["target_iqn"]
-		addrs, err := targetAddrs(publishCtx)
-		if iqn == "" || err != nil {
+		if iqn == "" {
 			return nil
 		}
-		var errs []error
-		for _, a := range addrs {
-			portal := iscsiPortalAddr(a.ip, a.port)
-			// Exit status 21: no matching session (already logged out, or never logged in on
-			// this portal), which is fine.
-			if out, err := iscsiadm(ctx, "-m", "node", "-T", iqn, "-p", portal, "--logout").CombinedOutput(); err != nil && exitCode(err) != 21 {
-				errs = append(errs, fmt.Errorf("iscsiadm logout %s at %s: %w (%s)", iqn, portal, err, strings.TrimSpace(string(out))))
-				continue
-			}
-			// Forget the target too, so the node keeps no record of volumes it no longer uses
-			// (and iscsid doesn't keep retrying a target that's gone).
-			_ = iscsiadm(ctx, "-m", "node", "-T", iqn, "-p", portal, "-o", "delete").Run()
-		}
-		return errors.Join(errs...)
+		return iscsiLogoutTargets(ctx, func(t string) bool { return t == iqn })
 	default:
-		nqn := publishCtx["target_nqn"]
-		if nqn != "" {
-			// Disconnects every path (controller) of the subsystem.
-			out, err := exec.CommandContext(ctx, "nvme", "disconnect", "-n", nqn).CombinedOutput()
-			if err != nil && !strings.Contains(string(out), "disconnected 0 controller") {
-				return fmt.Errorf("nvme disconnect %s: %w (%s)", nqn, err, strings.TrimSpace(string(out)))
-			}
-		}
+		return nvmeDisconnect(ctx, publishCtx["target_nqn"])
+	}
+}
+
+// DisconnectVolume disconnects every iSCSI session and NVMe subsystem of volumeID on this node.
+// Export names are csi-<volume ID>-<node hash> (or -shared), so the volume's targets carry
+// ":csi-<volume ID>-" in their IQN/NQN.
+func (m *LinuxMounter) DisconnectVolume(ctx context.Context, volumeID string) error {
+	if volumeID == "" {
 		return nil
 	}
+	mark := ":csi-" + strings.ToLower(volumeID) + "-"
+	var errs []error
+	if err := iscsiLogoutTargets(ctx, func(t string) bool { return strings.Contains(strings.ToLower(t), mark) }); err != nil {
+		errs = append(errs, err)
+	}
+	subs, _ := filepath.Glob(m.sys("class", "nvme-subsystem", "*"))
+	for _, sub := range subs {
+		if nqn := readTrim(filepath.Join(sub, "subsysnqn")); strings.Contains(strings.ToLower(nqn), mark) {
+			if err := nvmeDisconnect(ctx, nqn); err != nil {
+				errs = append(errs, err)
+			}
+		}
+	}
+	return errors.Join(errs...)
+}
+
+func nvmeDisconnect(ctx context.Context, nqn string) error {
+	if nqn == "" {
+		return nil
+	}
+	// Disconnects every path (controller) of the subsystem.
+	out, err := exec.CommandContext(ctx, "nvme", "disconnect", "-n", nqn).CombinedOutput()
+	if err != nil && !strings.Contains(string(out), "disconnected 0 controller") {
+		return fmt.Errorf("nvme disconnect %s: %w (%s)", nqn, err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// iscsiSession is one line of `iscsiadm -m session`.
+type iscsiSession struct {
+	SID    string
+	Portal string // ip:port
+	Target string
+}
+
+var iscsiSessionRe = regexp.MustCompile(`^\S+: \[(\d+)\] (\S+?),\d+ (\S+)`)
+
+// parseISCSISessions parses `iscsiadm -m session` ("tcp: [2] 10.0.0.1:3260,1 iqn... (non-flash)").
+func parseISCSISessions(out string) []iscsiSession {
+	var sessions []iscsiSession
+	for _, line := range strings.Split(out, "\n") {
+		if m := iscsiSessionRe.FindStringSubmatch(strings.TrimSpace(line)); m != nil {
+			sessions = append(sessions, iscsiSession{SID: m[1], Portal: m[2], Target: m[3]})
+		}
+	}
+	return sessions
+}
+
+func listISCSISessions(ctx context.Context) ([]iscsiSession, error) {
+	out, err := iscsiadm(ctx, "-m", "session").CombinedOutput()
+	// No iscsiadm (an NVMe-only node, exit 127 through nsenter/env): no sessions either.
+	if errors.Is(err, exec.ErrNotFound) || exitCode(err) == 127 {
+		return nil, nil
+	}
+	// Exit status 21: no sessions at all.
+	if err != nil && exitCode(err) != 21 {
+		return nil, fmt.Errorf("iscsiadm -m session: %w (%s)", err, strings.TrimSpace(string(out)))
+	}
+	return parseISCSISessions(string(out)), nil
+}
+
+// iscsiLogoutTargets logs out of every session whose target matches, whatever portal or iface it
+// was opened on, forgets their node records, and checks that none is left: a session that
+// outlives its volume keeps a node logging in to a target that's gone, and an unstage that
+// reported success without logging out would let Kubernetes detach under it.
+func iscsiLogoutTargets(ctx context.Context, match func(target string) bool) error {
+	sessions, err := listISCSISessions(ctx)
+	if err != nil {
+		return err
+	}
+	targets := map[string]bool{}
+	var errs []error
+	for _, s := range sessions {
+		if !match(s.Target) {
+			continue
+		}
+		targets[s.Target] = true
+		if out, err := iscsiadm(ctx, "-m", "session", "-r", s.SID, "-u").CombinedOutput(); err != nil && exitCode(err) != 21 {
+			errs = append(errs, fmt.Errorf("iscsiadm logout of session %s (%s at %s): %w (%s)", s.SID, s.Target, s.Portal, err, strings.TrimSpace(string(out))))
+		}
+	}
+	// Forget the targets too (every portal and iface), so iscsid has nothing to retry and the
+	// node keeps no record of volumes it no longer uses.
+	if out, err := iscsiadm(ctx, "-m", "node").CombinedOutput(); err == nil {
+		for _, line := range strings.Split(string(out), "\n") {
+			if f := strings.Fields(line); len(f) == 2 && match(f[1]) {
+				targets[f[1]] = true
+			}
+		}
+	}
+	for t := range targets {
+		_ = iscsiadm(ctx, "-m", "node", "-T", t, "-o", "delete").Run()
+	}
+	if len(errs) > 0 {
+		return errors.Join(errs...)
+	}
+	left, err := listISCSISessions(ctx)
+	if err != nil {
+		return err
+	}
+	for _, s := range left {
+		if match(s.Target) {
+			return fmt.Errorf("still logged in to %s at %s (session %s) after logging out", s.Target, s.Portal, s.SID)
+		}
+	}
+	return nil
 }
 
 // FlushDevice writes out what the kernel still holds for a raw block device. Raw block

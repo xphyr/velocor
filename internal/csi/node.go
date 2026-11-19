@@ -3,6 +3,7 @@ package csi
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"sync"
@@ -165,6 +166,13 @@ func (s *NodeServer) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstage
 			}
 		}
 		_ = os.Remove(metaPath)
+	} else if errors.Is(err, os.ErrNotExist) {
+		// No stage metadata (never staged here, or lost): still make sure nothing of the
+		// volume stays connected, or the node keeps a session to a target that may be deleted
+		// once Kubernetes detaches.
+		if err := s.mounter.DisconnectVolume(ctx, req.GetVolumeId()); err != nil {
+			return nil, status.Errorf(codes.Internal, "disconnect: %v", err)
+		}
 	}
 	s.mu.Lock()
 	delete(s.stagingPaths, req.GetVolumeId())
