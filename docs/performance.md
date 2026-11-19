@@ -29,6 +29,38 @@ While the jobs ran, a sampler on the appliance recorded every 10 s: CPU time, pe
 utilisation (`/proc/diskstats`), SAN NIC bytes, and each SPDK thread's busy/idle ticks
 (`thread_get_stats`).
 
+## 2026-11-19: baseline before the next Fedora release (Fedora 45)
+
+**Setup.** The same appliance and client as the virtio-scsi run below, on build dev-cdf1064
+(Fedora 45, kernel 7.3.4; P0-4 write-cache handling, P1-1 built-in monitoring **on**, running on
+the cores SPDK doesn't use). Meant as the reference for the move to Fedora 46 once it is
+released, and for later changes.
+
+**Results** (IOPS, except MB/s for the sequential jobs; mean and p99 latency in µs for the QD1
+jobs), against the virtio-scsi run of 2026-11-18:
+
+| Job | NVMe/TCP 11-18 | NVMe/TCP 11-19 | iSCSI 11-18 | iSCSI 11-19 |
+|---|---|---|---|---|
+| `lat-randread` | 1,680 | 1,741 (558 / 1,028) | 1,682 | 1,653 (592 / 1,221) |
+| `lat-randwrite` | 3,933 | **2,153** (441 / 2,736) | 3,940 | **2,340** (419 / 3,031) |
+| `iops-randread` | 45,628 | 50,568 | 34,319 | 34,133 |
+| `iops-randwrite` | 27,884 | **22,240** | 21,938 | **16,521** |
+| `mixed-70-30` | 29,039 | 30,476 | 22,745 | 24,968 |
+| `seq-read` MB/s | 984 | 1,024 | 788 | 642 |
+| `seq-write` MB/s | 513 | 540 | 446 | **371** |
+| `dsync-randwrite-qd1` | 3,933 | **1,947** | 4,043 | **1,952** |
+| `dsync-randwrite` | 27,285 | **23,155** | 20,803 | **17,730** |
+| `dsync-seq-write` MB/s | 549 | 496 | 449 | **392** |
+| `fsync-randwrite-qd1` | 3,800 | **1,925** | 3,789 | **2,114** |
+
+**Findings.**
+- **Reads are unchanged or better**, so the network path and SPDK's read side didn't regress.
+- **Writes are slower, most at queue depth 1 (about half: 3,900 to 2,000 IOPS, 0.25 to 0.44 ms)**
+  and by about 20% at depth. Not explained yet (TODO P2-16): between the two runs the build
+  changed (P0-4's write-cache handling among others), the built-in monitoring was turned on,
+  and the NAS behind the virtual disks may have been busier. The next step is to repeat the
+  write jobs with monitoring off, then on the 11-18 build.
+
 ## 2026-11-18: the same appliance on virtio-scsi disks
 
 **Setup.** As in the run below, with two changes: the appliance's six pool disks were moved
