@@ -76,7 +76,7 @@ func (s *Server) reserveSpace(ctx context.Context, poolID string, delta uint64,
 		}
 	}
 	if err := store.CheckGrowth(pool, committed, delta); err != nil {
-		return nil, err
+		return nil, withDeletedVolumes(err, volumes)
 	}
 	if s.space.pending == nil {
 		s.space.pending = map[*reservation]struct{}{}
@@ -209,4 +209,22 @@ func (s *Server) handleUpdatePool(w http.ResponseWriter, r *http.Request) {
 	}
 	s.logger.Info("pool space policy changed", "pool", id, "policy", fmt.Sprintf("%+v", pool.SpacePolicy.Effective()))
 	writeJSON(w, http.StatusOK, map[string]any{"pool": pool})
+}
+
+// withDeletedVolumes adds to a capacity refusal how much of the pool deleted volumes still
+// hold (they count until purged), so the operator knows purging them frees the space.
+func withDeletedVolumes(err error, volumes []*store.Volume) error {
+	var n int
+	var held uint64
+	for _, v := range volumes {
+		if v.Deleted() {
+			n++
+			held += v.SizeBytes
+		}
+	}
+	if n == 0 {
+		return err
+	}
+	return fmt.Errorf("%w (%d deleted volumes still hold %.1f GiB until they are purged; an administrator can purge them now)",
+		err, n, float64(held)/(1<<30))
 }

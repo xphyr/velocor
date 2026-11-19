@@ -5,6 +5,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -425,4 +426,56 @@ func seedBackend(t *testing.T, st *store.BoltStore, poolID string) *spdktest.Fak
 		t.Fatal(err)
 	}
 	return fake
+}
+
+// A protected volume's DeleteVolume fails with FailedPrecondition (the provisioner retries);
+// an unprotected one is deleted, kept by velod until its retention ends (TODO.md P1-4).
+func TestDeleteVolumeProtectionAndRetention(t *testing.T) {
+	tmp := t.TempDir()
+	db, err := store.OpenBoltStore(filepath.Join(tmp, "velocor.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+	fake := seedBackend(t, db, "pool-1")
+	pool, _ := db.GetPool("pool-1")
+	uuid, err := fake.Client().BdevLvolCreate(context.Background(), pool.LVSName, "vol-p", 1<<30, true, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.CreateVolume(&store.Volume{ID: "vol-p", Name: "vol-p", PoolID: "pool-1", UUID: uuid,
+		LvolBdevName: pool.LVSName + "/vol-p", SizeBytes: 1 << 30, DeletionProtection: true}); err != nil {
+		t.Fatal(err)
+	}
+	authMgr, err := auth.NewManager(db, "test-pass-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, rawToken, err := authMgr.CreateApiToken("csi", store.RoleCSIProvisioner, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts := httptest.NewServer(server.New(db, fake.Client(), nil, authMgr, nil, nil).Handler())
+	defer ts.Close()
+	cs := &ControllerServer{client: NewHTTPClient(ts.URL, rawToken, true)}
+	ctx := context.Background()
+
+	_, err = cs.DeleteVolume(ctx, &csi.DeleteVolumeRequest{VolumeId: "vol-p"})
+	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "deletion protection") {
+		t.Fatalf("protected volume: %v", err)
+	}
+	if _, err := db.MutateVolume("vol-p", func(v *store.Volume) error { v.DeletionProtection = false; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ { // the second call is a retry
+		if _, err := cs.DeleteVolume(ctx, &csi.DeleteVolumeRequest{VolumeId: "vol-p"}); err != nil {
+			t.Fatalf("DeleteVolume #%d: %v", i+1, err)
+		}
+	}
+	if v, err := db.GetVolume("vol-p"); err != nil || !v.Deleted() || !fake.LvolExists(pool.LVSName+"/vol-p") {
+		t.Fatalf("volume should be kept as deleted: %+v %v", v, err)
+	}
+	if _, err := cs.ControllerGetVolume(ctx, &csi.ControllerGetVolumeRequest{VolumeId: "vol-p"}); status.Code(err) != codes.NotFound {
+		t.Fatalf("ControllerGetVolume of a deleted volume: %v", err)
+	}
 }

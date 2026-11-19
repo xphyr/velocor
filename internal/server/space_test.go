@@ -97,6 +97,15 @@ func TestCriticalPoolRefusesAllGrowthButDeletes(t *testing.T) {
 	h.expect(h.do("POST", "/api/v1/volumes/"+v1["id"].(string)+"/snapshots", h.admin, map[string]any{"name": "s"}))(http.StatusInsufficientStorage)
 	h.expect(h.do("DELETE", "/api/v1/volumes/"+v1["id"].(string), h.admin, nil))(http.StatusOK)
 	h.reconcile()
+	if p = h.getPool(pool); p["space_state"] != "CRITICAL" {
+		t.Fatalf("a deleted volume keeps its data until purged, so the pool stays full: %v", p["space_state"])
+	}
+	resp = h.expect(h.do("POST", "/api/v1/volumes", h.admin, map[string]any{"name": "tiny", "pool_id": pool, "size_bytes": 1 * mib}))(http.StatusInsufficientStorage)
+	if !strings.Contains(resp["error"].(string), "1 deleted volumes still hold") {
+		t.Fatalf("refusal should point at the deleted volume: %v", resp)
+	}
+	h.expect(h.do("DELETE", "/api/v1/deleted-volumes/"+v1["id"].(string), h.admin, nil))(http.StatusOK)
+	h.reconcile()
 	if p = h.getPool(pool); p["space_state"] != "OK" {
 		t.Fatalf("after freeing space: %v", p["space_state"])
 	}

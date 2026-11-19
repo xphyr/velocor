@@ -12,7 +12,7 @@
 
 2. **Two-Tier Flash Support (NVMe + SATA/SAS SSDs):**
    - **NVMe Tier (`bdev_nvme`):** Unbound from the Linux kernel (`nvme` driver) and bound to `vfio-pci` (or, only when `VELOCOR_ALLOW_UNSAFE_NOIOMMU=true` is set for lab VMs without a vIOMMU, `uio_pci_generic` / `vfio-noiommu`). Polled directly in user space by SPDK. SMART health is queried via `bdev_nvme_get_controller_health_info`.
-   - **SSD Tier (`bdev_uring`):** Remains attached to the Linux kernel (`/dev/sdX`) and claimed exclusively by SPDK using Linux `io_uring` (`bdev_uring_create`).
+   - **SSD Tier (`bdev_uring`):** Remains attached to the Linux kernel (`/dev/sdX`) and claimed exclusively by SPDK using Linux `io_uring` (`bdev_uring_create`). Before each attach velod checks that `spdk_tgt` can set up io_uring (kernel, sysctl, SELinux, seccomp), because a failed setup crashes it, and uses Linux AIO (`bdev_aio_create`) instead when it can't (`--ssd-bdev auto`).
    - **Boot Disk Safety Guard:** `velod` resolves the backing block devices and PCIe BDF addresses for `/`, `/boot`, `/boot/efi`, and `/sysroot` on startup and permanently marks them `is_boot_device = true` so the OS drive can never be unbound or formatted.
 
 3. **Pool, Volume & Filter Bdev Hierarchy:**

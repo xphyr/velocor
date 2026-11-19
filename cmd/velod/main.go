@@ -44,7 +44,7 @@ func main() {
 		tlsCertFile       = flag.String("tls-cert", os.Getenv("VELOCOR_TLS_CERT"), "TLS certificate file (auto-generates self-signed ECDSA cert if empty)")
 		tlsKeyFile        = flag.String("tls-key", os.Getenv("VELOCOR_TLS_KEY"), "TLS private key file")
 		insecureHTTP      = flag.Bool("insecure-http", os.Getenv("VELOCOR_INSECURE_HTTP") == "true", "Serve plain HTTP instead of HTTPS")
-		ssdBdev           = flag.String("ssd-bdev", envOrDefault("VELOCOR_SSD_BDEV", "uring"), "How SSDs are attached to SPDK: uring (default) or aio (for hosts without usable io_uring)")
+		ssdBdev           = flag.String("ssd-bdev", envOrDefault("VELOCOR_SSD_BDEV", "auto"), "How SSDs are attached to SPDK: auto (default: io_uring if spdk_tgt can use it, else AIO), uring, or aio")
 		metricsPublic     = flag.Bool("metrics-public", os.Getenv("VELOCOR_METRICS_PUBLIC") == "true", "Serve /metrics without authentication (default: requires a READONLY token)")
 		metaCopies        = flag.Bool("meta-copies", os.Getenv("VELOCOR_META_COPIES") != "false", "Keep a copy of each pool's configuration on the pool (needs SPDK built with ublk and the ublk_drv module)")
 		showVersion       = flag.Bool("version", false, "Print version information and exit")
@@ -65,12 +65,18 @@ func main() {
 		"spdk_socket", *spdkSocket,
 	)
 
+	dataplane.Logger = logger
 	switch *ssdBdev {
-	case "uring", "aio":
+	case "auto", "uring", "aio":
 		dataplane.SSDBackend = *ssdBdev
 	default:
-		logger.Error("invalid --ssd-bdev; use uring or aio", "value", *ssdBdev)
+		logger.Error("invalid --ssd-bdev; use auto, uring or aio", "value", *ssdBdev)
 		os.Exit(1)
+	}
+	if *ssdBdev == "uring" {
+		if probe := hardware.ProbeIOURing(); !probe.Usable {
+			logger.Warn("--ssd-bdev=uring although io_uring may not work for spdk_tgt; a failed io_uring setup crashes it (use auto or aio)", "reason", probe.Reason)
+		}
 	}
 
 	if err := os.MkdirAll(filepath.Dir(*dbPath), 0700); err != nil {

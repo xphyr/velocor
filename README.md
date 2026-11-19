@@ -355,6 +355,31 @@ veloctl volume usage <volume-id>
 
 Exports with no initiator groups are refused unless `--allow-any-host` is given explicitly, which lets anyone who can reach the portal connect.
 
+#### Deleting volumes
+
+A deleted volume isn't destroyed at once. It disappears from the API, the UI and Kubernetes, and
+can't be exported, but its data is kept for **24 hours** by default. Until then an administrator
+can bring it back, or purge it early. This applies to deletes from the CSI driver too, so a
+deleted PVC can be recovered. A deleted volume keeps holding the space it used, and a pool
+can't be deleted while it holds deleted volumes.
+
+```bash
+veloctl volume deleted                              # deleted volumes and when they'll be purged
+veloctl volume restore [--name new-name] <volume-id>
+veloctl volume purge --yes <volume-id>              # destroy its data now
+veloctl system volume-retention --hours 72          # 0 = destroy volumes at once; at most 720
+veloctl volume protect <volume-id>                  # refuse deletes; --off to allow them again
+```
+
+Volumes with deletion protection (`veloctl volume create --protect`, or **Protect** on the
+volume's page) can't be deleted, by anyone, until an administrator turns protection off. A CSI
+`DeleteVolume` for one fails with `FailedPrecondition`, and the provisioner keeps retrying.
+Restoring, purging, protection and the retention period need an administrator; a CSI token can
+only delete.
+
+A snapshot that volumes were cloned from can be deleted too. It disappears at once, and its
+data goes when the last of those volumes has been deleted and purged.
+
 ---
 
 ## Installing the Kubernetes CSI Driver (`csi.velocor.io`)

@@ -302,7 +302,8 @@ work still open, ranked by risk to data, how fixes are verified, and what has be
   - [x] Pool-level flag (2026-11-18): pools carry `durability` (the weakest member's: DURABLE,
     AT_RISK, UNKNOWN), maintained by the reconciler; shown in the pool list and detail of the UI
     with what to do, and in `veloctl pool list`.
-  - [ ] Step 5: power-pull test on real hardware.
+  - [ ] Step 5: power-pull test on real hardware. *Deferred (2026-11-18):* no suitable hardware
+    for now.
   - [x] **Disks whose cache can't be turned off.** Lab, 2026-11-18: virtio-scsi disks of a
     Synology VM ("SYNOLOGY Storage", LIO behind them) report "write back" and refuse the change
     (`cache_type` write: EINVAL). velod retried every pass and listed all six disks under the
@@ -314,13 +315,32 @@ work still open, ranked by risk to data, how fixes are verified, and what has be
     refused when the drive refuses. `TestRefusedWriteCacheIsRecordedNotRetried`,
     `TestRefusedWriteCacheWarning`.
 
-- [ ] **P0-6. A failed io_uring setup crashes `spdk_tgt`. (Verified)**
+- [x] **P0-6. A failed io_uring setup crashes `spdk_tgt`. (Verified)**
   Claiming an SSD with the io_uring backend where io_uring can't be set up (locked-memory
   limits, seccomp, `kernel.io_uring_disabled`) makes `spdk_tgt` segfault instead of returning an
   error, taking every export down. The production quadlet sets `memlock=-1`, which avoids the
   known cause, but nothing checks it. *Done:* an `aio` backend (`--ssd-bdev aio` /
   `VELOCOR_SSD_BDEV=aio`). *Needed:* velod should probe io_uring before using it and fall back
   to AIO; report the SPDK crash upstream.
+  *Done (2026-11-18):*
+  - **Cause, reproduced** with the SPDK test image (v26.09) under rootless Podman on Fedora:
+    `bdev_uring_create` → "uring I/O context setup failure" (EPERM) → exit 139. Not memlock (8 MiB
+    is fine on current kernels, which no longer charge rings to it) and not seccomp (unconfined):
+    **SELinux** (`container_t` may not use io_uring). The same container as `spc_t`
+    (`label=disable`, what the appliance quadlets use) works. In SPDK, `bdev_uring_create_cb`
+    uses `spdk_get_io_channel(&uring_if)` without a NULL check; report and one-line fix in
+    [docs/upstream/spdk-uring-channel-crash.md](docs/upstream/spdk-uring-channel-crash.md).
+  - **Probe.** `--ssd-bdev auto` is the new default: before every SSD attach (claims, and
+    re-attaches after an `spdk_tgt` restart, where a crash would repeat on every restart) velod
+    checks `kernel.io_uring_disabled`, sets up a ring itself, and checks each visible `spdk_tgt`
+    process (host PID namespace): SELinux type when enforcing (spc_t/unconfined only), no
+    seccomp filter, and an unlimited memlock on kernels before 5.12. Unsure means AIO, logged
+    with the reason when the choice changes. `uring` still forces io_uring (with a warning at
+    start if the probe disagrees), `aio` forces AIO. `TestProbeIOURing`, `TestKernelBefore`;
+    checked live against the confined and unconfined containers; the integration suite now runs
+    with `auto` (it used to force AIO), so a wrong verdict would crash its `spdk_tgt`.
+  - *Open:* send the report upstream (user), and carry the fix as an SPDK patch once
+    `spdk-patch-unit-tests.sh` can accept a module without unit tests (bdev_uring has none).
 
 ### P1: outages, lock-outs, things operators can't see
 
@@ -335,14 +355,59 @@ work still open, ranked by risk to data, how fixes are verified, and what has be
   *Needed:* apply, then confirm from a new connection within ~120 s or roll back automatically;
   refuse or warn about interfaces that host portals.
 
-- [ ] **P1-4. Deletion is immediate and irreversible.** With CSI automation and API tokens, one
+- [x] **P1-4. Deletion is immediate and irreversible.** With CSI automation and API tokens, one
   mistake is unrecoverable. *Needed:* per-volume deletion protection and/or a recycle period in
   which a deleted volume is unexported and hidden but kept for N hours.
+  *Done (2026-11-18), both:*
+  - **Retention.** `DELETE /volumes/{id}` (UI, veloctl, CSI) marks the volume deleted
+    (`deleted_at`, `purge_at`, `deleted_by`) and leaves its lvol alone. It is then hidden from
+    the volume API (404, not listed, CSI sees it gone), can't be exported, attached, snapshotted
+    or resized, and its name is free again. The reconciler purges it (lvol, then record) once
+    `purge_at` has passed, only while its pool is online. Default 24 h;
+    `GET|PUT /system/volume-retention {hours}` (0 = delete at once, at most 720), on the System
+    page and `veloctl system volume-retention`. Admin only: `GET /deleted-volumes`,
+    `POST /deleted-volumes/{id}/restore {name?}` (a new name if the old one was reused),
+    `DELETE /deleted-volumes/{id}` (purge now); veloctl `volume deleted | restore | purge --yes`,
+    and a Deleted volumes section on the Volumes page. A purge marks the volume `purging` in the
+    same transaction that checks it is due, so a concurrent restore can't bring back a volume
+    whose lvol is being deleted.
+  - **Space.** A deleted volume counts as committed by its allocated bytes (it can't grow), and
+    a capacity refusal says how much deleted volumes still hold. A pool holding deleted volumes
+    can't be deleted (the refusal says so).
+  - **Deletion protection.** `deletion_protection` on create, `PUT /volumes/{id}/protection`
+    (admin; veloctl `volume protect [--off]`, UI Protect/Unprotect). Deletes are refused (409;
+    CSI `FailedPrecondition`, so the provisioner retries) until an administrator turns it off.
+  - **Snapshots with clones.** Deleting a snapshot that volumes were cloned from used to be
+    refused, which with retention would have kept a deleted PVC's VolumeSnapshot stuck for a
+    day (and was already wrong for Kubernetes, which allows deleting a VolumeSnapshot after
+    restoring from it). It is now hidden at once and the reconciler deletes it when no volume,
+    live or deleted, depends on it. Snapshots with no clones are still deleted at once.
+  - Tests: `TestDeletedVolumeIsKeptAndRestorable`, `TestDeletedVolumeIsPurgedWhenRetentionEnds`,
+    `TestDeletionProtection`, `TestVolumeRetentionSetting`, `TestSnapshotDeleteWaitsForItsClones`,
+    `TestDeleteVolumeProtectionAndRetention` (CSI); real SPDK: `TestSnapshotsAndClones` (purge,
+    deferred snapshot delete, lvols gone afterwards), `TestPoolDeleteThenReuseDisks`,
+    `TestPoolSpaceLifecycle`.
+  - *Not done:* a `deletionProtection` StorageClass parameter (clones made from snapshots take
+    another API path, so both would need it); a retention period for snapshots without clones.
 
-- [ ] **P1-5. Orphaned SPDK objects are invisible.** Lvols, RAIDs or lvstores in SPDK but not
+- [x] **P1-5. Orphaned SPDK objects are invisible.** Lvols, RAIDs or lvstores in SPDK but not
   in the store (failed rollback, crash between SPDK and store writes, manual changes) consume
   space silently, and after metadata loss they're the only copy of the data. *Needed:* the
   reconciler reports unmanaged objects (never deletes them).
+  *Done (2026-11-18):* every pass (after SPDK has examined its bdevs) compares lvstores, lvols in
+  managed lvstores (volumes, snapshots, deleted ones, the metadata lvol), RAIDs, other bdevs
+  (claimed disks', pools', volumes'), NVMe-oF subsystems and iSCSI targets (exports') with the
+  store. Anything unaccounted for a minute (the API creates in SPDK first and records right
+  after) is reported: reconciler state `unmanaged_objects` (kind, name, UUID, detail, first
+  seen) in `/system/status`, one status warning with counts and what to do, a list on the
+  System page and in `veloctl system status`, `velocor_spdk_unmanaged_objects{kind}` for
+  alerting, and a log line when first reported. Lvols of an unmanaged lvstore are covered by
+  its line (a lost database reports each pool once). Unmanaged subsystems and targets are
+  called out as access no export controls. Nothing is deleted or degraded; a failed listing
+  keeps the previous report. `TestUnmanagedSPDKObjectsAreReportedNotDeleted`,
+  `TestUnmanagedLvstoreAfterDatabaseLoss`; real SPDK: the integration suite asserts nothing
+  managed is reported after crash/clean restarts and the snapshot/clone/purge scenario, and
+  that a stray lvol is reported and kept.
 
 - [ ] **P1-6. Single node, no high availability.** One appliance, one copy of each pool; ANA
   states are modelled but unused. A legitimate first-version scope, but it should be stated in
@@ -701,14 +766,14 @@ this order and keep this file current as each moves.
    per-volume/snapshot allocated space.
 3. **P0-3 metadata** (done): on-pool metadata copy, scheduled backups + `veloctl` backup/restore,
    recovery from SPDK and the on-pool copy.
-4. **P0-4 durability, remaining** (in progress): NVMe write cache through SPDK and the pool
-   flag are done, pending the lab check on QEMU NVMe; power-pull test on real hardware (user).
-   The SPDK FLUSH patch stays L-1.
-5. **P1-4 deletion protection** (recycle period / per-volume protection); fold in **P0-6**
-   (probe io_uring, fall back to AIO).
+4. **P0-4 durability, remaining**: NVMe write cache through SPDK and the pool flag are done and
+   checked on QEMU NVMe. The power-pull test on real hardware is deferred (no hardware for it
+   yet, 2026-11-18). The SPDK FLUSH patch stays L-1.
+5. **P1-4 deletion protection** (done: retention period, per-volume protection) and **P0-6**
+   (done: io_uring probe, AIO fallback; upstream report drafted).
 
-After the release gate: P1-1 alerting, P1-3 network rollback, P1-5 orphan reporting, P2-2
-scrub, P2-11.
+After the release gate: P1-1 alerting, P1-3 network rollback, P2-2 scrub, P2-11 (P1-5 orphan
+reporting done 2026-11-18).
 
 ---
 
@@ -754,8 +819,8 @@ everything deleted cleanly (no PVs, snapshots, volumes or exports left). **iSCSI
 d60e9ec + the SPDK WRITE SAME patch (P1-10, dev-559ea38): write, cross-node re-attach, verify. Not covered: RWX / live migration
 (P1-12), Kasten.
 
-**Not yet covered:** real NVMe drives (`bdev_nvme`, vfio), io_uring (needs a host where it
-works, see P0-6), iSCSI data paths (needs an iSCSI initiator in the test image), power-loss
+**Not yet covered:** real NVMe drives (`bdev_nvme`, vfio), io_uring (the test containers
+run confined, where the probe picks AIO, see P0-6; covered on the lab appliances), iSCSI data paths (needs an iSCSI initiator in the test image), power-loss
 tests on real hardware, killing SPDK *during* a multi-step API operation, and hardware checks
 of the boot-disk guard and CSI device resolution on NVMe native multipath.
 

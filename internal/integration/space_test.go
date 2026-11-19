@@ -89,6 +89,7 @@ func TestPoolSpaceLifecycle(t *testing.T) {
 		}
 	}
 	a.must("DELETE", "/volumes/"+v2["id"].(string), nil, "")
+	a.must("DELETE", "/deleted-volumes/"+v2["id"].(string), nil, "") // kept until purged (P1-4)
 	if st, used := state(); st == store.SpaceStateFull || st == store.SpaceStateCritical {
 		t.Fatalf("after deleting v2: %s at %.0f%%", st, used)
 	}

@@ -745,6 +745,9 @@ func checkPoolDeletableTx(tx *bolt.Tx, id string) (*Pool, error) {
 			if err := json.Unmarshal(v, &vol); err != nil {
 				return err
 			}
+			if vol.PoolID == id && vol.Deleted() {
+				return fmt.Errorf("%w: pool %s holds deleted volume %s until %s; purge it first", ErrInUse, id, vol.ID, vol.PurgeAt.Format(time.RFC3339))
+			}
 			if vol.PoolID == id {
 				return fmt.Errorf("%w: pool %s contains volume %s", ErrInUse, id, vol.ID)
 			}
@@ -831,6 +834,9 @@ func (s *BoltStore) CreateVolume(vol *Volume) error {
 			if err := getJSON(tx.Bucket(bucketSnapshots), []byte(cp.ParentSnapshotID), &snap); err != nil {
 				return fmt.Errorf("parent snapshot %s: %w", cp.ParentSnapshotID, err)
 			}
+			if snap.Deleted() {
+				return fmt.Errorf("%w: parent snapshot %s is deleted", ErrNotFound, cp.ParentSnapshotID)
+			}
 		}
 
 		if cp.LvolBdevName == "" {
@@ -849,7 +855,7 @@ func (s *BoltStore) CreateVolume(vol *Volume) error {
 			if err := json.Unmarshal(v, &existing); err != nil {
 				return err
 			}
-			if existing.PoolID == cp.PoolID && existing.Name == cp.Name {
+			if existing.PoolID == cp.PoolID && existing.Name == cp.Name && !existing.Deleted() {
 				return fmt.Errorf("%w: volume %s in pool %s", ErrAlreadyExists, cp.Name, cp.PoolID)
 			}
 			return nil
@@ -888,7 +894,7 @@ func (s *BoltStore) GetVolumeByName(poolID, name string) (*Volume, error) {
 			if err := json.Unmarshal(v, &vol); err != nil {
 				return err
 			}
-			if vol.Name == name && (poolID == "" || vol.PoolID == poolID) {
+			if vol.Name == name && !vol.Deleted() && (poolID == "" || vol.PoolID == poolID) {
 				found = &vol
 			}
 			return nil
@@ -910,6 +916,9 @@ func (s *BoltStore) SetVolumeAttachmentState(id string, state AttachmentState) (
 		b := tx.Bucket(bucketVolumes)
 		if err := getJSON(b, []byte(id), &vol); err != nil {
 			return err
+		}
+		if state != AttachmentStateUnattached && vol.Deleted() {
+			return errVolumeDeleted(&vol)
 		}
 		if state != AttachmentStateUnattached &&
 			vol.AttachmentState != AttachmentStateUnattached &&
@@ -967,6 +976,9 @@ func checkVolumeDeletableTx(tx *bolt.Tx, id string) error {
 	if err := getJSON(volsB, []byte(id), &vol); err != nil {
 		return err
 	}
+	if vol.DeletionProtection {
+		return fmt.Errorf("%w: volume %s has deletion protection; an administrator must turn it off first", ErrInUse, id)
+	}
 	if vol.AttachmentState != AttachmentStateUnattached && vol.AttachmentState != "" {
 		return fmt.Errorf("%w: volume %s has active attachment state %s", ErrInUse, id, vol.AttachmentState)
 	}
@@ -1013,6 +1025,9 @@ func (s *BoltStore) CreateSnapshot(snap *Snapshot) error {
 		if err := getJSON(tx.Bucket(bucketVolumes), []byte(cp.VolumeID), &vol); err != nil {
 			return fmt.Errorf("volume %s: %w", cp.VolumeID, err)
 		}
+		if vol.Deleted() {
+			return errVolumeDeleted(&vol)
+		}
 		var pool Pool
 		if err := getJSON(tx.Bucket(bucketPools), []byte(vol.PoolID), &pool); err != nil {
 			return fmt.Errorf("pool %s: %w", vol.PoolID, err)
@@ -1039,7 +1054,7 @@ func (s *BoltStore) CreateSnapshot(snap *Snapshot) error {
 				return err
 			}
 			if existing.VolumeID == cp.VolumeID {
-				if existing.Name == cp.Name {
+				if existing.Name == cp.Name && !existing.Deleted() {
 					return fmt.Errorf("%w: snapshot %s for volume %s", ErrAlreadyExists, cp.Name, cp.VolumeID)
 				}
 				if latestSnap == nil || existing.SequenceNumber > latestSnap.SequenceNumber {
@@ -1092,7 +1107,7 @@ func (s *BoltStore) GetSnapshotByName(volumeID, name string) (*Snapshot, error) 
 			if err := json.Unmarshal(v, &snap); err != nil {
 				return err
 			}
-			if snap.Name == name && (volumeID == "" || snap.VolumeID == volumeID) {
+			if snap.Name == name && !snap.Deleted() && (volumeID == "" || snap.VolumeID == volumeID) {
 				found = &snap
 			}
 			return nil
@@ -1729,6 +1744,9 @@ func (s *BoltStore) CreateExport(exp *Export) error {
 		var vol Volume
 		if err := getJSON(volsB, []byte(cp.VolumeID), &vol); err != nil {
 			return fmt.Errorf("volume %s: %w", cp.VolumeID, err)
+		}
+		if vol.Deleted() {
+			return errVolumeDeleted(&vol)
 		}
 		if vol.AttachmentState == AttachmentStateFilesystem {
 			return fmt.Errorf("%w: volume %s is attached to a local filesystem", ErrAttachmentConflict, cp.VolumeID)

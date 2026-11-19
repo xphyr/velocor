@@ -255,15 +255,16 @@ func TestSPDKFailuresAreNotPersisted(t *testing.T) {
 		t.Fatalf("failed snapshot persisted")
 	}
 
-	// Delete failure -> record retained (no leaked lvol).
+	// Purge failure -> record retained (no leaked lvol).
+	h.expect(h.do("DELETE", "/api/v1/volumes/"+volID, h.admin, nil))(http.StatusOK)
 	h.fake.Fail("bdev_lvol_delete", 1)
-	if code, _ := h.do("DELETE", "/api/v1/volumes/"+volID, h.admin, nil); code != http.StatusInternalServerError {
-		t.Fatalf("delete returned %d", code)
+	if code, _ := h.do("DELETE", "/api/v1/deleted-volumes/"+volID, h.admin, nil); code != http.StatusInternalServerError {
+		t.Fatalf("purge returned %d", code)
 	}
 	if _, err := h.st.GetVolume(volID); err != nil {
 		t.Fatalf("volume record dropped although SPDK delete failed")
 	}
-	h.expect(h.do("DELETE", "/api/v1/volumes/"+volID, h.admin, nil))(http.StatusOK)
+	h.expect(h.do("DELETE", "/api/v1/deleted-volumes/"+volID, h.admin, nil))(http.StatusOK)
 	if h.fake.LvolExists(vol["lvol_bdev_name"].(string)) {
 		t.Fatalf("lvol leaked")
 	}

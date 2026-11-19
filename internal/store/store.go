@@ -83,6 +83,15 @@ type Store interface {
 	SetVolumeAttachmentState(id string, state AttachmentState) (*Volume, error)
 	ListVolumes(poolID string) ([]*Volume, error)
 	DeleteVolume(id string) error
+	// TrashVolume marks a volume deleted but keeps it (and its data) until purgeAt.
+	TrashVolume(id string, now, purgeAt time.Time, by string) (*Volume, error)
+	// RestoreVolume undoes TrashVolume, optionally under a new name.
+	RestoreVolume(id, newName string) (*Volume, error)
+	// DeferSnapshotDelete marks a snapshot that clones depend on as deleted (true); false
+	// means nothing depends on it and the caller deletes it now.
+	DeferSnapshotDelete(id string, now time.Time, by string) (bool, error)
+	// PurgeableSnapshot reports whether a deleted snapshot no longer has dependent clones.
+	PurgeableSnapshot(id string) (bool, error)
 
 	// Snapshots
 	CreateSnapshot(snap *Snapshot) error

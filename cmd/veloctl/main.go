@@ -340,7 +340,7 @@ func runToken(cfg *cliConfig, args []string) error {
 
 func runSystem(cfg *cliConfig, args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("subcommand required: status | os | reconcile | iostats | upgrade | rollback | reboot | containers | rebuild | backup | backups | restore")
+		return fmt.Errorf("subcommand required: status | os | reconcile | iostats | upgrade | rollback | reboot | containers | rebuild | volume-retention | backup | backups | restore")
 	}
 	switch args[0] {
 	case "backup", "backups", "restore":
@@ -369,6 +369,30 @@ func runSystem(cfg *cliConfig, args []string) error {
 		}
 		return nil
 
+	case "volume-retention":
+		fs := flag.NewFlagSet("system volume-retention", flag.ExitOnError)
+		hours := fs.Int("hours", -1, "Keep deleted volumes this many hours before purging them (0 = delete at once); applies to volumes deleted afterwards. Omit to show the current setting")
+		_ = fs.Parse(args[1:])
+		var resp map[string]any
+		var err error
+		if *hours < 0 {
+			resp, err = cfg.request("GET", "/api/v1/system/volume-retention", nil)
+		} else {
+			resp, err = cfg.request("PUT", "/api/v1/system/volume-retention", map[string]any{"hours": *hours})
+		}
+		if err != nil {
+			return err
+		}
+		if cfg.jsonOutput {
+			return printJSON(resp)
+		}
+		if h := uint64FromAny(resp["hours"]); h == 0 {
+			fmt.Println("Deleted volumes: deleted at once")
+		} else {
+			fmt.Printf("Deleted volumes: kept %d hours before they are purged\n", h)
+		}
+		return nil
+
 	case "status":
 		resp, err := cfg.request("GET", "/api/v1/system/status", nil)
 		if err != nil {
@@ -391,6 +415,15 @@ func runSystem(cfg *cliConfig, args []string) error {
 		}
 		for _, w := range sliceOfAny(resp["warnings"]) {
 			fmt.Printf("WARNING: %v\n", w)
+		}
+		if objs := sliceOfMaps(recSt["unmanaged_objects"]); len(objs) > 0 {
+			fmt.Println("\nIn spdk_tgt, not managed by Velocor (left alone):")
+			tw := newTabWriter()
+			fmt.Fprintln(tw, "KIND\tNAME\tUUID\tDETAILS\tSINCE")
+			for _, o := range objs {
+				fmt.Fprintf(tw, "%v\t%v\t%v\t%v\t%v\n", o["kind"], o["name"], strOrDash(o["uuid"]), strOrDash(o["detail"]), o["first_seen"])
+			}
+			return tw.Flush()
 		}
 		return nil
 
@@ -800,7 +833,7 @@ func runPool(cfg *cliConfig, args []string) error {
 
 func runVolume(cfg *cliConfig, args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("subcommand required: list | get | usage | create | resize | qos | delete")
+		return fmt.Errorf("subcommand required: list | get | usage | create | resize | qos | protect | delete | deleted | restore | purge")
 	}
 	switch args[0] {
 	case "get":
@@ -855,15 +888,17 @@ func runVolume(cfg *cliConfig, args []string) error {
 		poolID := fs.String("pool", "", "Pool ID")
 		sizeGiB := fs.Uint64("size-gib", 10, "Volume size in GiB")
 		thin := fs.Bool("thin", true, "Thin provision volume")
+		protect := fs.Bool("protect", false, "Refuse deletion until an administrator turns protection off")
 		_ = fs.Parse(args[1:])
 		if *name == "" || *poolID == "" {
 			return fmt.Errorf("--name and --pool are required")
 		}
 		resp, err := cfg.request("POST", "/api/v1/volumes", map[string]any{
-			"name":           *name,
-			"pool_id":        *poolID,
-			"size_bytes":     *sizeGiB * 1024 * 1024 * 1024,
-			"thin_provision": *thin,
+			"name":                *name,
+			"pool_id":             *poolID,
+			"size_bytes":          *sizeGiB * 1024 * 1024 * 1024,
+			"thin_provision":      *thin,
+			"deletion_protection": *protect,
 		})
 		if err != nil {
 			return err
@@ -910,11 +945,82 @@ func runVolume(cfg *cliConfig, args []string) error {
 		if len(args) < 2 {
 			return fmt.Errorf("usage: veloctl volume delete <volume-id>")
 		}
-		_, err := cfg.request("DELETE", "/api/v1/volumes/"+args[1], nil)
+		resp, err := cfg.request("DELETE", "/api/v1/volumes/"+url.PathEscape(args[1]), nil)
 		if err != nil {
 			return err
 		}
-		fmt.Printf("Deleted volume %s\n", args[1])
+		if cfg.jsonOutput {
+			return printJSON(resp)
+		}
+		if v, ok := resp["volume"].(map[string]any); ok && v["purge_at"] != nil {
+			fmt.Printf("Deleted volume %s; its data is kept until %v ('veloctl volume restore %s' brings it back)\n", args[1], v["purge_at"], args[1])
+		} else {
+			fmt.Printf("Deleted volume %s\n", args[1])
+		}
+		return nil
+
+	case "protect":
+		fs := flag.NewFlagSet("volume protect", flag.ExitOnError)
+		off := fs.Bool("off", false, "Turn deletion protection off instead of on")
+		_ = fs.Parse(args[1:])
+		if fs.NArg() != 1 {
+			return fmt.Errorf("usage: veloctl volume protect [--off] <volume-id>")
+		}
+		resp, err := cfg.request("PUT", "/api/v1/volumes/"+url.PathEscape(fs.Arg(0))+"/protection", map[string]any{"deletion_protection": !*off})
+		if err != nil {
+			return err
+		}
+		if cfg.jsonOutput {
+			return printJSON(resp)
+		}
+		fmt.Printf("Deletion protection of %s: %v\n", fs.Arg(0), !*off)
+		return nil
+
+	case "deleted":
+		resp, err := cfg.request("GET", "/api/v1/deleted-volumes", nil)
+		if err != nil {
+			return err
+		}
+		if cfg.jsonOutput {
+			return printJSON(resp)
+		}
+		tw := newTabWriter()
+		fmt.Fprintln(tw, "ID\tNAME\tPOOL\tSIZE\tALLOCATED\tDELETED\tBY\tPURGE AT")
+		for _, v := range sliceOfMaps(resp["volumes"]) {
+			fmt.Fprintf(tw, "%v\t%v\t%v\t%s\t%s\t%v\t%v\t%v\n",
+				v["id"], v["name"], v["pool_id"], humanBytes(uint64FromAny(v["size_bytes"])), humanBytes(uint64FromAny(v["allocated_bytes"])),
+				v["deleted_at"], v["deleted_by"], v["purge_at"])
+		}
+		return tw.Flush()
+
+	case "restore":
+		fs := flag.NewFlagSet("volume restore", flag.ExitOnError)
+		name := fs.String("name", "", "Restore under this name (if the old one has been reused)")
+		_ = fs.Parse(args[1:])
+		if fs.NArg() != 1 {
+			return fmt.Errorf("usage: veloctl volume restore [--name <new-name>] <volume-id>")
+		}
+		var body map[string]any
+		if *name != "" {
+			body = map[string]any{"name": *name}
+		}
+		resp, err := cfg.request("POST", "/api/v1/deleted-volumes/"+url.PathEscape(fs.Arg(0))+"/restore", body)
+		if err != nil {
+			return err
+		}
+		return printJSON(resp)
+
+	case "purge":
+		fs := flag.NewFlagSet("volume purge", flag.ExitOnError)
+		yes := fs.Bool("yes", false, "Confirm: the volume's data is destroyed and can't be recovered")
+		_ = fs.Parse(args[1:])
+		if fs.NArg() != 1 || !*yes {
+			return fmt.Errorf("usage: veloctl volume purge --yes <volume-id> (destroys a deleted volume's data now)")
+		}
+		if _, err := cfg.request("DELETE", "/api/v1/deleted-volumes/"+url.PathEscape(fs.Arg(0)), nil); err != nil {
+			return err
+		}
+		fmt.Printf("Purged volume %s\n", fs.Arg(0))
 		return nil
 
 	default:

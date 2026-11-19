@@ -48,6 +48,10 @@ type Settings struct {
 	// RebuildMaxMBps limits RAID rebuild bandwidth (SPDK applies it to every array); 0 means
 	// unlimited.
 	RebuildMaxMBps uint32 `json:"rebuild_max_mbps"`
+	// VolumeRetentionHours is how long a deleted volume is kept (unexported, hidden, its data
+	// intact) before the reconciler purges it; nil means DefaultVolumeRetention, 0 deletes at
+	// once.
+	VolumeRetentionHours *uint32 `json:"volume_retention_hours,omitempty"`
 }
 
 // DiskType categorizes physical flash media tiers.
@@ -323,7 +327,21 @@ type Volume struct {
 	StatusMessage     string            `json:"status_message,omitempty"`
 	Labels            map[string]string `json:"labels,omitempty"`
 	CreatedAt         time.Time         `json:"created_at"`
+	// DeletionProtection refuses deletion until an administrator turns it off.
+	DeletionProtection bool `json:"deletion_protection,omitempty"`
+	// DeletedAt is set while a deleted volume waits for its retention period to end: it is
+	// hidden from the API and can't be exported, but its data is intact and it can be restored.
+	DeletedAt *time.Time `json:"deleted_at,omitempty"`
+	// PurgeAt is when the reconciler deletes a deleted volume's data for good.
+	PurgeAt *time.Time `json:"purge_at,omitempty"`
+	// DeletedBy is the API subject that deleted the volume.
+	DeletedBy string `json:"deleted_by,omitempty"`
+	// Purging is set once the purge of a deleted volume has started; it can't be restored then.
+	Purging bool `json:"purging,omitempty"`
 }
+
+// Deleted reports whether the volume is deleted and waiting to be purged.
+func (v *Volume) Deleted() bool { return v.DeletedAt != nil }
 
 // Snapshot represents an immutable point-in-time SPDK bdev_lvol_snapshot.
 type Snapshot struct {
@@ -338,7 +356,15 @@ type Snapshot struct {
 	ParentSnapshotID string    `json:"parent_snapshot_id,omitempty"`
 	SequenceNumber   uint64    `json:"sequence_number"`
 	CreatedAt        time.Time `json:"created_at"`
+	// DeletedAt is set when a snapshot was deleted while volumes cloned from it still depend
+	// on it (live ones, or deleted ones waiting to be purged): it is hidden from the API and
+	// the reconciler deletes it once nothing depends on it.
+	DeletedAt *time.Time `json:"deleted_at,omitempty"`
+	DeletedBy string     `json:"deleted_by,omitempty"`
 }
+
+// Deleted reports whether the snapshot is deleted and waiting for its clones to go.
+func (s *Snapshot) Deleted() bool { return s.DeletedAt != nil }
 
 // VolumeGroupSnapshot represents a point-in-time consistent group of snapshots across multiple volumes.
 type VolumeGroupSnapshot struct {

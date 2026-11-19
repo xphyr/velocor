@@ -23,6 +23,8 @@ type State struct {
 	DriftRepairedCount uint64    `json:"drift_repaired_count"`
 	DegradedResources  []string  `json:"degraded_resources"`
 	LastError          string    `json:"last_error,omitempty"`
+	// Unmanaged lists what spdk_tgt holds that no store record accounts for (P1-5).
+	Unmanaged []UnmanagedObject `json:"unmanaged_objects,omitempty"`
 }
 
 // Reconciler continuously converges observed state in Linux sysfs and spdk_tgt
@@ -53,6 +55,14 @@ type Reconciler struct {
 	// reported in the durability warnings).
 	cacheRefused map[string]bool
 
+	now func() time.Time // replaces time.Now (tests)
+
+	// unmanagedSeen: when each unaccounted SPDK object was first seen (reported after
+	// unmanagedGrace); unmanagedLogged: those already logged.
+	unmanagedSeen   map[string]time.Time
+	unmanagedLogged map[string]bool
+	unmanagedGrace  *time.Duration // nil: defaultUnmanagedGrace
+
 	mu    sync.Mutex
 	state State
 }
@@ -76,6 +86,7 @@ func (r *Reconciler) State() State {
 	defer r.mu.Unlock()
 	cp := r.state
 	cp.DegradedResources = slices.Clone(r.state.DegradedResources)
+	cp.Unmanaged = slices.Clone(r.state.Unmanaged)
 	return cp
 }
 
@@ -105,6 +116,9 @@ type pass struct {
 	degraded []string
 	errs     []string
 	notes    map[string][]string // pool ID -> extra reasons for its status message
+
+	unmanaged        []UnmanagedObject
+	unmanagedChecked bool // false: keep the last report
 }
 
 // notePool adds a reason to a pool's status message (and the pass's degraded resources).
@@ -156,13 +170,21 @@ func (r *Reconciler) ReconcileOnce(ctx context.Context) (State, error) {
 	}
 
 	poolOnline := r.reconcilePools(ctx, p, examined)
+	r.purgeDeletedVolumes(ctx, p, poolOnline)
+	r.purgeDeletedSnapshots(ctx, p, poolOnline)
 	r.reconcileSpace(ctx, p, poolOnline)
 	volOnline := r.reconcileVolumes(ctx, p, poolOnline)
 	r.reconcileExports(ctx, p, volOnline)
 	r.reconcileMeta(ctx, p, poolOnline)
+	r.findUnmanaged(ctx, p, examined)
 
 	lastErr := strings.Join(p.errs, "; ")
 	r.finishPass(p.repaired, p.degraded, lastErr)
+	if p.unmanagedChecked {
+		r.mu.Lock()
+		r.state.Unmanaged = p.unmanaged
+		r.mu.Unlock()
+	}
 	if len(p.errs) > 0 {
 		return r.State(), fmt.Errorf("%s", lastErr)
 	}

@@ -247,7 +247,7 @@ func (s *Server) resolveWithOverride(groupIDs []string, override *store.Initiato
 
 // handleVolumeUsage reports how much of a volume is actually allocated in its pool.
 func (s *Server) handleVolumeUsage(w http.ResponseWriter, r *http.Request) {
-	vol, err := s.store.GetVolume(r.PathValue("id"))
+	vol, err := s.liveVolume(r.PathValue("id"))
 	if err != nil {
 		writeError(w, err)
 		return

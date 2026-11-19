@@ -734,8 +734,9 @@ async function createVolumeDialog(poolId) {
       ...(items.length > 1 || !poolId ? [{ name: "pool", label: "Pool", value: poolId || (items[0] || {}).id, options: items.map((p) => ({ value: p.id, label: `${p.name} (${humanSize(p.free_bytes)} free)` })) }] : []),
       { name: "size", label: "Size", size: true, required: true, value: 10 * 2 ** 30 },
       { name: "thin", kind: "tick", value: true, text: "Thin provisioned: space is only allocated as it's written" },
+      { name: "protect", kind: "tick", value: false, text: "Deletion protection: refuse deletes until an administrator turns it off" },
     ],
-    action: (v) => send("POST", "/volumes", { name: v.name, pool_id: v.pool || poolId, size_bytes: v.size, thin_provision: v.thin }),
+    action: (v) => send("POST", "/volumes", { name: v.name, pool_id: v.pool || poolId, size_bytes: v.size, thin_provision: v.thin, deletion_protection: v.protect }),
     done: (r) => { notify(`Created ${r.volume.name}.`); location.hash = hash("volume", r.volume.id); },
   });
 }
@@ -793,15 +794,72 @@ function cloneDialog(s) {
   });
 }
 
-function deleteVolumeDialog(v) {
+async function deleteVolumeDialog(v) {
+  const hours = ((await api("/system/volume-retention").catch(() => null)) || { hours: 24 }).hours;
   confirmDialog({
     title: `Delete ${v.name}`,
-    intro: "This destroys its data, and can't be undone. Its snapshots are kept, and can be cloned later.",
+    intro: hours
+      ? `Its data is kept for ${retentionText(hours)}: until then an administrator can restore it from Deleted volumes, and it still takes up its space in the pool. After that it's destroyed. Its snapshots are kept either way.`
+      : "This destroys its data at once, and can't be undone (deleted volumes aren't kept on this appliance). Its snapshots are kept, and can be cloned later.",
     submit: "Delete volume",
     confirmText: v.name,
     action: () => send("DELETE", "/volumes/" + encodeURIComponent(v.id)),
-    done: () => { notify(`Deleted ${v.name}.`); location.hash = "#/volumes"; },
+    done: () => { notify(hours ? `Deleted ${v.name}; it can be restored for ${retentionText(hours)}.` : `Deleted ${v.name}.`); location.hash = "#/volumes"; },
   });
+}
+
+function retentionText(hours) {
+  return hours % 24 === 0 && hours >= 48 ? `${hours / 24} days` : hours === 1 ? "1 hour" : `${hours} hours`;
+}
+
+function protectionDialog(v) {
+  const on = !v.deletion_protection;
+  openDialog({
+    title: on ? `Protect ${v.name}` : `Remove protection from ${v.name}`,
+    intro: on
+      ? "Deletes are refused, from this page and from the CSI driver, until an administrator turns protection off."
+      : "It can be deleted again, including by the CSI driver when its claim is deleted.",
+    submit: on ? "Protect" : "Remove protection",
+    danger: !on,
+    action: () => send("PUT", `/volumes/${encodeURIComponent(v.id)}/protection`, { deletion_protection: on }),
+    done: () => { notify(on ? `${v.name} is protected.` : `${v.name} is no longer protected.`); rerender(); },
+  });
+}
+
+function restoreVolumeDialog(v) {
+  openDialog({
+    title: `Restore ${v.name}`,
+    intro: "It comes back as it was deleted, with its data, not exported. If a volume with its name exists now, give it another name.",
+    submit: "Restore",
+    fields: [{ name: "name", label: "Name", required: true, value: v.name }],
+    action: (x) => send("POST", `/deleted-volumes/${encodeURIComponent(v.id)}/restore`, x.name === v.name ? {} : { name: x.name }),
+    done: (r) => { notify(`Restored ${r.volume.name}.`); location.hash = hash("volume", r.volume.id); },
+  });
+}
+
+function purgeVolumeDialog(v) {
+  confirmDialog({
+    title: `Purge ${v.name}`,
+    intro: `This destroys its data now rather than at ${humanTime(v.purge_at)}, and frees its space. It can't be undone.`,
+    submit: "Purge",
+    confirmText: v.name,
+    action: () => send("DELETE", "/deleted-volumes/" + encodeURIComponent(v.id)),
+    done: () => { notify(`Purged ${v.name}.`); rerender(); },
+  });
+}
+
+function deletedVolumeTable(items, poolList) {
+  const poolsById = byId(poolList);
+  return table([
+    { title: "Name", cell: (v) => [el("strong", {}, v.name), el("span", { class: "sub mono" }, v.id)], text: (v) => `${v.name} ${v.id}` },
+    { title: "Pool", cell: (v) => (poolsById[v.pool_id] ? link(poolsById[v.pool_id].name, "pool", v.pool_id) : mono(v.pool_id)) },
+    { title: "Size", num: true, cell: (v) => [humanSize(v.size_bytes), el("span", { class: "sub" }, `${humanSize(v.allocated_bytes || 0)} held`)] },
+    { title: "Deleted", cell: (v) => [humanTime(v.deleted_at), v.deleted_by && el("span", { class: "sub" }, `by ${v.deleted_by}`)] },
+    { title: "Purged", cell: (v) => (v.purging ? pill("Purging", "warn") : humanTime(v.purge_at)) },
+    { title: "", cell: (v) => el("div", { class: "row-actions" },
+      action(can.admin && !v.purging, { onclick: () => restoreVolumeDialog(v) }, "Restore"),
+      action(can.admin, { class: "danger-quiet", onclick: () => purgeVolumeDialog(v) }, "Purge")) },
+  ], items, { empty: "No deleted volumes.", state: stateOf("deleted-volumes") });
 }
 
 function volumeTable(items, poolList, options = {}) {
@@ -826,7 +884,8 @@ function poolPicker(poolList, current) {
 }
 
 async function volumes(poolId) {
-  const [items, poolList] = await Promise.all([list("/volumes" + (poolId ? "?pool_id=" + encodeURIComponent(poolId) : ""), "volumes"), list("/pools", "pools")]);
+  const q = poolId ? "?pool_id=" + encodeURIComponent(poolId) : "";
+  const [items, poolList, deleted] = await Promise.all([list("/volumes" + q, "volumes"), list("/pools", "pools"), list("/deleted-volumes" + q, "volumes")]);
   const exported = items.filter((v) => v.attachment_state === "BLOCK_EXPORT").length;
   return [
     el("h1", {}, poolId ? `Volumes in ${(poolList.find((p) => p.id === poolId) || {}).name || poolId}` : "Volumes"),
@@ -836,6 +895,11 @@ async function volumes(poolId) {
         : el("span", { class: "muted" }, ["Create a pool to make volumes: see ", el("a", { href: "#/pools" }, "Pools")])),
     volumeTable(items, poolList),
     items.length > 0 && el("p", { class: "count" }, `${exported} of ${items.length} are exported.`),
+    deleted.length > 0 && [
+      el("h2", { id: "deleted-volumes" }, "Deleted volumes"),
+      el("p", { class: "muted" }, "Deleted volumes keep their data, and their space in the pool, until they're purged. An administrator can restore one until then, or purge it now to free the space."),
+      deletedVolumeTable(deleted, poolList),
+    ],
   ];
 }
 
@@ -863,8 +927,10 @@ async function volume(id) {
       action(can.provision, { id: "take-snapshot", onclick: () => snapshotDialog(v) }, "Take snapshot"),
       action(can.provision, { id: "grow-volume", onclick: () => growDialog(v) }, "Grow"),
       action(can.provision, { id: "qos-volume", onclick: () => qosDialog(v) }, "Limits"),
-      action(can.provision, { class: "danger-quiet", id: "delete-volume", disabled: exps.length > 0, onclick: () => deleteVolumeDialog(v) }, "Delete"),
-      exps.length > 0 && can.provision && el("span", { class: "muted" }, "It can't be deleted while it's exported.")),
+      action(can.admin, { id: "protect-volume", onclick: () => protectionDialog(v) }, v.deletion_protection ? "Unprotect" : "Protect"),
+      action(can.provision, { class: "danger-quiet", id: "delete-volume", disabled: exps.length > 0 || v.deletion_protection, onclick: () => deleteVolumeDialog(v) }, "Delete"),
+      exps.length > 0 && can.provision && el("span", { class: "muted" }, "It can't be deleted while it's exported."),
+      !exps.length && v.deletion_protection && can.provision && el("span", { class: "muted" }, "It can't be deleted while it's protected.")),
     el("dl", { class: "facts" },
       fact("Health", health(v)),
       fact("Space", usage ? [bar(usage.allocated_bytes, usage.size_bytes), el("span", { class: "sub" }, "Includes what it shares with its snapshots.")] : el("span", { class: "muted" }, "SPDK can't say at the moment.")),
@@ -873,6 +939,7 @@ async function volume(id) {
       fact("Exported", exps.length ? exps.map((e) => el("div", {}, link(e.name, "export", e.id), ` (${protoName(e.protocol)})`)) : pill("Not exported", "quiet")),
       v.parent_snapshot_id && fact("Cloned from", `snapshot ${v.parent_snapshot_id}`),
       fact("Limits", qos || "None"),
+      fact("Deletion protection", v.deletion_protection ? pill("On", "ok") : "Off"),
       fact("UUID", mono(v.uuid)),
       fact("SPDK bdev", mono(v.lvol_bdev_name)),
       fact("Created", humanTime(v.created_at)),
@@ -903,7 +970,7 @@ function groupBySnapshot(vgs) {
 function deleteSnapshotDialog(s) {
   confirmDialog({
     title: `Delete snapshot ${s.name}`,
-    intro: "This can't be undone. A snapshot that volumes were cloned from is refused.",
+    intro: "This can't be undone. If volumes were cloned from it, it disappears now and its data goes once they've been deleted and purged.",
     submit: "Delete snapshot",
     action: () => send("DELETE", "/snapshots/" + encodeURIComponent(s.id)),
     done: () => { notify(`Deleted snapshot ${s.name}.`); rerender(); },
@@ -1416,8 +1483,8 @@ function rebootDialog(hostname) {
 
 async function system() {
   const soft = (err) => { if (err instanceof Unauthorized) throw err; return null; };
-  const [st, os, containers, rebuild, backups] = await Promise.all([api("/system/status"), api("/system/os").catch(soft), api("/system/containers").catch(soft), api("/system/rebuild").catch(soft),
-    can.admin ? api("/system/backups").catch(soft) : null]);
+  const [st, os, containers, rebuild, backups, retention] = await Promise.all([api("/system/status"), api("/system/os").catch(soft), api("/system/containers").catch(soft), api("/system/rebuild").catch(soft),
+    can.admin ? api("/system/backups").catch(soft) : null, api("/system/volume-retention").catch(soft)]);
   const ctr = containers || { available: false };
   const rec = st.reconciler || {};
   const dep = (d) => (d ? [mono(d.image || "-"), el("span", { class: "sub" }, [d.version, d.timestamp && humanTime(d.timestamp)].filter(Boolean).join(", "))] : "-");
@@ -1443,11 +1510,27 @@ async function system() {
         os && os.available
           ? el("dl", { class: "facts" }, fact("Booted", dep(os.booted)), fact("Staged", dep(os.staged)), fact("Rollback", dep(os.rollback)))
           : el("div", { class: "panel-notice" }, (os && os.message) || "bootc isn't available on this host."))),
+    (rec.unmanaged_objects || []).length > 0 && [
+      el("div", { class: "section-head" }, el("h2", { id: "unmanaged" }, "Not managed by Velocor")),
+      el("div", { class: "panel-notice warn" }, "spdk_tgt holds these, but no Velocor record accounts for them. Velocor leaves them alone. They may be leftovers of a failed operation, or, after the database was lost, the only copy of data: import the pool or restore a database backup if they're yours. Subsystems and targets may give hosts access that no export controls."),
+      table([
+        { title: "Kind", cell: (o) => o.kind },
+        { title: "Name", cell: (o) => [mono(o.name), o.uuid && el("span", { class: "sub mono" }, o.uuid)], text: (o) => `${o.name} ${o.uuid || ""}` },
+        { title: "Details", cell: (o) => o.detail || "-" },
+        { title: "Since", cell: (o) => humanTime(o.first_seen) },
+      ], rec.unmanaged_objects, { empty: "", state: stateOf("unmanaged") }),
+    ],
     rebuild && [
       el("div", { class: "section-head" }, el("h2", {}, "Rebuild speed"),
         action(can.admin, { id: "rebuild-speed", onclick: () => rebuildSpeedDialog(rebuild.max_mb_per_sec) }, "Change")),
       el("p", {}, rebuild.max_mb_per_sec ? `Each rebuilding pool uses at most ${rebuild.max_mb_per_sec} MB/s.` : "Unlimited: rebuilds run as fast as the disks allow."),
       el("p", { class: "muted" }, "A limit leaves more bandwidth for hosts while a disk is rebuilt, but the pool stays without full redundancy for longer. A change applies to rebuilds that start after it; one already running keeps its speed."),
+    ],
+    retention && [
+      el("div", { class: "section-head" }, el("h2", {}, "Deleted volumes"),
+        action(can.admin, { id: "volume-retention", onclick: () => retentionDialog(retention.hours) }, "Change")),
+      el("p", {}, retention.hours ? `A deleted volume is kept for ${retentionText(retention.hours)}, then purged.` : "Deleted volumes are destroyed at once."),
+      el("p", { class: "muted" }, "While kept, a deleted volume can be restored by an administrator, and it still takes up its space in the pool. A change applies to volumes deleted after it."),
     ],
     backups && backupSection(backups),
     el("div", { class: "section-head" }, el("h2", {}, "Containers")),
@@ -1516,6 +1599,21 @@ function restoreFileDialog() {
       return raw("POST", "/system/restore", v.file);
     },
     done: afterRestore,
+  });
+}
+
+function retentionDialog(current) {
+  openDialog({
+    title: "Keep deleted volumes",
+    intro: "How long a deleted volume's data is kept, so it can be restored, before it is destroyed. 0 destroys it at once.",
+    submit: "Save",
+    fields: [{ name: "hours", label: "Hours (0 to 720)", value: String(current ?? 24), required: true }],
+    action: (v) => {
+      const n = Number(v.hours);
+      if (!Number.isInteger(n) || n < 0 || n > 720) throw new Error("Enter a whole number of hours from 0 to 720.");
+      return send("PUT", "/system/volume-retention", { hours: n });
+    },
+    done: () => { notify("Saved."); rerender(); },
   });
 }
 

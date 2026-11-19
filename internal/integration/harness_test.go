@@ -174,7 +174,10 @@ type appliance struct {
 
 func newAppliance(t *testing.T, tg *target) *appliance {
 	t.Helper()
-	dataplane.SSDBackend = "aio" // rootless containers can't set up io_uring (see TODO.md P0-6)
+	// The test containers run confined (SELinux container_t), where io_uring_setup fails and
+	// spdk_tgt would crash on the first io_uring bdev (TODO.md P0-6). "auto" must see that and
+	// use AIO; if it didn't, every test here would lose its spdk_tgt.
+	dataplane.SSDBackend = "auto"
 	st, err := store.OpenBoltStore(filepath.Join(t.TempDir(), "velocor.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -189,6 +192,7 @@ func newAppliance(t *testing.T, tg *target) *appliance {
 		t.Fatal(err)
 	}
 	rec := reconciler.New(st, tg.client(), nil, nil)
+	rec.SetUnmanagedGrace(0) // report unaccounted SPDK objects at once, so tests can assert there are none
 	ts := httptest.NewServer(server.New(st, tg.client(), nil, authMgr, rec, nil).Handler())
 	t.Cleanup(ts.Close)
 	return &appliance{t: t, tg: tg, st: st, rec: rec, ts: ts, token: tok, port: freePort(t)}

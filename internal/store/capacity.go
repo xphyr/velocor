@@ -74,10 +74,15 @@ func (sp SpacePolicy) Validate() error {
 }
 
 // CommittedBytes is the worst case a pool has promised: every volume (thin or thick, clones
-// included) fully written, plus the clusters every snapshot holds now.
+// included) fully written, plus the clusters every snapshot and every deleted volume waiting
+// to be purged holds now.
 func CommittedBytes(volumes []*Volume, snapshots []*Snapshot) uint64 {
 	var k uint64
 	for _, v := range volumes {
+		if v.Deleted() {
+			k += v.AllocatedBytes // can't grow any more: only what it holds
+			continue
+		}
 		k += v.SizeBytes
 	}
 	for _, s := range snapshots {

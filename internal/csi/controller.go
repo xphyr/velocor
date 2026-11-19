@@ -235,6 +235,9 @@ func (s *ControllerServer) DeleteVolume(ctx context.Context, req *csi.DeleteVolu
 		if IsNotFound(err) {
 			return &csi.DeleteVolumeResponse{}, nil
 		}
+		if IsAlreadyExists(err) { // 409: protected, exported or attached
+			return nil, status.Error(codes.FailedPrecondition, err.Error())
+		}
 		return nil, mapAPIError(err)
 	}
 	return &csi.DeleteVolumeResponse{}, nil
