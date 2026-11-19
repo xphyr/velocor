@@ -29,8 +29,14 @@ func (a *appliance) failDisk(id string) {
 	if err != nil {
 		a.t.Fatal(err)
 	}
-	if err := a.tg.client().BdevAioDelete(context.Background(), d.SPDKBdevName); err != nil {
-		a.t.Fatalf("hot-remove %s: %v", id, err)
+	// The SSD backend is chosen at attach (--ssd-bdev auto: io_uring where spdk_tgt can use it,
+	// as on CI runners; AIO under SELinux confinement, as in rootless podman on Fedora).
+	del := a.tg.client().BdevUringDelete
+	if d.DriverState == store.DiskDriverStateAIOClaimed {
+		del = a.tg.client().BdevAioDelete
+	}
+	if err := del(context.Background(), d.SPDKBdevName); err != nil {
+		a.t.Fatalf("hot-remove %s (%s): %v", id, d.DriverState, err)
 	}
 }
 

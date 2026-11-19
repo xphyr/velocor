@@ -102,7 +102,10 @@ func (tg *target) start() {
 	tg.t.Helper()
 	_, _ = podman(tg.t, "rm", "-f", "-t", "0", tg.name)
 	_ = os.Remove(tg.socket())
+	// Unconfined like the appliance's quadlet (SecurityLabelDisable=true), so SELinux hosts run
+	// the same SSD backend (io_uring) as the appliance and CI runners (TODO.md P0-6).
 	out, err := podman(tg.t, "run", "-d", "--name", tg.name, "--network", "host", "--security-opt", "seccomp=unconfined",
+		"--security-opt", "label=disable",
 		"-v", tg.dir+":"+tg.dir+":z", "--entrypoint", "spdk_tgt", image(),
 		"-r", tg.socket(), "-m", "0x1", "-s", "1024", "--no-huge", "--no-pci", "--interrupt-mode", "--json", "/etc/velocor/spdk.json")
 	if err != nil {
