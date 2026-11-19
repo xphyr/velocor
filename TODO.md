@@ -678,6 +678,10 @@ Everything here was written by Gemini and is in scope to rewrite.
   `make` targets verified locally, but the GitHub-side pieces (ghcr login, cosign, attestations,
   rootless podman with arm64 emulation on the runner, the PR local registry) are only proven by
   a first run. Also enable Renovate on the repository (`renovate.json`).
+  **2026-11-19:** PR #5 green after fixing the rebuild tests for io_uring on runners (`fefb779`);
+  merged; the repository is now public, so the `main` run is the first with attestations.
+  Pre-release tags (`v0.1.0-rc.1`) now push only their own image tag (not `0.1`/`latest`) and
+  create a GitHub pre-release, so the release job can be proven with an rc tag first.
 - [x] **B1/B2.** The OS image now embeds the velod/spdk images built and pushed in the same run
   (`make push`; one CI job) as `oci-archive` and its quadlets reference them by digest, so an
   appliance runs exactly what it was built with, needs no registry at boot, and changes only via

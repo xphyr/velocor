@@ -178,6 +178,9 @@ jobs:
           elif [[ "$GITHUB_REF" == refs/tags/v* ]]; then
             v="${GITHUB_REF_NAME}"; minor="$(cut -d. -f1,2 <<<"${v#v}")"
             prefix="$REGISTRY/$owner"; tag="$v"; extra="$minor latest"; release=true; insecure=false
+            # A pre-release (v0.1.0-rc.1) gets only its own tag: "0.1" and "latest" stay on the
+            # last final release.
+            if [[ "$v" == *-* ]]; then extra=""; fi
           else
             prefix="$REGISTRY/$owner"; tag="sha-${GITHUB_SHA::7}"; extra="${GITHUB_REF_NAME//\//-}"; release=false; insecure=false
           fi
@@ -361,6 +364,9 @@ jobs:
             dist/velocor-csi-*.tgz
       - uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3.0.4
         with:
+          # v0.1.0-rc.1 and the like: a pre-release, never shown as the latest release.
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          make_latest: ${{ !contains(github.ref_name, '-') }}
           generate_release_notes: true
           files: |
             dist/veloctl-*
