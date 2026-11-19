@@ -734,6 +734,13 @@ Everything here was written by Gemini and is in scope to rewrite.
   0.1.0-rc.1 with the CSI image pinned by digest; packages are public. *Left:* enable
   Renovate; the old `latest` tags on ghcr (pre-review build 977d4ae, 2026-11-14) until the
   first final release replaces them.
+- [x] **B23. Every pull request ran every job** (about 15 minutes, with an SPDK build and the
+  integration tests) even when it changed only the Helm chart or docs. Since 2026-11-19 a
+  `changes` job classifies a PR's files (`hack/ci-changes.sh`): Go code runs the unit tests,
+  veloctl and images; SPDK's build or patches the SPDK patch tests and images; other image
+  inputs the images; the chart, static manifests and docs only lint (which lints and renders
+  the chart). Unknown paths (the workflow, the Makefile, renovate.json) run everything. main
+  and tags always run everything; skipped jobs count as passed checks.
 - [x] **B1/B2.** The OS image now embeds the velod/spdk images built and pushed in the same run
   (`make push`; one CI job) as `oci-archive` and its quadlets reference them by digest, so an
   appliance runs exactly what it was built with, needs no registry at boot, and changes only via
