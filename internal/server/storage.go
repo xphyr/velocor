@@ -936,7 +936,7 @@ func (s *Server) handleCreateVolumeGroupSnapshot(w http.ResponseWriter, r *http.
 		pool *store.Pool
 	}
 	targets := make([]target, 0, len(volIDs))
-	var nqns []string
+	var exported []string
 	for _, volID := range volIDs {
 		vol, err := s.liveVolume(volID)
 		if err != nil {
@@ -954,11 +954,20 @@ func (s *Server) handleCreateVolumeGroupSnapshot(w http.ResponseWriter, r *http.
 			writeError(w, err)
 			return
 		}
-		for _, e := range exps {
-			if dataplane.IsNVMe(e.Protocol) && !containsString(nqns, e.SubsystemNQN) {
-				nqns = append(nqns, e.SubsystemNQN)
-			}
+		if len(exps) > 0 {
+			exported = append(exported, vol.Name)
 		}
+	}
+	// A group snapshot must capture every member at the same instant. That needs host I/O to
+	// the members paused while they are snapshotted, and SPDK v26.09 offers no way to do that
+	// (TODO.md P1-15): snapshots taken one after another while hosts write are not consistent
+	// with each other, so they are refused rather than presented as a group.
+	if len(exported) > 0 {
+		writeJSON(w, http.StatusPreconditionFailed, map[string]any{"error": fmt.Sprintf(
+			"can't take a consistent group snapshot of volumes in use (%s): Velocor can't pause their I/O together yet. "+
+				"Snapshot them while no host uses them, or snapshot each volume on its own (not consistent with each other)",
+			strings.Join(exported, ", "))})
+		return
 	}
 	if err := s.requireSPDK(); err != nil {
 		writeError(w, err)
@@ -968,24 +977,6 @@ func (s *Server) handleCreateVolumeGroupSnapshot(w http.ResponseWriter, r *http.
 	ctx := r.Context()
 	cleanup := context.WithoutCancel(ctx)
 
-	// Quiesce NVMe-oF I/O on every member so all snapshots capture the same instant.
-	// (iSCSI exports have no pause RPC; for those the group is best-effort ordered.)
-	var paused []string
-	resume := func() {
-		for _, nqn := range paused {
-			s.resumeSubsystem(cleanup, nqn)
-		}
-		paused = nil
-	}
-	defer resume()
-	for _, nqn := range nqns {
-		if err := s.spdk.NvmfSubsystemPause(ctx, nqn); err != nil {
-			writeError(w, fmt.Errorf("pause %s for consistent group snapshot: %w", nqn, err))
-			return
-		}
-		paused = append(paused, nqn)
-	}
-
 	var snaps []*store.Snapshot
 	var releases []func()
 	defer func() {
@@ -994,7 +985,6 @@ func (s *Server) handleCreateVolumeGroupSnapshot(w http.ResponseWriter, r *http.
 		}
 	}()
 	rollback := func(err error) {
-		resume()
 		for _, sn := range snaps {
 			_ = s.store.DeleteSnapshot(sn.ID)
 			_ = s.spdk.BdevLvolDelete(cleanup, sn.UUID)
@@ -1010,7 +1000,6 @@ func (s *Server) handleCreateVolumeGroupSnapshot(w http.ResponseWriter, r *http.
 		releases = append(releases, release)
 		snaps = append(snaps, snap)
 	}
-	resume()
 
 	snapIDs := make([]string, 0, len(snaps))
 	for i, sn := range snaps {
@@ -1042,15 +1031,6 @@ func (s *Server) handleCreateVolumeGroupSnapshot(w http.ResponseWriter, r *http.
 		"volume_group_snapshot": vgs,
 		"snapshots":             snaps,
 	})
-}
-
-func containsString(list []string, v string) bool {
-	for _, x := range list {
-		if x == v {
-			return true
-		}
-	}
-	return false
 }
 
 func (s *Server) handleDeleteVolumeGroupSnapshot(w http.ResponseWriter, r *http.Request) {
@@ -1229,28 +1209,4 @@ func (s *Server) handleDeleteExport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{})
-}
-
-// resumeSubsystem resumes I/O on a subsystem paused for a group snapshot. A paused subsystem
-// holds every host's I/O, so a failed resume is retried (in the background, with backoff)
-// rather than left for an operator to notice.
-func (s *Server) resumeSubsystem(ctx context.Context, nqn string) {
-	if err := s.spdk.NvmfSubsystemResume(ctx, nqn); err == nil || spdk.IsNotFound(err) {
-		return
-	} else {
-		s.logger.Error("resume nvmf subsystem after group snapshot failed; retrying", "nqn", nqn, "error", err)
-	}
-	go func() {
-		delay := 200 * time.Millisecond
-		for attempt := 1; attempt <= 60; attempt++ {
-			time.Sleep(delay)
-			err := s.spdk.NvmfSubsystemResume(ctx, nqn)
-			if err == nil || spdk.IsNotFound(err) {
-				s.logger.Info("resumed nvmf subsystem", "nqn", nqn, "attempt", attempt)
-				return
-			}
-			delay = min(delay*2, 5*time.Second)
-		}
-		s.logger.Error("nvmf subsystem is still paused after retries; hosts' I/O is blocked", "nqn", nqn)
-	}()
 }

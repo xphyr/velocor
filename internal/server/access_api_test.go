@@ -1,9 +1,10 @@
 package server
 
 import (
+	"fmt"
 	"net/http"
+	"strings"
 	"testing"
-	"time"
 )
 
 // nvmeExport creates a pool, volume, NVMe/TCP portal and an export limited to a group with hostNQN.
@@ -95,17 +96,21 @@ func TestUpdateInitiatorGroupReappliesExports(t *testing.T) {
 	}
 }
 
-func TestGroupSnapshotResumeIsRetried(t *testing.T) {
+// A group snapshot of volumes in use is refused (TODO.md P1-15): SPDK can't pause their I/O
+// together, and snapshots taken one by one while hosts write aren't consistent with each other.
+func TestGroupSnapshotOfExportedVolumesIsRefused(t *testing.T) {
 	h := newHarness(t)
-	exp, vol, _ := h.nvmeExport("nqn.2026-01.io.example:host-a")
-	_ = exp
-	h.fake.Fail("nvmf_subsystem_resume", 2)
-	h.expect(h.do("POST", "/api/v1/volume-group-snapshots", h.admin, map[string]any{"name": "g", "volume_ids": []string{vol["id"].(string)}}))(http.StatusCreated)
-	deadline := time.Now().Add(5 * time.Second)
-	for h.fake.CallCount("nvmf_subsystem_resume") < 3 && time.Now().Before(deadline) {
-		time.Sleep(50 * time.Millisecond)
+	_, vol, _ := h.nvmeExport("nqn.2026-01.io.example:host-a")
+	pool := vol["pool_id"].(string)
+	other := h.volume(pool, "idle", 64<<20)
+	code, out := h.do("POST", "/api/v1/volume-group-snapshots", h.admin, map[string]any{"name": "g", "volume_ids": []string{vol["id"].(string), other["id"].(string)}})
+	if code != http.StatusPreconditionFailed || !strings.Contains(fmt.Sprint(out["error"]), vol["name"].(string)) || strings.Contains(fmt.Sprint(out["error"]), "idle") {
+		t.Fatalf("group snapshot of an exported volume: HTTP %d %v; want 412 naming only the exported volume", code, out)
 	}
-	if n := h.fake.CallCount("nvmf_subsystem_resume"); n < 3 {
-		t.Fatalf("a failed resume must be retried until it succeeds; resume called %d times", n)
+	if snaps, _ := h.st.ListSnapshots("", ""); len(snaps) != 0 {
+		t.Fatalf("a refused group snapshot left %d snapshots", len(snaps))
 	}
+	// Volumes no host uses can still be snapshotted as a group.
+	another := h.volume(pool, "idle2", 64<<20)
+	h.expect(h.do("POST", "/api/v1/volume-group-snapshots", h.admin, map[string]any{"name": "g2", "volume_ids": []string{other["id"].(string), another["id"].(string)}}))(http.StatusCreated)
 }

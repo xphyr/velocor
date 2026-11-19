@@ -214,17 +214,6 @@ func (c *Client) NvmfSubsystemAllowAnyHost(ctx context.Context, nqn string, allo
 	return c.Call(ctx, "nvmf_subsystem_allow_any_host", params, nil)
 }
 
-// NvmfSubsystemPause quiesces I/O on a subsystem: outstanding commands complete and new
-// ones are queued until NvmfSubsystemResume. Used to take crash-consistent group snapshots.
-func (c *Client) NvmfSubsystemPause(ctx context.Context, nqn string) error {
-	return c.Call(ctx, "nvmf_subsystem_pause", map[string]any{"nqn": nqn}, nil)
-}
-
-// NvmfSubsystemResume resumes I/O on a subsystem paused with NvmfSubsystemPause.
-func (c *Client) NvmfSubsystemResume(ctx context.Context, nqn string) error {
-	return c.Call(ctx, "nvmf_subsystem_resume", map[string]any{"nqn": nqn}, nil)
-}
-
 // NvmfController is a host controller connected to an NVMe-oF subsystem.
 type NvmfController struct {
 	Cntlid      uint32 `json:"cntlid"`

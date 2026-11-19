@@ -420,7 +420,7 @@ The Velocor CSI driver (`velocor-csi`) integrates Kubernetes clusters with a Vel
 - **Online Volume Expansion** (`allowVolumeExpansion: true`)
 - **CoW Volume Snapshots & Restores** (`VolumeSnapshot`)
 - **Volume Cloning** (`dataSource` referencing an existing `PersistentVolumeClaim` or `VolumeSnapshot`)
-- **Volume Group Snapshots** (`VolumeGroupSnapshot` via CSI `GroupController`)
+- **Volume Group Snapshots** (`VolumeGroupSnapshot` via CSI `GroupController`), of volumes no host is using: Velocor can't yet pause I/O on several volumes at once, so a group snapshot of volumes in use is refused (`FailedPrecondition`) rather than taken inconsistently.
 
 #### Shared volumes and KubeVirt live migration
 

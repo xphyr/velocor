@@ -286,3 +286,41 @@ func TestRAID5FRefused(t *testing.T) {
 		t.Fatalf("SPDK can now create a volume store on raid5f: RAID5F support can be reconsidered")
 	}
 }
+
+// Group snapshots on real SPDK (TODO.md P1-15): SPDK v26.09 can't pause the members' I/O
+// together, so a group including an exported volume is refused (HTTP 412) and leaves nothing
+// behind; once no host uses the volumes, the group is taken and each member snapshot holds its
+// volume's data.
+func TestGroupSnapshots(t *testing.T) {
+	a, pool, vol, in := setup(t, "RAID0", 1)
+	data := randomData(t, 1<<20)
+	if err := in.write(0, data); err != nil {
+		t.Fatal(err)
+	}
+	other := a.must("POST", "/volumes", map[string]any{"name": "w", "pool_id": pool["id"], "size_bytes": volSize, "thin_provision": true}, "volume")
+	ids := []string{vol["id"].(string), other["id"].(string)}
+
+	if code, out := a.do("POST", "/volume-group-snapshots", map[string]any{"name": "g", "volume_ids": ids}); code != 412 {
+		t.Fatalf("group snapshot with an exported member: HTTP %d %v, want 412", code, out)
+	}
+	if snaps := a.must("GET", "/snapshots", nil, "")["snapshots"].([]any); len(snaps) != 0 {
+		t.Fatalf("a refused group snapshot left %d snapshots", len(snaps))
+	}
+
+	for _, e := range a.must("GET", "/exports?volume_id="+vol["id"].(string), nil, "")["exports"].([]any) {
+		a.must("DELETE", "/exports/"+e.(map[string]any)["id"].(string), nil, "")
+	}
+	g := a.must("POST", "/volume-group-snapshots", map[string]any{"name": "g", "volume_ids": ids}, "")
+	members := g["snapshots"].([]any)
+	if len(members) != 2 {
+		t.Fatalf("group snapshot: %v", g)
+	}
+	var mine string
+	for _, m := range members {
+		if m.(map[string]any)["volume_id"] == vol["id"] {
+			mine = m.(map[string]any)["id"].(string)
+		}
+	}
+	clone := a.must("POST", "/snapshots/"+mine+":clone", map[string]any{"clone_name": "gc"}, "volume")
+	a.initiator(a.exportTo(clone["id"].(string), "gc", hostA), hostA).mustRead(0, data)
+}
