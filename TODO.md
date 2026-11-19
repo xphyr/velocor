@@ -586,6 +586,13 @@ work still open, ranked by risk to data, how fixes are verified, and what has be
   snapshot of exported volumes under I/O, and removing the RPC from the fake until real SPDK
   has it. Until then, refuse group snapshots of exported volumes with a clear error rather
   than a 500.
+  **Interim done (2026-11-19):** a group snapshot including an exported volume (NVMe/TCP or
+  iSCSI; iSCSI used to be snapshotted one by one, silently not consistent) is refused with
+  HTTP 412 naming the volumes, which CSI reports as FailedPrecondition; nothing is left behind.
+  The pause/resume RPCs are gone from velod's client and from the fake. New integration test
+  `TestGroupSnapshots` (real SPDK): refusal while exported, then a group taken once unexported,
+  with a member's clone holding the data. README says group snapshots need volumes no host uses.
+  *Left:* the real fix (quiescing I/O through an SPDK patch) and its test under I/O.
 - [ ] **P2-11. velod reports ONLINE before a restarted data plane is restored.** After an SPDK
   restart, status said ONLINE within ~10 s while volume stores, the iSCSI portal and target came
   back about a minute later.
@@ -700,6 +707,12 @@ Everything here was written by Gemini and is in scope to rewrite.
 - [ ] **B15. CI compiles SPDK on every run** (one compile per run, shared by the integration
   tests and the image). *Option:* reuse the previous `velocor-spdk` image when
   `Containerfile.spdk` hasn't changed.
+  **Partly (2026-11-19, B23):** pull requests that change only the chart, manifests or docs no
+  longer build anything. Go-only pull requests, and every run on `main` and tags, still compile
+  SPDK. A cache keyed on `Containerfile.spdk`, the patches, the SPDK commit and the resolved
+  Fedora base digest would mostly hit within a day only, since the rolling base (B17) changes
+  almost daily; keeping SPDK's base fixed between real SPDK changes would save more but give up
+  B17's daily fixes for SPDK. Undecided trade-off; not worth doing for now.
 - [x] **B18. CI review after the SPDK patch and rolling bases (2026-11-17).** Nothing we
   changed broke the workflow (all builds go through `make`; the static CSI manifest still
   matches the chart), but: (1) the integration tests and the push resolved the rolling Fedora
