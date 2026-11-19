@@ -26,7 +26,13 @@
         "/^quay\\.io/fedora//"
       ],
       "groupName": "Fedora base images",
-      "pinDigests": false
+      "pinDigests": false,
+      "labels": [
+        "needs-lab-test"
+      ],
+      "prBodyNotes": [
+        "A new Fedora release under the appliance: build the images and run the integration suite and an install on the lab VM before merging."
+      ]
     },
     {
       "description": "Built-in monitoring (P1-1): Prometheus and Alertmanager move together",
@@ -35,6 +41,44 @@
         "quay.io/prometheus/alertmanager"
       ],
       "groupName": "Built-in monitoring"
+    },
+    {
+      "description": "Velocor's own images are set by the release pipeline (chart values, OS image), never by Renovate",
+      "matchPackageNames": [
+        "/^ghcr\\.io/xphyr//"
+      ],
+      "enabled": false
+    },
+    {
+      "description": "The CSI sidecars move together and are tested on a cluster before merging",
+      "matchPackageNames": [
+        "/^registry\\.k8s\\.io/sig-storage//"
+      ],
+      "groupName": "CSI sidecars",
+      "labels": [
+        "needs-cluster-test"
+      ],
+      "prBodyNotes": [
+        "Test before merging on two clusters, one arm64 and one x86_64 (with KubeVirt): CI only renders the chart."
+      ]
+    },
+    {
+      "description": "GitHub Actions in one PR (upload-artifact and download-artifact must move together)",
+      "matchManagers": [
+        "github-actions"
+      ],
+      "matchDatasources": [
+        "github-tags",
+        "github-releases"
+      ],
+      "groupName": "GitHub Actions"
+    },
+    {
+      "description": "A new CI runner image changes podman and the kernel under the integration tests: only on request (Dependency Dashboard)",
+      "matchDatasources": [
+        "github-runners"
+      ],
+      "dependencyDashboardApproval": true
     }
   ],
   "customManagers": [
