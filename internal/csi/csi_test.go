@@ -23,8 +23,9 @@ import (
 )
 
 type fakeMounter struct {
-	mu      sync.Mutex
-	mounted map[string]bool
+	mu                  sync.Mutex
+	mounted             map[string]bool
+	disconnectedVolumes []string
 }
 
 func newFakeMounter() *fakeMounter {
@@ -36,6 +37,13 @@ func (f *fakeMounter) ConnectTarget(_ context.Context, publishCtx map[string]str
 }
 
 func (f *fakeMounter) DisconnectTarget(_ context.Context, _ map[string]string) error {
+	return nil
+}
+
+func (f *fakeMounter) DisconnectVolume(_ context.Context, volumeID string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.disconnectedVolumes = append(f.disconnectedVolumes, volumeID)
 	return nil
 }
 
