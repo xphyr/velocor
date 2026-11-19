@@ -393,11 +393,23 @@ work still open, ranked by risk to data, how fixes are verified, and what has be
   *Left:* delivery to a real email/webhook receiver isn't tested (no receiver in the lab);
   Slack/PagerDuty-native receivers (webhook covers them through relays).
 
-- [ ] **P1-3. Network changes can lock the appliance out.** `PUT /system/network/interfaces/{name}`
+- [x] **P1-3. Network changes can lock the appliance out.** `PUT /system/network/interfaces/{name}`
   applies at once; a wrong static address or disabling the management interface cuts the
   appliance off, and changing an interface that carries portals breaks the SAN silently.
   *Needed:* apply, then confirm from a new connection within ~120 s or roll back automatically;
   refuse or warn about interfaces that host portals.
+  **Done (2026-11-19):** velod takes a NetworkManager checkpoint of the interface (rollback
+  after 120 s, 60-600 s), applies the change with `nmcli --temporary`, and answers 202 with the
+  pending change; `POST /system/network/confirm` saves it and commits the checkpoint, `/rollback`
+  restores it now. Without a confirmation NetworkManager itself restores the checkpoint, so the
+  appliance comes back even if velod can't be reached. Interfaces carrying portals need
+  `"force": true`; one change at a time. Network page: confirm banner with countdown and a link
+  to the new address; `veloctl system network [confirm|rollback <id>]` for the console.
+  Lab-checked on the p01-lab VM (dev-5a3608e): a wrong static address cut the API off and
+  NetworkManager restored DHCP at the 60 s deadline (reachable again after 55 s, velod reported
+  EXPIRED); a confirmed MTU change survived a reboot; an unconfirmed one was gone after a
+  reboot during its window. *Left:* a pending change is forgotten if velod restarts during the
+  window (NetworkManager still rolls it back; it just can't be confirmed any more).
 
 - [x] **P1-4. Deletion is immediate and irreversible.** With CSI automation and API tokens, one
   mistake is unrecoverable. *Needed:* per-volume deletion protection and/or a recycle period in
@@ -867,7 +879,7 @@ Before tagging the first release (agreed 2026-11-19): P1-13 portal choice (done)
 tag to prove the release pipeline (B16). B8: no qcow2 with releases (the README explains how to
 build one). The real-hardware tests of P0-1 and P0-4 stay open.
 
-After the release gate: P1-1 alerting (done 2026-11-19), P1-3 network rollback, P2-2 scrub, P2-11 (P1-5 orphan
+After the release gate: P1-1 alerting (done 2026-11-19), P1-3 network rollback (done 2026-11-19), P2-2 scrub, P2-11 (P1-5 orphan
 reporting done 2026-11-18).
 
 ---
