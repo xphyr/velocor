@@ -1412,10 +1412,12 @@ async function portals() {
 
 // --- Network ---
 
-function interfaceDialog(i) {
+function interfaceDialog(i, portalsHere) {
   openDialog({
     title: `Configure ${i.name}`,
-    intro: "Changing the interface you're connected through can cut this session off. Have console access ready.",
+    intro: "The change is applied for a trial period: confirm it on this page from a connection that still works, or it's rolled back automatically, also if this session is cut off.",
+    warning: portalsHere.length > 0 && el("div", { class: "panel-notice warn" },
+      `${i.name} carries the portals ${portalsHere.map((p) => p.name).join(", ")}: changing it interrupts every host connected through them.`),
     submit: "Apply",
     danger: true,
     fields: [
@@ -1425,18 +1427,48 @@ function interfaceDialog(i) {
       { name: "gateway", label: "Gateway", when: (v) => v.method === "manual", value: i.gateway },
       { name: "dns", label: "DNS servers", when: (v) => v.method === "manual", value: (i.dns || []).join(", "), placeholder: "Comma separated" },
       { name: "mtu", label: "MTU", number: true, when: (v) => v.method !== "disabled", value: i.mtu ? String(i.mtu) : "", hint: "9000 for jumbo frames on a storage network." },
-    ],
-    action: (x) => send("PUT", "/system/network/interfaces/" + encodeURIComponent(i.name), { method: x.method, address: x.address, gateway: x.gateway, dns: x.dns, mtu: Number(x.mtu) || 0 }),
-    done: () => { notify(`Applied to ${i.name}.`); rerender(); },
+      { name: "timeout", label: "Seconds to confirm (60 to 600)", value: "120" },
+      portalsHere.length > 0 && { name: "force", kind: "tick", text: "Change it anyway, interrupting the hosts using these portals", value: false },
+    ].filter(Boolean),
+    action: (x) => {
+      if (portalsHere.length > 0 && !x.force) throw new Error("Tick the box to change an interface that carries portals.");
+      return send("PUT", "/system/network/interfaces/" + encodeURIComponent(i.name), {
+        method: x.method, address: x.address, gateway: x.gateway, dns: x.dns, mtu: Number(x.mtu) || 0,
+        confirm_timeout_seconds: Number(x.timeout) || 120, force: !!x.force });
+    },
+    done: (r) => { notify(r.message || `Applied to ${i.name}; confirm it to keep it.`); rerender(); },
   });
 }
 
+// pendingChangeBanner asks to confirm a network change before NetworkManager rolls it back.
+function pendingChangeBanner(c) {
+  const left = Math.max(0, Math.round((new Date(c.deadline) - Date.now()) / 1000));
+  const newURL = c.new_address && !c.old_addresses.some((a) => a.split("/")[0] === c.new_address)
+    ? `${location.protocol}//${c.new_address}${location.port ? ":" + location.port : ""}/#/network` : "";
+  const act = (path, msg) => async () => {
+    try { await send("POST", path, { id: c.id }); notify(msg); } catch (err) { notify(err.message); }
+    rerender();
+  };
+  return el("div", { class: "panel-notice warn", role: "alert" },
+    el("strong", {}, `Confirm the change to ${c.interface}`),
+    el("p", {}, `It's rolled back automatically in ${left} seconds unless confirmed. Confirm only if you can still reach the appliance the way you need to.`),
+    newURL && el("p", {}, ["If this page stops answering, open ", el("a", { href: newURL }, newURL), " (sign in again there) and confirm from that page."]),
+    el("div", { class: "row-actions" },
+      action(can.admin, { class: "primary", id: "confirm-network", onclick: act("/system/network/confirm", "Change confirmed and saved.") }, "Confirm"),
+      action(can.admin, { class: "danger-quiet", id: "rollback-network", onclick: act("/system/network/rollback", "Change rolled back.") }, "Roll back now")));
+}
+
 async function network() {
-  const net = await api("/system/network");
+  const [net, portalList] = await Promise.all([api("/system/network"), list("/portals", "portals")]);
+  const portalsOn = (i) => portalList.filter((p) => (i.addresses || []).some((a) => a.split("/")[0] === p.ip_address));
+  const last = net.last_change;
   return [
     el("h1", {}, "Network"),
     !net.available && el("div", { class: "panel-notice warn" }, net.message || "Network information isn't available."),
     net.available && !net.nmcli_available && el("div", { class: "panel-notice warn" }, "NetworkManager isn't reachable, so interfaces can only be viewed."),
+    net.pending_change && pendingChangeBanner(net.pending_change),
+    !net.pending_change && last && last.state !== "CONFIRMED" && (Date.now() - new Date(last.finished_at)) < 3600e3 &&
+      el("div", { class: "panel-notice" }, `The change to ${last.interface} was ${last.state === "EXPIRED" ? "not confirmed in time and was rolled back" : "rolled back"} ${humanTime(last.finished_at)}.`),
     el("dl", { class: "facts" }, fact("Hostname", net.hostname)),
     el("h2", {}, "Interfaces"),
     table([
@@ -1444,11 +1476,13 @@ async function network() {
       { title: "Link", cell: (i) => (i.link_up ? pill("Up", "ok") : pill("Down", "quiet")) },
       { title: "Addressing", cell: (i) => i.method || "-" },
       { title: "Addresses", cell: (i) => (i.addresses || []).map((a) => el("div", { class: "mono" }, a)) },
+      { title: "Portals", cell: (i) => portalsOn(i).map((p) => p.name).join(", ") || "-" },
       { title: "Gateway", cell: (i) => mono(i.gateway || "-") },
       { title: "DNS", cell: (i) => (i.dns || []).join(", ") || "-" },
       { title: "MTU", num: true, cell: (i) => i.mtu },
       { title: "MAC", cell: (i) => mono(i.mac || "-") },
-      { title: "", cell: (i) => el("div", { class: "row-actions" }, can.admin && net.nmcli_available && i.type !== "loopback" && el("button", { onclick: () => interfaceDialog(i) }, "Configure")) },
+      { title: "", cell: (i) => el("div", { class: "row-actions" }, can.admin && net.nmcli_available && i.type !== "loopback" &&
+        el("button", { disabled: !!net.pending_change, onclick: () => interfaceDialog(i, portalsOn(i)) }, "Configure")) },
     ], net.interfaces || [], { filter: false, empty: "No interfaces.", state: stateOf("ifaces") }),
   ];
 }

@@ -58,6 +58,8 @@ type Server struct {
 	sbReader      func(*store.Disk) (*hardware.RaidSuperblock, error) // tests
 	monitoring    *monitoring.Manager
 	mon           monitoringState
+	net           *netChanges
+	netQuery      func(context.Context) NetworkStatus // tests
 }
 
 // WithInsecureHTTP records that the API is served over plain HTTP, so status can warn about it.
@@ -156,6 +158,7 @@ func New(
 		mux:        http.NewServeMux(),
 
 		loginLimiter: newLoginLimiter(),
+		net:          &netChanges{backend: nmHost{}},
 	}
 	for _, o := range opts {
 		o(s)
@@ -321,6 +324,8 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /api/v1/system/containers", s.withAuth(store.RoleReadOnly, s.handleListContainers))
 	s.mux.HandleFunc("GET /api/v1/system/network", s.withAuth(store.RoleReadOnly, s.handleGetNetwork))
 	s.mux.HandleFunc("PUT /api/v1/system/network/interfaces/{name}", s.withAuth(store.RoleAdmin, s.handleUpdateNetworkInterface))
+	s.mux.HandleFunc("POST /api/v1/system/network/confirm", s.withAuth(store.RoleAdmin, s.handleConfirmNetworkChange))
+	s.mux.HandleFunc("POST /api/v1/system/network/rollback", s.withAuth(store.RoleAdmin, s.handleRollbackNetworkChange))
 }
 
 type contextKey string

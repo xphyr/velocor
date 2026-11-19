@@ -340,7 +340,7 @@ func runToken(cfg *cliConfig, args []string) error {
 
 func runSystem(cfg *cliConfig, args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("subcommand required: status | os | reconcile | iostats | upgrade | rollback | reboot | containers | rebuild | volume-retention | monitoring | backup | backups | restore")
+		return fmt.Errorf("subcommand required: status | os | reconcile | iostats | upgrade | rollback | reboot | containers | rebuild | volume-retention | monitoring | network | backup | backups | restore")
 	}
 	switch args[0] {
 	case "backup", "backups", "restore":
@@ -390,6 +390,49 @@ func runSystem(cfg *cliConfig, args []string) error {
 			fmt.Println("Deleted volumes: deleted at once")
 		} else {
 			fmt.Printf("Deleted volumes: kept %d hours before they are purged\n", h)
+		}
+		return nil
+
+	case "network":
+		// veloctl system network [confirm|rollback <change-id>]
+		if len(args) >= 3 && (args[1] == "confirm" || args[1] == "rollback") {
+			resp, err := cfg.request("POST", "/api/v1/system/network/"+args[1], map[string]any{"id": args[2]})
+			if err != nil {
+				return err
+			}
+			if cfg.jsonOutput {
+				return printJSON(resp)
+			}
+			c, _ := resp["change"].(map[string]any)
+			fmt.Printf("Change %v to %v: %v\n", c["id"], c["interface"], c["state"])
+			return nil
+		}
+		resp, err := cfg.request("GET", "/api/v1/system/network", nil)
+		if err != nil {
+			return err
+		}
+		if cfg.jsonOutput {
+			return printJSON(resp)
+		}
+		tw := newTabWriter()
+		fmt.Fprintln(tw, "INTERFACE\tLINK\tADDRESSING\tADDRESSES\tMTU")
+		for _, i := range sliceOfMaps(resp["interfaces"]) {
+			link := "down"
+			if i["link_up"] == true {
+				link = "up"
+			}
+			var addrs []string
+			for _, a := range sliceOfAny(i["addresses"]) {
+				addrs = append(addrs, fmt.Sprint(a))
+			}
+			fmt.Fprintf(tw, "%v\t%s\t%v\t%s\t%v\n", i["name"], link, i["method"], strings.Join(addrs, ","), i["mtu"])
+		}
+		_ = tw.Flush()
+		if c, ok := resp["pending_change"].(map[string]any); ok {
+			fmt.Printf("\nPENDING: change %v to %v, rolled back at %v unless confirmed:\n  veloctl system network confirm %v\n  veloctl system network rollback %v\n",
+				c["id"], c["interface"], c["deadline"], c["id"], c["id"])
+		} else if c, ok := resp["last_change"].(map[string]any); ok {
+			fmt.Printf("\nLast change: %v to %v, %v\n", c["id"], c["interface"], c["state"])
 		}
 		return nil
 
