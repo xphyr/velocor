@@ -371,6 +371,13 @@ work still open, ranked by risk to data, how fixes are verified, and what has be
   data plane, reconciler, per pool/volume/disk I/O); 25 rules in
   `deploy/monitoring/velocor-alerts.rules.yml` with promtool unit tests (`make check-alerts`,
   in lint and CI); a Go test ties rule metrics to the exporter; `docs/monitoring.md`.
+  **Step 2 code (2026-11-19, not yet lab-tested):** `internal/monitoring` (config, scrape-token
+  rotation, systemctl start/stop/restart, AllowedCPUs off SPDK's reactors, status);
+  `MonitoringEnabled` setting, `GET|PUT /system/monitoring`, `veloctl system monitoring`,
+  System page section; status warns when nothing scrapes /metrics and built-in is off;
+  quadlets `velocor-prometheus` / `velocor-alertmanager` (no [Install], loopback ports
+  19090/19093, memory limits); images quay.io/prometheus v3.15.1 / v0.34.2 embedded in the OS
+  image; Renovate regex manager for those ARGs.
 
 - [ ] **P1-3. Network changes can lock the appliance out.** `PUT /system/network/interfaces/{name}`
   applies at once; a wrong static address or disabling the management interface cuts the

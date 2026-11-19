@@ -13,6 +13,8 @@ Network=host
 SecurityLabelDisable=true
 PodmanArgs=--privileged --pid=host
 Volume=/var/lib/velocor:/var/lib/velocor:rw
+# Built-in monitoring's config (velod writes it) and data.
+Volume=/var/lib/velocor-monitoring:/var/lib/velocor-monitoring:rw
 Volume=/run/velocor:/run/velocor:rw
 Volume=/sys:/sys:rw
 Volume=/dev:/dev:rslave

@@ -340,7 +340,7 @@ func runToken(cfg *cliConfig, args []string) error {
 
 func runSystem(cfg *cliConfig, args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("subcommand required: status | os | reconcile | iostats | upgrade | rollback | reboot | containers | rebuild | volume-retention | backup | backups | restore")
+		return fmt.Errorf("subcommand required: status | os | reconcile | iostats | upgrade | rollback | reboot | containers | rebuild | volume-retention | monitoring | backup | backups | restore")
 	}
 	switch args[0] {
 	case "backup", "backups", "restore":
@@ -390,6 +390,54 @@ func runSystem(cfg *cliConfig, args []string) error {
 			fmt.Println("Deleted volumes: deleted at once")
 		} else {
 			fmt.Printf("Deleted volumes: kept %d hours before they are purged\n", h)
+		}
+		return nil
+
+	case "monitoring":
+		fs := flag.NewFlagSet("system monitoring", flag.ExitOnError)
+		on := fs.Bool("on", false, "Turn on the built-in Prometheus and Alertmanager")
+		off := fs.Bool("off", false, "Turn them off (their data is kept)")
+		_ = fs.Parse(args[1:])
+		if *on && *off {
+			return fmt.Errorf("give --on or --off, not both")
+		}
+		var resp map[string]any
+		var err error
+		switch {
+		case *on || *off:
+			resp, err = cfg.request("PUT", "/api/v1/system/monitoring", map[string]any{"enabled": *on})
+		default:
+			resp, err = cfg.request("GET", "/api/v1/system/monitoring", nil)
+		}
+		if err != nil {
+			return err
+		}
+		if cfg.jsonOutput {
+			return printJSON(resp)
+		}
+		if resp["available"] != true {
+			fmt.Println("Built-in monitoring isn't available on this host (no /var/lib/velocor-monitoring).")
+			return nil
+		}
+		m, _ := resp["monitoring"].(map[string]any)
+		state := "off"
+		if m["enabled"] == true {
+			state = "on"
+		}
+		fmt.Printf("Built-in monitoring: %s (data kept %v days, at most %s)\n", state, m["retention_days"], humanBytes(uint64FromAny(m["retention_bytes"])))
+		for _, svc := range []string{"prometheus", "alertmanager"} {
+			s, _ := m[svc].(map[string]any)
+			st := "stopped"
+			switch {
+			case s["ready"] == true:
+				st = "running"
+			case s["active"] == true:
+				st = "starting"
+			}
+			if d, _ := s["detail"].(string); d != "" && st != "running" {
+				st += " (" + d + ")"
+			}
+			fmt.Printf("  %-13s %s\n", svc+":", st)
 		}
 		return nil
 

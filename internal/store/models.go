@@ -52,6 +52,8 @@ type Settings struct {
 	// intact) before the reconciler purges it; nil means DefaultVolumeRetention, 0 deletes at
 	// once.
 	VolumeRetentionHours *uint32 `json:"volume_retention_hours,omitempty"`
+	// MonitoringEnabled runs the built-in Prometheus and Alertmanager (TODO.md P1-1).
+	MonitoringEnabled bool `json:"monitoring_enabled,omitempty"`
 }
 
 // DiskType categorizes physical flash media tiers.

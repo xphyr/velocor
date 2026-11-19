@@ -19,6 +19,7 @@ import (
 	"github.com/velocor/velocor/internal/dataplane"
 	"github.com/velocor/velocor/internal/hardware"
 	"github.com/velocor/velocor/internal/meta"
+	"github.com/velocor/velocor/internal/monitoring"
 	"github.com/velocor/velocor/internal/reconciler"
 	"github.com/velocor/velocor/internal/server"
 	"github.com/velocor/velocor/internal/spdk"
@@ -47,6 +48,7 @@ func main() {
 		ssdBdev           = flag.String("ssd-bdev", envOrDefault("VELOCOR_SSD_BDEV", "auto"), "How SSDs are attached to SPDK: auto (default: io_uring if spdk_tgt can use it, else AIO), uring, or aio")
 		metricsPublic     = flag.Bool("metrics-public", os.Getenv("VELOCOR_METRICS_PUBLIC") == "true", "Serve /metrics without authentication (default: requires a READONLY token)")
 		metaCopies        = flag.Bool("meta-copies", os.Getenv("VELOCOR_META_COPIES") != "false", "Keep a copy of each pool's configuration on the pool (needs SPDK built with ublk and the ublk_drv module)")
+		monitoringDir     = flag.String("monitoring-dir", envOrDefault("VELOCOR_MONITORING_DIR", "/var/lib/velocor-monitoring"), "Directory for the built-in Prometheus/Alertmanager's config and data; the feature is offered only where it exists (the appliance image creates it)")
 		showVersion       = flag.Bool("version", false, "Print version information and exit")
 	)
 	flag.Parse()
@@ -159,7 +161,16 @@ func main() {
 	backups := &backup.Manager{Dir: filepath.Join(filepath.Dir(*dbPath), "backups"), DBPath: *dbPath, Source: st, Logger: logger}
 	go backups.Run(ctx)
 
+	var mon *monitoring.Manager
+	if fi, err := os.Stat(*monitoringDir); err == nil && fi.IsDir() {
+		scheme := "https"
+		if *insecureHTTP {
+			scheme = "http"
+		}
+		mon = &monitoring.Manager{Dir: *monitoringDir, MetricsURL: scheme + "://" + monitoring.LocalTarget(*listenAddr) + "/metrics"}
+	}
 	srv := server.New(st, spdkClient, hwMgr, authMgr, rec, logger,
+		server.WithMonitoring(mon),
 		server.WithPublicMetrics(*metricsPublic),
 		server.WithInsecureHTTP(*insecureHTTP),
 		server.WithBackups(backups, stop),
@@ -174,6 +185,9 @@ func main() {
 		IdleTimeout:       2 * time.Minute,
 		MaxHeaderBytes:    64 << 10,
 	}
+
+	// The built-in Prometheus/Alertmanager have no [Install]: velod starts them when they're on.
+	go srv.StartMonitoring(ctx)
 
 	errCh := make(chan error, 1)
 	go func() {

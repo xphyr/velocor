@@ -28,6 +28,7 @@ import (
 	"github.com/velocor/velocor/internal/dataplane"
 	"github.com/velocor/velocor/internal/hardware"
 	"github.com/velocor/velocor/internal/meta"
+	"github.com/velocor/velocor/internal/monitoring"
 	"github.com/velocor/velocor/internal/reconciler"
 	"github.com/velocor/velocor/internal/spdk"
 	"github.com/velocor/velocor/internal/store"
@@ -55,6 +56,8 @@ type Server struct {
 	restart       func()
 	metaDev       meta.Device
 	sbReader      func(*store.Disk) (*hardware.RaidSuperblock, error) // tests
+	monitoring    *monitoring.Manager
+	mon           monitoringState
 }
 
 // WithInsecureHTTP records that the API is served over plain HTTP, so status can warn about it.
@@ -114,6 +117,9 @@ func (s *Server) warnings() []string {
 	if s.hw != nil && s.hw.UnsafeNoIOMMUAllowed() {
 		out = append(out, "Unsafe no-IOMMU mode is allowed: SPDK can DMA anywhere in host memory. Use this only in lab VMs.")
 	}
+	if w := s.monitoringWarning(); w != "" {
+		out = append(out, w)
+	}
 	return out
 }
 
@@ -153,6 +159,22 @@ func New(
 	}
 	for _, o := range opts {
 		o(s)
+	}
+	if m := s.monitoring; m != nil {
+		if m.NewToken == nil {
+			m.NewToken = s.rotateScrapeToken
+		}
+		if m.ReactorCPUs == nil {
+			m.ReactorCPUs = s.reactorCPUs
+		}
+		if m.Run == nil {
+			m.Run = func(ctx context.Context, name string, args ...string) ([]byte, error) {
+				return hostCommand(ctx, name, args...).CombinedOutput()
+			}
+		}
+		if m.Logger == nil {
+			m.Logger = s.logger
+		}
 	}
 	s.removeStaleBootstrapFile()
 	s.registerRoutes()
@@ -232,6 +254,8 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /api/v1/deleted-volumes", s.withAuth(store.RoleReadOnly, s.handleListDeletedVolumes))
 	s.mux.HandleFunc("POST /api/v1/deleted-volumes/{id}/restore", s.withAuth(store.RoleAdmin, s.handleRestoreVolume))
 	s.mux.HandleFunc("DELETE /api/v1/deleted-volumes/{id}", s.withAuth(store.RoleAdmin, s.handlePurgeVolume))
+	s.mux.HandleFunc("GET /api/v1/system/monitoring", s.withAuth(store.RoleReadOnly, s.handleGetMonitoring))
+	s.mux.HandleFunc("PUT /api/v1/system/monitoring", s.withAuth(store.RoleAdmin, s.handlePutMonitoring))
 	s.mux.HandleFunc("GET /api/v1/system/volume-retention", s.withAuth(store.RoleReadOnly, s.handleGetVolumeRetention))
 	s.mux.HandleFunc("PUT /api/v1/system/volume-retention", s.withAuth(store.RoleAdmin, s.handlePutVolumeRetention))
 

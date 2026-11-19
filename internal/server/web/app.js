@@ -1483,8 +1483,8 @@ function rebootDialog(hostname) {
 
 async function system() {
   const soft = (err) => { if (err instanceof Unauthorized) throw err; return null; };
-  const [st, os, containers, rebuild, backups, retention] = await Promise.all([api("/system/status"), api("/system/os").catch(soft), api("/system/containers").catch(soft), api("/system/rebuild").catch(soft),
-    can.admin ? api("/system/backups").catch(soft) : null, api("/system/volume-retention").catch(soft)]);
+  const [st, os, containers, rebuild, backups, retention, mon] = await Promise.all([api("/system/status"), api("/system/os").catch(soft), api("/system/containers").catch(soft), api("/system/rebuild").catch(soft),
+    can.admin ? api("/system/backups").catch(soft) : null, api("/system/volume-retention").catch(soft), api("/system/monitoring").catch(soft)]);
   const ctr = containers || { available: false };
   const rec = st.reconciler || {};
   const dep = (d) => (d ? [mono(d.image || "-"), el("span", { class: "sub" }, [d.version, d.timestamp && humanTime(d.timestamp)].filter(Boolean).join(", "))] : "-");
@@ -1532,6 +1532,7 @@ async function system() {
       el("p", {}, retention.hours ? `A deleted volume is kept for ${retentionText(retention.hours)}, then purged.` : "Deleted volumes are destroyed at once."),
       el("p", { class: "muted" }, "While kept, a deleted volume can be restored by an administrator, and it still takes up its space in the pool. A change applies to volumes deleted after it."),
     ],
+    mon && mon.available && monitoringSection(mon.monitoring),
     backups && backupSection(backups),
     el("div", { class: "section-head" }, el("h2", {}, "Containers")),
     el("p", { class: "muted" }, "The containers are part of the operating system image, pinned to exact versions. They change only when you upgrade the operating system."),
@@ -1599,6 +1600,33 @@ function restoreFileDialog() {
       return raw("POST", "/system/restore", v.file);
     },
     done: afterRestore,
+  });
+}
+
+function monitoringSection(m) {
+  const svc = (s) => (s.ready ? pill("Running", "ok") : s.active ? pill("Starting", "warn") : pill(m.enabled ? "Not running" : "Off", m.enabled ? "bad" : ""));
+  return [
+    el("div", { class: "section-head" }, el("h2", {}, "Monitoring and alerts"),
+      action(can.admin, { id: "monitoring", onclick: () => monitoringDialog(m.enabled) }, m.enabled ? "Turn off" : "Turn on")),
+    el("p", {}, m.enabled
+      ? `Built-in Prometheus and Alertmanager are on. They keep ${m.retention_days} days of history (at most ${humanSize(m.retention_bytes)}) and evaluate Velocor's alert rules.`
+      : "Built-in monitoring is off. Turn it on to evaluate Velocor's alert rules and keep history on the appliance, or scrape /metrics with your own Prometheus."),
+    m.enabled && el("dl", { class: "facts" }, fact("Prometheus", svc(m.prometheus)), fact("Alertmanager", svc(m.alertmanager))),
+    el("p", { class: "muted" }, "Alerts sent from the appliance can't report that the appliance itself is down: also monitor it from outside (see docs/monitoring.md)."),
+  ];
+}
+
+function monitoringDialog(enabled) {
+  openDialog({
+    title: enabled ? "Turn off monitoring" : "Turn on monitoring",
+    intro: enabled
+      ? "Prometheus and Alertmanager stop, and no alerts are evaluated until monitoring is turned on again. Their history stays on disk."
+      : `Starts Prometheus and Alertmanager on the appliance, listening only on localhost. They use some memory and CPU, kept off SPDK's cores, and up to 2 GB of the boot disk for history.`,
+    submit: enabled ? "Turn off" : "Turn on",
+    danger: enabled,
+    fields: [],
+    action: () => send("PUT", "/system/monitoring", { enabled: !enabled }),
+    done: () => { notify(enabled ? "Monitoring is off." : "Monitoring is on."); rerender(); },
   });
 }
 

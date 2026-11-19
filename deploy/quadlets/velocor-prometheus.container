@@ -1,0 +1,27 @@
+[Unit]
+Description=Velocor built-in Prometheus (started by velod when monitoring is on)
+After=velocor-velod.service
+
+[Container]
+# Filled in by the OS image build with the embedded image, pinned by digest.
+Image=@VELOCOR_PROMETHEUS_IMAGE@
+ContainerName=velocor-prometheus
+# Host network, but listening on loopback only; velod proxies what the UI needs.
+Network=host
+# velod writes config/ (read-only here); the data directory is the container's own.
+Volume=/var/lib/velocor-monitoring/config:/etc/velocor-monitoring:ro,z
+Volume=/var/lib/velocor-monitoring/prometheus:/prometheus:Z
+Exec=--config.file=/etc/velocor-monitoring/prometheus.yml \
+     --storage.tsdb.path=/prometheus \
+     --storage.tsdb.retention.time=15d \
+     --storage.tsdb.retention.size=2GB \
+     --web.listen-address=127.0.0.1:19090 \
+     --web.enable-lifecycle
+
+[Service]
+# Never compete with SPDK or velod for memory; velod also keeps it off SPDK's cores.
+MemoryMax=768M
+CPUWeight=20
+Restart=on-failure
+RestartSec=10s
+# No [Install]: only velod starts it, when built-in monitoring is turned on.

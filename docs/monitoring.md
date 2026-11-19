@@ -4,13 +4,41 @@ velod exports Prometheus metrics at `https://<appliance>:8443/metrics`, and Velo
 of alert rules for them in [`deploy/monitoring/`](../deploy/monitoring/). Point an existing
 Prometheus and Alertmanager at the appliance as described below.
 
-A built-in Prometheus and Alertmanager on the appliance (off by default, configured from the
-UI, with history graphs) is the next step of this work; it will run the same rules.
+Or turn on the appliance's **built-in Prometheus and Alertmanager** (below), which run the same
+rules.
 
 **Monitor from outside as well.** Alerts sent by the appliance itself can't report that the
 appliance is down, hung or cut off from the network. Route the always-firing `VelocorWatchdog`
 alert to a dead man's switch (a heartbeat service that raises an alarm when the heartbeat stops),
 and alert on `up{job="velocor"} == 0` from a Prometheus that runs elsewhere.
+
+## Built-in monitoring
+
+Off by default. Turn it on from the System page, or:
+
+```bash
+veloctl system monitoring --on      # --off stops it; with neither, shows its state
+```
+
+velod then writes the configuration under `/var/lib/velocor-monitoring/config` and starts two
+containers that ship with the OS image (pinned by digest, updated with OS upgrades):
+
+- **Prometheus** on `127.0.0.1:19090`: scrapes velod every 30 seconds with its own READONLY
+  token (`builtin-prometheus`, replaced each time velod applies the setting), evaluates the
+  shipped rules, and keeps 15 days of history, at most 2 GB, in
+  `/var/lib/velocor-monitoring/prometheus`.
+- **Alertmanager** on `127.0.0.1:19093`, without clustering.
+
+Both listen on localhost only, are limited in memory (768 MB and 256 MB) and CPU weight, and
+velod keeps them off the cores SPDK polls on. Their units have no `[Install]` section: velod
+starts them at boot when the setting is on. Turning monitoring off stops them and keeps their
+data.
+
+Alert receivers (email, webhook), per-rule settings, active alerts and history graphs in the UI
+are the next steps.
+
+Until monitoring is on, or something else scrapes `/metrics`, the status page warns that no
+alerts reach anyone (after velod has been up for 15 minutes).
 
 ## Scraping
 

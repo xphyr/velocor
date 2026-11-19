@@ -133,6 +133,7 @@ func statusOrUnknown[T ~string](s T) string {
 }
 
 func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
+	s.noteScrape(r)
 	m := s.collectMetrics(r.Context())
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 	_ = m.writeTo(w)
