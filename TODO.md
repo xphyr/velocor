@@ -605,9 +605,17 @@ work still open, ranked by risk to data, how fixes are verified, and what has be
   `TestGroupSnapshots` (real SPDK): refusal while exported, then a group taken once unexported,
   with a member's clone holding the data. README says group snapshots need volumes no host uses.
   *Left:* the real fix (quiescing I/O through an SPDK patch) and its test under I/O.
-- [ ] **P2-11. velod reports ONLINE before a restarted data plane is restored.** After an SPDK
+- [x] **P2-11. velod reports ONLINE before a restarted data plane is restored.** After an SPDK
   restart, status said ONLINE within ~10 s while volume stores, the iSCSI portal and target came
   back about a minute later.
+  **Done (2026-11-19):** status was the last completed pass's verdict, and that pass had
+  reconciled the spdk_tgt that just died. Now each pass records which spdk_tgt process it
+  reconciled (PID and start time from /proc, `hardware.SPDKInstance`; velod shares the host PID
+  namespace); when the running one differs, status says RECONCILING (`spdk.restoring`, a notice
+  on the overview, metric `velocor_dataplane_restoring`) until a pass covers it, and the
+  reconciler starts that pass within 2 s instead of at the next 15 s tick. Checked on real SPDK
+  in `TestDataSurvivesCrashAndRestart` (RECONCILING right after a crash or clean restart, ONLINE
+  after the pass). Without a visible process (another PID namespace) there is no detection.
 - [x] **P2-12. An enabled export on a portal whose address is gone retries forever with SPDK's
   error.** Lab, 2026-11-18: after a reboot removed 10.77.0.1, the export on that portal was
   DEGRADED with "add listener 10.77.0.1:4420 ...: spdk rpc error (code -32602): Invalid
@@ -921,7 +929,7 @@ Before tagging the first release (agreed 2026-11-19): P1-13 portal choice (done)
 tag to prove the release pipeline (B16). B8: no qcow2 with releases (the README explains how to
 build one). The real-hardware tests of P0-1 and P0-4 stay open.
 
-After the release gate: P1-1 alerting (done 2026-11-19), P1-3 network rollback (done 2026-11-19), P2-2 scrub, P2-11 (P1-5 orphan
+After the release gate: P1-1 alerting (done 2026-11-19), P1-3 network rollback (done 2026-11-19), P2-2 scrub, P2-11 (done 2026-11-19) (P1-5 orphan
 reporting done 2026-11-18).
 
 ---

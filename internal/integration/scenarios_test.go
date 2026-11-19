@@ -55,7 +55,18 @@ func TestDataSurvivesCrashAndRestart(t *testing.T) {
 				a.tg.stop()
 			}
 			a.tg.start()
+			// Until a pass has restored the new spdk_tgt, status must not say ONLINE (P2-11).
+			health := func() string { return a.must("GET", "/system/status", nil, "")["overall_health"].(string) }
+			visible := a.rec.SPDKInstance() != ""
+			if !visible {
+				t.Log("spdk_tgt's process isn't visible from here: restart detection can't be checked")
+			} else if h := health(); h != "RECONCILING" {
+				t.Fatalf("right after the %s restart, status says %s, want RECONCILING", how, h)
+			}
 			st := a.reconcile()
+			if h := health(); visible && h != "ONLINE" {
+				t.Fatalf("after restoring, status says %s, want ONLINE (%+v)", h, st)
+			}
 			p, _ := a.st.GetPool(pool["id"].(string))
 			v, _ := a.st.GetVolume(vol["id"].(string))
 			if p.HealthStatus != store.HealthStatusOnline || v.HealthStatus != store.HealthStatusOnline || p.LVSUUID != pool["lvs_uuid"] {
