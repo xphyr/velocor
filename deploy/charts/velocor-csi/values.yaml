@@ -2,7 +2,7 @@ driverName: csi.velocor.io
 
 image:
   repository: ghcr.io/xphyr/velocor-csi
-  tag: "" # Defaults to Chart.appVersion
+  tag: "@sha256:0fc52c2faaaf16dc28ec36438a282841f06ebec5fa656e102664a7b17d851870" # Defaults to Chart.appVersion
   # sha256:... pins the image (used instead of the tag); release charts set it.
   digest: ""
   pullPolicy: IfNotPresent
@@ -53,19 +53,19 @@ node:
 
 sidecars:
   provisioner:
-    image: registry.k8s.io/sig-storage/csi-provisioner:v5.1.0
+    image: registry.k8s.io/sig-storage/csi-provisioner:v5.1.0@sha256:672e45d6a55678abc1d102de665b5cbd63848e75dc7896f238c8eaaf3c7d322f
     resources: {}
   attacher:
-    image: registry.k8s.io/sig-storage/csi-attacher:v4.7.0
+    image: registry.k8s.io/sig-storage/csi-attacher:v4.7.0@sha256:6e54dae32284f60a2de1645c527715e4c934e5ce7899560c0d845bac957118dc
     resources: {}
   resizer:
-    image: registry.k8s.io/sig-storage/csi-resizer:v1.12.0
+    image: registry.k8s.io/sig-storage/csi-resizer:v1.12.0@sha256:ab774734705a906561e15b67f6a96538f3ad520335d636f793aaafe87a3b5200
     resources: {}
   snapshotter:
-    image: registry.k8s.io/sig-storage/csi-snapshotter:v8.1.0
+    image: registry.k8s.io/sig-storage/csi-snapshotter:v8.1.0@sha256:b3e90b33781670ac050c22c9e88b9e876493dca248966b9da6f7a90cc412ab86
     resources: {}
   nodeDriverRegistrar:
-    image: registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.12.0
+    image: registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.12.0@sha256:0d23a6fd60c421054deec5e6d0405dc3498095a5a597e175236c0692f4adee0f
     resources: {}
 
 storageClasses:
