@@ -65,7 +65,7 @@ func (s *Server) StartMonitoring(ctx context.Context) {
 	if !st.MonitoringEnabled {
 		return
 	}
-	if err := s.monitoring.Apply(ctx, true); err != nil {
+	if err := s.monitoring.Apply(ctx, true, st.Alerting); err != nil {
 		s.logger.Error("starting built-in monitoring failed", "err", err)
 	}
 }
@@ -145,7 +145,7 @@ func (s *Server) handlePutMonitoring(w http.ResponseWriter, r *http.Request) {
 	// Starting both services can take a while on the first run; don't tie it to the client.
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 2*time.Minute)
 	defer cancel()
-	if err := s.monitoring.Apply(ctx, *req.Enabled); err != nil {
+	if err := s.monitoring.Apply(ctx, *req.Enabled, st.Alerting); err != nil {
 		s.logger.Error("applying the monitoring setting failed", "enabled", *req.Enabled, "err", err)
 		writeError(w, fmt.Errorf("monitoring is now %s, but: %w", map[bool]string{true: "on", false: "off"}[*req.Enabled], err))
 		return

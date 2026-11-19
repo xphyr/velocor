@@ -140,3 +140,23 @@ code.command { display: inline-block; padding: .1rem .4rem; border-radius: 5px; 
 dialog textarea { width: 100%; min-height: 4.5rem; font: inherit; font-family: var(--mono); font-size: .9em; color: inherit; padding: .35rem .55rem; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); }
 dialog input[type="number"] { font: inherit; color: inherit; padding: .35rem .55rem; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); width: 100%; }
 .account .role { color: var(--muted); font-size: .82rem; }
+
+/* History graphs (built-in monitoring). */
+.graph-panel { margin: .5rem 0 1rem; }
+.range-picker { display: flex; gap: .25rem; margin-bottom: .5rem; }
+.range-picker .range { padding: .15rem .55rem; font-size: .85rem; }
+.range-picker .range.on { background: var(--accent-soft); color: var(--accent); border-color: var(--accent); font-weight: 600; }
+.graphs { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 380px), 1fr)); gap: .75rem; }
+.graph { margin: 0; padding: .6rem .75rem .4rem; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; min-width: 0; }
+.graph figcaption { display: flex; flex-wrap: wrap; justify-content: space-between; gap: .25rem .75rem; font-size: .88rem; font-weight: 600; }
+.graph-legend { display: flex; gap: .75rem; font-weight: 400; color: var(--muted); }
+.legend::before { content: ""; display: inline-block; width: .7rem; height: .2rem; margin-right: .3rem; vertical-align: middle; border-radius: 1px; }
+.legend-0::before { background: var(--accent); }
+.legend-1::before { background: var(--warn); }
+.chart { display: block; width: 100%; height: auto; }
+.chart-grid { stroke: var(--line); stroke-width: 1; }
+.chart-axis { fill: var(--muted); font-size: 11px; }
+.chart-empty { fill: var(--muted); font-size: 13px; }
+.chart-line { fill: none; stroke-width: 1.8; stroke-linejoin: round; vector-effect: non-scaling-stroke; }
+.chart-line-0 { stroke: var(--accent); }
+.chart-line-1 { stroke: var(--warn); }

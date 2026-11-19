@@ -22,7 +22,7 @@ import (
 	"sync"
 	"time"
 
-	rules "github.com/velocor/velocor/deploy/monitoring"
+	"github.com/velocor/velocor/internal/store"
 )
 
 const (
@@ -59,6 +59,8 @@ type Manager struct {
 	Run         Runner
 	HTTP        *http.Client
 	Logger      *slog.Logger
+	// PrometheusAddr and AlertmanagerAddr override where the services are reached (tests).
+	PrometheusAddr, AlertmanagerAddr string
 
 	mu sync.Mutex
 }
@@ -86,6 +88,20 @@ func (m *Manager) logger() *slog.Logger {
 	return slog.Default()
 }
 
+func (m *Manager) promAddr() string {
+	if m.PrometheusAddr != "" {
+		return m.PrometheusAddr
+	}
+	return PrometheusAddr
+}
+
+func (m *Manager) amAddr() string {
+	if m.AlertmanagerAddr != "" {
+		return m.AlertmanagerAddr
+	}
+	return AlertmanagerAddr
+}
+
 func (m *Manager) client() *http.Client {
 	if m.HTTP != nil {
 		return m.HTTP
@@ -95,7 +111,7 @@ func (m *Manager) client() *http.Client {
 
 // Apply makes the services match enabled: writes the configuration and starts (or reloads)
 // them, or stops them. Their data stays on disk when they are stopped.
-func (m *Manager) Apply(ctx context.Context, enabled bool) error {
+func (m *Manager) Apply(ctx context.Context, enabled bool, alerting store.AlertingSettings) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if !enabled {
@@ -113,7 +129,17 @@ func (m *Manager) Apply(ctx context.Context, enabled bool) error {
 			m.Instance = strings.TrimSpace(string(out))
 		}
 	}
-	if err := m.writeConfig(); err != nil {
+	token, err := m.NewToken()
+	if err != nil {
+		return fmt.Errorf("create the scrape token: %w", err)
+	}
+	if err := os.MkdirAll(filepath.Join(m.Dir, "config"), 0o750); err != nil {
+		return err
+	}
+	if err := writeShared(filepath.Join(m.Dir, "config", "scrape.token"), []byte(token)); err != nil {
+		return err
+	}
+	if err := m.writeConfig(alerting); err != nil {
 		return err
 	}
 	cpus := m.allowedCPUs(ctx)
@@ -136,8 +162,8 @@ func (m *Manager) Apply(ctx context.Context, enabled bool) error {
 // Status reports the services' state.
 func (m *Manager) Status(ctx context.Context, enabled bool) Status {
 	st := Status{Enabled: enabled, RetentionDays: RetentionDays, RetentionBytes: RetentionBytes}
-	st.Prometheus = m.service(ctx, PrometheusUnit, PrometheusAddr)
-	st.Alertmanager = m.service(ctx, AlertmanagerUnit, AlertmanagerAddr)
+	st.Prometheus = m.service(ctx, PrometheusUnit, m.promAddr())
+	st.Alertmanager = m.service(ctx, AlertmanagerUnit, m.amAddr())
 	return st
 }
 
@@ -196,24 +222,51 @@ func (m *Manager) allowedCPUs(ctx context.Context) string {
 	return formatCPUList(free)
 }
 
-// writeConfig writes prometheus.yml, the rules, the scrape token and alertmanager.yml.
-func (m *Manager) writeConfig() error {
+// Reconfigure rewrites the rules and Alertmanager's configuration and reloads both services
+// (no restart, same scrape token).
+func (m *Manager) Reconfigure(ctx context.Context, alerting store.AlertingSettings) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := m.writeConfig(alerting); err != nil {
+		return err
+	}
+	var errs []error
+	for _, addr := range []string{m.promAddr(), m.amAddr()} {
+		if err := m.do(ctx, http.MethodPost, addr, "/-/reload", nil, nil); err != nil {
+			errs = append(errs, fmt.Errorf("reload %s: %w", addr, err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// writeConfig writes prometheus.yml, the rules and alertmanager.yml with its secret files.
+func (m *Manager) writeConfig(alerting store.AlertingSettings) error {
 	cfg := filepath.Join(m.Dir, "config")
 	if err := os.MkdirAll(cfg, 0o750); err != nil {
 		return err
 	}
-	token, err := m.NewToken()
+	ruleData, err := RenderRules(alerting.Rules)
 	if err != nil {
-		return fmt.Errorf("create the scrape token: %w", err)
+		return err
 	}
+	am, secrets := alertmanagerConfig(alerting)
 	files := map[string][]byte{
-		"scrape.token":             []byte(token),
-		"velocor-alerts.rules.yml": rules.Rules,
+		"velocor-alerts.rules.yml": ruleData,
 		"prometheus.yml":           []byte(m.prometheusConfig()),
-		"alertmanager.yml":         []byte(alertmanagerConfig()),
+		"alertmanager.yml":         []byte(am),
 	}
 	for name, data := range files {
 		if err := writeShared(filepath.Join(cfg, name), data); err != nil {
+			return err
+		}
+	}
+	for _, name := range secretFiles {
+		path := filepath.Join(cfg, name)
+		if data, ok := secrets[name]; ok {
+			if err := writeShared(path, []byte(data)); err != nil {
+				return err
+			}
+		} else if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return err
 		}
 	}
@@ -273,19 +326,66 @@ scrape_configs:
 `, AlertmanagerAddr, scheme, path, host, instance)
 }
 
-// alertmanagerConfig has no receivers yet: alerts are listed in the UI; receivers (email,
-// webhook) come with the alerting settings (TODO.md P1-1 step 3).
-func alertmanagerConfig() string {
-	return `# Written by velod (built-in monitoring); changes are overwritten.
-route:
-  receiver: none
-  group_by: [alertname, pool, disk]
-  group_wait: 30s
-  group_interval: 5m
-  repeat_interval: 4h
-receivers:
-  - name: none
-`
+// secretFiles are the receivers' secrets, kept out of alertmanager.yml.
+var secretFiles = []string{"smtp.password", "webhook.url", "heartbeat.url"}
+
+// alertmanagerConfig routes alerts by severity to the configured receivers, and the watchdog
+// to the heartbeat URL. It returns the config and the secret files it refers to.
+func alertmanagerConfig(a store.AlertingSettings) (string, map[string]string) {
+	secrets := map[string]string{}
+	var sb strings.Builder
+	sb.WriteString("# Written by velod (built-in monitoring); changes are overwritten.\n")
+	critical, warning := []string{}, []string{}
+	receiver := func(min string, conf string) {
+		critical = append(critical, conf)
+		if min != "critical" {
+			warning = append(warning, conf)
+		}
+	}
+	if e := a.Email; e != nil && len(e.To) > 0 {
+		var c strings.Builder
+		fmt.Fprintf(&c, "      - to: %q\n        from: %q\n        smarthost: %q\n        require_tls: %t\n        send_resolved: true\n",
+			strings.Join(e.To, ", "), e.From, net.JoinHostPort(e.SMTPHost, fmt.Sprint(e.SMTPPort)), e.RequireTLS)
+		if e.Username != "" {
+			fmt.Fprintf(&c, "        auth_username: %q\n", e.Username)
+		}
+		if e.Password != "" {
+			secrets["smtp.password"] = e.Password
+			c.WriteString("        auth_password_file: /etc/velocor-monitoring/smtp.password\n")
+		}
+		receiver(e.MinSeverity, "    email_configs:\n"+c.String())
+	}
+	if w := a.Webhook; w != nil && w.URL != "" {
+		secrets["webhook.url"] = w.URL
+		receiver(w.MinSeverity, "    webhook_configs:\n      - url_file: /etc/velocor-monitoring/webhook.url\n        send_resolved: true\n")
+	}
+	if a.HeartbeatURL != "" {
+		secrets["heartbeat.url"] = a.HeartbeatURL
+	}
+
+	sb.WriteString("route:\n  receiver: none\n  group_by: [alertname, pool, disk, volume, export]\n  group_wait: 30s\n  group_interval: 5m\n  repeat_interval: 4h\n  routes:\n")
+	if a.HeartbeatURL != "" {
+		sb.WriteString("    - matchers: ['alertname=\"VelocorWatchdog\"']\n      receiver: heartbeat\n      group_wait: 0s\n      group_interval: 1m\n      repeat_interval: 5m\n")
+	} else {
+		sb.WriteString("    - matchers: ['alertname=\"VelocorWatchdog\"']\n      receiver: none\n")
+	}
+	if len(critical) > 0 {
+		sb.WriteString("    - matchers: ['severity=\"critical\"']\n      receiver: critical\n")
+	}
+	if len(warning) > 0 {
+		sb.WriteString("    - matchers: ['severity=\"warning\"']\n      receiver: warning\n")
+	}
+	sb.WriteString("receivers:\n  - name: none\n")
+	if len(critical) > 0 {
+		sb.WriteString("  - name: critical\n" + strings.Join(critical, ""))
+	}
+	if len(warning) > 0 {
+		sb.WriteString("  - name: warning\n" + strings.Join(warning, ""))
+	}
+	if a.HeartbeatURL != "" {
+		sb.WriteString("  - name: heartbeat\n    webhook_configs:\n      - url_file: /etc/velocor-monitoring/heartbeat.url\n        send_resolved: false\n")
+	}
+	return sb.String(), secrets
 }
 
 // parseCPUList parses the kernel's CPU list syntax ("0-3,8,10-11").

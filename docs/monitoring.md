@@ -34,8 +34,16 @@ velod keeps them off the cores SPDK polls on. Their units have no `[Install]` se
 starts them at boot when the setting is on. Turning monitoring off stops them and keeps their
 data.
 
-Alert receivers (email, webhook), per-rule settings, active alerts and history graphs in the UI
-are the next steps.
+The **Alerts** page lists firing alerts (silence them for a while, e.g. during a disk swap),
+sets where alerts go (email by SMTP, a webhook in Alertmanager's format, and a heartbeat URL
+that receives the watchdog every 5 minutes for a dead man's switch), sends a test alert, and
+tunes the rules: each can be turned off or given another delay, and the disk temperature and
+wear rules another threshold. Receiver secrets (the SMTP password, webhook and heartbeat URLs)
+are kept in velod's database and in files only the containers read; the API never returns them,
+and they are never part of the pools' metadata copies.
+
+The overview, pool and volume pages show **history graphs** (IOPS, throughput, average latency,
+space) over 1 hour to 15 days, from the built-in Prometheus.
 
 Until monitoring is on, or something else scrapes `/metrics`, the status page warns that no
 alerts reach anyone (after velod has been up for 15 minutes).

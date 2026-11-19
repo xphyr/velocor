@@ -719,6 +719,9 @@ async function pool(id) {
     ],
     el("h2", {}, "Volumes"),
     volumeTable(volumes, [p]),
+    el("h2", {}, "History"),
+    graphPanel([{ name: "pool-space", title: "Space allocated" }, { name: "pool-iops", title: "IOPS" },
+      { name: "pool-throughput", title: "Throughput" }, { name: "pool-latency", title: "Average latency" }], { pool: p.name }),
   ];
 }
 
@@ -945,6 +948,10 @@ async function volume(id) {
       fact("Created", humanTime(v.created_at)),
       fact("Labels", labelsText(v.labels) || "-"),
       fact("ID", mono(v.id))),
+    el("h2", {}, "History"),
+    graphPanel([{ name: "volume-iops", title: "IOPS" }, { name: "volume-throughput", title: "Throughput" },
+      { name: "volume-latency", title: "Average latency" }, { name: "volume-space", title: "Space" }],
+    { volume: v.name, pool: (poolList.find((x) => x.id === v.pool_id) || {}).name || "" }),
     el("h2", {}, "Exports"),
     exportTable(exps, { [v.id]: v }, byId(groups), { filter: false, empty: "Not exported. Export it to let hosts connect." }),
     el("h2", {}, "Snapshots"),
@@ -1849,6 +1856,8 @@ async function dashboard() {
           { title: "Read", num: true, cell: (r) => perSecond(r.readBps) },
           { title: "Write", num: true, cell: (r) => perSecond(r.writeBps) },
         ], volRates.sort((a, b) => (b.readIOPS + b.writeIOPS) - (a.readIOPS + a.writeIOPS)), { empty: "No volumes.", state: stateOf("io") }),
+    el("h2", {}, "History"),
+    graphPanel([{ name: "appliance-iops", title: "IOPS, all pools" }, { name: "appliance-throughput", title: "Throughput, all pools" }]),
     el("h2", {}, "This appliance"),
     el("dl", { class: "facts" },
       fact("Hostname", node.hostname), fact("Node ID", mono(node.node_id)),
@@ -1865,8 +1874,288 @@ async function dashboard() {
 let screenState = {};
 const stateOf = (key) => (screenState[key] ||= { text: "", page: 0 });
 
+
+// ---- History graphs (built-in monitoring, TODO.md P1-1) -------------------------------------
+
+const GRAPH_RANGES = ["1h", "6h", "24h", "7d", "15d"];
+let graphRange = (() => { try { return localStorage.getItem("velocor-graph-range") || "6h"; } catch { return "6h"; } })();
+
+function graphValue(unit, v) {
+  if (v == null || !Number.isFinite(v)) return "-";
+  switch (unit) {
+    case "ratio": return (v * 100).toFixed(v < 0.1 ? 1 : 0) + "%";
+    case "bytes": return humanSize(v);
+    case "bytes_per_sec": return perSecond(v);
+    case "iops": return Math.round(v).toLocaleString() + "/s";
+    case "seconds": return v < 0.001 ? (v * 1e6).toFixed(0) + " µs" : v < 1 ? (v * 1000).toFixed(v < 0.01 ? 2 : 1) + " ms" : v.toFixed(2) + " s";
+    default: return String(v);
+  }
+}
+
+// svgChart draws lines [{name, points:[{t,v}]}] as an SVG line chart.
+function svgChart(title, unit, lines) {
+  const NS = "http://www.w3.org/2000/svg";
+  const W = 600, H = 170, L = 8, R = 8, T = 10, B = 22;
+  const all = lines.flatMap((l) => l.points);
+  const svg = document.createElementNS(NS, "svg");
+  svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+  svg.setAttribute("class", "chart");
+  svg.setAttribute("role", "img");
+  svg.setAttribute("aria-label", title);
+  const mk = (tag, attrs, text) => { const n = document.createElementNS(NS, tag); for (const [k, v] of Object.entries(attrs)) n.setAttribute(k, v); if (text != null) n.textContent = text; return n; };
+  if (!all.length) {
+    svg.append(mk("text", { x: W / 2, y: H / 2, "text-anchor": "middle", class: "chart-empty" }, "No data yet"));
+  } else {
+    const t0 = Math.min(...all.map((p) => p.t)), t1 = Math.max(...all.map((p) => p.t));
+    let vmax = Math.max(...all.map((p) => p.v));
+    if (unit === "ratio") vmax = Math.max(vmax, 1);
+    if (!(vmax > 0)) vmax = 1;
+    const x = (t) => L + (t1 > t0 ? (t - t0) / (t1 - t0) : 0.5) * (W - L - R);
+    const y = (v) => T + (1 - v / vmax) * (H - T - B);
+    for (const f of [0, 0.5, 1]) {
+      svg.append(mk("line", { x1: L, x2: W - R, y1: y(vmax * f), y2: y(vmax * f), class: "chart-grid" }));
+      svg.append(mk("text", { x: L + 2, y: y(vmax * f) - 3, class: "chart-axis" }, graphValue(unit, vmax * f)));
+    }
+    const fmt = (t) => { const d = new Date(t * 1000); return t1 - t0 > 2 * 86400 ? d.toLocaleDateString(undefined, { month: "short", day: "numeric" }) : d.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" }); };
+    svg.append(mk("text", { x: L, y: H - 6, class: "chart-axis" }, fmt(t0)), mk("text", { x: W - R, y: H - 6, "text-anchor": "end", class: "chart-axis" }, fmt(t1)));
+    lines.forEach((l, i) => {
+      // Break the line where samples are missing (more than 3 steps apart).
+      const pts = l.points;
+      const gap = pts.length > 1 ? 3 * Math.min(...pts.slice(1).map((p, j) => p.t - pts[j].t)) : Infinity;
+      let d = "";
+      pts.forEach((p, j) => { d += (j === 0 || p.t - pts[j - 1].t > gap ? "M" : "L") + x(p.t).toFixed(1) + "," + y(p.v).toFixed(1); });
+      if (d) svg.append(mk("path", { d, class: `chart-line chart-line-${i}` }));
+    });
+  }
+  const last = (l) => (l.points.length ? l.points[l.points.length - 1].v : null);
+  return el("figure", { class: "graph" },
+    el("figcaption", {}, el("span", {}, title),
+      el("span", { class: "graph-legend" }, lines.map((l, i) => el("span", { class: `legend legend-${i}` }, `${l.name} ${graphValue(unit, last(l))}`)))),
+    svg);
+}
+
+// graphPanel shows named graphs [{name, title}] for params ({pool} or {volume, pool}), with a
+// range selector. Without built-in monitoring it says how to turn it on.
+// Pages redraw every few seconds; graphs are fetched at most once a minute per view.
+const graphCache = new Map();
+
+function graphPanel(specs, params = {}) {
+  const body = el("div", { class: "graphs" }, el("p", { class: "muted" }, "Loading history..."));
+  const draw = (results) => body.replaceChildren(...results.map((r, i) => svgChart(specs[i].title, r.unit, r.lines)));
+  const load = async () => {
+    const q = new URLSearchParams({ ...params, range: graphRange }).toString();
+    const key = specs.map((g) => g.name).join(",") + "?" + q;
+    const hit = graphCache.get(key);
+    if (hit) draw(hit.results);
+    if (hit && Date.now() - hit.at < 60000) return;
+    try {
+      const results = await Promise.all(specs.map((g) => api(`/monitoring/graphs/${g.name}?${q}`)));
+      graphCache.set(key, { at: Date.now(), results });
+      draw(results);
+    } catch (err) {
+      if (err instanceof Unauthorized) throw err;
+      body.replaceChildren(el("p", { class: "muted" },
+        /off|isn't available/.test(err.message)
+          ? ["History graphs need built-in monitoring: turn it on on the ", el("a", { href: "#/system" }, "System"), " page."]
+          : `History isn't available: ${err.message}`));
+    }
+  };
+  const buttons = GRAPH_RANGES.map((r) => el("button", { class: r === graphRange ? "range on" : "range", onclick: () => {
+    graphRange = r;
+    try { localStorage.setItem("velocor-graph-range", r); } catch { /* per-viewer convenience only */ }
+    buttons.forEach((b) => b.classList.toggle("on", b.textContent === r));
+    load();
+  } }, r));
+  load();
+  return el("div", { class: "graph-panel" }, el("div", { class: "range-picker", role: "group", "aria-label": "Time range" }, buttons), body);
+}
+
+// ---- Alerts (built-in monitoring) -------------------------------------------------------------
+
+const ALERT_LABELS = ["pool", "disk", "volume", "export", "slot", "kind", "status", "state"];
+
+async function alertsScreen() {
+  const soft = (err) => { if (err instanceof Unauthorized) throw err; return { error: err }; };
+  const [mon, data, rulesResp, settings] = await Promise.all([
+    api("/system/monitoring").catch(soft), api("/monitoring/alerts").catch(soft), api("/monitoring/rules").catch(soft),
+    can.admin ? api("/monitoring/settings").catch(soft) : null,
+  ]);
+  const head = el("h1", {}, "Alerts");
+  if (!mon.available) return [head, el("div", { class: "panel-notice" }, "Built-in monitoring isn't available on this host. Scrape /metrics with your own Prometheus and load Velocor's alert rules (docs/monitoring.md).")];
+  const m = mon.monitoring || {};
+  const off = !m.enabled;
+  const alerts = (data && data.alerts) || [], silences = (data && data.silences) || [];
+  const a = (settings && settings.alerting) || {};
+  const rules = (rulesResp && rulesResp.rules) || [];
+  const sev = (s) => pill(s === "critical" ? "Critical" : s === "warning" ? "Warning" : s, s === "critical" ? "bad" : "warn");
+  const where = (x) => ALERT_LABELS.filter((k) => x.labels && x.labels[k]).map((k) => `${k} ${x.labels[k]}`).join(", ");
+  return [
+    head,
+    off && el("div", { class: "panel-notice warn" }, ["Built-in monitoring is off, so no alerts are evaluated here. Turn it on on the ", el("a", { href: "#/system" }, "System"), " page, or scrape /metrics with your own Prometheus."]),
+    !off && data.error && el("div", { class: "panel-notice warn" }, `Alertmanager doesn't answer: ${data.error.message}`),
+    !off && !data.error && [
+      el("div", { class: "section-head" }, el("h2", {}, "Firing"),
+        action(can.admin, { id: "test-alert", onclick: async () => { try { await send("POST", "/monitoring/test"); notify("Test alert sent; it shows here and goes to the receivers within a minute."); } catch (err) { notify(err.message); } } }, "Send test alert")),
+      table([
+        { title: "Severity", cell: (x) => sev(x.severity), text: (x) => x.severity },
+        { title: "Alert", cell: (x) => [el("div", {}, x.summary || x.name), el("span", { class: "sub" }, [x.name, where(x)].filter(Boolean).join(" · "))], text: (x) => `${x.name} ${x.summary}` },
+        { title: "Since", cell: (x) => humanTime(x.starts_at) },
+        { title: "State", cell: (x) => (x.state === "suppressed" ? pill("Silenced", "") : pill("Active", x.severity === "critical" ? "bad" : "warn")) },
+        { title: "", cell: (x) => action(can.admin && x.state !== "suppressed", { onclick: () => silenceDialog(x) }, "Silence") },
+      ], alerts, { empty: "Nothing is firing.", state: stateOf("alerts") }),
+      silences.length > 0 && [
+        el("h2", {}, "Silences"),
+        table([
+          { title: "Silences", cell: (x) => x.matchers.map((mt) => `${mt.name}=${mt.value}`).join(", ") },
+          { title: "Until", cell: (x) => humanTime(x.ends_at) },
+          { title: "By", cell: (x) => [x.created_by, x.comment && el("span", { class: "sub" }, x.comment)] },
+          { title: "", cell: (x) => action(can.admin, { onclick: async () => { try { await send("DELETE", "/monitoring/silences/" + encodeURIComponent(x.id)); notify("Silence ended."); rerender(); } catch (err) { notify(err.message); } } }, "End") },
+        ], silences, { empty: "" }),
+      ],
+    ],
+    can.admin && settings && !settings.error && [
+      el("div", { class: "section-head" }, el("h2", {}, "Where alerts go")),
+      el("dl", { class: "facts" },
+        fact("Email", [a.email ? `${a.email.to.join(", ")} via ${a.email.smtp_host}:${a.email.smtp_port}, ${a.email.min_severity === "critical" ? "critical only" : "warnings and critical"}` : el("span", { class: "muted" }, "Not set"),
+          el("button", { onclick: () => emailDialog(a.email) }, a.email ? "Change" : "Set up"),
+          a.email && el("button", { class: "danger-quiet", onclick: () => removeReceiver("email", "Email") }, "Remove")]),
+        fact("Webhook", [a.webhook ? `${a.webhook.url_host}, ${a.webhook.min_severity === "critical" ? "critical only" : "warnings and critical"}` : el("span", { class: "muted" }, "Not set"),
+          el("button", { onclick: () => webhookDialog(a.webhook) }, a.webhook ? "Change" : "Set up"),
+          a.webhook && el("button", { class: "danger-quiet", onclick: () => removeReceiver("webhook", "Webhook") }, "Remove")]),
+        fact("Heartbeat", [a.heartbeat_url_set ? `Every 5 minutes to ${a.heartbeat_url_host}` : el("span", { class: "muted" }, "Not set"),
+          el("button", { onclick: () => heartbeatDialog(a.heartbeat_url_set) }, a.heartbeat_url_set ? "Change" : "Set up"),
+          el("span", { class: "sub" }, "A dead man's switch: a service that raises an alarm when these stop arriving, which is how you learn the appliance itself is down.")])),
+      !a.email && !a.webhook && el("div", { class: "panel-notice warn" }, "No receivers are set up: alerts show on this page only."),
+    ],
+    el("h2", {}, "Rules"),
+    el("p", { class: "muted" }, "Velocor's shipped rules (docs/monitoring.md). Delays are how long a condition must last before the alert fires."),
+    table([
+      { title: "Rule", cell: (r) => [el("div", {}, r.name), el("span", { class: "sub" }, r.summary.replace(/\{\{[^}]*\}\}/g, "…"))], text: (r) => `${r.name} ${r.summary}` },
+      { title: "Severity", cell: (r) => sev(r.severity), text: (r) => r.severity },
+      { title: "Delay", cell: (r) => (r.setting.for ? [r.setting.for, el("span", { class: "sub" }, `default ${r.default_for || "none"}`)] : r.default_for || "none") },
+      { title: "Threshold", cell: (r) => (r.tunable ? thresholdText(r.tunable, r.setting.threshold ?? r.tunable.default) : "-") },
+      { title: "", cell: (r) => (r.setting.disabled ? pill("Off", "") : pill("On", "ok")) },
+      { title: "", cell: (r) => action(can.admin, { onclick: () => ruleDialog(r, rules) }, "Change") },
+    ], rules, { empty: "No rules.", state: stateOf("rules") }),
+  ];
+}
+
+function thresholdText(t, v) {
+  return t.unit === "ratio" ? `${t.label} ${Math.round(v * 100)}%` : t.unit === "celsius" ? `${t.label} ${v} °C` : `${t.label} ${v}`;
+}
+
+function silenceDialog(x) {
+  const matchers = [{ name: "alertname", value: x.name }, ...ALERT_LABELS.filter((k) => x.labels && x.labels[k] && k !== "status" && k !== "state").map((k) => ({ name: k, value: x.labels[k] }))];
+  openDialog({
+    title: "Silence alert",
+    intro: `Mutes ${x.name}${matchers.length > 1 ? ` for ${matchers.slice(1).map((m) => `${m.name} ${m.value}`).join(", ")}` : ""}: it still shows here, but isn't sent. The condition isn't fixed by this.`,
+    submit: "Silence",
+    fields: [
+      { name: "hours", label: "For how many hours", value: "4", required: true },
+      { name: "comment", label: "Why (optional)", placeholder: "e.g. replacing the disk" },
+    ],
+    action: (v) => {
+      const n = Number(v.hours);
+      if (!(n > 0 && n <= 720)) throw new Error("Enter a number of hours from 1 to 720.");
+      return send("POST", "/monitoring/silences", { matchers, duration_hours: n, comment: v.comment });
+    },
+    done: () => { notify("Silenced."); rerender(); },
+  });
+}
+
+const SEVERITY_OPTIONS = [{ value: "warning", label: "Warnings and critical alerts" }, { value: "critical", label: "Critical alerts only" }];
+
+function emailDialog(e) {
+  e = e || {};
+  openDialog({
+    title: "Email alerts",
+    submit: "Save",
+    fields: [
+      { name: "to", label: "Send to", kind: "lines", value: e.to, placeholder: "ops@example.com" },
+      { name: "from", label: "From", value: e.from, required: true, placeholder: "velocor@example.com" },
+      { name: "smtp_host", label: "SMTP server", value: e.smtp_host, required: true },
+      { name: "smtp_port", label: "Port", value: String(e.smtp_port || 587), required: true },
+      { name: "username", label: "User name (optional)", value: e.username },
+      { name: "password", label: e.password_set ? "Password (leave empty to keep the current one)" : "Password (optional)", secret: true },
+      { name: "require_tls", kind: "tick", text: "Require TLS (STARTTLS; port 465 always uses TLS)", value: e.require_tls ?? true },
+      { name: "min_severity", label: "Send", options: SEVERITY_OPTIONS, value: e.min_severity || "warning" },
+    ],
+    action: (v) => {
+      const body = { to: v.to, from: v.from, smtp_host: v.smtp_host, smtp_port: Number(v.smtp_port), username: v.username, require_tls: v.require_tls, min_severity: v.min_severity };
+      if (v.password) body.password = v.password;
+      return send("PUT", "/monitoring/settings", { email: body });
+    },
+    done: () => { notify("Saved. Use Send test alert to check delivery."); rerender(); },
+  });
+}
+
+function webhookDialog(w) {
+  w = w || {};
+  openDialog({
+    title: "Webhook alerts",
+    intro: "Alerts are posted as JSON in Alertmanager's webhook format (Slack, Teams and PagerDuty accept it through their integrations or a small relay).",
+    submit: "Save",
+    fields: [
+      { name: "url", label: w.url_set ? "URL (leave empty to keep the current one)" : "URL", secret: true, required: !w.url_set, placeholder: "https://..." },
+      { name: "min_severity", label: "Send", options: SEVERITY_OPTIONS, value: w.min_severity || "warning" },
+    ],
+    action: (v) => send("PUT", "/monitoring/settings", { webhook: v.url ? { url: v.url, min_severity: v.min_severity } : { min_severity: v.min_severity } }),
+    done: () => { notify("Saved. Use Send test alert to check delivery."); rerender(); },
+  });
+}
+
+function heartbeatDialog(isSet) {
+  openDialog({
+    title: "Heartbeat",
+    intro: "Every 5 minutes, the always-firing watchdog alert is posted to this URL. Point it at a dead man's switch service, which raises an alarm when the posts stop. Leave it empty to stop sending.",
+    submit: "Save",
+    fields: [{ name: "url", label: isSet ? "URL (empty stops the heartbeat)" : "URL", secret: true, placeholder: "https://..." }],
+    action: (v) => send("PUT", "/monitoring/settings", { heartbeat_url: v.url }),
+    done: () => { notify("Saved."); rerender(); },
+  });
+}
+
+function removeReceiver(key, label) {
+  confirmDialog({
+    title: `Remove ${label.toLowerCase()} alerts`,
+    intro: `Alerts are no longer sent by ${label.toLowerCase()}.`,
+    submit: "Remove",
+    action: () => send("PUT", "/monitoring/settings", { [key]: null }),
+    done: () => { notify("Removed."); rerender(); },
+  });
+}
+
+function ruleDialog(r, all) {
+  const t = r.tunable;
+  openDialog({
+    title: r.name,
+    intro: r.summary.replace(/\{\{[^}]*\}\}/g, "…"),
+    submit: "Save",
+    fields: [
+      { name: "on", kind: "tick", text: "Evaluate this rule", value: !r.setting.disabled },
+      { name: "for", label: `Delay (default ${r.default_for || "none"}; e.g. 10m, 2h; empty for the default)`, value: r.setting.for || "" },
+      t && { name: "threshold", label: t.unit === "ratio" ? `${t.label} (%; default ${t.default * 100})` : `${t.label} (°C; default ${t.default})`,
+        value: r.setting.threshold == null ? "" : String(t.unit === "ratio" ? Math.round(r.setting.threshold * 100) : r.setting.threshold) },
+    ].filter(Boolean),
+    action: (v) => {
+      const rules = Object.fromEntries(all.filter((x) => x.name !== r.name && (x.setting.disabled || x.setting.for || x.setting.threshold != null)).map((x) => [x.name, x.setting]));
+      const s = {};
+      if (!v.on) s.disabled = true;
+      if (v.for) s.for = v.for;
+      if (t && v.threshold !== "" && v.threshold != null) {
+        const n = Number(v.threshold);
+        if (!Number.isFinite(n)) throw new Error("The threshold must be a number.");
+        s.threshold = t.unit === "ratio" ? n / 100 : n;
+      }
+      if (Object.keys(s).length) rules[r.name] = s;
+      return send("PUT", "/monitoring/settings", { rules });
+    },
+    done: () => { notify("Saved."); rerender(); },
+  });
+}
+
 const NAV = [["Overview", ""], ["Disks", "disks"], ["Pools", "pools"], ["Volumes", "volumes"], ["Snapshots", "snapshots"],
-  ["Exports", "exports"], ["Hosts", "hosts"], ["Portals", "portals"], ["Network", "network"], ["System", "system"], ["Access", "access"]];
+  ["Exports", "exports"], ["Hosts", "hosts"], ["Portals", "portals"], ["Network", "network"], ["Alerts", "alerts"], ["System", "system"], ["Access", "access"]];
 
 function route() {
   const [screen, ...rest] = location.hash.replace(/^#\/?/, "").split("/").map(decodeURIComponent);
@@ -1883,6 +2172,7 @@ function route() {
     case "hosts": return { nav: "hosts", draw: hosts };
     case "portals": return { nav: "portals", draw: portals };
     case "network": return { nav: "network", draw: network };
+    case "alerts": return { nav: "alerts", draw: alertsScreen };
     case "system": return { nav: "system", draw: system };
     case "access": return { nav: "access", draw: access };
     default: return { nav: null, draw: async () => [el("h1", {}, "Nothing here"), el("p", {}, el("a", { href: "#/" }, "Back to the overview"))] };

@@ -378,6 +378,13 @@ work still open, ranked by risk to data, how fixes are verified, and what has be
   quadlets `velocor-prometheus` / `velocor-alertmanager` (no [Install], loopback ports
   19090/19093, memory limits); images quay.io/prometheus v3.15.1 / v0.34.2 embedded in the OS
   image; Renovate regex manager for those ARGs.
+  **Step 2 lab check (velocor-1, dev-7ffea94, 2026-11-19):** turned on via the API; target up
+  (19 ms scrapes), 25 rules healthy, only the watchdog firing; loopback-only listeners;
+  AllowedCPUs=1-3 (SPDK on 0); 34 MB / 12 MB memory.
+  **Steps 3 and 4 code (2026-11-19):** receivers (email, webhook, heartbeat; secrets in files,
+  never returned by the API), per-rule on/off, delay and thresholds (disk temperature, wear),
+  test alert, silences, Alerts page; named history graphs (`/monitoring/graphs/{name}`, no
+  PromQL from browsers) as SVG charts on the overview, pool and volume pages.
 
 - [ ] **P1-3. Network changes can lock the appliance out.** `PUT /system/network/interfaces/{name}`
   applies at once; a wrong static address or disabling the management interface cuts the
