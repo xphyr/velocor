@@ -30,6 +30,12 @@ for f in $(git ls-files 'deploy/**/Containerfile*'); do
   done < <(awk 'toupper($1)=="ARG" && index($2, "=") {split($2, kv, "="); print kv[1], kv[2]}' "$f")
 done
 
+# One Fedora release for every base image (a bump must move them all), and the Makefile takes
+# them from the Containerfiles rather than keeping its own copy (it once overrode a bump).
+releases=$(git ls-files 'deploy/**/Containerfile*' | xargs grep -hoE 'quay\.io/fedora/[a-z-]+:[0-9]+' | sed 's/.*://' | sort -u)
+[[ $(wc -l <<<"$releases") -eq 1 ]] || bad "Containerfiles use several Fedora releases: $(tr '\n' ' ' <<<"$releases")"
+grep -nE 'quay\.io/fedora/[a-z-]+:[0-9]+' Makefile && bad "Makefile names a Fedora release; it must take the base images from the Containerfiles"
+
 toolchain=$(awk '$1=="toolchain" {sub(/^go/, "", $2); print $2}' go.mod)
 [[ -n "$toolchain" ]] || bad "go.mod has no toolchain line"
 for f in $(git ls-files 'deploy/**/Containerfile*'); do
