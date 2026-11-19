@@ -104,9 +104,9 @@ func TestNVMeWriteCachePolicyAPI(t *testing.T) {
 	if !h.fake.NVMeCacheOf("0000:02:00.0").Enabled {
 		t.Fatal("an unclaimed drive's cache changed before the claim")
 	}
-	h.expect(h.do("POST", "/api/v1/disks/nv2:claim", h.admin, nil))(http.StatusOK)
-	if h.fake.NVMeCacheOf("0000:02:00.0").Enabled {
-		t.Fatal("the claim didn't switch the cache off")
+	claimed := h.expect(h.do("POST", "/api/v1/disks/nv2:claim", h.admin, nil))(http.StatusOK)["disk"].(map[string]any)
+	if h.fake.NVMeCacheOf("0000:02:00.0").Enabled || claimed["write_cache"] != "WRITE_THROUGH" {
+		t.Fatalf("the claim didn't switch the cache off (reported %v)", claimed["write_cache"])
 	}
 
 	// A drive that refuses: the change is refused, with the drive's reason.

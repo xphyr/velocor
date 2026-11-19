@@ -292,8 +292,13 @@ work still open, ranked by risk to data, how fixes are verified, and what has be
     drive (refusal: 400 with the drive's status); for an unclaimed drive it is recorded and
     applied at claim, before anything is written. `TestNVMeWriteCacheThroughSPDK`,
     `TestNVMeWriteCacheKeptOffAndPoolDurability`, `TestNVMeWriteCachePolicyAPI` (fake SPDK
-    modelling the admin commands). *To check on the lab:* QEMU NVMe drives on the P0-1 VM (real
-    SPDK, real admin commands).
+    modelling the admin commands). Lab (P0-1 VM, QEMU NVMe, dev-dfa39a5, 2026-11-18): the first
+    lab run found every admin command refused ("Invalid parameters": SPDK's base64 decoder wants
+    padding; fixed in dfa39a5, the fake now decodes as strictly). Then: the drives report VWC 1,
+    saveable, WCE 1; `PATCH` DISABLED on both `nvmepool` members switched them off (saved value
+    0, read back from the drives) and the pool went from AT_RISK to DURABLE; a cache switched
+    back on behind velod's back was off again after one pass; a policy set on an unclaimed drive
+    was applied by its claim; the drive was then restored (policy left, cache on, released).
   - [x] Pool-level flag (2026-11-18): pools carry `durability` (the weakest member's: DURABLE,
     AT_RISK, UNKNOWN), maintained by the reconciler; shown in the pool list and detail of the UI
     with what to do, and in `veloctl pool list`.
