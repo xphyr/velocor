@@ -104,9 +104,14 @@ func iscsiIface(ctx context.Context, initiatorIQN string) (string, error) {
 	}
 	sum := sha256.Sum256([]byte(initiatorIQN))
 	name := "velocor-" + hex.EncodeToString(sum[:4])
-	if out, err := iscsiadm(ctx, "-m", "iface", "-I", name, "-o", "new").CombinedOutput(); err != nil &&
-		!strings.Contains(strings.ToLower(string(out)), "exists") {
-		return "", fmt.Errorf("iscsiadm iface new %s: %w (%s)", name, err, strings.TrimSpace(string(out)))
+	// Create it only if it's missing: for an existing iface, `-o new` fails with exit 15 and
+	// "Could not create new interface" (iscsi-initiator-utils 6.2.1.11, RHCOS 9.8), which made
+	// every attach after the node's first fail.
+	if iscsiadm(ctx, "-m", "iface", "-I", name).Run() != nil {
+		if out, err := iscsiadm(ctx, "-m", "iface", "-I", name, "-o", "new").CombinedOutput(); err != nil &&
+			!strings.Contains(strings.ToLower(string(out)), "exists") {
+			return "", fmt.Errorf("iscsiadm iface new %s: %w (%s)", name, err, strings.TrimSpace(string(out)))
+		}
 	}
 	if out, err := iscsiadm(ctx, "-m", "iface", "-I", name, "-o", "update",
 		"-n", "iface.initiatorname", "-v", initiatorIQN).CombinedOutput(); err != nil {
