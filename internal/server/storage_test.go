@@ -22,6 +22,7 @@ type harness struct {
 	st    *store.BoltStore
 	fake  *spdktest.Fake
 	ts    *httptest.Server
+	srv   *Server
 	admin string
 }
 
@@ -39,7 +40,7 @@ func newHarness(t *testing.T) *harness {
 	}
 	clearMustChange(t, st)
 	srv := New(st, f.Client(), nil, authMgr, reconciler.New(st, f.Client(), nil, nil), nil)
-	h := &harness{t: t, st: st, fake: f, ts: httptest.NewServer(srv.Handler())}
+	h := &harness{t: t, st: st, fake: f, srv: srv, ts: httptest.NewServer(srv.Handler())}
 	t.Cleanup(h.ts.Close)
 	code, resp := h.do("POST", "/api/v1/auth/login", "", map[string]any{"username": "admin", "password": "admin-pass-123"})
 	if code != http.StatusOK {

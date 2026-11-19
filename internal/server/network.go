@@ -11,7 +11,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/velocor/velocor/internal/store"
 )
 
 // NetworkInterface describes a host network interface and its active IP/NetworkManager state.
@@ -45,6 +44,11 @@ type UpdateNetworkInterfaceRequest struct {
 	Gateway string `json:"gateway,omitempty"`
 	DNS     string `json:"dns,omitempty"` // comma-separated IP list
 	MTU     int    `json:"mtu,omitempty"`
+	// ConfirmTimeoutSeconds is how long the change waits for confirmation before it is rolled
+	// back (60 to 600; 0 means 120).
+	ConfirmTimeoutSeconds int `json:"confirm_timeout_seconds,omitempty"`
+	// Force allows changing an interface that carries portals (it interrupts their hosts).
+	Force bool `json:"force,omitempty"`
 }
 
 var validIfaceNameRe = regexp.MustCompile(`^[a-zA-Z0-9._:-]{1,32}$`)
@@ -281,21 +285,32 @@ func findNMCLIConnectionForDevice(ctx context.Context, dev string) (string, erro
 	return "", nil
 }
 
-func applyNetworkInterfaceConfig(ctx context.Context, name string, req UpdateNetworkInterfaceRequest, dnsList []string) error {
+// applyNetworkInterfaceConfig configures name with nmcli. temporary changes only the running
+// configuration (a new profile isn't saved, a modification uses --temporary); the saved one
+// changes when the change is confirmed (applied again with temporary false).
+func applyNetworkInterfaceConfig(ctx context.Context, name string, req UpdateNetworkInterfaceRequest, dnsList []string, temporary bool) error {
 	conName, err := findNMCLIConnectionForDevice(ctx, name)
 	if err != nil {
 		return err
 	}
 	if conName == "" {
 		conName = name
-		out, err := hostCommand(ctx, "nmcli", "connection", "add", "type", "ethernet", "ifname", name, "con-name", conName).CombinedOutput()
+		save := "yes"
+		if temporary {
+			save = "no"
+		}
+		out, err := hostCommand(ctx, "nmcli", "connection", "add", "save", save, "type", "ethernet", "ifname", name, "con-name", conName).CombinedOutput()
 		if err != nil {
 			return fmt.Errorf("nmcli connection add failed: %w: %s", err, strings.TrimSpace(string(out)))
 		}
 	}
 
 	method := strings.ToLower(strings.TrimSpace(req.Method))
-	args := []string{"connection", "modify", conName}
+	args := []string{"connection", "modify"}
+	if temporary {
+		args = append(args, "--temporary")
+	}
+	args = append(args, conName)
 	switch method {
 	case "disabled":
 		args = append(args, "connection.autoconnect", "no", "ipv4.method", "disabled", "ipv4.addresses", "", "ipv4.gateway", "", "ipv4.dns", "")
@@ -322,6 +337,9 @@ func applyNetworkInterfaceConfig(ctx context.Context, name string, req UpdateNet
 	if out, err := hostCommand(ctx, "nmcli", args...).CombinedOutput(); err != nil {
 		return fmt.Errorf("nmcli connection modify failed: %w: %s", err, strings.TrimSpace(string(out)))
 	}
+	if !temporary {
+		return nil // confirming: the running configuration already is this one
+	}
 
 	if method == "disabled" {
 		if out, err := hostCommand(ctx, "nmcli", "device", "disconnect", name).CombinedOutput(); err != nil {
@@ -340,33 +358,90 @@ func applyNetworkInterfaceConfig(ctx context.Context, name string, req UpdateNet
 func (s *Server) handleGetNetwork(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
-	writeJSON(w, http.StatusOK, queryNetworkStatus(ctx))
+	st := s.queryNetwork(ctx)
+	pending, last := s.net.snapshot()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"available": st.Available, "nmcli_available": st.NMCLIAvailable, "message": st.Message,
+		"hostname": st.Hostname, "interfaces": st.Interfaces, "pending_change": pending, "last_change": last,
+	})
 }
 
-func (s *Server) handleUpdateNetworkInterface(w http.ResponseWriter, r *http.Request) {
-	name := r.PathValue("name")
-	var req UpdateNetworkInterfaceRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, fmt.Errorf("%w: invalid JSON payload", store.ErrInvalidArgument))
-		return
+func (s *Server) queryNetwork(ctx context.Context) NetworkStatus {
+	if s.netQuery != nil {
+		return s.netQuery(ctx)
 	}
+	return queryNetworkStatus(ctx)
+}
 
-	dnsList, err := validateNetworkRequest(name, req)
+// nmHost is the real nmBackend: checkpoints through NetworkManager's D-Bus API (busctl on the
+// host), settings through nmcli.
+type nmHost struct{}
+
+const (
+	nmService = "org.freedesktop.NetworkManager"
+	nmPath    = "/org/freedesktop/NetworkManager"
+	// NM_CHECKPOINT_CREATE_FLAG_DELETE_NEW_CONNECTIONS: a rollback also removes a profile
+	// the change created.
+	nmCheckpointDeleteNew = 0x02
+)
+
+func busctl(ctx context.Context, args ...string) (string, error) {
+	out, err := hostCommand(ctx, "busctl", append([]string{"--system"}, args...)...).CombinedOutput()
 	if err != nil {
-		writeError(w, fmt.Errorf("%w: %s", store.ErrInvalidArgument, err.Error()))
-		return
+		return "", fmt.Errorf("busctl %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(string(out)))
 	}
+	return strings.TrimSpace(string(out)), nil
+}
 
-	ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
-	defer cancel()
-
-	if err := applyNetworkInterfaceConfig(ctx, name, req, dnsList); err != nil {
-		writeError(w, err)
-		return
+// objectPath parses busctl's `o "/path"` reply.
+func objectPath(reply string) (string, error) {
+	f := strings.Fields(reply)
+	if len(f) != 2 || f[0] != "o" {
+		return "", fmt.Errorf("unexpected reply %q", reply)
 	}
+	return strings.Trim(f[1], `"`), nil
+}
 
-	writeJSON(w, http.StatusOK, map[string]any{
-		"message": fmt.Sprintf("interface %s configured (%s)", name, strings.ToLower(strings.TrimSpace(req.Method))),
-		"network": queryNetworkStatus(ctx),
-	})
+func (nmHost) Checkpoint(ctx context.Context, iface string, timeout time.Duration) (string, error) {
+	reply, err := busctl(ctx, "call", nmService, nmPath, nmService, "GetDeviceByIpIface", "s", iface)
+	if err != nil {
+		return "", err
+	}
+	dev, err := objectPath(reply)
+	if err != nil {
+		return "", err
+	}
+	reply, err = busctl(ctx, "call", nmService, nmPath, nmService, "CheckpointCreate", "aouu", "1", dev,
+		fmt.Sprint(int(timeout.Seconds())), fmt.Sprint(nmCheckpointDeleteNew))
+	if err != nil {
+		return "", err
+	}
+	return objectPath(reply)
+}
+
+func (nmHost) CheckpointExists(ctx context.Context, cp string) (bool, error) {
+	reply, err := busctl(ctx, "get-property", nmService, nmPath, nmService, "Checkpoints")
+	if err != nil {
+		return false, err
+	}
+	for _, f := range strings.Fields(reply) {
+		if strings.Trim(f, `"`) == cp {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func (nmHost) Commit(ctx context.Context, cp string) error {
+	_, err := busctl(ctx, "call", nmService, nmPath, nmService, "CheckpointDestroy", "o", cp)
+	return err
+}
+
+func (nmHost) Rollback(ctx context.Context, cp string) error {
+	_, err := busctl(ctx, "call", nmService, nmPath, nmService, "CheckpointRollback", "o", cp)
+	return err
+}
+
+func (nmHost) Apply(ctx context.Context, iface string, req UpdateNetworkInterfaceRequest, dns []string, temporary bool) error {
+	return applyNetworkInterfaceConfig(ctx, iface, req, dns, temporary)
 }
