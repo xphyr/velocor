@@ -6,8 +6,8 @@
     "helpers:pinGitHubActionDigests"
   ],
   "dockerfile": {
-    "fileMatch": [
-      "(^|/)Containerfile[^/]*$"
+    "managerFilePatterns": [
+      "/(^|/)Containerfile[^/]*$/"
     ]
   },
   "packageRules": [
