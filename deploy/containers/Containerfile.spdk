@@ -4,7 +4,7 @@
 # per build and records it in the org.opencontainers.image.base.* labels). The SPDK source is
 # pinned by commit (the tag is checked against it) and patched from spdk-patches/. spdk_tgt's
 # arguments come from the quadlet (deploy/quadlets/velocor-spdk.container), the only source of them.
-ARG FEDORA_IMAGE=quay.io/fedora/fedora:45
+ARG FEDORA_IMAGE=quay.io/fedora/fedora:46
 
 # Patched SPDK source and its build dependencies, shared by the shipped build and the unit tests.
 FROM ${FEDORA_IMAGE} AS source

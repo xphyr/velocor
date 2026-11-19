@@ -4,7 +4,7 @@
 # (hack/check-pins.sh enforces both), so the shipped binaries come from the same Go release CI
 # tests with. The runtime follows Fedora's rolling fedora-minimal 45 (resolved to a digest per
 # build by `make`, recorded in the org.opencontainers.image.base.* labels).
-ARG FEDORA_MINIMAL_IMAGE=quay.io/fedora/fedora-minimal:45
+ARG FEDORA_MINIMAL_IMAGE=quay.io/fedora/fedora-minimal:46
 FROM docker.io/library/golang:1.27.4@sha256:205c7636d74e0ffbe3d007162df7d74f859f5a8c8322dfb9f907977686c126cf AS builder
 
 ENV CGO_ENABLED=0 GOTOOLCHAIN=local

@@ -12,7 +12,7 @@
 # labels.
 ARG VELOD_IMAGE
 ARG SPDK_IMAGE
-ARG BOOTC_BASE_IMAGE=quay.io/fedora/fedora-bootc:45
+ARG BOOTC_BASE_IMAGE=quay.io/fedora/fedora-bootc:46
 # Built-in monitoring (TODO.md P1-1): embedded like spdk/velod, started only when turned on.
 ARG PROMETHEUS_IMAGE=quay.io/prometheus/prometheus:v3.16.0@sha256:9332054523223e2ddc18d8101799d54a4a8d823b030c53216f063a6c117773cd
 ARG ALERTMANAGER_IMAGE=quay.io/prometheus/alertmanager:v0.35.0@sha256:5f6e66c01bd610aef6dd671642a52eee775fd3a89bd8788ebada33efaf373d10
