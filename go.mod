@@ -2,7 +2,7 @@ module github.com/velocor/velocor
 
 go 1.26.0
 
-toolchain go1.26.11
+toolchain go1.27.4
 
 require (
 	github.com/container-storage-interface/spec v1.13.0
