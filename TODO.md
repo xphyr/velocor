@@ -470,13 +470,21 @@ work still open, ranked by risk to data, how fixes are verified, and what has be
   the docs together with what hosts see during an appliance reboot (I/O stalls until
   `ctrl_loss_tmo`, then errors).
 
-- [ ] **P1-7. OS lifecycle.** `bootc upgrade` runs inside the HTTP request (minutes) and should
+- [x] **P1-7. OS lifecycle.** `bootc upgrade` runs inside the HTTP request (minutes) and should
   be a tracked background job. Reboot doesn't stop exports or SPDK cleanly first, and doesn't
   warn about connected hosts. **A failed upgrade is silent:** if the staged deployment isn't
   finalized at shutdown, the appliance simply boots the old version. velod should remember the
   image it staged and, after the reboot, warn when the booted image differs (seen on velocor-1,
   see the UEFI `/boot` fix below).
 
+  **Done (2026-11-19):** upgrades are background jobs (`GET /system/upgrade` with live output;
+  one at a time; reboot refused meanwhile); velod records what it staged (image, digest, boot
+  ID) and warns after a reboot that booted something else, until dismissed; reboot names the
+  connected hosts and needs `force` while any are connected. Lab VM: job with live output,
+  second upgrade and reboot refused (409), then a hard power cut after staging: it booted the
+  previous image and status warned "didn't take effect"; velocor-1 with an NVW pod attached:
+  reboot refused, naming the node. *Left:* exports are still not stopped before the reboot
+  (spdk_tgt's graceful stop, StopTimeout=120, closes them).
 - [ ] **P1-8. A RAID1 missing a member at startup is not served. (Verified)** SPDK keeps a
   superblock RAID1 in `configuring` until every member is present; it does not start degraded.
   A disk that fails while the appliance is down makes the pool unavailable after boot (data
@@ -676,8 +684,11 @@ work still open, ranked by risk to data, how fixes are verified, and what has be
   buffer size) and whether a larger `MaxRecvDataSegmentLength` or iobuf size avoids it.
 - [ ] **P2-5. Slow test suites.** Auth/server tests take ~50–100 s under `-race` because every
   login runs 600k PBKDF2 iterations; consider a test-only iteration override (was F7).
-- [ ] **P2-7. The CSI driver logs nothing per request.** Stage/publish failures are only
+- [x] **P2-7. The CSI driver logs nothing per request.** Stage/publish failures are only
   visible as Kubernetes events; the node plugin's log shows just its start line.
+  **Done (2026-11-19):** a gRPC interceptor logs each changing call (method, volume/snapshot/
+  node, duration, result); frequent read-only calls only on failure; requests never (secrets).
+  NVW: provision, publish, stage, unstage, unpublish and delete each one line.
 - [ ] **P2-10. Recovery time after an unclean SPDK stop** is now ~1 min per 500 GB on emulated
   disks (was 16 min). If it matters on real hardware, lower the lvstore metadata reservation
   (`num_md_pages_per_cluster_ratio`) and report a "recovering" state instead of DEGRADED.
@@ -691,7 +702,7 @@ work still open, ranked by risk to data, how fixes are verified, and what has be
   crash-loops if given it; the chart passed it only on v1beta1 clusters, which hid it. The
   chart now creates its VolumeGroupSnapshotClass with the API the cluster serves (v1, else
   v1beta1); it was v1beta1 only, so on clusters with only v1 (OpenShift 5) no class was made.
-- [ ] **P2-6. No health endpoint.** velod has no unauthenticated liveness/readiness route
+- [x] **P2-6. No health endpoint.** velod has no unauthenticated liveness/readiness route
   (found in the 2026-11-16 qcow2 boot test), so quadlets can't use `HealthCmd=` and monitoring
   can't tell "velod up but SPDK unreachable" from "all good". *Needed:* `/healthz` (process up)
   and `/readyz` (SPDK RPC answers, DB open), no auth and no detail leakage, plus `HealthCmd=` in
@@ -701,6 +712,10 @@ work still open, ranked by risk to data, how fixes are verified, and what has be
 
 Everything here was written by Gemini and is in scope to rewrite.
 
+  **Done (2026-11-19):** `/healthz` and `/readyz` (ok / not ready only, no auth); the velod
+  quadlet runs `velod healthcheck` every 30 s and kills (systemd restarts) a velod that stops
+  answering. Lab VM: both answer without login, podman reports velod healthy, `/readyz` 503
+  while spdk_tgt is stopped and 200 again after.
 - [x] **B8 (rest). Publish a qcow2 with releases?** `make qcow2` now runs `hack/build-qcow2.sh`
   (rootless, KVM only; bootc-image-builder and its sudo are gone). **Decision (2026-11-19): no
   qcow2 with releases for now.** The README's install Option 2 explains how to build one from
