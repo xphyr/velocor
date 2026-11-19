@@ -102,7 +102,7 @@ carries unit tests, which `make spdk-unit-tests` and CI run).
 
 The Go toolchain, the SPDK source commit and the GitHub Actions are pinned (`make check-pins`
 verifies it; Renovate proposes bumps). The Fedora base images follow Fedora's rolling release tag
-(`:45`) to pick up its daily fixes: each build resolves the tag to a digest, builds from exactly
+(e.g. `:45`, set in the Containerfiles; the Makefile uses the same) to pick up its daily fixes: each build resolves the tag to a digest, builds from exactly
 that digest and records it in the image's `org.opencontainers.image.base.name` /
 `org.opencontainers.image.base.digest` labels (`skopeo inspect` shows which base a build used).
 

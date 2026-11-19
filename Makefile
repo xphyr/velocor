@@ -60,9 +60,12 @@ LABEL_ARGS := --label org.opencontainers.image.source=https://github.com/xphyr/v
 # Fedora base images follow Fedora's rolling release tags (daily fixes). Each build resolves the
 # tag to the digest it points to right then, builds from exactly that digest, and records it in
 # the OCI base-image labels, so every image says which base it was built on.
-FEDORA_IMAGE ?= quay.io/fedora/fedora:45
-FEDORA_MINIMAL_IMAGE ?= quay.io/fedora/fedora-minimal:45
-BOOTC_BASE_IMAGE ?= quay.io/fedora/fedora-bootc:45
+# The release tags come from the Containerfiles' ARG defaults (which Renovate updates), so a
+# Fedora release bump there is what builds use; hack/check-pins.sh checks they agree.
+base-arg = $(shell sed -n 's/^ARG $(1)=//p' $(2) | head -n1)
+FEDORA_IMAGE ?= $(call base-arg,FEDORA_IMAGE,deploy/containers/Containerfile.spdk)
+FEDORA_MINIMAL_IMAGE ?= $(call base-arg,FEDORA_MINIMAL_IMAGE,deploy/containers/Containerfile.velod)
+BOOTC_BASE_IMAGE ?= $(call base-arg,BOOTC_BASE_IMAGE,deploy/bootc/Containerfile)
 # BASE_PIN_DIR (optional; CI sets it): resolve each base once and reuse it for every build that
 # follows, so e.g. the integration-tested SPDK image and the pushed one share one base (and one
 # SPDK compile) even if Fedora publishes in between. The files there record what was used.

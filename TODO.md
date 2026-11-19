@@ -796,6 +796,12 @@ Everything here was written by Gemini and is in scope to rewrite.
   inputs the images; the chart, static manifests and docs only lint (which lints and renders
   the chart). Unknown paths (the workflow, the Makefile, renovate.json) run everything. main
   and tags always run everything; skipped jobs count as passed checks.
+- [x] **B24. The Makefile overrode the Fedora release in the Containerfiles.** Found
+  2026-11-19 with Renovate's "Fedora 46" PR: it changed the Containerfiles' ARG defaults, but
+  the Makefile passed its own `fedora…:45` to every build, so CI (and a lab build) built Fedora
+  45 again and the PR would have changed nothing while claiming the move. The Makefile now reads
+  the base images from the Containerfiles; `hack/check-pins.sh` fails if the Containerfiles use
+  more than one Fedora release or the Makefile names one.
 - [x] **B1/B2.** The OS image now embeds the velod/spdk images built and pushed in the same run
   (`make push`; one CI job) as `oci-archive` and its quadlets reference them by digest, so an
   appliance runs exactly what it was built with, needs no registry at boot, and changes only via
