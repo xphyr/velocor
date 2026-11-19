@@ -56,7 +56,7 @@ sidecars:
     image: registry.k8s.io/sig-storage/csi-provisioner:v5.1.0
     resources: {}
   attacher:
-    image: registry.k8s.io/sig-storage/csi-attacher:v4.7.0
+    image: registry.k8s.io/sig-storage/csi-attacher:v4.13.0@sha256:d1a26170efed45491074ca4545c81844eee2b9043fb885ac01fb4aed6f8b72d2
     resources: {}
   resizer:
     image: registry.k8s.io/sig-storage/csi-resizer:v1.12.0
