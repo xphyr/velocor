@@ -79,7 +79,7 @@ endef
 GO_BUILD_ARGS := --build-arg VERSION=$(VERSION) --build-arg COMMIT=$(COMMIT) --build-arg BUILD_TIME=$(BUILD_TIME)
 DIGEST_DIR := $(BINARY_DIR)/digests
 
-.PHONY: build build-velod build-veloctl build-csi test test-integration lint shellcheck check-pins \
+.PHONY: build build-velod build-veloctl build-csi test test-integration lint shellcheck check-pins check-alerts \
 	proto proto-lint clean images image-spdk image-spdk-test spdk-unit-tests image-velod image-csi image-os \
 	push push-spdk push-velod push-csi push-os check-push qcow2
 
@@ -103,7 +103,7 @@ test-integration: image-spdk-test
 GOLANGCI_LINT ?= golangci-lint
 SHELLCHECK ?= shellcheck
 
-lint: check-pins shellcheck
+lint: check-pins shellcheck check-alerts
 	go vet ./...
 	go vet -tags integration ./internal/integration/
 	$(GOLANGCI_LINT) run --build-tags integration ./...
@@ -114,6 +114,10 @@ shellcheck:
 
 check-pins:
 	hack/check-pins.sh
+
+# Alert rules: promtool syntax check and unit tests (deploy/monitoring).
+check-alerts:
+	hack/check-alerts.sh
 
 proto:
 	buf generate

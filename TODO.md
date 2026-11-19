@@ -366,6 +366,11 @@ work still open, ranked by risk to data, how fixes are verified, and what has be
   4. **History graphs in the UI** (in scope, agreed 2026-11-19): pool space over time, IOPS
      and throughput per pool/volume, from the built-in Prometheus.
   Receiver secrets (SMTP password, webhook URLs) never go into the pools' metadata copies.
+  **Step 1 done (2026-11-19):** exporter rewritten (`internal/server/metrics.go`: grouped
+  families, Prometheus escaping; health, SMART, rebuild, durability, metadata copy, backups,
+  data plane, reconciler, per pool/volume/disk I/O); 25 rules in
+  `deploy/monitoring/velocor-alerts.rules.yml` with promtool unit tests (`make check-alerts`,
+  in lint and CI); a Go test ties rule metrics to the exporter; `docs/monitoring.md`.
 
 - [ ] **P1-3. Network changes can lock the appliance out.** `PUT /system/network/interfaces/{name}`
   applies at once; a wrong static address or disabling the management interface cuts the
