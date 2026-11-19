@@ -3,7 +3,8 @@ name: Build, Test & Release Velocor
 # Build logic lives in the Makefile; this workflow only decides what to call it with.
 #  - pull requests: lint, unit + integration tests, the SPDK unit tests of our SPDK patches, and
 #    a full image build pushed to a throwaway local registry (so the OS image build is exercised
-#    too). Nothing is published.
+#    too). Nothing is published. Only the jobs the changed files need run (hack/ci-changes.sh):
+#    a chart- or docs-only change runs lint alone. Skipped jobs count as passed checks.
 #  - main: images as sha-<sha> (+ moving tag "main"), signed and attested; dev Helm chart.
 #  - v* tags: release images (vX.Y.Z, X.Y, latest), chart, CLI binaries, GitHub release.
 # Every action is pinned to a commit SHA (hack/check-pins.sh enforces it) and every job gets
@@ -28,6 +29,34 @@ env:
   REGISTRY: ghcr.io
 
 jobs:
+  # Which jobs this run needs. Pull requests: from the files they change. Everything else (main,
+  # tags, manual runs): all of them, so what gets published is always fully tested.
+  changes:
+    name: Changed areas
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      go: ${{ steps.areas.outputs.go }}
+      spdk: ${{ steps.areas.outputs.spdk }}
+      images: ${{ steps.areas.outputs.images }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Classify the changed files
+        id: areas
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          if [[ "$EVENT" == pull_request ]]; then
+            git diff --name-only "$BASE...HEAD" | tee /dev/stderr | hack/ci-changes.sh | tee -a "$GITHUB_OUTPUT"
+          else
+            printf 'go=true\nspdk=true\nimages=true\n' | tee -a "$GITHUB_OUTPUT"
+          fi
+
   lint:
     name: Lint
     runs-on: ubuntu-24.04
@@ -66,6 +95,8 @@ jobs:
 
   test:
     name: Unit & CSI sanity tests
+    needs: changes
+    if: needs.changes.outputs.go == 'true'
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -81,7 +112,8 @@ jobs:
 
   veloctl:
     name: veloctl binaries
-    needs: [lint, test]
+    needs: [changes, lint, test]
+    if: needs.changes.outputs.go == 'true'
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -121,6 +153,8 @@ jobs:
   # unless they pass.
   spdk-unit-tests:
     name: SPDK patch unit tests
+    needs: changes
+    if: needs.changes.outputs.spdk == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     permissions:
@@ -135,7 +169,9 @@ jobs:
   # (pinned by digest), and SPDK is compiled once for both the integration tests and the image.
   images:
     name: Images (integration tests, build, push)
-    needs: [lint, test, spdk-unit-tests]
+    needs: [changes, lint, test, spdk-unit-tests]
+    # Runs when the jobs before it passed or were skipped (not needed for this change).
+    if: ${{ !cancelled() && !failure() && needs.changes.outputs.images == 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     env:
