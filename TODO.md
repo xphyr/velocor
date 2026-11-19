@@ -573,6 +573,19 @@ work still open, ranked by risk to data, how fixes are verified, and what has be
   without any operator step; the members now have the new IDs and keep their old bdev UUIDs,
   the old records are gone, serials no longer end in NUL, and the volume on `mirror250a` is
   ONLINE. The new disks can't have their write cache switched off (see P0-4).
+- [ ] **P1-15. Consistent group snapshots of volumes in use fail. (Verified)** To make a group
+  snapshot crash-consistent, velod pauses each volume's NVMe/TCP subsystem with
+  `nvmf_subsystem_pause` (and resumes it afterwards), but SPDK v26.09 has no such RPC: the
+  request fails with "Method not found" (-32601) as soon as any member volume is exported. Found
+  2026-11-19 with a VolumeGroupSnapshot on snoarm; group snapshots of unexported volumes work.
+  The fake SPDK (`internal/spdk/spdktest`) implements the RPC, so no unit test noticed, and the
+  integration suite never snapshots an exported volume as a group. iSCSI exports need the same.
+  *Needed:* a way to quiesce I/O that real SPDK has (e.g. pausing the NVMe-oF subsystem through
+  an SPDK patch exposing `spdk_nvmf_subsystem_pause`, or quiescing the lvol bdevs
+  (`spdk_bdev_quiesce`) through a patch-provided RPC), an integration test that takes a group
+  snapshot of exported volumes under I/O, and removing the RPC from the fake until real SPDK
+  has it. Until then, refuse group snapshots of exported volumes with a clear error rather
+  than a 500.
 - [ ] **P2-11. velod reports ONLINE before a restarted data plane is restored.** After an SPDK
   restart, status said ONLINE within ~10 s while volume stores, the iSCSI portal and target came
   back about a minute later.
@@ -641,7 +654,16 @@ work still open, ranked by risk to data, how fixes are verified, and what has be
 - [ ] **P2-10. Recovery time after an unclean SPDK stop** is now ~1 min per 500 GB on emulated
   disks (was 16 min). If it matters on real hardware, lower the lvstore metadata reservation
   (`num_md_pages_per_cluster_ratio`) and report a "recovering" state instead of DEGRADED.
-- [ ] **P2-8. CSI sidecar images are pinned by tag** (`csi-provisioner:v5.1.0`, ...), not digest.
+- [x] **P2-8. CSI sidecar images are pinned by tag** (`csi-provisioner:v5.1.0`, ...), not digest.
+  **Done (2026-11-19):** the chart and the static manifest pin all five by digest, at the
+  versions tested on an arm64 and an x86_64 cluster (provisioner v6.4.0, attacher v4.13.0,
+  resizer v2.3.0, snapshotter v8.7.0, registrar v2.18.0); `hack/check-pins.sh` fails if the
+  manifest's sidecars differ from the chart's or aren't pinned. Renovate groups sidecar updates
+  (label needs-cluster-test). Found in the test: snapshotter v8.7 has no
+  `--enable-volume-group-snapshots` flag any more (group snapshots are GA and always on) and
+  crash-loops if given it; the chart passed it only on v1beta1 clusters, which hid it. The
+  chart now creates its VolumeGroupSnapshotClass with the API the cluster serves (v1, else
+  v1beta1); it was v1beta1 only, so on clusters with only v1 (OpenShift 5) no class was made.
 - [ ] **P2-6. No health endpoint.** velod has no unauthenticated liveness/readiness route
   (found in the 2026-11-16 qcow2 boot test), so quadlets can't use `HealthCmd=` and monitoring
   can't tell "velod up but SPDK unreachable" from "all good". *Needed:* `/healthz` (process up)

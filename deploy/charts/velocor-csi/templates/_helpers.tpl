@@ -38,3 +38,15 @@ Secret name for Velocor API credentials
 {{- .Values.auth.secretName -}}
 {{- end -}}
 {{- end }}
+
+{{/*
+The VolumeGroupSnapshot API the cluster serves: v1 (GA; OpenShift 5 / external-snapshotter
+v8.5+ CRDs) if present, else v1beta1, else "".
+*/}}
+{{- define "velocor-csi.groupSnapshotAPI" -}}
+{{- if .Capabilities.APIVersions.Has "groupsnapshot.storage.k8s.io/v1" -}}
+groupsnapshot.storage.k8s.io/v1
+{{- else if .Capabilities.APIVersions.Has "groupsnapshot.storage.k8s.io/v1beta1" -}}
+groupsnapshot.storage.k8s.io/v1beta1
+{{- end -}}
+{{- end }}
