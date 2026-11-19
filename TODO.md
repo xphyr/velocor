@@ -344,7 +344,7 @@ work still open, ranked by risk to data, how fixes are verified, and what has be
 
 ### P1: outages, lock-outs, things operators can't see
 
-- [ ] **P1-1. Nothing alerts anyone.** Degraded or faulted pools, SMART critical warnings, a
+- [x] **P1-1. Nothing alerts anyone.** Degraded or faulted pools, SMART critical warnings, a
   filling pool or a stalled reconciler are visible only in the UI. `/metrics` exports capacity
   but no health. *Needed:* health gauges per disk/pool/volume/export (so Prometheus /
   Alertmanager can page), and optionally a webhook or e-mail notifier.
@@ -385,6 +385,13 @@ work still open, ranked by risk to data, how fixes are verified, and what has be
   never returned by the API), per-rule on/off, delay and thresholds (disk temperature, wear),
   test alert, silences, Alerts page; named history graphs (`/monitoring/graphs/{name}`, no
   PromQL from browsers) as SVG charts on the overview, pool and volume pages.
+  **Done (2026-11-19), lab-checked on velocor-1 (dev-99eece0):** monitoring restarts with velod
+  after a reboot and keeps its history; test alert, silence round trip and a rule change
+  (reloaded into Prometheus) work through the API; graphs checked by the user with load from
+  snoarm. Found there: latency graphs are 0/0 = NaN while idle, which encoding/json refused
+  after a 200 (fixed in 99eece0: NaN dropped, writeJSON encodes before writing).
+  *Left:* delivery to a real email/webhook receiver isn't tested (no receiver in the lab);
+  Slack/PagerDuty-native receivers (webhook covers them through relays).
 
 - [ ] **P1-3. Network changes can lock the appliance out.** `PUT /system/network/interfaces/{name}`
   applies at once; a wrong static address or disabling the management interface cuts the
@@ -860,7 +867,7 @@ Before tagging the first release (agreed 2026-11-19): P1-13 portal choice (done)
 tag to prove the release pipeline (B16). B8: no qcow2 with releases (the README explains how to
 build one). The real-hardware tests of P0-1 and P0-4 stay open.
 
-After the release gate: P1-1 alerting, P1-3 network rollback, P2-2 scrub, P2-11 (P1-5 orphan
+After the release gate: P1-1 alerting (done 2026-11-19), P1-3 network rollback, P2-2 scrub, P2-11 (P1-5 orphan
 reporting done 2026-11-18).
 
 ---
