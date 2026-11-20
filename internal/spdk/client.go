@@ -32,8 +32,11 @@ var longRunningMethods = map[string]bool{
 	"bdev_lvol_inflate":         true,
 	"bdev_lvol_decouple_parent": true,
 	"bdev_lvol_resize":          true,
-	"bdev_raid_create":          true,
-	"bdev_raid_delete":          true,
+	// Waits up to its quiesce timeout, then writes metadata for every member's snapshot; if
+	// velod gave up first, its cleanup could run before snapshots SPDK then completes.
+	"bdev_lvol_snapshot_group": true,
+	"bdev_raid_create":         true,
+	"bdev_raid_delete":         true,
 	// Membership changes quiesce I/O and read/write the members' superblocks.
 	"bdev_raid_add_base_bdev":    true,
 	"bdev_raid_remove_base_bdev": true,

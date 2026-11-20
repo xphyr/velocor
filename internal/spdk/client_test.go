@@ -104,6 +104,10 @@ func TestSPDKClientTypedRPCs(t *testing.T) {
 		case "iscsi_create_target_node":
 			return true, nil
 		case "bdev_get_iostat":
+			// SPDK v26.09 rejects "name"; it takes "names", an array.
+			if names, ok := params["names"].([]any); !ok || len(names) != 1 || names[0] != "lvs_pool0/vol1" || params["name"] != nil {
+				return nil, &RPCError{Code: -32603, Message: "spdk_json_decode_object failed"}
+			}
 			return BdevGetIostatResponse{
 				TickRate: 2400000000,
 				Ticks:    1000000,

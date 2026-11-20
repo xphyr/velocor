@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"time"
 )
 
 // LvolStoreInfo describes an SPDK logical volume store (lvol_store).
@@ -123,6 +124,35 @@ func (c *Client) BdevLvolSnapshot(ctx context.Context, lvolName, snapshotName st
 		return "", err
 	}
 	return uuid, nil
+}
+
+// SnapshotGroupEntry is one member of BdevLvolSnapshotGroup.
+type SnapshotGroupEntry struct {
+	LvolName     string `json:"lvol_name"`
+	SnapshotName string `json:"snapshot_name"`
+}
+
+// MaxSnapshotGroup is the most lvols one BdevLvolSnapshotGroup call may cover.
+const MaxSnapshotGroup = 64
+
+// BdevLvolSnapshotGroup snapshots several lvols at one point in time (patch 0003): SPDK quiesces
+// I/O to all of them, snapshots each, then resumes I/O, all within the one RPC, so I/O can't be
+// left paused. It returns the snapshot UUIDs in entry order. If I/O doesn't drain within
+// quiesceTimeout no snapshot is taken (ETIMEDOUT). On other failures some snapshots may have been
+// taken; the caller deletes them by name.
+func (c *Client) BdevLvolSnapshotGroup(ctx context.Context, entries []SnapshotGroupEntry, quiesceTimeout time.Duration) ([]string, error) {
+	params := map[string]any{
+		"snapshots":          entries,
+		"quiesce_timeout_ms": quiesceTimeout.Milliseconds(),
+	}
+	var uuids []string
+	if err := c.Call(ctx, "bdev_lvol_snapshot_group", params, &uuids); err != nil {
+		return nil, err
+	}
+	if len(uuids) != len(entries) {
+		return nil, fmt.Errorf("bdev_lvol_snapshot_group returned %d snapshots for %d lvols", len(uuids), len(entries))
+	}
+	return uuids, nil
 }
 
 // BdevLvolClone creates a writable thin clone volume from snapshotName and returns the clone UUID.

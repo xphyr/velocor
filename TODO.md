@@ -593,7 +593,7 @@ work still open, ranked by risk to data, how fixes are verified, and what has be
   without any operator step; the members now have the new IDs and keep their old bdev UUIDs,
   the old records are gone, serials no longer end in NUL, and the volume on `mirror250a` is
   ONLINE. The new disks can't have their write cache switched off (see P0-4).
-- [ ] **P1-15. Consistent group snapshots of volumes in use fail. (Verified)** To make a group
+- [x] **P1-15. Consistent group snapshots of volumes in use fail. (Verified)** To make a group
   snapshot crash-consistent, velod pauses each volume's NVMe/TCP subsystem with
   `nvmf_subsystem_pause` (and resumes it afterwards), but SPDK v26.09 has no such RPC: the
   request fails with "Method not found" (-32601) as soon as any member volume is exported. Found
@@ -612,7 +612,29 @@ work still open, ranked by risk to data, how fixes are verified, and what has be
   The pause/resume RPCs are gone from velod's client and from the fake. New integration test
   `TestGroupSnapshots` (real SPDK): refusal while exported, then a group taken once unexported,
   with a member's clone holding the data. README says group snapshots need volumes no host uses.
-  *Left:* the real fix (quiescing I/O through an SPDK patch) and its test under I/O.
+  **Done (2026-11-20):** SPDK patch 0003 adds `bdev_lvol_snapshot_group`, which does the whole
+  group in one RPC: it quiesces every member lvol bdev (`spdk_bdev_quiesce`: I/O in flight
+  completes, new I/O waits), snapshots each once all are quiesced, then unquiesces them. It acts
+  at the bdev layer, so NVMe/TCP and iSCSI are both covered, and I/O can't be left paused by a
+  caller dying between RPCs (the risk of the old pause/resume design, P1-2). If I/O doesn't drain
+  within 5 s nothing is taken (ETIMEDOUT; velod answers 503, CSI `Unavailable`, the snapshotter
+  retries); members already quiesced resume at once. A failed snapshot stops the rest and names
+  those taken; velod deletes them by name. A descriptor is held on each member so a concurrent
+  delete can't free it mid-operation. velod uses the one call for every group (exported or not)
+  and no longer refuses volumes in use; the RPC is on the client's long-timeout list (giving up
+  while SPDK finishes would orphan snapshots). Tests: SPDK unit test `ut_lvol_snapshot_group`
+  (snapshots only while every member is quiesced; duplicates, timeout with a late quiesce,
+  quiesce failure, snapshot failure, no-limit wait); velod tests for the single call, cleanup of
+  snapshots SPDK took before failing, and the 503; integration `TestGroupSnapshots` (real SPDK)
+  snapshots two exported volumes while one is rewritten at queue depth 1 and checks the clone is
+  an exact point in time (a prefix of new blocks, the rest old; e.g. 14 of 4096 new), the writer
+  sees no errors, and the idle member's clone holds its data. Schema entry, `rpc.py` command and
+  RPC docs are in the patch, ready to send upstream.
+  *Left:* lab check on snoarm/NVW with a VolumeGroupSnapshot of PVCs in use.
+  **Found alongside:** velod's `bdev_get_iostat` call sent `name`, which SPDK v26.09 rejects (it
+  takes `names`, an array), so `GET /api/v1/system/iostats?bdev_name=...` failed on real SPDK (the
+  unfiltered metrics path was fine). Fixed; the fake now rejects `name` like SPDK and the client
+  test checks the parameter.
 - [x] **P2-11. velod reports ONLINE before a restarted data plane is restored.** After an SPDK
   restart, status said ONLINE within ~10 s while volume stores, the iSCSI portal and target came
   back about a minute later.
@@ -977,7 +999,7 @@ Before tagging the first release (agreed 2026-11-19): P1-13 portal choice (done)
 tag to prove the release pipeline (B16). B8: no qcow2 with releases (the README explains how to
 build one). The real-hardware tests of P0-1 and P0-4 stay open.
 
-After the release gate: P1-1 alerting (done 2026-11-19), P1-3 network rollback (done 2026-11-19), P2-2 scrub, P2-11 (done 2026-11-19) (P1-5 orphan
+After the release gate: P1-1 alerting (done 2026-11-19), P1-3 network rollback (done 2026-11-19), P1-15 (done 2026-11-20), P2-2 scrub, P2-11 (done 2026-11-19) (P1-5 orphan
 reporting done 2026-11-18).
 
 ---

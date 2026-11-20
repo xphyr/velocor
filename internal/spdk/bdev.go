@@ -224,7 +224,7 @@ type BdevGetIostatResponse struct {
 func (c *Client) BdevGetIostat(ctx context.Context, name string) (*BdevGetIostatResponse, error) {
 	var params any
 	if name != "" {
-		params = map[string]any{"name": name}
+		params = map[string]any{"names": []string{name}} // v26.09 dropped "name"
 	}
 	var res BdevGetIostatResponse
 	if err := c.Call(ctx, "bdev_get_iostat", params, &res); err != nil {

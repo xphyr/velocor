@@ -156,8 +156,10 @@ func mapGroupControllerError(err error) error {
 			return status.Error(codes.NotFound, apiErr.Message)
 		case 409:
 			return status.Error(codes.AlreadyExists, apiErr.Message)
-		case 412: // e.g. a group snapshot of volumes in use (TODO.md P1-15)
+		case 412:
 			return status.Error(codes.FailedPrecondition, apiErr.Message)
+		case 503: // e.g. the members' I/O didn't pause in time: retry later
+			return status.Error(codes.Unavailable, apiErr.Message)
 		default:
 			return status.Error(codes.Internal, apiErr.Message)
 		}

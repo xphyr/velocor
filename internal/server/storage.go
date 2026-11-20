@@ -888,6 +888,26 @@ func (s *Server) deleteSnapshot(ctx context.Context, snap *store.Snapshot) error
 
 // --- Volume group snapshots ---
 
+// groupSnapshotQuiesceTimeout bounds how long a group snapshot waits for I/O already in flight to
+// the members to complete. Hosts' new I/O waits meanwhile, so it stays well under their I/O
+// timeouts (30 s for Linux NVMe/TCP and iSCSI).
+const groupSnapshotQuiesceTimeout = 5 * time.Second
+
+// groupSnapshotError explains SPDK's group snapshot failures that callers can act on.
+func groupSnapshotError(err error) error {
+	var rpcErr *spdk.RPCError
+	if errors.As(err, &rpcErr) {
+		switch rpcErr.Code {
+		case -110: // ETIMEDOUT: no snapshot was taken
+			return fmt.Errorf("%w: I/O to the volumes didn't pause within %s (a disk may be slow); no snapshot was taken, try again: %v",
+				errDataPlaneUnavailable, groupSnapshotQuiesceTimeout, err)
+		case -32601: // method not found: an SPDK without patch 0003
+			return fmt.Errorf("%w: this data plane can't take group snapshots: %v", errDataPlaneUnavailable, err)
+		}
+	}
+	return fmt.Errorf("group snapshot: %w", err)
+}
+
 func (s *Server) handleCreateVolumeGroupSnapshot(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Name      string   `json:"name"`
@@ -936,7 +956,6 @@ func (s *Server) handleCreateVolumeGroupSnapshot(w http.ResponseWriter, r *http.
 		pool *store.Pool
 	}
 	targets := make([]target, 0, len(volIDs))
-	var exported []string
 	for _, volID := range volIDs {
 		vol, err := s.liveVolume(volID)
 		if err != nil {
@@ -949,24 +968,9 @@ func (s *Server) handleCreateVolumeGroupSnapshot(w http.ResponseWriter, r *http.
 			return
 		}
 		targets = append(targets, target{vol, pool})
-		exps, err := s.store.ListExports(volID, "")
-		if err != nil {
-			writeError(w, err)
-			return
-		}
-		if len(exps) > 0 {
-			exported = append(exported, vol.Name)
-		}
 	}
-	// A group snapshot must capture every member at the same instant. That needs host I/O to
-	// the members paused while they are snapshotted, and SPDK v26.09 offers no way to do that
-	// (TODO.md P1-15): snapshots taken one after another while hosts write are not consistent
-	// with each other, so they are refused rather than presented as a group.
-	if len(exported) > 0 {
-		writeJSON(w, http.StatusPreconditionFailed, map[string]any{"error": fmt.Sprintf(
-			"can't take a consistent group snapshot of volumes in use (%s): Velocor can't pause their I/O together yet. "+
-				"Snapshot them while no host uses them, or snapshot each volume on its own (not consistent with each other)",
-			strings.Join(exported, ", "))})
+	if len(targets) > spdk.MaxSnapshotGroup {
+		writeError(w, fmt.Errorf("%w: a group snapshot can cover at most %d volumes", store.ErrInvalidArgument, spdk.MaxSnapshotGroup))
 		return
 	}
 	if err := s.requireSPDK(); err != nil {
@@ -977,13 +981,55 @@ func (s *Server) handleCreateVolumeGroupSnapshot(w http.ResponseWriter, r *http.
 	ctx := r.Context()
 	cleanup := context.WithoutCancel(ctx)
 
-	var snaps []*store.Snapshot
+	// Reserve the space each snapshot pins (as takeSnapshot does) before taking any.
 	var releases []func()
 	defer func() {
 		for _, rel := range releases {
 			rel()
 		}
 	}()
+	snaps := make([]*store.Snapshot, 0, len(targets))
+	entries := make([]spdk.SnapshotGroupEntry, 0, len(targets))
+	for _, t := range targets {
+		held, err := s.lvolHeldBytes(ctx, t.vol.UUID)
+		if err != nil {
+			writeError(w, err)
+			return
+		}
+		id := newResourceID("snap")
+		release, err := s.reserveSpace(ctx, t.pool.ID, held, snapshotRecorded(id))
+		if err != nil {
+			writeError(w, err)
+			return
+		}
+		releases = append(releases, release)
+		snaps = append(snaps, &store.Snapshot{
+			ID:             id,
+			Name:           req.Name + "-" + t.vol.ID,
+			VolumeID:       t.vol.ID,
+			PoolID:         t.pool.ID,
+			LvolBdevName:   t.pool.LVSName + "/" + id,
+			SizeBytes:      t.vol.SizeBytes,
+			AllocatedBytes: held,
+		})
+		entries = append(entries, spdk.SnapshotGroupEntry{LvolName: t.vol.UUID, SnapshotName: id})
+	}
+
+	// One SPDK call pauses I/O to every member (hosts' writes wait, nothing fails), snapshots
+	// them all at that instant and resumes I/O, so the snapshots are consistent with each other
+	// whether or not hosts are writing (TODO.md P1-15, SPDK patch 0003).
+	uuids, err := s.spdk.BdevLvolSnapshotGroup(ctx, entries, groupSnapshotQuiesceTimeout)
+	if err != nil {
+		// SPDK stops at the first failed snapshot and may leave earlier ones; remove them.
+		for _, sn := range snaps {
+			_ = s.spdk.BdevLvolDelete(cleanup, sn.LvolBdevName)
+		}
+		writeError(w, groupSnapshotError(err))
+		return
+	}
+	for i, sn := range snaps {
+		sn.UUID = uuids[i]
+	}
 	rollback := func(err error) {
 		for _, sn := range snaps {
 			_ = s.store.DeleteSnapshot(sn.ID)
@@ -991,27 +1037,11 @@ func (s *Server) handleCreateVolumeGroupSnapshot(w http.ResponseWriter, r *http.
 		}
 		writeError(w, err)
 	}
-	for _, t := range targets {
-		snap, release, err := s.takeSnapshot(ctx, t.vol, t.pool, req.Name+"-"+t.vol.ID)
-		if err != nil {
-			rollback(err)
-			return
-		}
-		releases = append(releases, release)
-		snaps = append(snaps, snap)
-	}
 
 	snapIDs := make([]string, 0, len(snaps))
-	for i, sn := range snaps {
+	for _, sn := range snaps {
 		if err := s.store.CreateSnapshot(sn); err != nil {
-			// Only roll back store records that were actually written.
-			for _, done := range snaps[:i] {
-				_ = s.store.DeleteSnapshot(done.ID)
-			}
-			for _, x := range snaps {
-				_ = s.spdk.BdevLvolDelete(cleanup, x.UUID)
-			}
-			writeError(w, err)
+			rollback(err)
 			return
 		}
 		snapIDs = append(snapIDs, sn.ID)

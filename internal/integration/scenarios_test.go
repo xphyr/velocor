@@ -3,10 +3,13 @@
 package integration
 
 import (
+	"bytes"
 	"context"
+	"fmt"
 	"os"
 	"slices"
 	"testing"
+	"time"
 
 	"github.com/velocor/velocor/internal/spdk"
 	"github.com/velocor/velocor/internal/store"
@@ -298,40 +301,99 @@ func TestRAID5FRefused(t *testing.T) {
 	}
 }
 
-// Group snapshots on real SPDK (TODO.md P1-15): SPDK v26.09 can't pause the members' I/O
-// together, so a group including an exported volume is refused (HTTP 412) and leaves nothing
-// behind; once no host uses the volumes, the group is taken and each member snapshot holds its
-// volume's data.
+// Group snapshots on real SPDK (TODO.md P1-15, SPDK patch 0003) of exported volumes, one of
+// them being written: SPDK quiesces both, snapshots them and resumes I/O in one RPC. The writer
+// runs at queue depth 1 with 4 KiB blocks, so its writes are strictly sequential and any point
+// in time shows a prefix of new blocks followed by old ones; the snapshot must show exactly that
+// (a torn or out-of-order image would not), and the writer must finish without errors.
+// Cross-volume ordering (every member quiesced before the first snapshot) is covered by SPDK's
+// unit test ut_lvol_snapshot_group.
 func TestGroupSnapshots(t *testing.T) {
-	a, pool, vol, in := setup(t, "RAID0", 1)
-	data := randomData(t, 1<<20)
-	if err := in.write(0, data); err != nil {
+	const size = 16 << 20
+	tg := newTarget(t)
+	a := newAppliance(t, tg)
+	a.addDisk("diska", diskSize)
+	a.addDisk("diskb", diskSize)
+	pool := a.must("POST", "/pools", map[string]any{"name": "p", "raid_level": "RAID0", "disk_ids": []string{"diska", "diskb"}}, "pool")
+	vol := a.must("POST", "/volumes", map[string]any{"name": "v", "pool_id": pool["id"], "size_bytes": size, "thin_provision": true}, "volume")
+	other := a.must("POST", "/volumes", map[string]any{"name": "w", "pool_id": pool["id"], "size_bytes": volSize, "thin_provision": true}, "volume")
+	in := a.initiator(a.exportTo(vol["id"].(string), "v", hostA), hostA)
+	otherIn := a.initiator(a.exportTo(other["id"].(string), "w", hostA), hostA)
+	otherData := randomData(t, 1<<20)
+	if err := otherIn.write(0, otherData); err != nil {
 		t.Fatal(err)
 	}
-	other := a.must("POST", "/volumes", map[string]any{"name": "w", "pool_id": pool["id"], "size_bytes": volSize, "thin_provision": true}, "volume")
+	oldData := randomData(t, size)
+	if err := in.write(0, oldData); err != nil {
+		t.Fatal(err)
+	}
 	ids := []string{vol["id"].(string), other["id"].(string)}
 
-	if code, out := a.do("POST", "/volume-group-snapshots", map[string]any{"name": "g", "volume_ids": ids}); code != 412 {
-		t.Fatalf("group snapshot with an exported member: HTTP %d %v, want 412", code, out)
-	}
-	if snaps := a.must("GET", "/snapshots", nil, "")["snapshots"].([]any); len(snaps) != 0 {
-		t.Fatalf("a refused group snapshot left %d snapshots", len(snaps))
-	}
-
-	for _, e := range a.must("GET", "/exports?volume_id="+vol["id"].(string), nil, "")["exports"].([]any) {
-		a.must("DELETE", "/exports/"+e.(map[string]any)["id"].(string), nil, "")
-	}
-	g := a.must("POST", "/volume-group-snapshots", map[string]any{"name": "g", "volume_ids": ids}, "")
-	members := g["snapshots"].([]any)
-	if len(members) != 2 {
-		t.Fatalf("group snapshot: %v", g)
-	}
-	var mine string
-	for _, m := range members {
-		if m.(map[string]any)["volume_id"] == vol["id"] {
-			mine = m.(map[string]any)["id"].(string)
+	writes := func() uint64 {
+		st, err := tg.client().BdevGetIostat(context.Background(), vol["uuid"].(string))
+		if err != nil || len(st.Bdevs) != 1 {
+			t.Fatalf("iostat of %s: %v", vol["uuid"], err)
 		}
+		return st.Bdevs[0].NumWriteOps
 	}
-	clone := a.must("POST", "/snapshots/"+mine+":clone", map[string]any{"clone_name": "gc"}, "volume")
-	a.initiator(a.exportTo(clone["id"].(string), "gc", hostA), hostA).mustRead(0, data)
+	// Retry if the writer happens to finish before the snapshot is taken.
+	for attempt := 1; ; attempt++ {
+		newData := randomData(t, size)
+		in.qd = 1
+		before := writes()
+		done := make(chan error, 1)
+		go func() { done <- in.write(0, newData) }()
+		for writes() == before {
+			time.Sleep(5 * time.Millisecond)
+		}
+		name := fmt.Sprintf("g%d", attempt)
+		g := a.must("POST", "/volume-group-snapshots", map[string]any{"name": name, "volume_ids": ids}, "")
+		atSnapshot := writes()
+		if err := <-done; err != nil {
+			t.Fatalf("writes during the group snapshot: %v", err)
+		}
+		in.qd = 0
+		if writes() == atSnapshot {
+			if attempt == 5 {
+				t.Fatal("the writer finished before the group snapshot every time")
+			}
+			// Free the space the missed snapshots pin.
+			a.must("DELETE", "/volume-group-snapshots/"+g["volume_group_snapshot"].(map[string]any)["id"].(string), nil, "")
+			oldData = newData
+			continue
+		}
+
+		members := g["snapshots"].([]any)
+		if len(members) != 2 {
+			t.Fatalf("group snapshot: %v", g)
+		}
+		snapOf := map[string]string{}
+		for _, m := range members {
+			snapOf[m.(map[string]any)["volume_id"].(string)] = m.(map[string]any)["id"].(string)
+		}
+		clone := a.must("POST", "/snapshots/"+snapOf[vol["id"].(string)]+":clone", map[string]any{"clone_name": "gc"}, "volume")
+		got, err := a.initiator(a.exportTo(clone["id"].(string), "gc", hostB), hostB).read(0, size)
+		if err != nil {
+			t.Fatal(err)
+		}
+		blocks := size / blockSize
+		k := 0
+		for k < blocks && bytes.Equal(got[k*blockSize:(k+1)*blockSize], newData[k*blockSize:(k+1)*blockSize]) {
+			k++
+		}
+		for i := k; i < blocks; i++ {
+			if !bytes.Equal(got[i*blockSize:(i+1)*blockSize], oldData[i*blockSize:(i+1)*blockSize]) {
+				t.Fatalf("snapshot isn't a point in time: blocks 0-%d are new, but block %d is neither the old nor the following new data", k-1, i)
+			}
+		}
+		if k == 0 || k == blocks {
+			t.Fatalf("snapshot taken during the writes holds %d of %d new blocks, want a part", k, blocks)
+		}
+		t.Logf("attempt %d: the snapshot holds the first %d of %d rewritten blocks", attempt, k, blocks)
+
+		otherClone := a.must("POST", "/snapshots/"+snapOf[other["id"].(string)]+":clone", map[string]any{"clone_name": "wc"}, "volume")
+		a.initiator(a.exportTo(otherClone["id"].(string), "wc", hostB), hostB).mustRead(0, otherData)
+		in.mustRead(0, newData)
+		return
+	}
 }
