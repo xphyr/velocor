@@ -1,0 +1,991 @@
+From: Velocor <noreply@velocor.invalid>
+Subject: [PATCH] bdev/lvol: add bdev_lvol_snapshot_group
+
+bdev_lvol_snapshot makes one lvol's snapshot consistent on its own, but there is no way to
+snapshot several lvols at one point in time while hosts write to them: snapshots taken one
+after another by separate RPCs each capture a different moment, so an application spreading
+its data over several volumes (a database and its log, a VM with several disks) can't be
+restored consistently. The NVMe-oF subsystem pause and bdev quiesce functions that could
+order this exist in the C API but have no RPC, and pausing through separate RPCs would leave
+I/O stalled if the caller died between them.
+
+Add vbdev_lvol_create_snapshot_group() and the bdev_lvol_snapshot_group RPC, which do the
+whole operation in one call: every member lvol bdev is quiesced (spdk_bdev_quiesce: I/O
+submitted before completes, new I/O is queued), the snapshots are created one after another
+once all are quiesced, then every bdev is unquiesced and the queued I/O runs. This works for
+any front end (NVMe-oF, iSCSI, vhost, ublk) because it acts at the bdev layer. A descriptor is
+held on each member for the duration, so a concurrent delete can't free a bdev under a
+pending quiesce.
+
+If the bdevs aren't all quiesced within quiesce_timeout_ms (default 5000; 0 for no limit, for
+example a member whose I/O is stuck on a failing disk), no snapshot is taken: the members
+already quiesced are unquiesced at once and the others as soon as their quiesce completes,
+and the RPC fails with ETIMEDOUT. If a snapshot fails, the remaining ones aren't attempted,
+everything is unquiesced, and the error names the snapshots that were taken so the caller can
+delete them. The same lvol listed twice is refused (it would wait for itself).
+
+  bdev_lvol_snapshot_group {"snapshots": [{"lvol_name": "...", "snapshot_name": "..."}, ...],
+                            "quiesce_timeout_ms": 5000}
+  result: the snapshots' UUIDs, in request order
+
+Also: the schema entry, the rpc.py command and the RPC documentation.
+
+Unit test: ut_lvol_snapshot_group.
+
+Applies to SPDK v26.09 (0bbb7fe4dccfb31e8d446da8822360704949d1e9) after 0001 and 0002.
+---
+diff --git a/doc/jsonrpc.md.jinja2 b/doc/jsonrpc.md.jinja2
+index 3f587d5..6d7a764 100644
+--- a/doc/jsonrpc.md.jinja2
++++ b/doc/jsonrpc.md.jinja2
+@@ -7854,6 +7854,37 @@ Example response:
+ }
+ ~~~
+ 
++### bdev_lvol_snapshot_group {#rpc_bdev_lvol_snapshot_group}
++
++{{ bdev_lvol_snapshot_group_description }}
++
++#### Parameters
++
++{{ bdev_lvol_snapshot_group_params }}
++
++#### Response
++
++{{ bdev_lvol_snapshot_group_response }}
++
++#### Example
++
++Example request:
++
++{{ example_request("bdev_lvol_snapshot_group", "1b38702c-7f0c-411e-a962-92c6a5a8a602:SNAP1 lvs0/db-log:SNAP2", "-t", "2000") }}
++
++Example response:
++
++~~~json
++{
++  "jsonrpc": "2.0",
++  "id": 1,
++  "result": [
++    "cc8d7fdf-7865-4d1f-9fc6-35da8e368670",
++    "6f5c7a1e-23b4-4c7e-8a8e-0f6e3c2a9b51"
++  ]
++}
++~~~
++
+ ### bdev_lvol_clone {#rpc_bdev_lvol_clone}
+ 
+ {{ bdev_lvol_clone_description }}
+diff --git a/module/bdev/lvol/vbdev_lvol.c b/module/bdev/lvol/vbdev_lvol.c
+index 470b062..5f3fa87 100644
+--- a/module/bdev/lvol/vbdev_lvol.c
++++ b/module/bdev/lvol/vbdev_lvol.c
+@@ -1317,6 +1317,318 @@ ignore_bdev_event_cb(enum spdk_bdev_event_type type, struct spdk_bdev *bdev, voi
+ {
+ }
+ 
++/*
++ * Group snapshots: quiesce every member bdev, snapshot each while all are quiesced, unquiesce.
++ * Everything runs on the calling (app) thread; the quiesce and unquiesce completions come back
++ * on it.
++ */
++enum snapshot_group_member_state {
++	SNAPSHOT_GROUP_MEMBER_IDLE,		/* not quiesced (yet, or the quiesce failed) */
++	SNAPSHOT_GROUP_MEMBER_QUIESCING,
++	SNAPSHOT_GROUP_MEMBER_QUIESCED,
++	SNAPSHOT_GROUP_MEMBER_UNQUIESCING,
++	SNAPSHOT_GROUP_MEMBER_DONE,		/* unquiesced */
++};
++
++enum snapshot_group_phase {
++	SNAPSHOT_GROUP_QUIESCE,
++	SNAPSHOT_GROUP_SNAPSHOT,
++	SNAPSHOT_GROUP_UNQUIESCE,
++};
++
++struct snapshot_group_ctx;
++
++struct snapshot_group_member {
++	struct snapshot_group_ctx		*group;
++	struct spdk_lvol			*lvol;
++	/* Held for the whole operation, so the bdev can't be freed under a pending (un)quiesce. */
++	struct spdk_bdev_desc			*desc;
++	const char				*snapshot_name;
++	enum snapshot_group_member_state	state;
++};
++
++struct snapshot_group_ctx {
++	struct snapshot_group_member	*members;
++	struct spdk_lvol		**snapshots;
++	size_t				num;
++	size_t				next_snapshot;
++	/* Quiesce or unquiesce completions still to come. */
++	size_t				outstanding;
++	enum snapshot_group_phase	phase;
++	/* Set while quiesces are being submitted, so completions can't finish the group early. */
++	bool				submitting;
++	int				status;
++	struct spdk_poller		*timer;
++	vbdev_lvol_snapshot_group_cb	cb_fn;
++	void				*cb_arg;
++};
++
++static void snapshot_group_advance(struct snapshot_group_ctx *ctx);
++
++static void
++snapshot_group_free(struct snapshot_group_ctx *ctx)
++{
++	size_t i;
++
++	for (i = 0; i < ctx->num; i++) {
++		if (ctx->members[i].desc != NULL) {
++			spdk_bdev_close(ctx->members[i].desc);
++		}
++	}
++	free(ctx->members);
++	free(ctx->snapshots);
++	free(ctx);
++}
++
++static void
++snapshot_group_finish(struct snapshot_group_ctx *ctx)
++{
++	spdk_poller_unregister(&ctx->timer);
++	ctx->cb_fn(ctx->cb_arg, ctx->snapshots, ctx->status);
++	snapshot_group_free(ctx);
++}
++
++static void
++snapshot_group_unquiesced(void *cb_arg, int status)
++{
++	struct snapshot_group_member *member = cb_arg;
++	struct snapshot_group_ctx *ctx = member->group;
++
++	assert(ctx->outstanding > 0);
++	ctx->outstanding--;
++	member->state = SNAPSHOT_GROUP_MEMBER_DONE;
++	if (status != 0) {
++		SPDK_ERRLOG("group snapshot: unquiescing lvol %s failed: %s\n",
++			    member->lvol->unique_id, spdk_strerror(-status));
++		if (ctx->status == 0) {
++			ctx->status = status;
++		}
++	}
++	snapshot_group_advance(ctx);
++}
++
++static void
++snapshot_group_unquiesce_member(struct snapshot_group_member *member)
++{
++	struct snapshot_group_ctx *ctx = member->group;
++	int rc;
++
++	assert(member->state == SNAPSHOT_GROUP_MEMBER_QUIESCED);
++	member->state = SNAPSHOT_GROUP_MEMBER_UNQUIESCING;
++	ctx->outstanding++;
++	rc = spdk_bdev_unquiesce(member->lvol->bdev, &g_lvol_if, snapshot_group_unquiesced, member);
++	if (rc != 0) {
++		/* Not expected: the range was quiesced by us. Log loudly; I/O to it stays queued. */
++		SPDK_ERRLOG("group snapshot: can't unquiesce lvol %s: %s\n",
++			    member->lvol->unique_id, spdk_strerror(-rc));
++		ctx->outstanding--;
++		member->state = SNAPSHOT_GROUP_MEMBER_DONE;
++		if (ctx->status == 0) {
++			ctx->status = rc;
++		}
++	}
++}
++
++/* Stop: no (more) snapshots; unquiesce what is quiesced now and what completes later. */
++static void
++snapshot_group_abort(struct snapshot_group_ctx *ctx, int status)
++{
++	size_t i;
++
++	if (ctx->status == 0) {
++		ctx->status = status;
++	}
++	if (ctx->phase == SNAPSHOT_GROUP_UNQUIESCE) {
++		return;
++	}
++	ctx->phase = SNAPSHOT_GROUP_UNQUIESCE;
++	spdk_poller_unregister(&ctx->timer);
++	for (i = 0; i < ctx->num; i++) {
++		if (ctx->members[i].state == SNAPSHOT_GROUP_MEMBER_QUIESCED) {
++			snapshot_group_unquiesce_member(&ctx->members[i]);
++		}
++	}
++}
++
++static void
++snapshot_group_quiesced(void *cb_arg, int status)
++{
++	struct snapshot_group_member *member = cb_arg;
++	struct snapshot_group_ctx *ctx = member->group;
++
++	assert(ctx->outstanding > 0);
++	ctx->outstanding--;
++	if (status != 0) {
++		SPDK_ERRLOG("group snapshot: quiescing lvol %s failed: %s\n",
++			    member->lvol->unique_id, spdk_strerror(-status));
++		member->state = SNAPSHOT_GROUP_MEMBER_IDLE;
++		snapshot_group_abort(ctx, status);
++	} else {
++		member->state = SNAPSHOT_GROUP_MEMBER_QUIESCED;
++		if (ctx->phase == SNAPSHOT_GROUP_UNQUIESCE) {
++			/* Completed after a timeout or another member's failure. */
++			snapshot_group_unquiesce_member(member);
++		}
++	}
++	snapshot_group_advance(ctx);
++}
++
++static int
++snapshot_group_timeout(void *arg)
++{
++	struct snapshot_group_ctx *ctx = arg;
++
++	spdk_poller_unregister(&ctx->timer);
++	if (ctx->phase == SNAPSHOT_GROUP_QUIESCE) {
++		SPDK_ERRLOG("group snapshot: I/O to the lvols did not drain in time; no snapshots taken\n");
++		snapshot_group_abort(ctx, -ETIMEDOUT);
++		snapshot_group_advance(ctx);
++	}
++	return SPDK_POLLER_BUSY;
++}
++
++static void
++snapshot_group_snapshot_done(void *cb_arg, struct spdk_lvol *snapshot, int lvolerrno)
++{
++	struct snapshot_group_ctx *ctx = cb_arg;
++	struct snapshot_group_member *member = &ctx->members[ctx->next_snapshot];
++
++	if (lvolerrno != 0) {
++		SPDK_ERRLOG("group snapshot: snapshot %s of lvol %s failed: %s\n",
++			    member->snapshot_name, member->lvol->unique_id, spdk_strerror(-lvolerrno));
++		snapshot_group_abort(ctx, lvolerrno);
++	} else {
++		ctx->snapshots[ctx->next_snapshot] = snapshot;
++	}
++	ctx->next_snapshot++;
++	snapshot_group_advance(ctx);
++}
++
++static void
++snapshot_group_advance(struct snapshot_group_ctx *ctx)
++{
++	size_t i;
++
++	if (ctx->submitting || ctx->outstanding > 0) {
++		return;
++	}
++	switch (ctx->phase) {
++	case SNAPSHOT_GROUP_QUIESCE:
++		/* Every member is quiesced: no I/O is in flight to any of them. */
++		spdk_poller_unregister(&ctx->timer);
++		ctx->phase = SNAPSHOT_GROUP_SNAPSHOT;
++	/* fallthrough */
++	case SNAPSHOT_GROUP_SNAPSHOT:
++		if (ctx->next_snapshot < ctx->num) {
++			struct snapshot_group_member *member = &ctx->members[ctx->next_snapshot];
++
++			vbdev_lvol_create_snapshot(member->lvol, member->snapshot_name,
++						   snapshot_group_snapshot_done, ctx);
++			return;
++		}
++		ctx->phase = SNAPSHOT_GROUP_UNQUIESCE;
++		for (i = 0; i < ctx->num; i++) {
++			snapshot_group_unquiesce_member(&ctx->members[i]);
++		}
++		if (ctx->outstanding > 0) {
++			return;
++		}
++		break;
++	case SNAPSHOT_GROUP_UNQUIESCE:
++		break;
++	}
++	snapshot_group_finish(ctx);
++}
++
++void
++vbdev_lvol_create_snapshot_group(struct spdk_lvol **lvols, const char **snapshot_names,
++				 size_t num, uint32_t quiesce_timeout_ms,
++				 vbdev_lvol_snapshot_group_cb cb_fn, void *cb_arg)
++{
++	struct snapshot_group_ctx *ctx;
++	size_t i, j;
++	int rc;
++
++	if (num == 0 || num > VBDEV_LVOL_SNAPSHOT_GROUP_MAX) {
++		cb_fn(cb_arg, NULL, -EINVAL);
++		return;
++	}
++	for (i = 0; i < num; i++) {
++		if (lvols[i] == NULL || lvols[i]->bdev == NULL || snapshot_names[i] == NULL) {
++			cb_fn(cb_arg, NULL, -EINVAL);
++			return;
++		}
++		/* Quiescing a bdev twice would wait for itself. */
++		for (j = 0; j < i; j++) {
++			if (lvols[j] == lvols[i]) {
++				SPDK_ERRLOG("group snapshot: lvol %s is listed twice\n", lvols[i]->unique_id);
++				cb_fn(cb_arg, NULL, -EINVAL);
++				return;
++			}
++		}
++	}
++
++	ctx = calloc(1, sizeof(*ctx));
++	if (ctx == NULL) {
++		cb_fn(cb_arg, NULL, -ENOMEM);
++		return;
++	}
++	ctx->members = calloc(num, sizeof(*ctx->members));
++	ctx->snapshots = calloc(num, sizeof(*ctx->snapshots));
++	if (ctx->members == NULL || ctx->snapshots == NULL) {
++		free(ctx->members);
++		free(ctx->snapshots);
++		free(ctx);
++		cb_fn(cb_arg, NULL, -ENOMEM);
++		return;
++	}
++	ctx->num = num;
++	ctx->cb_fn = cb_fn;
++	ctx->cb_arg = cb_arg;
++	ctx->phase = SNAPSHOT_GROUP_QUIESCE;
++
++	for (i = 0; i < num; i++) {
++		struct snapshot_group_member *member = &ctx->members[i];
++
++		member->group = ctx;
++		member->lvol = lvols[i];
++		member->snapshot_name = snapshot_names[i];
++		rc = spdk_bdev_open_ext(spdk_bdev_get_name(lvols[i]->bdev), false, ignore_bdev_event_cb,
++					NULL, &member->desc);
++		if (rc != 0) {
++			SPDK_ERRLOG("group snapshot: can't open lvol %s: %s\n", lvols[i]->unique_id,
++				    spdk_strerror(-rc));
++			member->desc = NULL;
++			cb_fn(cb_arg, NULL, rc);
++			snapshot_group_free(ctx);
++			return;
++		}
++	}
++
++	if (quiesce_timeout_ms > 0) {
++		ctx->timer = SPDK_POLLER_REGISTER(snapshot_group_timeout, ctx,
++						  (uint64_t)quiesce_timeout_ms * 1000);
++	}
++
++	ctx->submitting = true;
++	for (i = 0; i < num && ctx->phase == SNAPSHOT_GROUP_QUIESCE; i++) {
++		struct snapshot_group_member *member = &ctx->members[i];
++
++		member->state = SNAPSHOT_GROUP_MEMBER_QUIESCING;
++		ctx->outstanding++;
++		rc = spdk_bdev_quiesce(member->lvol->bdev, &g_lvol_if, snapshot_group_quiesced, member);
++		if (rc != 0) {
++			SPDK_ERRLOG("group snapshot: can't quiesce lvol %s: %s\n",
++				    member->lvol->unique_id, spdk_strerror(-rc));
++			ctx->outstanding--;
++			member->state = SNAPSHOT_GROUP_MEMBER_IDLE;
++			snapshot_group_abort(ctx, rc);
++		}
++	}
++	ctx->submitting = false;
++	snapshot_group_advance(ctx);
++}
++
+ void
+ vbdev_lvol_create_bdev_clone(const char *esnap_name,
+ 			     struct spdk_lvol_store *lvs, const char *clone_name,
+diff --git a/module/bdev/lvol/vbdev_lvol.h b/module/bdev/lvol/vbdev_lvol.h
+index 288bc3d..945f0fe 100644
+--- a/module/bdev/lvol/vbdev_lvol.h
++++ b/module/bdev/lvol/vbdev_lvol.h
+@@ -45,6 +45,44 @@ int vbdev_lvol_create(struct spdk_lvol_store *lvs, const char *name, uint64_t sz
+ void vbdev_lvol_create_snapshot(struct spdk_lvol *lvol, const char *snapshot_name,
+ 				spdk_lvol_op_with_handle_complete cb_fn, void *cb_arg);
+ 
++/* Most lvols one group snapshot may cover. */
++#define VBDEV_LVOL_SNAPSHOT_GROUP_MAX 64
++
++/**
++ * Completion of vbdev_lvol_create_snapshot_group().
++ *
++ * \param cb_arg The caller's argument.
++ * \param snapshots One entry per requested lvol, in request order: the snapshot taken, or NULL
++ * if none was. On failure some may still have been taken (the caller deletes them). Valid only
++ * during the callback.
++ * \param lvolerrno 0 on success, negative errno otherwise (-ETIMEDOUT: the lvols' outstanding
++ * I/O did not drain within the quiesce timeout; no snapshot was taken).
++ */
++typedef void (*vbdev_lvol_snapshot_group_cb)(void *cb_arg, struct spdk_lvol **snapshots,
++		int lvolerrno);
++
++/**
++ * Snapshot several lvols at one point in time (a crash-consistent group snapshot).
++ *
++ * I/O to all the lvols' bdevs is quiesced first: the call waits for I/O submitted earlier to
++ * complete and queues new I/O. Once every bdev is quiesced the snapshots are created one after
++ * another, then all bdevs are unquiesced and the queued I/O runs. No write submitted after the
++ * first bdev was quiesced is in any snapshot, and every write completed before the call is in
++ * its lvol's snapshot. If the bdevs aren't all quiesced within quiesce_timeout_ms (0: no
++ * limit), the call fails with -ETIMEDOUT without taking snapshots. In every case all bdevs are
++ * unquiesced before cb_fn runs.
++ *
++ * \param lvols The lvols, each with a registered bdev, no lvol twice.
++ * \param snapshot_names The snapshot names, one per lvol.
++ * \param num Number of lvols (1 to VBDEV_LVOL_SNAPSHOT_GROUP_MAX).
++ * \param quiesce_timeout_ms Limit for quiescing all bdevs, in milliseconds; 0 for none.
++ * \param cb_fn Completion callback, always called (possibly before this function returns).
++ * \param cb_arg Argument for cb_fn.
++ */
++void vbdev_lvol_create_snapshot_group(struct spdk_lvol **lvols, const char **snapshot_names,
++				      size_t num, uint32_t quiesce_timeout_ms,
++				      vbdev_lvol_snapshot_group_cb cb_fn, void *cb_arg);
++
+ void vbdev_lvol_create_clone(struct spdk_lvol *lvol, const char *clone_name,
+ 			     spdk_lvol_op_with_handle_complete cb_fn, void *cb_arg);
+ void vbdev_lvol_create_bdev_clone(const char *esnap_uuid,
+diff --git a/module/bdev/lvol/vbdev_lvol_rpc.c b/module/bdev/lvol/vbdev_lvol_rpc.c
+index f557bd9..fb1bf05 100644
+--- a/module/bdev/lvol/vbdev_lvol_rpc.c
++++ b/module/bdev/lvol/vbdev_lvol_rpc.c
+@@ -329,6 +329,105 @@ cleanup:
+ 
+ SPDK_RPC_REGISTER("bdev_lvol_snapshot", rpc_bdev_lvol_snapshot, SPDK_RPC_RUNTIME)
+ 
++/* Default limit for quiescing the group, in milliseconds. */
++#define RPC_SNAPSHOT_GROUP_QUIESCE_TIMEOUT_MS 5000
++
++SPDK_STATIC_ASSERT(RPC_LVOL_SNAPSHOT_GROUP_ENTRIES_MAX <= VBDEV_LVOL_SNAPSHOT_GROUP_MAX,
++		   "the schema allows more lvols than a group snapshot takes");
++
++static void
++rpc_bdev_lvol_snapshot_group_cb(void *cb_arg, struct spdk_lvol **snapshots, int lvolerrno)
++{
++	struct rpc_bdev_lvol_snapshot_group_ctx *req = cb_arg;
++	struct spdk_json_write_ctx *w;
++	char *taken = NULL, *tmp;
++	size_t i;
++
++	if (lvolerrno == 0) {
++		w = spdk_jsonrpc_begin_result(req->request);
++		spdk_json_write_array_begin(w);
++		for (i = 0; i < req->snapshots.count; i++) {
++			spdk_json_write_string(w, snapshots[i]->unique_id);
++		}
++		spdk_json_write_array_end(w);
++		spdk_jsonrpc_end_result(req->request, w);
++		goto out;
++	}
++
++	/* Name the snapshots that were taken anyway, so the caller can delete them. */
++	for (i = 0; snapshots != NULL && i < req->snapshots.count; i++) {
++		if (snapshots[i] == NULL) {
++			continue;
++		}
++		tmp = spdk_sprintf_alloc("%s%s%s", taken ? taken : "", taken ? ", " : "",
++					 req->snapshots.items[i].snapshot_name);
++		free(taken);
++		taken = tmp;
++		if (taken == NULL) {
++			break;
++		}
++	}
++	if (taken != NULL) {
++		spdk_jsonrpc_send_error_response_fmt(req->request, lvolerrno, "%s (snapshots taken: %s)",
++						     spdk_strerror(-lvolerrno), taken);
++		free(taken);
++	} else {
++		spdk_jsonrpc_send_error_response(req->request, lvolerrno, spdk_strerror(-lvolerrno));
++	}
++out:
++	free_rpc_bdev_lvol_snapshot_group_heap(req);
++}
++
++static void
++rpc_bdev_lvol_snapshot_group(struct spdk_jsonrpc_request *request,
++			     const struct spdk_json_val *params)
++{
++	struct rpc_bdev_lvol_snapshot_group_ctx *req;
++	struct spdk_lvol *lvols[RPC_LVOL_SNAPSHOT_GROUP_ENTRIES_MAX];
++	const char *names[RPC_LVOL_SNAPSHOT_GROUP_ENTRIES_MAX];
++	struct spdk_bdev *bdev;
++	size_t i;
++
++	req = calloc(1, sizeof(*req));
++	if (req == NULL) {
++		spdk_jsonrpc_send_error_response(request, -ENOMEM, spdk_strerror(ENOMEM));
++		return;
++	}
++	req->quiesce_timeout_ms = RPC_SNAPSHOT_GROUP_QUIESCE_TIMEOUT_MS;
++
++	if (spdk_json_decode_object(params, rpc_bdev_lvol_snapshot_group_decoders,
++				    SPDK_COUNTOF(rpc_bdev_lvol_snapshot_group_decoders), req)) {
++		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
++						 "spdk_json_decode_object failed");
++		free_rpc_bdev_lvol_snapshot_group_heap(req);
++		return;
++	}
++	if (req->snapshots.count == 0) {
++		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
++						 "snapshots must not be empty");
++		free_rpc_bdev_lvol_snapshot_group_heap(req);
++		return;
++	}
++
++	for (i = 0; i < req->snapshots.count; i++) {
++		bdev = spdk_bdev_get_by_name(req->snapshots.items[i].lvol_name);
++		lvols[i] = bdev ? vbdev_lvol_get_from_bdev(bdev) : NULL;
++		if (lvols[i] == NULL) {
++			spdk_jsonrpc_send_error_response_fmt(request, -ENODEV, "lvol %s does not exist",
++							     req->snapshots.items[i].lvol_name);
++			free_rpc_bdev_lvol_snapshot_group_heap(req);
++			return;
++		}
++		names[i] = req->snapshots.items[i].snapshot_name;
++	}
++
++	req->request = request;
++	vbdev_lvol_create_snapshot_group(lvols, names, req->snapshots.count, req->quiesce_timeout_ms,
++					 rpc_bdev_lvol_snapshot_group_cb, req);
++}
++
++SPDK_RPC_REGISTER("bdev_lvol_snapshot_group", rpc_bdev_lvol_snapshot_group, SPDK_RPC_RUNTIME)
++
+ static void
+ rpc_bdev_lvol_clone_cb(void *cb_arg, struct spdk_lvol *lvol, int lvolerrno)
+ {
+diff --git a/python/spdk/cli/lvol.py b/python/spdk/cli/lvol.py
+index 913e5b8..85c453d 100644
+--- a/python/spdk/cli/lvol.py
++++ b/python/spdk/cli/lvol.py
+@@ -5,6 +5,8 @@
+ #  Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ #
+ 
++from functools import partial
++
+ from spdk.rpc.cmd_parser import print_dict, print_json
+ 
+ 
+@@ -85,6 +87,25 @@ def add_parser(subparsers):
+     p.add_argument('snapshot_name', help='Name for the newly created snapshot')
+     p.set_defaults(func=bdev_lvol_snapshot)
+ 
++    def bdev_lvol_snapshot_group(args):
++        snapshots = []
++        for entry in args.snapshots:
++            lvol_name, sep, snapshot_name = entry.rpartition(':')
++            if not sep or not lvol_name or not snapshot_name:
++                raise ValueError(f"expected LVOL:SNAPSHOT, got '{entry}'")
++            snapshots.append({'lvol_name': lvol_name, 'snapshot_name': snapshot_name})
++        print_json(args.client.bdev_lvol_snapshot_group(
++            snapshots=snapshots,
++            quiesce_timeout_ms=args.quiesce_timeout_ms))
++
++    p = subparsers.add_parser('bdev_lvol_snapshot_group',
++                              help='Snapshot several lvol bdevs at one point in time')
++    p.add_argument('snapshots', type=partial(str.split, sep=' '),
++                   help='Whitespace-separated LVOL:SNAPSHOT pairs (lvol UUID or alias, snapshot name)')
++    p.add_argument('-t', '--quiesce-timeout-ms', type=int,
++                   help='Longest wait for I/O to drain, in milliseconds (default 5000; 0 for no limit)')
++    p.set_defaults(func=bdev_lvol_snapshot_group)
++
+     def bdev_lvol_clone(args):
+         print_json(args.client.bdev_lvol_clone(
+                                             snapshot_name=args.snapshot_name,
+diff --git a/schema/schema.yaml b/schema/schema.yaml
+index 7926139..c087269 100644
+--- a/schema/schema.yaml
++++ b/schema/schema.yaml
+@@ -350,6 +350,16 @@ objects:
+         type: int32
+         required: true
+         description: Existing portal group tag
++  - name: lvol_snapshot_group_entry
++    fields:
++      - name: lvol_name
++        type: string
++        required: true
++        description: UUID or alias of the logical volume to snapshot
++      - name: snapshot_name
++        type: string
++        required: true
++        description: Name for its snapshot
+   - name: iscsi_portal
+     fields:
+       - name: host
+@@ -712,6 +722,10 @@ arrays:
+     item_type: object
+     class: scsi_lun
+     max_count: 64
++  - name: lvol_snapshot_group_entries
++    item_type: object
++    class: lvol_snapshot_group_entry
++    max_count: 64
+   - name: iscsi_portals
+     item_type: object
+     class: iscsi_portal
+@@ -4543,6 +4557,25 @@ methods:
+         type: string
+         required: true
+         description: Name for the newly created snapshot
++  - name: bdev_lvol_snapshot_group
++    description: |
++      Snapshot several logical volumes at one point in time (a crash-consistent group snapshot).
++      I/O to all of them is quiesced (I/O already submitted completes, new I/O is queued), each
++      is snapshotted, then I/O resumes. No snapshot is taken if the I/O doesn't drain within
++      quiesce_timeout_ms (error ETIMEDOUT). If a snapshot fails, the remaining ones are not
++      attempted and the error names the snapshots that were taken.
++    result:
++      type: array
++      description: UUIDs of the created snapshots, in request order.
++    params:
++      - name: snapshots
++        type: array
++        class: lvol_snapshot_group_entries
++        required: true
++        description: The logical volumes to snapshot and their snapshot names (each volume once)
++      - name: quiesce_timeout_ms
++        type: uint32
++        description: Longest wait for I/O to drain, in milliseconds (default 5000; 0 for no limit)
+   - name: bdev_lvol_clone
+     description: Create a logical volume based on a snapshot.
+     result:
+diff --git a/test/unit/lib/bdev/vbdev_lvol.c/vbdev_lvol_ut.c b/test/unit/lib/bdev/vbdev_lvol.c/vbdev_lvol_ut.c
+index cf5e268..d830ad8 100644
+--- a/test/unit/lib/bdev/vbdev_lvol.c/vbdev_lvol_ut.c
++++ b/test/unit/lib/bdev/vbdev_lvol.c/vbdev_lvol_ut.c
+@@ -578,12 +578,105 @@ spdk_bs_get_cluster_size(struct spdk_blob_store *bs)
+ 	return g_cluster_size;
+ }
+ 
++/*
++ * Group snapshots: lvol bdevs the test looks up by name, and bdev quiesce stubs whose
++ * completions are delivered by poll_threads(). The quiesce of g_ut_quiesce_hold completes only
++ * when ut_release_held_quiesce() is called; that of g_ut_quiesce_fail fails with -EIO.
++ */
++#define UT_GROUP_MAX 4
++static struct spdk_bdev *g_ut_group_bdevs[UT_GROUP_MAX];
++static int g_ut_quiesced;
++static int g_ut_quiesce_calls;
++static int g_ut_unquiesce_calls;
++static int g_ut_quiesced_at_snapshot = -1;
++static const char *g_ut_snapshot_fail;
++static struct spdk_bdev *g_ut_quiesce_hold;
++static struct spdk_bdev *g_ut_quiesce_fail;
++static spdk_bdev_quiesce_cb g_ut_held_cb;
++static void *g_ut_held_arg;
++
++struct ut_quiesce_cpl {
++	spdk_bdev_quiesce_cb	cb_fn;
++	void			*cb_arg;
++	int			status;
++};
++
++static void
++ut_quiesce_cpl_msg(void *arg)
++{
++	struct ut_quiesce_cpl *cpl = arg;
++
++	cpl->cb_fn(cpl->cb_arg, cpl->status);
++	free(cpl);
++}
++
++static void
++ut_send_quiesce_cpl(spdk_bdev_quiesce_cb cb_fn, void *cb_arg, int status)
++{
++	struct ut_quiesce_cpl *cpl = calloc(1, sizeof(*cpl));
++
++	SPDK_CU_ASSERT_FATAL(cpl != NULL);
++	cpl->cb_fn = cb_fn;
++	cpl->cb_arg = cb_arg;
++	cpl->status = status;
++	spdk_thread_send_msg(spdk_get_thread(), ut_quiesce_cpl_msg, cpl);
++}
++
++int
++spdk_bdev_quiesce(struct spdk_bdev *bdev, struct spdk_bdev_module *module,
++		  spdk_bdev_quiesce_cb cb_fn, void *cb_arg)
++{
++	CU_ASSERT(module == &g_lvol_if);
++	g_ut_quiesce_calls++;
++	if (bdev == g_ut_quiesce_fail) {
++		ut_send_quiesce_cpl(cb_fn, cb_arg, -EIO);
++		return 0;
++	}
++	if (bdev == g_ut_quiesce_hold) {
++		CU_ASSERT(g_ut_held_cb == NULL);
++		g_ut_held_cb = cb_fn;
++		g_ut_held_arg = cb_arg;
++		return 0;
++	}
++	g_ut_quiesced++;
++	ut_send_quiesce_cpl(cb_fn, cb_arg, 0);
++	return 0;
++}
++
++static void
++ut_release_held_quiesce(void)
++{
++	SPDK_CU_ASSERT_FATAL(g_ut_held_cb != NULL);
++	g_ut_quiesced++;
++	ut_send_quiesce_cpl(g_ut_held_cb, g_ut_held_arg, 0);
++	g_ut_held_cb = NULL;
++	g_ut_held_arg = NULL;
++}
++
++int
++spdk_bdev_unquiesce(struct spdk_bdev *bdev, struct spdk_bdev_module *module,
++		    spdk_bdev_quiesce_cb cb_fn, void *cb_arg)
++{
++	CU_ASSERT(module == &g_lvol_if);
++	g_ut_unquiesce_calls++;
++	g_ut_quiesced--;
++	CU_ASSERT(g_ut_quiesced >= 0);
++	ut_send_quiesce_cpl(cb_fn, cb_arg, 0);
++	return 0;
++}
++
+ struct spdk_bdev *
+ spdk_bdev_get_by_name(const char *bdev_name)
+ {
+ 	struct spdk_uuid uuid;
+ 	int rc;
+ 
++	for (int i = 0; i < UT_GROUP_MAX; i++) {
++		if (g_ut_group_bdevs[i] != NULL && !strcmp(g_ut_group_bdevs[i]->name, bdev_name)) {
++			return g_ut_group_bdevs[i];
++		}
++	}
++
+ 	if (g_bdev.name != NULL && !strcmp(g_bdev.name, bdev_name)) {
+ 		return &g_bdev;
+ 	}
+@@ -863,6 +956,11 @@ spdk_lvol_create_snapshot(struct spdk_lvol *lvol, const char *snapshot_name,
+ {
+ 	struct spdk_lvol *snap;
+ 
++	g_ut_quiesced_at_snapshot = g_ut_quiesced;
++	if (g_ut_snapshot_fail != NULL && strcmp(snapshot_name, g_ut_snapshot_fail) == 0) {
++		cb_fn(cb_arg, NULL, -ENOSPC);
++		return;
++	}
+ 	snap = _lvol_create(lvol->lvol_store);
+ 	snprintf(snap->name, sizeof(snap->name), "%s", snapshot_name);
+ 	cb_fn(cb_arg, snap, 0);
+@@ -2074,6 +2172,203 @@ ut_lvol_set_external_parent(void)
+ 	CU_ASSERT(g_lvolerrno == 0);
+ }
+ 
++static struct spdk_lvol *g_ut_group_snaps[UT_GROUP_MAX];
++static int g_ut_group_status;
++static bool g_ut_group_done;
++
++static void
++ut_snapshot_group_cb(void *cb_arg, struct spdk_lvol **snapshots, int lvolerrno)
++{
++	size_t num = *(size_t *)cb_arg, i;
++
++	CU_ASSERT(!g_ut_group_done);
++	g_ut_group_done = true;
++	g_ut_group_status = lvolerrno;
++	for (i = 0; i < num; i++) {
++		g_ut_group_snaps[i] = snapshots ? snapshots[i] : NULL;
++	}
++}
++
++static void
++ut_snapshot_group_reset(void)
++{
++	memset(g_ut_group_snaps, 0, sizeof(g_ut_group_snaps));
++	g_ut_group_status = 0xbad;
++	g_ut_group_done = false;
++	g_ut_quiesce_calls = 0;
++	g_ut_unquiesce_calls = 0;
++	g_ut_quiesced_at_snapshot = -1;
++	g_ut_snapshot_fail = NULL;
++	g_ut_quiesce_hold = NULL;
++	g_ut_quiesce_fail = NULL;
++}
++
++static void
++ut_snapshot_group_destroy_snaps(size_t num)
++{
++	size_t i;
++
++	for (i = 0; i < num; i++) {
++		if (g_ut_group_snaps[i] != NULL) {
++			vbdev_lvol_destroy(g_ut_group_snaps[i], lvol_store_op_complete, NULL);
++			g_ut_group_snaps[i] = NULL;
++		}
++	}
++	poll_threads();
++}
++
++static void
++ut_lvol_snapshot_group(void)
++{
++	struct spdk_lvol_store *lvs;
++	struct spdk_lvol *lvols[3], *dup[2];
++	const char *names[3] = { "snap0", "snap1", "snap2" };
++	size_t num = 3, num_dup = 2, i;
++	int rc;
++
++	ut_init_bdev(DEFAULT_BDEV_NAME, DEFAULT_BDEV_UUID);
++	rc = vbdev_lvs_create(DEFAULT_BDEV_NAME, "lvs", 0, LVS_CLEAR_WITH_UNMAP, 0,
++			      lvol_store_op_with_handle_complete, NULL);
++	CU_ASSERT(rc == 0);
++	SPDK_CU_ASSERT_FATAL(g_lvol_store != NULL);
++	lvs = g_lvol_store;
++
++	for (i = 0; i < 3; i++) {
++		char name[16];
++
++		snprintf(name, sizeof(name), "lvol%zu", i);
++		g_lvol = NULL;
++		rc = vbdev_lvol_create(lvs, name, 10, false, LVOL_CLEAR_WITH_DEFAULT,
++				       vbdev_lvol_create_complete, NULL);
++		SPDK_CU_ASSERT_FATAL(rc == 0);
++		SPDK_CU_ASSERT_FATAL(g_lvol != NULL && g_lvol->bdev != NULL);
++		lvols[i] = g_lvol;
++		/* The bdev is named after unique_id; give each its own. */
++		snprintf(lvols[i]->unique_id, sizeof(lvols[i]->unique_id), "ut-group-%zu", i);
++		g_ut_group_bdevs[i] = lvols[i]->bdev;
++	}
++
++	/* Success: snapshots taken only while all three are quiesced, then all unquiesced. */
++	ut_snapshot_group_reset();
++	vbdev_lvol_create_snapshot_group(lvols, names, num, 0, ut_snapshot_group_cb, &num);
++	CU_ASSERT(!g_ut_group_done);
++	poll_threads();
++	CU_ASSERT(g_ut_group_done);
++	CU_ASSERT(g_ut_group_status == 0);
++	CU_ASSERT(g_ut_quiesce_calls == 3);
++	CU_ASSERT(g_ut_unquiesce_calls == 3);
++	CU_ASSERT(g_ut_quiesced_at_snapshot == 3);
++	CU_ASSERT(g_ut_quiesced == 0);
++	for (i = 0; i < 3; i++) {
++		SPDK_CU_ASSERT_FATAL(g_ut_group_snaps[i] != NULL);
++		CU_ASSERT(strcmp(g_ut_group_snaps[i]->name, names[i]) == 0);
++	}
++	ut_snapshot_group_destroy_snaps(num);
++
++	/* The same lvol twice is refused before anything is quiesced. */
++	ut_snapshot_group_reset();
++	dup[0] = lvols[0];
++	dup[1] = lvols[0];
++	vbdev_lvol_create_snapshot_group(dup, names, num_dup, 0, ut_snapshot_group_cb, &num_dup);
++	CU_ASSERT(g_ut_group_done);
++	CU_ASSERT(g_ut_group_status == -EINVAL);
++	CU_ASSERT(g_ut_quiesce_calls == 0);
++
++	/* No lvols, or too many: refused. */
++	ut_snapshot_group_reset();
++	vbdev_lvol_create_snapshot_group(lvols, names, 0, 0, ut_snapshot_group_cb, &num);
++	CU_ASSERT(g_ut_group_done && g_ut_group_status == -EINVAL);
++	ut_snapshot_group_reset();
++	vbdev_lvol_create_snapshot_group(lvols, names, VBDEV_LVOL_SNAPSHOT_GROUP_MAX + 1, 0,
++					 ut_snapshot_group_cb, &num);
++	CU_ASSERT(g_ut_group_done && g_ut_group_status == -EINVAL);
++
++	/*
++	 * One bdev's I/O doesn't drain within the timeout: the others are unquiesced at the
++	 * timeout (their hosts resume), no snapshot is taken, and the call completes once the late
++	 * quiesce has completed and been undone.
++	 */
++	ut_snapshot_group_reset();
++	g_ut_quiesce_hold = lvols[1]->bdev;
++	vbdev_lvol_create_snapshot_group(lvols, names, num, 100, ut_snapshot_group_cb, &num);
++	poll_threads();
++	CU_ASSERT(!g_ut_group_done);
++	CU_ASSERT(g_ut_quiesced == 2);
++	spdk_delay_us(99 * 1000);
++	poll_threads();
++	CU_ASSERT(g_ut_quiesced == 2);
++	spdk_delay_us(2 * 1000);
++	poll_threads();
++	CU_ASSERT(!g_ut_group_done);
++	CU_ASSERT(g_ut_quiesced == 0);
++	CU_ASSERT(g_ut_unquiesce_calls == 2);
++	ut_release_held_quiesce();
++	poll_threads();
++	CU_ASSERT(g_ut_group_done);
++	CU_ASSERT(g_ut_group_status == -ETIMEDOUT);
++	CU_ASSERT(g_ut_unquiesce_calls == 3);
++	CU_ASSERT(g_ut_quiesced == 0);
++	CU_ASSERT(g_ut_quiesced_at_snapshot == -1);
++	for (i = 0; i < 3; i++) {
++		CU_ASSERT(g_ut_group_snaps[i] == NULL);
++	}
++
++	/* Without a timeout, a slow quiesce is waited for. */
++	ut_snapshot_group_reset();
++	g_ut_quiesce_hold = lvols[2]->bdev;
++	vbdev_lvol_create_snapshot_group(lvols, names, num, 0, ut_snapshot_group_cb, &num);
++	spdk_delay_us(60 * 1000 * 1000);
++	poll_threads();
++	CU_ASSERT(!g_ut_group_done);
++	ut_release_held_quiesce();
++	poll_threads();
++	CU_ASSERT(g_ut_group_done);
++	CU_ASSERT(g_ut_group_status == 0);
++	CU_ASSERT(g_ut_quiesced_at_snapshot == 3);
++	CU_ASSERT(g_ut_quiesced == 0);
++	ut_snapshot_group_destroy_snaps(num);
++
++	/* A quiesce fails: the others are unquiesced, no snapshot. */
++	ut_snapshot_group_reset();
++	g_ut_quiesce_fail = lvols[2]->bdev;
++	vbdev_lvol_create_snapshot_group(lvols, names, num, 1000, ut_snapshot_group_cb, &num);
++	poll_threads();
++	CU_ASSERT(g_ut_group_done);
++	CU_ASSERT(g_ut_group_status == -EIO);
++	CU_ASSERT(g_ut_quiesced == 0);
++	CU_ASSERT(g_ut_unquiesce_calls == 2);
++	CU_ASSERT(g_ut_quiesced_at_snapshot == -1);
++
++	/* The second snapshot fails: the first is reported (for the caller to delete), the third
++	 * isn't attempted, and everything is unquiesced. */
++	ut_snapshot_group_reset();
++	g_ut_snapshot_fail = "snap1";
++	vbdev_lvol_create_snapshot_group(lvols, names, num, 1000, ut_snapshot_group_cb, &num);
++	poll_threads();
++	CU_ASSERT(g_ut_group_done);
++	CU_ASSERT(g_ut_group_status == -ENOSPC);
++	CU_ASSERT(g_ut_group_snaps[0] != NULL);
++	CU_ASSERT(g_ut_group_snaps[1] == NULL);
++	CU_ASSERT(g_ut_group_snaps[2] == NULL);
++	CU_ASSERT(g_ut_quiesced == 0);
++	CU_ASSERT(g_ut_unquiesce_calls == 3);
++	ut_snapshot_group_destroy_snaps(num);
++
++	/* The timer of an operation that finished must not fire later. */
++	spdk_delay_us(10 * 1000 * 1000);
++	poll_threads();
++
++	ut_snapshot_group_reset();
++	for (i = 0; i < 3; i++) {
++		g_ut_group_bdevs[i] = NULL;
++		vbdev_lvol_destroy(lvols[i], lvol_store_op_complete, NULL);
++	}
++	poll_threads();
++	vbdev_lvs_destruct(lvs, lvol_store_op_complete, NULL);
++	CU_ASSERT(g_lvserrno == 0);
++	CU_ASSERT(g_lvol_store == NULL);
++}
++
+ int
+ main(int argc, char **argv)
+ {
+@@ -2107,6 +2402,7 @@ main(int argc, char **argv)
+ 	CU_ADD_TEST(suite, ut_lvol_esnap_clone_bad_args);
+ 	CU_ADD_TEST(suite, ut_lvol_shallow_copy);
+ 	CU_ADD_TEST(suite, ut_lvol_set_external_parent);
++	CU_ADD_TEST(suite, ut_lvol_snapshot_group);
+ 
+ 	allocate_threads(1);
+ 	set_thread(0);

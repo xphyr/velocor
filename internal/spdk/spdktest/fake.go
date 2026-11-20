@@ -16,6 +16,7 @@ package spdktest
 
 import (
 	"bufio"
+	"cmp"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
@@ -37,6 +38,7 @@ const (
 	codeENODEV        = -19
 	codeEEXIST        = -17
 	codeEBUSY         = -16
+	codeEINVAL        = -22
 )
 
 type rpcErr struct {
@@ -108,6 +110,7 @@ type Fake struct {
 	nvmeConns    map[string][]spdk.NvmfController // subsystem NQN -> connected hosts
 	failures     map[string]int                   // method -> remaining failures (<0 = forever)
 	lateFailures map[string]int                   // method -> calls that succeed in SPDK but report an error
+	failureCodes map[string]int                   // method -> error code of injected failures (default -5)
 	calls        []string
 	uuidCounter  int
 
@@ -128,6 +131,7 @@ func New(t testing.TB) *Fake {
 		lvsMedia:     map[string]*mediaLvstore{},
 		failures:     map[string]int{},
 		lateFailures: map[string]int{},
+		failureCodes: map[string]int{},
 	}
 	f.resetRuntime()
 	ln, err := net.Listen("unix", f.sockPath)
@@ -227,6 +231,14 @@ func (f *Fake) Fail(method string, n int) {
 	f.failures[method] = n
 }
 
+// FailWithCode sets the JSON-RPC error code that Fail's injected failures of method return
+// (e.g. -110 for ETIMEDOUT); 0 restores the default, -5 (EIO).
+func (f *Fake) FailWithCode(method string, code int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.failureCodes[method] = code
+}
+
 // FailAfterApplying makes the next n calls to method take effect in the fake but report an
 // error, like a client that timed out while spdk_tgt went on and completed the request.
 func (f *Fake) FailAfterApplying(method string, n int) {
@@ -264,6 +276,19 @@ func (f *Fake) LvstoreGeneration(lvsName string) int {
 		}
 	}
 	return 0
+}
+
+// LvolCount returns the number of lvols (volumes, snapshots, clones) in loaded lvstores.
+func (f *Fake) LvolCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	n := 0
+	for key := range f.loadedLvsByKey() {
+		if lvs := f.lvsMedia[key]; lvs != nil {
+			n += len(lvs.Lvols)
+		}
+	}
+	return n
 }
 
 // LvolExists reports whether an lvol with the given lvs/name alias exists on media.
@@ -423,7 +448,7 @@ func (f *Fake) dispatch(method string, raw json.RawMessage) (any, *rpcErr) {
 				f.failures[method] = n
 			}
 		}
-		return nil, errf(-5, "injected failure for %s", method)
+		return nil, errf(cmp.Or(f.failureCodes[method], -5), "injected failure for %s", method)
 	}
 	var p map[string]any
 	if len(raw) > 0 && string(raw) != "null" {
@@ -484,6 +509,16 @@ func remarshal(v any, dst any) {
 }
 
 // ---------- bdev lookups ----------
+
+// snapshotLocked snapshots l as name: the snapshot takes ownership of every cluster written so
+// far; the volume becomes an empty thin clone of it.
+func (f *Fake) snapshotLocked(lvs *mediaLvstore, l *mediaLvol, name string) string {
+	s := &mediaLvol{UUID: f.newUUID(), Name: name, SizeMiB: l.SizeMiB, IsSnapshot: true, Parent: l.Parent, Allocated: l.Allocated, Clusters: l.Clusters}
+	l.Clusters, l.Allocated = nil, 0
+	l.Parent = s.UUID
+	lvs.Lvols[s.UUID] = s
+	return s.UUID
+}
 
 func (f *Fake) findLvolLocked(ref string) (*mediaLvstore, *mediaLvol) {
 	for key, lvsName := range f.loadedLvsByKey() {
@@ -873,13 +908,55 @@ var handlers = map[string]handler{
 				return nil, errf(codeEEXIST, "lvol %s already exists", name)
 			}
 		}
-		// The snapshot takes ownership of every cluster written so far; the volume becomes an
-		// empty thin clone of it.
-		s := &mediaLvol{UUID: f.newUUID(), Name: name, SizeMiB: l.SizeMiB, IsSnapshot: true, Parent: l.Parent, Allocated: l.Allocated, Clusters: l.Clusters}
-		l.Clusters, l.Allocated = nil, 0
-		l.Parent = s.UUID
-		lvs.Lvols[s.UUID] = s
-		return s.UUID, nil
+		return f.snapshotLocked(lvs, l, name), nil
+	},
+	// Patch 0003 (deploy/containers/spdk-patches): snapshots of several lvols at one point in
+	// time. The fake has no I/O in flight to quiesce; it checks everything first, so it never
+	// leaves some snapshots behind (real SPDK can, and names them in the error).
+	"bdev_lvol_snapshot_group": func(f *Fake, p map[string]any) (any, *rpcErr) {
+		entries, _ := p["snapshots"].([]any)
+		if len(entries) == 0 || len(entries) > 64 {
+			return nil, errf(codeInvalidParams, "snapshots must list 1 to 64 lvols")
+		}
+		type member struct {
+			lvs  *mediaLvstore
+			lvol *mediaLvol
+			name string
+		}
+		members := make([]member, 0, len(entries))
+		seen := map[*mediaLvol]bool{}
+		names := map[*mediaLvstore]map[string]bool{}
+		for _, e := range entries {
+			m, _ := e.(map[string]any)
+			lvs, l := f.findLvolLocked(str(m, "lvol_name"))
+			if l == nil {
+				return nil, errf(codeENODEV, "lvol %s does not exist", str(m, "lvol_name"))
+			}
+			if seen[l] {
+				return nil, errf(codeEINVAL, "Invalid argument")
+			}
+			seen[l] = true
+			name := str(m, "snapshot_name")
+			if name == "" || len(name) > spdk.MaxLvolNameLen {
+				return nil, errf(codeEINVAL, "Invalid argument")
+			}
+			if names[lvs] == nil {
+				names[lvs] = map[string]bool{}
+			}
+			for _, o := range lvs.Lvols {
+				names[lvs][o.Name] = true
+			}
+			if names[lvs][name] {
+				return nil, errf(codeEEXIST, "File exists")
+			}
+			names[lvs][name] = true
+			members = append(members, member{lvs, l, name})
+		}
+		uuids := make([]string, 0, len(members))
+		for _, m := range members {
+			uuids = append(uuids, f.snapshotLocked(m.lvs, m.lvol, m.name))
+		}
+		return uuids, nil
 	},
 	"bdev_lvol_clone": func(f *Fake, p map[string]any) (any, *rpcErr) {
 		lvs, s := f.findLvolLocked(str(p, "snapshot_name"))
@@ -940,7 +1017,18 @@ var handlers = map[string]handler{
 		}
 		return true, nil
 	},
-	"bdev_get_iostat": func(f *Fake, _ map[string]any) (any, *rpcErr) {
+	"bdev_get_iostat": func(f *Fake, p map[string]any) (any, *rpcErr) {
+		// SPDK v26.09 takes "names" (an array); it rejects the older "name".
+		if _, ok := p["name"]; ok {
+			return nil, errf(-32603, "spdk_json_decode_object failed")
+		}
+		var want map[string]bool
+		if names, ok := p["names"].([]any); ok {
+			want = map[string]bool{}
+			for _, n := range names {
+				want[fmt.Sprint(n)] = true
+			}
+		}
 		// Fixed counters for every bdev, named as SPDK names them (lvols by UUID).
 		res := spdk.BdevGetIostatResponse{TickRate: 1000}
 		stat := func(name string) spdk.BdevIoStat {
@@ -959,6 +1047,18 @@ var handlers = map[string]handler{
 			for _, l := range f.lvsMedia[key].Lvols {
 				res.Bdevs = append(res.Bdevs, stat(l.UUID))
 			}
+		}
+		if want != nil {
+			kept := res.Bdevs[:0]
+			for _, b := range res.Bdevs {
+				if want[b.Name] {
+					kept = append(kept, b)
+				}
+			}
+			if len(kept) == 0 {
+				return nil, errf(codeENODEV, "No such device")
+			}
+			res.Bdevs = kept
 		}
 		return res, nil
 	},

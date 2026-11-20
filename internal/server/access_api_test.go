@@ -1,9 +1,7 @@
 package server
 
 import (
-	"fmt"
 	"net/http"
-	"strings"
 	"testing"
 )
 
@@ -96,21 +94,14 @@ func TestUpdateInitiatorGroupReappliesExports(t *testing.T) {
 	}
 }
 
-// A group snapshot of volumes in use is refused (TODO.md P1-15): SPDK can't pause their I/O
-// together, and snapshots taken one by one while hosts write aren't consistent with each other.
-func TestGroupSnapshotOfExportedVolumesIsRefused(t *testing.T) {
+// A group snapshot of volumes in use is taken (TODO.md P1-15): SPDK pauses their I/O together
+// (patch 0003), so hosts needn't stop.
+func TestGroupSnapshotOfExportedVolumes(t *testing.T) {
 	h := newHarness(t)
 	_, vol, _ := h.nvmeExport("nqn.2026-01.io.example:host-a")
-	pool := vol["pool_id"].(string)
-	other := h.volume(pool, "idle", 64<<20)
-	code, out := h.do("POST", "/api/v1/volume-group-snapshots", h.admin, map[string]any{"name": "g", "volume_ids": []string{vol["id"].(string), other["id"].(string)}})
-	if code != http.StatusPreconditionFailed || !strings.Contains(fmt.Sprint(out["error"]), vol["name"].(string)) || strings.Contains(fmt.Sprint(out["error"]), "idle") {
-		t.Fatalf("group snapshot of an exported volume: HTTP %d %v; want 412 naming only the exported volume", code, out)
+	other := h.volume(vol["pool_id"].(string), "idle", 64<<20)
+	resp := h.expect(h.do("POST", "/api/v1/volume-group-snapshots", h.admin, map[string]any{"name": "g", "volume_ids": []string{vol["id"].(string), other["id"].(string)}}))(http.StatusCreated)
+	if snaps := resp["snapshots"].([]any); len(snaps) != 2 {
+		t.Fatalf("group snapshot of an exported and an idle volume: %v", resp)
 	}
-	if snaps, _ := h.st.ListSnapshots("", ""); len(snaps) != 0 {
-		t.Fatalf("a refused group snapshot left %d snapshots", len(snaps))
-	}
-	// Volumes no host uses can still be snapshotted as a group.
-	another := h.volume(pool, "idle2", 64<<20)
-	h.expect(h.do("POST", "/api/v1/volume-group-snapshots", h.admin, map[string]any{"name": "g2", "volume_ids": []string{other["id"].(string), another["id"].(string)}}))(http.StatusCreated)
 }

@@ -5,7 +5,9 @@
 #   hack/spdk-patch-unit-tests.sh <spdk source dir> <patch dir>
 # Paths map to SPDK's unit test layout:
 #   lib/<component>/...        -> test/unit/lib/<component>/
-#   module/<kind>/<name>/...   -> test/unit/lib/<kind>/<name>/   (e.g. module/bdev/raid)
+#   module/<kind>/<name>/...   -> test/unit/lib/<kind>/<name>/   (e.g. module/bdev/raid), or
+#                                 test/unit/lib/<kind>/vbdev_<name>.c/ or <name>.c/ where SPDK
+#                                 names it after the source file (module/bdev/lvol)
 set -euo pipefail
 src="${1:?usage: $0 <spdk source dir> <patch dir>}"
 patches="${2:?usage: $0 <spdk source dir> <patch dir>}"
@@ -22,6 +24,11 @@ fi
 
 ran=0 fail=0
 for d in "${dirs[@]}"; do
+  if [[ ! -d $d ]]; then
+    for alt in "${d%/*}/vbdev_${d##*/}.c" "$d.c"; do
+      [[ -d $alt ]] && { d=$alt; break; }
+    done
+  fi
   mapfile -t tests < <(find "$d" -type f -name '*_ut' -perm -u+x 2>/dev/null | sort)
   # A patched component without unit tests would pass silently: make that visible.
   if [[ ${#tests[@]} -eq 0 ]]; then

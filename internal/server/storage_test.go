@@ -3,6 +3,7 @@ package server
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -314,15 +315,38 @@ func TestGroupSnapshotWithCSIStyleName(t *testing.T) {
 			t.Fatalf("member snapshot missing in SPDK: %v", s)
 		}
 	}
-	// A failing member rolls the whole group back.
-	h.fake.Fail("bdev_lvol_snapshot", -1)
-	if code, _ := h.do("POST", "/api/v1/volume-group-snapshots", h.admin, map[string]any{"name": "g2", "volume_ids": []string{v1["id"].(string), v2["id"].(string)}}); code != http.StatusInternalServerError {
+	// All members are taken in one SPDK call (patch 0003), never one by one.
+	if calls := h.fake.Calls(); slices.Contains(calls, "bdev_lvol_snapshot") || !slices.Contains(calls, "bdev_lvol_snapshot_group") {
+		t.Fatalf("group snapshot used %v", calls)
+	}
+	ids := []string{v1["id"].(string), v2["id"].(string)}
+	lvols := h.fake.LvolCount
+	before := lvols()
+
+	// A failed group leaves nothing behind.
+	h.fake.Fail("bdev_lvol_snapshot_group", 1)
+	if code, _ := h.do("POST", "/api/v1/volume-group-snapshots", h.admin, map[string]any{"name": "g2", "volume_ids": ids}); code != http.StatusInternalServerError {
 		t.Fatalf("failing group snapshot returned %d", code)
 	}
-	h.fake.Fail("bdev_lvol_snapshot", 0)
-	if all, _ := h.st.ListSnapshots("", ""); len(all) != 2 {
-		t.Fatalf("failed group snapshot left %d snapshots", len(all))
+	// SPDK can fail after taking some of the snapshots: velod deletes them by name.
+	h.fake.FailAfterApplying("bdev_lvol_snapshot_group", 1)
+	if code, _ := h.do("POST", "/api/v1/volume-group-snapshots", h.admin, map[string]any{"name": "g3", "volume_ids": ids}); code != http.StatusInternalServerError {
+		t.Fatalf("group snapshot failing after SPDK took it returned %d", code)
 	}
+	if n := lvols(); n != before {
+		t.Fatalf("failed group snapshots left %d lvols in SPDK", n-before)
+	}
+	// I/O that doesn't drain in time (ETIMEDOUT) is worth retrying: 503.
+	h.fake.FailWithCode("bdev_lvol_snapshot_group", -110)
+	h.fake.Fail("bdev_lvol_snapshot_group", 1)
+	if code, out := h.do("POST", "/api/v1/volume-group-snapshots", h.admin, map[string]any{"name": "g4", "volume_ids": ids}); code != http.StatusServiceUnavailable || !strings.Contains(fmt.Sprint(out["error"]), "no snapshot was taken") {
+		t.Fatalf("timed-out group snapshot: HTTP %d %v, want 503", code, out)
+	}
+	if all, _ := h.st.ListSnapshots("", ""); len(all) != 2 {
+		t.Fatalf("failed group snapshots left %d snapshot records", len(all))
+	}
+	// The same volume twice counts once.
+	h.expect(h.do("POST", "/api/v1/volume-group-snapshots", h.admin, map[string]any{"name": "g5", "volume_ids": []string{ids[0], ids[0]}}))(http.StatusCreated)
 }
 
 func TestIscsiExportACLs(t *testing.T) {

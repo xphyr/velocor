@@ -15,6 +15,7 @@ package integration
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"crypto/rand"
 	"encoding/json"
@@ -279,6 +280,7 @@ type initiator struct {
 	port    int
 	nqn     string
 	hostNQN string
+	qd      int // spdk_dd queue depth; 0 means 32
 }
 
 func (a *appliance) initiator(nqn, hostNQN string) *initiator {
@@ -302,7 +304,7 @@ func (in *initiator) dd(args ...string) error {
 	}
 	full := append([]string{"run", "--rm", "--timeout", "120", "--network", "host", "--security-opt", "seccomp=unconfined",
 		"-v", in.tg.dir + ":" + in.tg.dir + ":z", "--entrypoint", "spdk_dd", image(),
-		"--no-huge", "--no-pci", "-s", "1024", "--aio", "--qd", "32", "--json", cfgPath}, args...)
+		"--no-huge", "--no-pci", "-s", "1024", "--aio", "--qd", strconv.Itoa(cmp.Or(in.qd, 32)), "--json", cfgPath}, args...)
 	out, err := exec.Command("podman", full...).CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("spdk_dd %v: %v\n%s", args, err, lastLines(string(out), 15))
