@@ -20,8 +20,10 @@ GPL port of md/LVM into SPDK), the numbers and the plan are in
 phase 3. Items below marked **(K)** are resolved by the move and close at the cutover; they stay
 listed until then so nothing is lost if the plan changes.
 
-- [ ] **K-0. Design review** of the note; decide QoS (proposal: drop at cutover) and the thin
-  chunk size (proposal: 256 KiB, measured first).
+- [ ] **K-0. Design review** of the note. Decided 2026-11-20: QoS **dropped at the cutover**
+  (revisit later); thin pools use **64 KiB chunks with zeroing on**, measured in
+  [docs/performance.md](docs/performance.md) (best after snapshots, finest CBT; zeroing stays on
+  so new volumes can't read old data).
 - [ ] **K-1. Spike** behind the data-plane interface: md RAID1 + thin LV + nvmet, crash/restart,
   a rebuild, a group snapshot through the dm-linear wrapper; the fake command layer for unit
   tests; the privileged integration harness in CI.

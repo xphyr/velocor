@@ -29,6 +29,57 @@ While the jobs ran, a sampler on the appliance recorded every 10 s: CPU time, pe
 utilisation (`/proc/diskstats`), SAN NIC bytes, and each SPDK thread's busy/idle ticks
 (`thread_get_stats`).
 
+## 2026-11-20: LVM thin chunk size and zeroing
+
+**Question.** Which thin-pool chunk size, and should zeroing stay on, for the kernel data plane
+([design/kernel-dataplane.md](design/kernel-dataplane.md))? nvweaver's CBT checks favour 64-256
+KiB, because changed blocks are reported in whole chunks and 1 MiB over-reports nearly
+everything; nobody had measured speed.
+
+**Setup.** The test appliance's two 250 GB virtio-scsi disks as md RAID1 (write-intent bitmap)
+with one LVM thin pool (200 GB, 1 GiB metadata) per configuration, a 16 GiB thin volume exported
+by kernel nvmet-tcp, and the fio pod on the Arm node over the 10 GbE SAN as in the three-way
+benchmark. 4K random writes. Each configuration, twice (the second round in reverse order):
+
+1. **first writes:** 64 deep (4 jobs × QD16), 30 s, on a fresh volume (every write lands in an
+   unprovisioned chunk at first);
+2. **steady:** the volume filled, then 64 deep for 60 s after a 10 s ramp;
+3. **after a snapshot, deep:** a thin snapshot taken, then 64 deep for 30 s with no ramp (the
+   first write to each shared chunk copies it);
+4. **after a snapshot, QD1:** a second snapshot, then queue depth 1 for 30 s;
+5. **QD1 again:** queue depth 1 for 30 s after a 10 s ramp. The second snapshot still exists, so
+   this is still copy-on-write, only later; it is not a steady state.
+
+Then the pool was deactivated and activated again (timed), and its metadata use noted.
+
+| chunk, zeroing | first writes IOPS | steady IOPS | after snapshot, deep | after snapshot, QD1 | QD1 again | metadata used / activation |
+|---|---|---|---|---|---|---|
+| 64 KiB, on | 8,963 | 17,978 | 5,482 | 862 | 1,006 | 3.5% / 0.72 s |
+| 64 KiB, off | 17,272 | 17,630 | 4,954 | 840 | 976 | 3.3% / 0.70 s |
+| 128 KiB, on | 7,763 | 18,108 | 4,122 | 834 | 1,040 | 2.4% / 0.70 s |
+| 128 KiB, off | 17,507 | 18,047 | 4,138 | 851 | 1,064 | 2.4% / 0.69 s |
+| 256 KiB, on | 6,767 | 18,124 | 3,304 | 775 | 1,151 | 2.0% / 0.67 s |
+| 256 KiB, off | 17,644 | 18,438 | 3,270 | 784 | 1,156 | 2.0% / 0.67 s |
+
+Means of the two rounds, which agreed within a few percent. p99 latency for the deep runs:
+first writes 48 ms (64 KiB, zeroing on) to 98 ms (256 KiB, on), and 21-24 ms with zeroing off;
+after a snapshot 70 ms (64 KiB) to 152-169 ms (256 KiB); steady 18-21 ms everywhere.
+
+- **Steady writes don't depend on the chunk size** (17.6k-18.4k).
+- **Writes after a snapshot get worse with bigger chunks:** 5.5k at 64 KiB against 3.3k at
+  256 KiB, and p99 doubles, because each first write to a shared chunk copies all of it. Every
+  CSI snapshot and incremental backup puts volumes in this state.
+- **Zeroing halves first writes into new space**, more so with bigger chunks, and does nothing
+  once a chunk is provisioned. It must stay on for a shared appliance: without it a small write
+  into a newly provisioned chunk leaves the rest of the chunk readable, and that space may have
+  held a deleted volume's data.
+- **Metadata stays small:** 3.5% of 1 GiB for 16 GiB written plus two snapshots at 64 KiB, so
+  roughly 2 MB per GiB of data; activation is under a second at every size.
+- **Chosen: 64 KiB, zeroing on.** Best after snapshots and on first writes, the finest CBT
+  granularity (nvweaver: 55 MB reported for 0.5 MB of scattered change, against nearly the whole
+  volume at 1 MiB), and affordable metadata. Pool metadata is sized from the pool (about 2 MB
+  per GiB, with headroom) and monitored, as the design note says.
+
 ## 2026-11-20: SPDK against the kernel data path (three ways)
 
 **Question.** Would a kernel storage stack (md RAID1, LVM thin, kernel nvmet-tcp) be in the same

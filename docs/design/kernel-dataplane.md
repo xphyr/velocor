@@ -255,20 +255,24 @@ SnapshotMetadata layer above velod's `blocks:allocated` / `blocks:changed` stays
   stops polling while idle. Accepted.
 - **Userspace NVMe driver:** gone. Unmeasured on this lab; the one place SPDK clearly wins.
 - **QoS limits:** nvmet submits I/O from kernel context, so cgroup `io.max` can't see it and
-  there is no per-device throttle in the kernel target. **Decision needed:** drop QoS at the
-  cutover (API fields refused with a clear message) and revisit with a small dm target later,
-  or build that target first. Proposal: drop, since nothing in the lab or the CSI path uses
-  it.
+  there is no per-device throttle in the kernel target. **Decided (2026-11-20): dropped at the
+  cutover**, the API's QoS fields refused with a clear message; revisit later (a small dm target
+  is the likely route). Nothing in the lab or the CSI path uses QoS.
 - **Connections per export:** nvmet doesn't list controllers in configfs; the UI's connections
   view becomes "connected hosts" from the network side (`ss` on the port) for NVMe/TCP, exact
   for iSCSI (LIO lists sessions). Accepted, noted in the API docs.
 - **Thin pool metadata is finite** (16 GiB maximum) and a full metadata device is worse than a
   full data pool. velod sizes it generously, monitors it (`thin pool status`), alerts, and grows
   it while the pool has room; `lvm.conf` autoextend is a backstop.
-- **Chunk size vs. zeroing:** dm-thin zeroes a newly provisioned chunk so a partial write can't
-  expose a previous volume's data; at 1 MiB chunks lvm2 warns that this slows provisioning.
-  Proposal: 256 KiB chunks with zeroing on (CBT granularity improves too); measure before
-  fixing it.
+- **Chunk size and zeroing: 64 KiB, zeroing on** (measured 2026-11-20,
+  [performance.md](../performance.md) "LVM thin chunk size and zeroing"). Steady writes are the
+  same at 64, 128 and 256 KiB; writes after a snapshot are best at 64 KiB (5.5k IOPS against
+  3.3k at 256 KiB, half the p99), since the first write to a shared chunk copies the whole
+  chunk; zeroing halves first writes into new space but must stay on, or a partial write into a
+  new chunk exposes whatever a deleted volume left there. nvweaver (a sibling project on LVM
+  thin with the same `thin_delta` CBT) had shown CBT is exact at any size but over-reports in
+  whole chunks, which 64 KiB keeps smallest. Metadata at 64 KiB is about 2 MB per GiB written,
+  so velod sizes the metadata device from the pool, with headroom, and monitors it.
 - **Two license regimes avoided:** all kernel pieces are used, not linked; velod stays
   Apache-2.0.
 
@@ -291,7 +295,7 @@ SnapshotMetadata layer above velod's `blocks:allocated` / `blocks:changed` stays
 
 Phases, each ending in a merge; the SPDK stack keeps running in the lab until phase 3.
 
-0. **Design review** (this note), QoS decision, chunk-size measurement.
+0. **Design review** (this note); QoS dropped and chunk size 64 KiB with zeroing on (both decided 2026-11-20).
 1. **Spike behind the data-plane interface:** md RAID1 + thin LV + nvmet export, enough for
    `TestDataSurvivesCrashAndRestart`, a rebuild and a group snapshot; the fake command layer
    for unit tests; the privileged integration harness in CI. Exposes the real risks (§5.3,
