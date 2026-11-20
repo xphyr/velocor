@@ -104,7 +104,7 @@ func (tg *target) start() {
 	_, _ = podman(tg.t, "rm", "-f", "-t", "0", tg.name)
 	_ = os.Remove(tg.socket())
 	// Unconfined like the appliance's quadlet (SecurityLabelDisable=true), so SELinux hosts run
-	// the same SSD backend (io_uring) as the appliance and CI runners (TODO.md P0-6).
+	// the same SSD backend (io_uring) as the appliance and CI runners (docs/review-history.md P0-6).
 	out, err := podman(tg.t, "run", "-d", "--name", tg.name, "--network", "host", "--security-opt", "seccomp=unconfined",
 		"--security-opt", "label=disable",
 		"-v", tg.dir+":"+tg.dir+":z", "--entrypoint", "spdk_tgt", image(),
@@ -179,7 +179,7 @@ type appliance struct {
 func newAppliance(t *testing.T, tg *target) *appliance {
 	t.Helper()
 	// The test containers run confined (SELinux container_t), where io_uring_setup fails and
-	// spdk_tgt would crash on the first io_uring bdev (TODO.md P0-6). "auto" must see that and
+	// spdk_tgt would crash on the first io_uring bdev (docs/review-history.md P0-6). "auto" must see that and
 	// use AIO; if it didn't, every test here would lose its spdk_tgt.
 	dataplane.SSDBackend = "auto"
 	st, err := store.OpenBoltStore(filepath.Join(t.TempDir(), "velocor.db"))

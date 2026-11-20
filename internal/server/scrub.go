@@ -11,7 +11,7 @@ import (
 	"github.com/velocor/velocor/internal/store"
 )
 
-// Background scrubs of the pools (TODO.md P2-2). SPDK patch 0004 does the reading, comparing and
+// Background scrubs of the pools (docs/review-history.md P2-2). SPDK patch 0004 does the reading, comparing and
 // repairing; velod schedules it, follows it and keeps the results:
 //
 //   - a run covers a pool once. It can span several SPDK scrubs ("segments"): a scheduled run
@@ -65,6 +65,11 @@ func scrubEligible(pool *store.Pool, rb *spdk.RaidBdevInfo) string {
 		return "its RAID isn't in the data plane"
 	case rb.State != "online":
 		return "its RAID isn't online"
+	case rb.NumBaseBdevsOperational < rb.NumBaseBdevs:
+		// SPDK's count, not only the pool's health: the reconciler records a member that just
+		// failed (e.g. a scrub's failed repair write) up to a pass later, and a scrub resumed in
+		// between would scan a single copy and record the pool as scrubbed.
+		return fmt.Sprintf("it is degraded (%d of %d members)", rb.NumBaseBdevsOperational, rb.NumBaseBdevs)
 	case rb.Process != nil:
 		return "it is rebuilding"
 	case pool.HealthStatus != store.HealthStatusOnline:

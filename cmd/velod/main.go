@@ -28,7 +28,7 @@ import (
 )
 
 func main() {
-	// "velod healthcheck [-listen :8443] [-insecure-http]": the quadlet's HealthCmd (TODO.md
+	// "velod healthcheck [-listen :8443] [-insecure-http]": the quadlet's HealthCmd (docs/review-history.md
 	// P2-6). Asks this velod's /healthz on the loopback interface; exit 0 when it answers.
 	if len(os.Args) > 1 && os.Args[1] == "healthcheck" {
 		os.Exit(healthcheck(os.Args[2:]))
@@ -193,7 +193,7 @@ func main() {
 
 	// The built-in Prometheus/Alertmanager have no [Install]: velod starts them when they're on.
 	go srv.StartMonitoring(ctx)
-	// Did the OS image staged before the last reboot take effect? (TODO.md P1-7)
+	// Did the OS image staged before the last reboot take effect? (docs/review-history.md P1-7)
 	go srv.CheckOSUpgrade(ctx)
 	go srv.RunScrubScheduler(ctx)
 

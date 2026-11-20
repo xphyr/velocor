@@ -160,7 +160,7 @@ tests:
               description: "2 new media/data-integrity errors in the last hour."
       - {eval_time: 4m, alertname: VelocorDiskFailed, exp_alerts: []}
 
-  # Scrub findings (TODO.md P2-2).
+  # Scrub findings (docs/review-history.md P2-2).
   - interval: 1m
     input_series:
       - series: 'velocor_pool_scrub_unrecoverable_blocks{instance="a",pool="p1"}'

@@ -1,4 +1,4 @@
-# Velocor alert rules (TODO.md P1-1), for Prometheus scraping a Velocor appliance's /metrics.
+# Velocor alert rules (docs/review-history.md P1-1), for Prometheus scraping a Velocor appliance's /metrics.
 #
 # The same file is used by an existing Prometheus (load it with rule_files) and by the
 # appliance's built-in Prometheus/Alertmanager. The rules expect the appliance's scrape job to

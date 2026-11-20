@@ -15,7 +15,7 @@ import (
 )
 
 // IOURingProbe says whether spdk_tgt can be trusted to set up io_uring for SSD bdevs
-// (TODO.md P0-6). In SPDK v26.09 a failed io_uring setup in bdev_uring crashes spdk_tgt,
+// (docs/review-history.md P0-6). In SPDK v26.09 a failed io_uring setup in bdev_uring crashes spdk_tgt,
 // taking every export down, and after a restart the reconciler re-attaches the same disks,
 // so it would crash again. AIO has no such failure, so it is used whenever this is unsure.
 type IOURingProbe struct {

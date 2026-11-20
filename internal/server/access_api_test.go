@@ -94,7 +94,7 @@ func TestUpdateInitiatorGroupReappliesExports(t *testing.T) {
 	}
 }
 
-// A group snapshot of volumes in use is taken (TODO.md P1-15): SPDK pauses their I/O together
+// A group snapshot of volumes in use is taken (docs/review-history.md P1-15): SPDK pauses their I/O together
 // (patch 0003), so hosts needn't stop.
 func TestGroupSnapshotOfExportedVolumes(t *testing.T) {
 	h := newHarness(t)

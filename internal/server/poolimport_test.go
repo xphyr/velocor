@@ -177,7 +177,7 @@ func (h *harness) ssd(id, path string) {
 	}
 }
 
-// TODO.md P1-14: disks moved to another appliance and to another controller on the way (new
+// docs/review-history.md P1-14: disks moved to another appliance and to another controller on the way (new
 // IDs) are imported, keeping the member UUIDs their RAID knows them by.
 func TestImportMirrorUnderNewDiskIDs(t *testing.T) {
 	f := spdktest.New(t)

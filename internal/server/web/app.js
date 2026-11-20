@@ -417,7 +417,7 @@ function smartCell(d) {
     s.critical_warning && pill("Critical warning", "bad")];
 }
 
-// Write cache and durability (TODO.md P0-4): SPDK doesn't pass flushes through volumes, so a
+// Write cache and durability (docs/review-history.md P0-4): SPDK doesn't pass flushes through volumes, so a
 // drive caching writes in volatile memory can lose acknowledged writes on power failure.
 function durabilityCell(d) {
   const notes = [d.write_cache_policy === "DISABLED" && (d.write_cache_error ? "can't be turned off: " + d.write_cache_error : "kept off by Velocor"), d.power_loss_protected && "declared power-loss protected"].filter(Boolean).join(", ");
@@ -660,7 +660,7 @@ function spacePolicyDialog(p) {
   });
 }
 
-// A pool's scrub (TODO.md P2-2): the current or last run and what it found.
+// A pool's scrub (docs/review-history.md P2-2): the current or last run and what it found.
 function scrubFact(p, sv) {
   if (!sv) return null;
   const sc = sv.scrub;
@@ -837,7 +837,7 @@ function snapshotDialog(v) {
   });
 }
 
-// Changed-block tracking (TODO.md L-2): the regions written between two snapshots of a volume.
+// Changed-block tracking (docs/review-history.md L-2): the regions written between two snapshots of a volume.
 function changedBlocksDialog(snap, older) {
   openDialog({
     title: `What changed up to ${snap.name}`,
@@ -1576,7 +1576,7 @@ function upgradeDialog(os) {
   });
 }
 
-// upgradeJobView shows the running or last OS upgrade (TODO.md P1-7).
+// upgradeJobView shows the running or last OS upgrade (docs/review-history.md P1-7).
 function upgradeJobView(j) {
   const state = j.state === "RUNNING" ? pill("Downloading", "warn") : j.state === "SUCCEEDED" ? pill("Staged", "ok") : pill("Failed", "bad");
   const lines = (j.output || "").split("\n");
@@ -2031,7 +2031,7 @@ let screenState = {};
 const stateOf = (key) => (screenState[key] ||= { text: "", page: 0 });
 
 
-// ---- History graphs (built-in monitoring, TODO.md P1-1) -------------------------------------
+// ---- History graphs (built-in monitoring, docs/review-history.md P1-1) ----------------------
 
 const GRAPH_RANGES = ["1h", "6h", "24h", "7d", "15d"];
 let graphRange = (() => { try { return localStorage.getItem("velocor-graph-range") || "6h"; } catch { return "6h"; } })();

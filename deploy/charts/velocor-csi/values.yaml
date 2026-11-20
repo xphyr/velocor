@@ -71,7 +71,7 @@ sidecars:
     image: registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.18.0@sha256:b7fefd08651f00ac4df1a196ed4c621c2451fbb899297fe9fad9e36c667af0c0
     resources: {}
 
-# Changed-block tracking for incremental backups (CSI SnapshotMetadata, KEP-3314; TODO.md L-2).
+# Changed-block tracking for incremental backups (CSI SnapshotMetadata, KEP-3314; docs/review-history.md L-2).
 # Off by default. Needs the appliance's data plane with SPDK patch 0005 (bdev_lvol_get_fragmap),
 # the cluster's SnapshotMetadataService CRD (cbt.storage.k8s.io/v1beta1, installed from
 # kubernetes-csi/external-snapshot-metadata, like the VolumeSnapshot CRDs), and a TLS

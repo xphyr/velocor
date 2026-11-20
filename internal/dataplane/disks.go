@@ -29,7 +29,7 @@ func NVMeControllerFromBdev(bdev string) string {
 // SSDBackend selects how SATA/SAS/virtio SSDs are handed to SPDK: "auto" (the default:
 // io_uring when ProbeIOURing finds it usable, else AIO), "uring" (io_uring, the fastest,
 // regardless of the probe) or "aio" (Linux AIO with O_DIRECT). A failed io_uring setup crashes
-// spdk_tgt instead of returning an error (TODO.md P0-6), so "auto" checks before every attach.
+// spdk_tgt instead of returning an error (docs/review-history.md P0-6), so "auto" checks before every attach.
 var SSDBackend = "auto"
 
 // ProbeIOURing checks whether io_uring is usable (replaced in tests).

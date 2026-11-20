@@ -910,7 +910,7 @@ func (s *Server) handleDeleteSnapshot(w http.ResponseWriter, r *http.Request) {
 }
 
 // deleteSnapshot deletes a snapshot, or, while cloned volumes depend on it, hides it and
-// leaves its deletion to the reconciler once they are gone (TODO.md P1-4).
+// leaves its deletion to the reconciler once they are gone (docs/review-history.md P1-4).
 func (s *Server) deleteSnapshot(ctx context.Context, snap *store.Snapshot) error {
 	deferred, err := s.store.DeferSnapshotDelete(snap.ID, time.Now(), subjectFromContext(ctx))
 	if err != nil || deferred {
@@ -1060,7 +1060,7 @@ func (s *Server) handleCreateVolumeGroupSnapshot(w http.ResponseWriter, r *http.
 
 	// One SPDK call pauses I/O to every member (hosts' writes wait, nothing fails), snapshots
 	// them all at that instant and resumes I/O, so the snapshots are consistent with each other
-	// whether or not hosts are writing (TODO.md P1-15, SPDK patch 0003).
+	// whether or not hosts are writing (docs/review-history.md P1-15, SPDK patch 0003).
 	uuids, err := s.spdk.BdevLvolSnapshotGroup(ctx, entries, groupSnapshotQuiesceTimeout)
 	if err != nil {
 		// SPDK stops at the first failed snapshot and may leave earlier ones; remove them.

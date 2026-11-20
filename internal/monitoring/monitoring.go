@@ -1,5 +1,5 @@
 // Package monitoring runs the appliance's optional built-in Prometheus and Alertmanager
-// (TODO.md P1-1): off by default; when an administrator turns it on, velod writes their
+// (docs/review-history.md P1-1): off by default; when an administrator turns it on, velod writes their
 // configuration, starts their systemd units (quadlets velocor-prometheus / velocor-alertmanager,
 // which have no [Install] section, so only velod starts them) and keeps them reloaded.
 //

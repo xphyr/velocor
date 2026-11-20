@@ -151,7 +151,7 @@ func (s *Server) importCandidates() ([]ImportCandidate, map[string][]foundSB, er
 				configured[m.BdevUUID] = m.Slot
 			}
 		}
-		// Disks under new IDs (TODO.md P1-14): their bdev UUID no longer matches a member, so
+		// Disks under new IDs (docs/review-history.md P1-14): their bdev UUID no longer matches a member, so
 		// match the members nobody claims to the current disks that match none.
 		var moved []dataplane.MovedDisk
 		var unmatched []string

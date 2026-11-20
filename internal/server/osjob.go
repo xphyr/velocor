@@ -15,7 +15,7 @@ import (
 	"github.com/velocor/velocor/internal/store"
 )
 
-// OS lifecycle (TODO.md P1-7).
+// OS lifecycle (docs/review-history.md P1-7).
 //
 // An upgrade (bootc upgrade/switch) downloads hundreds of MB and takes minutes, so it runs as a
 // background job the API, UI and veloctl follow. velod records what it staged (image, digest,

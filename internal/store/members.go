@@ -81,7 +81,7 @@ func (s *BoltStore) ReplacePoolMember(poolID string, slot int, newDiskID string)
 	return &out, nil
 }
 
-// RelinkPoolMember moves a pool member to the record of the same disk under a new ID (TODO.md
+// RelinkPoolMember moves a pool member to the record of the same disk under a new ID (docs/review-history.md
 // P1-14): newDiskID takes oldDiskID's place in the pool's slots, keeps the bdev UUID the RAID
 // superblock knows the member by, and inherits the operator's settings for the disk. It is
 // claimed (the reconciler attaches it to SPDK). The old record, of a disk that is no longer

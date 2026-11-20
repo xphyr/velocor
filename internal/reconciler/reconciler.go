@@ -27,7 +27,7 @@ type State struct {
 	Unmanaged []UnmanagedObject `json:"unmanaged_objects,omitempty"`
 	// SPDKInstance is the spdk_tgt process the last completed pass reconciled
 	// (hardware.SPDKInstance; "" when unknown). When the running one differs, the data plane
-	// was restarted after that pass and isn't restored yet (TODO.md P2-11).
+	// was restarted after that pass and isn't restored yet (docs/review-history.md P2-11).
 	SPDKInstance string `json:"spdk_instance,omitempty"`
 }
 
@@ -132,7 +132,7 @@ func (r *Reconciler) Start(ctx context.Context, interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	// A restarted spdk_tgt has lost everything velod built in it: restore at once rather than
-	// at the next tick (TODO.md P2-11).
+	// at the next tick (docs/review-history.md P2-11).
 	watch := time.NewTicker(2 * time.Second)
 	defer watch.Stop()
 
@@ -264,7 +264,7 @@ func (r *Reconciler) syncHardware(p *pass) []*store.Disk {
 	return discovered
 }
 
-// enforceWriteCache keeps the volatile write cache off on disks whose policy says so (TODO.md
+// enforceWriteCache keeps the volatile write cache off on disks whose policy says so (docs/review-history.md
 // P0-4): drives can turn it back on after a power cycle or reset. A drive that refuses is
 // recorded (Disk.WriteCacheError, shown in the durability warnings) and tried again only after
 // velod restarts or the operator sets the policy again, so it doesn't fill every pass's errors.

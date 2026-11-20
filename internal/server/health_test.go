@@ -8,7 +8,7 @@ import (
 )
 
 // /healthz and /readyz answer without authentication and say nothing beyond ok / not ready
-// (TODO.md P2-6).
+// (docs/review-history.md P2-6).
 func TestHealthEndpoints(t *testing.T) {
 	h := newHarness(t)
 	get := func(path string) (int, string) {

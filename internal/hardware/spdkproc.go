@@ -8,7 +8,7 @@ import (
 
 // SPDKInstance identifies the running spdk_tgt process ("<pid>:<start time>", from /proc), or
 // returns "" when there isn't exactly one visible (not running, or another PID namespace). A
-// different value means the data plane was restarted (TODO.md P2-11): everything velod built
+// different value means the data plane was restarted (docs/review-history.md P2-11): everything velod built
 // in SPDK is gone until the reconciler restores it.
 func SPDKInstance() string { return spdkInstance("/proc") }
 

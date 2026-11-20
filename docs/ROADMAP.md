@@ -47,7 +47,7 @@ This file tracks implementation progress directly inside the Git repository so a
 - [x] CSI v1.x driver (`cmd/velocor-csi`, `internal/csi`) with NVMe-oF/TCP & iSCSI support, online expansion, CoW snapshots, cloning, and usage reporting (`NodeGetVolumeStats`, `GetCapacity`)
 - [x] Per-node Host & InitiatorGroup ACL automation during `ControllerPublishVolume`
 - [x] Volume Group Snapshots (`GroupController` / KEP-3476)
-- [x] Changed Block Tracking (`SnapshotMetadata` / KEP-3314), opt-in (SPDK patch 0005; TODO.md L-2)
+- [x] Changed Block Tracking (`SnapshotMetadata` / KEP-3314), opt-in (SPDK patch 0005; docs/review-history.md L-2)
 - [x] Official CSI sanity suite (`csi-test/v5`: 82 passed, 0 failed) & `k3s` VM lab end-to-end verification
 - [x] Multi-arch (`linux/amd64`, `linux/arm64`) `velocor-csi` container build & Helm chart (`deploy/charts/velocor-csi`)
 - [x] GitHub Actions CI/CD release pipeline (`.github/workflows/ci-release.yml`) with Cosign keyless signing, SPDX SBOMs, SLSA build provenance, and OCI Helm publishing
@@ -59,7 +59,11 @@ This file tracks implementation progress directly inside the Git repository so a
 - [x] Containers ship inside the OS image, pinned by digest; they change only with `bootc upgrade` (the separate container-update path was removed)
 
 ## Phase 8: Hardening & Storage Failure-Mode Testing
-- [ ] Control-plane & API hardening (audit logging, rate limiting, TLS/auth hardening, input validation, least-privilege container/host posture)
-- [ ] Resolve degraded RAID / lvol reclaim error on `spdk_tgt` restart (`bdev Nvme_* already claimed by module lvol` / `raid_bdev_configure_base_bdev` ordering during reconciler recovery)
-- [ ] Storage failure & fault-injection test suite (NVMe/SSD removal & fault handling, degraded RAID pool behavior, `spdk_tgt` & `velod` restart/crash recovery)
-- [ ] Initiator & CSI resilience testing (network drop/reconnect, multi-path/portal failover, node reboot & ungraceful detach recovery)
+Open work is tracked in [TODO.md](../TODO.md); finished items in [review-history.md](review-history.md).
+- [x] Code reviews of 2026-11-15/16 and their fixes (data loss, security, operational; review-history.md)
+- [x] RAID re-assembly after `spdk_tgt` restarts (deterministic member bdev UUIDs, R1), disk replacement, rebuild and degraded start (P0-1, P1-8)
+- [x] Real-SPDK integration suite: crash/restart, rebuild, degraded start, scrub repair, group snapshots, capacity, pool import
+- [x] Lab failure testing on a VM appliance: hot-unplug under writes, reboots without members, SPDK `kill -9` under Kubernetes I/O, metadata loss and import
+- [ ] Emulated and real disk faults (read errors, failing drives), power-loss tests (TODO.md P2-2, P0-1, P0-4)
+- [ ] API audit log (TODO.md A-1); CHAP and real host identities (TODO.md P2-1)
+- [ ] Initiator resilience: iSCSI multipath, two SAN paths (TODO.md P1-13); single-node scope documented (TODO.md P1-6)

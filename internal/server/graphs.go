@@ -12,7 +12,7 @@ import (
 	"github.com/velocor/velocor/internal/store"
 )
 
-// History graphs (TODO.md P1-1 step 4) come from the built-in Prometheus. The UI asks for a
+// History graphs (docs/review-history.md P1-1 step 4) come from the built-in Prometheus. The UI asks for a
 // graph by name; velod builds the query, so browsers never send PromQL.
 
 type graphLine struct {

@@ -1978,7 +1978,7 @@ func orDefault(v any, def float64) any {
 }
 
 // runPoolScrub: veloctl pool scrub <pool-id> [--start [--check-only] [--max-mb-per-sec N] | --stop]
-// (TODO.md P2-2). Without --start or --stop it shows the pool's current or last scrub.
+// (docs/review-history.md P2-2). Without --start or --stop it shows the pool's current or last scrub.
 func runPoolScrub(cfg *cliConfig, args []string) error {
 	fs := flag.NewFlagSet("pool scrub", flag.ExitOnError)
 	start := fs.Bool("start", false, "Start a scrub now (outside the schedule's window)")
@@ -2111,7 +2111,7 @@ func runSystemScrub(cfg *cliConfig, args []string) error {
 	return nil
 }
 
-// printBlocks prints a changed-block-tracking answer (TODO.md L-2): the byte ranges and their
+// printBlocks prints a changed-block-tracking answer (docs/review-history.md L-2): the byte ranges and their
 // total.
 func printBlocks(cfg *cliConfig, resp map[string]any, what string) error {
 	if cfg.jsonOutput {

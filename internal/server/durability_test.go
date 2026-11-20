@@ -81,7 +81,7 @@ func TestRefusedWriteCacheWarning(t *testing.T) {
 }
 
 // NVMe drives: the policy is applied through SPDK once SPDK owns the drive, and at claim for a
-// drive the policy was set on before (TODO.md P0-4).
+// drive the policy was set on before (docs/review-history.md P0-4).
 func TestNVMeWriteCachePolicyAPI(t *testing.T) {
 	h := newHarness(t)
 	h.addDisk("nv1", "0000:01:00.0")
