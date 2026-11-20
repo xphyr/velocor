@@ -1179,9 +1179,34 @@ func runVolume(cfg *cliConfig, args []string) error {
 
 func runSnapshot(cfg *cliConfig, args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("subcommand required: list | create | clone | delete")
+		return fmt.Errorf("subcommand required: list | create | clone | allocated-blocks | changed-blocks | delete")
 	}
 	switch args[0] {
+	case "allocated-blocks":
+		if len(args) < 2 {
+			return fmt.Errorf("usage: veloctl snapshot allocated-blocks <snapshot-id>")
+		}
+		resp, err := cfg.request("GET", "/api/v1/snapshots/"+url.PathEscape(args[1])+"/blocks:allocated", nil)
+		if err != nil {
+			return err
+		}
+		return printBlocks(cfg, resp, "hold data")
+
+	case "changed-blocks":
+		fs := flag.NewFlagSet("snapshot changed-blocks", flag.ExitOnError)
+		baseID := fs.String("base", "", "The older snapshot")
+		targetID := fs.String("target", "", "The newer snapshot")
+		_ = fs.Parse(args[1:])
+		if *baseID == "" || *targetID == "" {
+			return fmt.Errorf("usage: veloctl snapshot changed-blocks --base <older-snapshot-id> --target <newer-snapshot-id>")
+		}
+		path := fmt.Sprintf("/api/v1/snapshots/%s/blocks:changed?base_snapshot_id=%s", url.PathEscape(*targetID), url.QueryEscape(*baseID))
+		resp, err := cfg.request("GET", path, nil)
+		if err != nil {
+			return err
+		}
+		return printBlocks(cfg, resp, "changed")
+
 	case "list":
 		resp, err := cfg.request("GET", "/api/v1/snapshots", nil)
 		if err != nil {
@@ -1716,7 +1741,7 @@ Commands:
   disk              List, scan, claim, release drives; set write cache / power-loss protection
   pool              Create, list, inspect or delete pools; space policy; replace a disk, start a pool degraded; import a pool
   volume            Create, list, get, show usage, resize, set QoS, or delete volumes
-  snapshot          Create, list, clone and delete snapshots
+  snapshot          Create, list, clone and delete snapshots; changed-block tracking
   group-snapshot    Create, list, get, or delete consistency group snapshots
   portal            Manage NVMe-oF and iSCSI network portals
   host              Register NVMe-oF / iSCSI initiator hosts
@@ -2083,5 +2108,29 @@ func runSystemScrub(cfg *cliConfig, args []string) error {
 		when = "any time"
 	}
 	fmt.Printf("Scheduled scrubs: every %d days, %s (appliance time), %s\n", uint64FromAny(sc["interval_days"]), when, speed)
+	return nil
+}
+
+// printBlocks prints a changed-block-tracking answer (TODO.md L-2): the byte ranges and their
+// total.
+func printBlocks(cfg *cliConfig, resp map[string]any, what string) error {
+	if cfg.jsonOutput {
+		return printJSON(resp)
+	}
+	ext, _ := resp["extents"].([]any)
+	var total uint64
+	tw := newTabWriter()
+	fmt.Fprintln(tw, "OFFSET\tLENGTH")
+	for _, e := range ext {
+		m, _ := e.(map[string]any)
+		n := uint64FromAny(m["length_bytes"])
+		total += n
+		fmt.Fprintf(tw, "%d\t%d\n", uint64FromAny(m["offset_bytes"]), n)
+	}
+	if err := tw.Flush(); err != nil {
+		return err
+	}
+	fmt.Printf("%d ranges, %d bytes %s, of a %d-byte volume (%d-byte clusters)\n", len(ext), total, what,
+		uint64FromAny(resp["volume_size_bytes"]), uint64FromAny(resp["cluster_size_bytes"]))
 	return nil
 }

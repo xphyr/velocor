@@ -50,3 +50,23 @@ groupsnapshot.storage.k8s.io/v1
 groupsnapshot.storage.k8s.io/v1beta1
 {{- end -}}
 {{- end }}
+
+{{/*
+Changed-block tracking (snapshotMetadata): the sidecar's TLS secret, and the CA (PEM) clients
+verify it with. On OpenShift the service CA issues the certificate (annotation on the Service)
+and its bundle is in every namespace's openshift-service-ca.crt ConfigMap.
+*/}}
+{{- define "velocor-csi.snapshotMetadataTLSSecret" -}}
+{{- default "velocor-csi-snapshot-metadata-tls" .Values.snapshotMetadata.tlsSecretName -}}
+{{- end -}}
+
+{{- define "velocor-csi.snapshotMetadataCA" -}}
+{{- if .Values.snapshotMetadata.caCert -}}
+{{- .Values.snapshotMetadata.caCert -}}
+{{- else -}}
+{{- $cm := lookup "v1" "ConfigMap" .Release.Namespace "openshift-service-ca.crt" -}}
+{{- if and $cm (index $cm.data "service-ca.crt") -}}
+{{- index $cm.data "service-ca.crt" -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}

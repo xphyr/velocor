@@ -151,11 +151,29 @@ func TestSnapshotsAndClones(t *testing.T) {
 	a.must("DELETE", "/deleted-volumes/"+vol["id"].(string), nil, "") // purge: the lvol goes from SPDK
 	cin.mustRead(0, first)
 
-	// SPDK v26.09 has no bdev_lvol_get_fragmap, so changed-block tracking must say so
-	// clearly rather than return made-up extents (TODO.md P1-9).
-	code, out := a.do("GET", "/snapshots/"+s2["id"].(string)+"/blocks:changed?base_snapshot_id="+s1["id"].(string), nil)
-	if code != 501 {
-		t.Fatalf("changed blocks on SPDK without fragmap support: want 501, got %d %v", code, out)
+	// Changed-block tracking from SPDK's cluster maps (patch 0005, TODO.md L-2): cluster 0 was
+	// written before s1, cluster 3 between s1 and s2. Still right with the source volume gone.
+	extentsOf := func(path string) [][2]int {
+		t.Helper()
+		code, out := a.do("GET", path, nil)
+		if code != 200 {
+			t.Fatalf("%s: HTTP %d %v", path, code, out)
+		}
+		var res [][2]int
+		for _, e := range out["extents"].([]any) {
+			m := e.(map[string]any)
+			res = append(res, [2]int{int(m["offset_bytes"].(float64)), int(m["length_bytes"].(float64))})
+		}
+		return res
+	}
+	if got := extentsOf("/snapshots/" + s2["id"].(string) + "/blocks:changed?base_snapshot_id=" + s1["id"].(string)); !slices.Equal(got, [][2]int{{3 * cluster, cluster}}) {
+		t.Fatalf("changed blocks s1->s2: %v, want cluster 3", got)
+	}
+	if got := extentsOf("/snapshots/" + s1["id"].(string) + "/blocks:allocated"); !slices.Equal(got, [][2]int{{0, cluster}}) {
+		t.Fatalf("allocated blocks of s1: %v, want cluster 0", got)
+	}
+	if got := extentsOf("/snapshots/" + s2["id"].(string) + "/blocks:allocated"); !slices.Equal(got, [][2]int{{0, cluster}, {3 * cluster, cluster}}) {
+		t.Fatalf("allocated blocks of s2: %v, want clusters 0 and 3", got)
 	}
 
 	// A snapshot with a clone can be deleted: it disappears, and SPDK deletes it once the clone

@@ -698,26 +698,6 @@ func (s *Server) handleListSnapshots(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"snapshots": snaps})
 }
 
-func (s *Server) collectSnapshotLineage(target *store.Snapshot, stopAtParentID string) ([]*store.Snapshot, error) {
-	var chain []*store.Snapshot
-	cur := target
-	for cur != nil {
-		chain = append(chain, cur)
-		if cur.ParentSnapshotID == "" || cur.ParentSnapshotID == stopAtParentID {
-			if stopAtParentID != "" && cur.ParentSnapshotID != stopAtParentID {
-				return nil, fmt.Errorf("%w: snapshot %s is not an ancestor of %s", store.ErrInvalidArgument, stopAtParentID, target.ID)
-			}
-			break
-		}
-		parent, err := s.store.GetSnapshot(cur.ParentSnapshotID)
-		if err != nil {
-			return nil, fmt.Errorf("broken snapshot lineage at %s: %w", cur.ParentSnapshotID, err)
-		}
-		cur = parent
-	}
-	return chain, nil
-}
-
 func formatBlockExtents(extents []spdk.BlockExtent) []map[string]uint64 {
 	out := make([]map[string]uint64, 0, len(extents))
 	for _, e := range extents {

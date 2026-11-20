@@ -1,0 +1,437 @@
+From: Velocor <noreply@velocor.invalid>
+Subject: [PATCH] bdev/lvol: add bdev_lvol_get_fragmap
+
+Incremental backups need the blocks that changed between two snapshots. An lvol snapshot owns
+exactly the clusters written while it was the newest layer of its chain (the rest it reads
+through from its parent), so the changes between two snapshots of a chain are the clusters the
+layers after the older one own, up to the newer one. There is no RPC that reports which
+clusters an lvol owns.
+
+Add bdev_lvol_get_fragmap, the RPC of Longhorn's SPDK fork (github.com/longhorn/spdk, commit
+3e764f556 "fragmap: implement bdev_lvol_get_fragmap" by Derek Su), with the same parameters
+(name, offset, size) and result (cluster_size, num_clusters, num_allocated_clusters, fragmap: a
+base64 bitmap, cluster i at bit i % 8 of byte i / 8), so tools written for it work unchanged.
+
+Differences from that implementation:
+- the map is read from the blob's cluster table with spdk_blob_get_next_allocated_io_unit() /
+  spdk_blob_get_next_unallocated_io_unit(), the functions the lvol bdev's SEEK_DATA/SEEK_HOLE
+  use, so the result is the same, but synchronously and without a bdev descriptor, an I/O
+  channel and two seek I/Os per extent (whose completion status the original didn't check);
+- size 0 means "to the end of the lvol" also with a non-zero offset (the original then mapped
+  past the end);
+- cluster sizes needn't be powers of two;
+- the bitmap is encoded in the lvol module, without a new lib/util function.
+
+Also: the schema entry, an rpc.py command and the RPC documentation.
+
+Unit test: ut_lvol_get_fragmap.
+
+Applies to SPDK v26.09 (0bbb7fe4dccfb31e8d446da8822360704949d1e9) after 0001-0004.
+---
+diff --git a/doc/jsonrpc.md.jinja2 b/doc/jsonrpc.md.jinja2
+index 229d8bc..f9e9be4 100644
+--- a/doc/jsonrpc.md.jinja2
++++ b/doc/jsonrpc.md.jinja2
+@@ -7885,6 +7885,39 @@ Example response:
+ }
+ ~~~
+ 
++### bdev_lvol_get_fragmap {#rpc_bdev_lvol_get_fragmap}
++
++{{ bdev_lvol_get_fragmap_description }}
++
++#### Parameters
++
++{{ bdev_lvol_get_fragmap_params }}
++
++#### Response
++
++{{ bdev_lvol_get_fragmap_response }}
++
++#### Example
++
++Example request:
++
++{{ example_request("bdev_lvol_get_fragmap", "8a47421a-20cf-444f-845c-d97ad0b0bd8e", "-s", "41943040") }}
++
++Example response:
++
++~~~json
++{
++  "jsonrpc": "2.0",
++  "id": 1,
++  "result": {
++    "cluster_size": 4194304,
++    "num_clusters": 10,
++    "num_allocated_clusters": 3,
++    "fragmap": "BwA="
++  }
++}
++~~~
++
+ ### bdev_lvol_clone {#rpc_bdev_lvol_clone}
+ 
+ {{ bdev_lvol_clone_description }}
+diff --git a/module/bdev/lvol/vbdev_lvol.c b/module/bdev/lvol/vbdev_lvol.c
+index 5f3fa87..5c6ddae 100644
+--- a/module/bdev/lvol/vbdev_lvol.c
++++ b/module/bdev/lvol/vbdev_lvol.c
+@@ -2426,4 +2426,65 @@ vbdev_lvol_set_external_parent(struct spdk_lvol *lvol, const char *esnap_name,
+ 	spdk_bdev_close(desc);
+ }
+ 
++int
++vbdev_lvol_get_fragmap(struct spdk_lvol *lvol, uint64_t offset, uint64_t size,
++		       struct vbdev_lvol_fragmap *fragmap)
++{
++	struct spdk_blob *blob = lvol->blob;
++	uint64_t cluster_size = spdk_bs_get_cluster_size(lvol->lvol_store->blobstore);
++	uint64_t io_unit_size = spdk_bs_get_io_unit_size(lvol->lvol_store->blobstore);
++	uint64_t lvol_size = spdk_blob_get_num_clusters(blob) * cluster_size;
++	uint64_t io_unit, end_io_unit, data, hole, first, last, i;
++
++	memset(fragmap, 0, sizeof(*fragmap));
++	if (cluster_size == 0 || io_unit_size == 0 || offset > lvol_size) {
++		return -EINVAL;
++	}
++	if (size == 0) {
++		size = lvol_size - offset;
++	}
++	if (offset % cluster_size != 0 || size % cluster_size != 0 || size > lvol_size - offset) {
++		SPDK_ERRLOG("lvol %s: fragmap range %" PRIu64 "+%" PRIu64 " isn't a range of whole "
++			    "%" PRIu64 "-byte clusters within its %" PRIu64 " bytes\n", lvol->unique_id,
++			    offset, size, cluster_size, lvol_size);
++		return -EINVAL;
++	}
++
++	fragmap->cluster_size = cluster_size;
++	fragmap->num_clusters = size / cluster_size;
++	fragmap->map = calloc(spdk_max(spdk_divide_round_up(fragmap->num_clusters, 8), 1), 1);
++	if (fragmap->map == NULL) {
++		return -ENOMEM;
++	}
++
++	/* Allocation is per cluster, so the boundaries found are cluster-aligned. */
++	io_unit = offset / io_unit_size;
++	end_io_unit = (offset + size) / io_unit_size;
++	while (io_unit < end_io_unit) {
++		data = spdk_blob_get_next_allocated_io_unit(blob, io_unit);
++		if (data == UINT64_MAX || data >= end_io_unit) {
++			break;
++		}
++		hole = spdk_blob_get_next_unallocated_io_unit(blob, data);
++		if (hole == UINT64_MAX || hole > end_io_unit) {
++			hole = end_io_unit;
++		}
++		first = (data * io_unit_size - offset) / cluster_size;
++		last = spdk_divide_round_up(hole * io_unit_size - offset, cluster_size);
++		for (i = first; i < last; i++) {
++			fragmap->map[i / 8] |= 1 << (i % 8);
++		}
++		fragmap->num_allocated_clusters += last - first;
++		io_unit = hole;
++	}
++	return 0;
++}
++
++void
++vbdev_lvol_fragmap_free(struct vbdev_lvol_fragmap *fragmap)
++{
++	free(fragmap->map);
++	fragmap->map = NULL;
++}
++
+ SPDK_LOG_REGISTER_COMPONENT(vbdev_lvol)
+diff --git a/module/bdev/lvol/vbdev_lvol.h b/module/bdev/lvol/vbdev_lvol.h
+index 945f0fe..eefd207 100644
+--- a/module/bdev/lvol/vbdev_lvol.h
++++ b/module/bdev/lvol/vbdev_lvol.h
+@@ -184,4 +184,32 @@ int vbdev_lvol_shallow_copy(struct spdk_lvol *lvol, const char *bdev_name,
+ void vbdev_lvol_set_external_parent(struct spdk_lvol *lvol, const char *esnap_name,
+ 				    spdk_lvol_op_complete cb_fn, void *cb_arg);
+ 
++/* Clusters of a range of an lvol that the lvol's own blob has allocated (bdev_lvol_get_fragmap). */
++struct vbdev_lvol_fragmap {
++	uint64_t	cluster_size;
++	uint64_t	num_clusters;
++	uint64_t	num_allocated_clusters;
++	/* One bit per cluster of the range, cluster i at bit (i % 8) of byte i / 8; 1 = allocated. */
++	uint8_t		*map;
++};
++
++/**
++ * Report which clusters of [offset, offset + size) of an lvol the lvol has allocated itself.
++ * Clusters it only reads through from its parent (a snapshot, a clone's origin, an external
++ * snapshot) are not allocated. So for a snapshot this is what was written while it was the
++ * newest layer, and the changes between two snapshots of a chain are the union of the maps of
++ * the layers after the older one, up to the newer one. The map is read from the blob's cluster
++ * table, on the thread that changes it; it does no I/O.
++ *
++ * \param lvol The lvol.
++ * \param offset Start of the range in bytes, a multiple of the cluster size.
++ * \param size Length in bytes, a multiple of the cluster size; 0 means to the end of the lvol.
++ * \param fragmap Filled in on success; release with vbdev_lvol_fragmap_free().
++ * \return 0 on success, -EINVAL for a range that isn't cluster-aligned or exceeds the lvol,
++ * -ENOMEM.
++ */
++int vbdev_lvol_get_fragmap(struct spdk_lvol *lvol, uint64_t offset, uint64_t size,
++			   struct vbdev_lvol_fragmap *fragmap);
++void vbdev_lvol_fragmap_free(struct vbdev_lvol_fragmap *fragmap);
++
+ #endif /* SPDK_VBDEV_LVOL_H */
+diff --git a/module/bdev/lvol/vbdev_lvol_rpc.c b/module/bdev/lvol/vbdev_lvol_rpc.c
+index fb1bf05..341023d 100644
+--- a/module/bdev/lvol/vbdev_lvol_rpc.c
++++ b/module/bdev/lvol/vbdev_lvol_rpc.c
+@@ -9,6 +9,7 @@
+ #include "spdk/util.h"
+ #include "vbdev_lvol.h"
+ #include "spdk/string.h"
++#include "spdk/base64.h"
+ #include "spdk/log.h"
+ #include "spdk_internal/rpc_autogen.h"
+ 
+@@ -428,6 +429,66 @@ rpc_bdev_lvol_snapshot_group(struct spdk_jsonrpc_request *request,
+ 
+ SPDK_RPC_REGISTER("bdev_lvol_snapshot_group", rpc_bdev_lvol_snapshot_group, SPDK_RPC_RUNTIME)
+ 
++/*
++ * bdev_lvol_get_fragmap: which clusters of a range of an lvol it has allocated itself, as a
++ * base64 bitmap (the RPC of Longhorn's SPDK fork, same parameters and result).
++ */
++static void
++rpc_bdev_lvol_get_fragmap(struct spdk_jsonrpc_request *request, const struct spdk_json_val *params)
++{
++	struct rpc_bdev_lvol_get_fragmap_ctx req = {};
++	struct vbdev_lvol_fragmap fragmap;
++	struct spdk_json_write_ctx *w;
++	struct spdk_bdev *bdev;
++	struct spdk_lvol *lvol;
++	size_t map_len;
++	char *encoded = NULL;
++	int rc;
++
++	if (spdk_json_decode_object(params, rpc_bdev_lvol_get_fragmap_decoders,
++				    SPDK_COUNTOF(rpc_bdev_lvol_get_fragmap_decoders), &req)) {
++		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
++						 "spdk_json_decode_object failed");
++		goto cleanup;
++	}
++
++	bdev = spdk_bdev_get_by_name(req.name);
++	lvol = bdev ? vbdev_lvol_get_from_bdev(bdev) : NULL;
++	if (lvol == NULL) {
++		spdk_jsonrpc_send_error_response_fmt(request, -ENODEV, "lvol %s does not exist", req.name);
++		goto cleanup;
++	}
++
++	rc = vbdev_lvol_get_fragmap(lvol, req.offset, req.size, &fragmap);
++	if (rc != 0) {
++		spdk_jsonrpc_send_error_response(request, rc, spdk_strerror(-rc));
++		goto cleanup;
++	}
++	map_len = spdk_divide_round_up(fragmap.num_clusters, 8);
++	encoded = calloc(spdk_base64_get_encoded_strlen(map_len) + 1, 1);
++	if (encoded == NULL || spdk_base64_encode(encoded, fragmap.map, map_len) != 0) {
++		vbdev_lvol_fragmap_free(&fragmap);
++		spdk_jsonrpc_send_error_response(request, -ENOMEM, spdk_strerror(ENOMEM));
++		goto cleanup;
++	}
++
++	w = spdk_jsonrpc_begin_result(request);
++	spdk_json_write_object_begin(w);
++	spdk_json_write_named_uint64(w, "cluster_size", fragmap.cluster_size);
++	spdk_json_write_named_uint64(w, "num_clusters", fragmap.num_clusters);
++	spdk_json_write_named_uint64(w, "num_allocated_clusters", fragmap.num_allocated_clusters);
++	spdk_json_write_named_string(w, "fragmap", encoded);
++	spdk_json_write_object_end(w);
++	spdk_jsonrpc_end_result(request, w);
++	vbdev_lvol_fragmap_free(&fragmap);
++
++cleanup:
++	free(encoded);
++	free_rpc_bdev_lvol_get_fragmap(&req);
++}
++
++SPDK_RPC_REGISTER("bdev_lvol_get_fragmap", rpc_bdev_lvol_get_fragmap, SPDK_RPC_RUNTIME)
++
+ static void
+ rpc_bdev_lvol_clone_cb(void *cb_arg, struct spdk_lvol *lvol, int lvolerrno)
+ {
+diff --git a/python/spdk/cli/lvol.py b/python/spdk/cli/lvol.py
+index 85c453d..bc98a8c 100644
+--- a/python/spdk/cli/lvol.py
++++ b/python/spdk/cli/lvol.py
+@@ -106,6 +106,16 @@ def add_parser(subparsers):
+                    help='Longest wait for I/O to drain, in milliseconds (default 5000; 0 for no limit)')
+     p.set_defaults(func=bdev_lvol_snapshot_group)
+ 
++    def bdev_lvol_get_fragmap(args):
++        print_json(args.client.bdev_lvol_get_fragmap(name=args.name, offset=args.offset, size=args.size))
++
++    p = subparsers.add_parser('bdev_lvol_get_fragmap',
++                              help='Get the clusters an lvol has allocated itself, as a bitmap')
++    p.add_argument('name', help='UUID or alias of the logical volume')
++    p.add_argument('-o', '--offset', type=int, help='Start of the range in bytes (default 0)')
++    p.add_argument('-s', '--size', type=int, help='Length of the range in bytes (default: to the end)')
++    p.set_defaults(func=bdev_lvol_get_fragmap)
++
+     def bdev_lvol_clone(args):
+         print_json(args.client.bdev_lvol_clone(
+                                             snapshot_name=args.snapshot_name,
+diff --git a/schema/schema.yaml b/schema/schema.yaml
+index c69bcc0..03d8d15 100644
+--- a/schema/schema.yaml
++++ b/schema/schema.yaml
+@@ -4576,6 +4576,28 @@ methods:
+       - name: quiesce_timeout_ms
+         type: uint32
+         description: Longest wait for I/O to drain, in milliseconds (default 5000; 0 for no limit)
++  - name: bdev_lvol_get_fragmap
++    description: |
++      Get a fragmap of a range of a logical volume: a bitmap with one bit per cluster, 1 where the
++      logical volume has allocated the cluster itself. Clusters it reads through from its parent
++      are 0, so for a snapshot the map shows what was written while it was the newest layer; the
++      changes between two snapshots of a chain are the union of the maps of the layers after the
++      older one, up to the newer one. Cluster i is bit (i % 8) of byte i / 8 of the base64-decoded
++      fragmap.
++    result:
++      type: object
++      description: cluster_size, num_clusters (in the range), num_allocated_clusters and fragmap (base64)
++    params:
++      - name: name
++        type: string
++        required: true
++        description: UUID or alias of the logical volume
++      - name: offset
++        type: uint64
++        description: Start of the range in bytes, a multiple of the cluster size (default 0)
++      - name: size
++        type: uint64
++        description: Length of the range in bytes, a multiple of the cluster size (default 0, to the end)
+   - name: bdev_lvol_clone
+     description: Create a logical volume based on a snapshot.
+     result:
+diff --git a/test/unit/lib/bdev/vbdev_lvol.c/vbdev_lvol_ut.c b/test/unit/lib/bdev/vbdev_lvol.c/vbdev_lvol_ut.c
+index d830ad8..071c0e7 100644
+--- a/test/unit/lib/bdev/vbdev_lvol.c/vbdev_lvol_ut.c
++++ b/test/unit/lib/bdev/vbdev_lvol.c/vbdev_lvol_ut.c
+@@ -279,9 +279,32 @@ spdk_blob_get_num_clusters(struct spdk_blob *b)
+  */
+ uint64_t g_blob_allocated_io_unit_offset = 20;
+ 
++/*
++ * Fragmap tests set g_ut_alloc to one flag per cluster (g_num_clusters of them, with
++ * g_cluster_size / SPDK_BS_PAGE_SIZE io_units each) instead.
++ */
++static const bool *g_ut_alloc;
++
++static uint64_t
++ut_find_io_unit(uint64_t offset, bool allocated)
++{
++	uint64_t per_cluster = g_cluster_size / SPDK_BS_PAGE_SIZE;
++
++	while (offset < g_num_clusters * per_cluster) {
++		if (g_ut_alloc[offset / per_cluster] == allocated) {
++			return offset;
++		}
++		offset = (offset / per_cluster + 1) * per_cluster;
++	}
++	return UINT64_MAX;
++}
++
+ uint64_t
+ spdk_blob_get_next_allocated_io_unit(struct spdk_blob *blob, uint64_t offset)
+ {
++	if (g_ut_alloc != NULL) {
++		return ut_find_io_unit(offset, true);
++	}
+ 	if (offset <= g_blob_allocated_io_unit_offset) {
+ 		return g_blob_allocated_io_unit_offset;
+ 	} else {
+@@ -292,6 +315,9 @@ spdk_blob_get_next_allocated_io_unit(struct spdk_blob *blob, uint64_t offset)
+ uint64_t
+ spdk_blob_get_next_unallocated_io_unit(struct spdk_blob *blob, uint64_t offset)
+ {
++	if (g_ut_alloc != NULL) {
++		return ut_find_io_unit(offset, false);
++	}
+ 	if (offset < g_blob_allocated_io_unit_offset) {
+ 		return offset;
+ 	} else {
+@@ -2369,6 +2395,67 @@ ut_lvol_snapshot_group(void)
+ 	CU_ASSERT(g_lvol_store == NULL);
+ }
+ 
++static void
++ut_lvol_get_fragmap(void)
++{
++	/* 12 clusters of 4 io_units: allocated 0, 3-5, 11. */
++	static const bool alloc[12] = { true, false, false, true, true, true, false, false, false, false, false, true };
++	struct spdk_lvol_store lvs = {};
++	struct spdk_lvol lvol = {};
++	struct vbdev_lvol_fragmap fm;
++	int saved_cluster_size = g_cluster_size, saved_num_clusters = g_num_clusters;
++	uint64_t cs;
++
++	g_cluster_size = 4 * SPDK_BS_PAGE_SIZE;
++	g_num_clusters = 12;
++	g_ut_alloc = alloc;
++	cs = g_cluster_size;
++	lvol.lvol_store = &lvs;
++	snprintf(lvol.unique_id, sizeof(lvol.unique_id), "fragmap");
++
++	/* The whole lvol: bits 0, 3, 4, 5 and 11. */
++	CU_ASSERT(vbdev_lvol_get_fragmap(&lvol, 0, 0, &fm) == 0);
++	CU_ASSERT(fm.cluster_size == cs);
++	CU_ASSERT(fm.num_clusters == 12);
++	CU_ASSERT(fm.num_allocated_clusters == 5);
++	CU_ASSERT(fm.map[0] == 0x39);	/* 0b00111001 */
++	CU_ASSERT(fm.map[1] == 0x08);	/* cluster 11 */
++	vbdev_lvol_fragmap_free(&fm);
++
++	/* A range starting inside an allocated run, and one ending inside it. */
++	CU_ASSERT(vbdev_lvol_get_fragmap(&lvol, 4 * cs, 4 * cs, &fm) == 0);	/* clusters 4-7 */
++	CU_ASSERT(fm.num_clusters == 4);
++	CU_ASSERT(fm.num_allocated_clusters == 2);
++	CU_ASSERT(fm.map[0] == 0x03);
++	vbdev_lvol_fragmap_free(&fm);
++	CU_ASSERT(vbdev_lvol_get_fragmap(&lvol, 2 * cs, 2 * cs, &fm) == 0);	/* clusters 2-3 */
++	CU_ASSERT(fm.num_allocated_clusters == 1);
++	CU_ASSERT(fm.map[0] == 0x02);
++	vbdev_lvol_fragmap_free(&fm);
++
++	/* Size 0 means to the end; a range of unallocated clusters is all zeros. */
++	CU_ASSERT(vbdev_lvol_get_fragmap(&lvol, 10 * cs, 0, &fm) == 0);
++	CU_ASSERT(fm.num_clusters == 2);
++	CU_ASSERT(fm.num_allocated_clusters == 1);
++	CU_ASSERT(fm.map[0] == 0x02);
++	vbdev_lvol_fragmap_free(&fm);
++	CU_ASSERT(vbdev_lvol_get_fragmap(&lvol, 6 * cs, 5 * cs, &fm) == 0);
++	CU_ASSERT(fm.num_allocated_clusters == 0);
++	CU_ASSERT(fm.map[0] == 0);
++	vbdev_lvol_fragmap_free(&fm);
++
++	/* Ranges that aren't whole clusters within the lvol are refused. */
++	CU_ASSERT(vbdev_lvol_get_fragmap(&lvol, SPDK_BS_PAGE_SIZE, cs, &fm) == -EINVAL);
++	CU_ASSERT(vbdev_lvol_get_fragmap(&lvol, 0, cs + SPDK_BS_PAGE_SIZE, &fm) == -EINVAL);
++	CU_ASSERT(vbdev_lvol_get_fragmap(&lvol, 8 * cs, 5 * cs, &fm) == -EINVAL);
++	CU_ASSERT(vbdev_lvol_get_fragmap(&lvol, 13 * cs, 0, &fm) == -EINVAL);
++	CU_ASSERT(fm.map == NULL);
++
++	g_ut_alloc = NULL;
++	g_cluster_size = saved_cluster_size;
++	g_num_clusters = saved_num_clusters;
++}
++
+ int
+ main(int argc, char **argv)
+ {
+@@ -2403,6 +2490,7 @@ main(int argc, char **argv)
+ 	CU_ADD_TEST(suite, ut_lvol_shallow_copy);
+ 	CU_ADD_TEST(suite, ut_lvol_set_external_parent);
+ 	CU_ADD_TEST(suite, ut_lvol_snapshot_group);
++	CU_ADD_TEST(suite, ut_lvol_get_fragmap);
+ 
+ 	allocate_threads(1);
+ 	set_thread(0);

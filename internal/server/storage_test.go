@@ -178,6 +178,40 @@ func TestStorageEndToEndAndCBT(t *testing.T) {
 	if ext := resp["extents"].([]any); len(ext) != 1 || ext[0].(map[string]any)["length_bytes"].(float64) != 65536 {
 		t.Fatalf("allocated blocks of s1 wrong: %v", resp)
 	}
+	// A later snapshot's allocated blocks are those of its whole chain (s3 owns only cluster 2).
+	extent := func(path string) (float64, float64) {
+		t.Helper()
+		resp := h.expect(h.do("GET", path, csi, nil))(http.StatusOK)
+		ext := resp["extents"].([]any)
+		if len(ext) != 1 {
+			t.Fatalf("%s: want 1 extent, got %v", path, ext)
+		}
+		e := ext[0].(map[string]any)
+		return e["offset_bytes"].(float64), e["length_bytes"].(float64)
+	}
+	if off, n := extent("/api/v1/snapshots/" + snaps[2] + "/blocks:allocated"); off != 0 || n != 3*65536 {
+		t.Fatalf("allocated blocks of s3: %v+%v, want 0+192KiB", off, n)
+	}
+	// The base must be older than the target in its chain.
+	h.expect(h.do("GET", "/api/v1/snapshots/"+snaps[0]+"/blocks:changed?base_snapshot_id="+snaps[2], csi, nil))(http.StatusBadRequest)
+	h.expect(h.do("GET", "/api/v1/snapshots/"+snaps[0]+"/blocks:changed?base_snapshot_id="+snaps[0], csi, nil))(http.StatusBadRequest)
+	// Deleting the middle snapshot merges its clusters into s3: the changes since s1 stay the same.
+	h.expect(h.do("DELETE", "/api/v1/snapshots/"+snaps[1], csi, nil))(http.StatusOK)
+	if off, n := extent("/api/v1/snapshots/" + snaps[2] + "/blocks:changed?base_snapshot_id=" + snaps[0]); off != 65536 || n != 131072 {
+		t.Fatalf("changes s1->s3 after deleting s2: %v+%v", off, n)
+	}
+	// A snapshot of a clone holds its origin's data too: allocated reaches into the origin's chain.
+	clone := h.expect(h.do("POST", "/api/v1/snapshots/"+snaps[0]+":clone", csi, map[string]any{"clone_name": "restored"}))(http.StatusCreated)["volume"].(map[string]any)
+	h.fake.WriteCluster(clone["uuid"].(string), 5)
+	cs := h.expect(h.do("POST", "/api/v1/volumes/"+clone["id"].(string)+"/snapshots", csi, map[string]any{"name": "c1"}))(http.StatusCreated)
+	resp = h.expect(h.do("GET", "/api/v1/snapshots/"+field(cs, "snapshot", "id").(string)+"/blocks:allocated", csi, nil))(http.StatusOK)
+	if ext := resp["extents"].([]any); len(ext) != 2 || ext[0].(map[string]any)["offset_bytes"].(float64) != 0 || ext[1].(map[string]any)["offset_bytes"].(float64) != 5*65536 {
+		t.Fatalf("allocated blocks of a clone's snapshot: %v", ext)
+	}
+	// A data plane without the fragmap RPC: 501, never made-up extents.
+	h.fake.FailWithCode("bdev_lvol_get_fragmap", -32601)
+	h.fake.Fail("bdev_lvol_get_fragmap", 1)
+	h.expect(h.do("GET", "/api/v1/snapshots/"+snaps[2]+"/blocks:allocated", csi, nil))(http.StatusNotImplemented)
 }
 
 func TestSnapshotNamesDoNotCollideAcrossVolumes(t *testing.T) {

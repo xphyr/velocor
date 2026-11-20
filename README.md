@@ -33,7 +33,7 @@ Velocor decouples the user-space block data plane (`spdk_tgt`) from the control 
 - **`velod` (`cmd/velod`)**: Node control-plane daemon, hardware manager (`vfio-pci` & hugepages), transactional desired-state store (`bbolt`), background drift reconciler, and single-port (`:8443`) REST/JSON + OpenAPI server, authenticated Prometheus `/metrics` endpoint, and embedded Web UI console.
 - **`veloctl` (`cmd/veloctl`)**: Operator CLI for managing users, tokens, disks, pools, volumes, snapshots, network portals, initiator groups, and exports.
 - **`velocor-spdk` (`spdk_tgt`)**: User-space, polled-mode SPDK `v26.09` data plane managing PCIe NVMe (`vfio-pci` / `bdev_nvme`) and SATA/SAS SSD (`io_uring` / `bdev_uring`) devices directly.
-- **`velocor-csi` (`cmd/velocor-csi`)**: Kubernetes CSI driver (`csi.velocor.io`) supporting dynamic NVMe-oF/TCP and iSCSI provisioning, online volume expansion, CoW snapshots, cloning, and `VolumeGroupSnapshot`. Changed Block Tracking (CSI `SnapshotMetadata`, KEP-3314) is not supported yet; see [Changed Block Tracking](#changed-block-tracking-cbt-not-yet-supported).
+- **`velocor-csi` (`cmd/velocor-csi`)**: Kubernetes CSI driver (`csi.velocor.io`) supporting dynamic NVMe-oF/TCP and iSCSI provisioning, online volume expansion, CoW snapshots, cloning, and `VolumeGroupSnapshot`. Changed Block Tracking (CSI `SnapshotMetadata`, KEP-3314) is opt-in; see [Changed Block Tracking](#changed-block-tracking-cbt-for-incremental-backups-opt-in).
 - **Boot-Disk Safety Guard**: Automatically resolves backing devices and PCIe BDF addresses for `/`, `/boot`, `/boot/efi`, and `/sysroot` on startup and permanently marks them `is_boot_device = true` so OS drives can never be unbound or formatted.
 
 ---
@@ -450,19 +450,32 @@ The Velocor CSI driver (`velocor-csi`) integrates Kubernetes clusters with a Vel
   block first, driver clones (`csi-clone`), snapshots for golden images. DataVolumes then need no
   access or volume mode of their own, and VMs created from them are live-migratable.
 
-#### Changed Block Tracking (CBT): not yet supported
+#### Changed Block Tracking (CBT) for incremental backups (opt-in)
 
-The driver does **not** implement the CSI `SnapshotMetadata` service (KEP-3314) and does not
-advertise the `SNAPSHOT_METADATA_SERVICE` capability, so backup tools such as Kasten take full
-backups of Velocor volumes rather than incremental, CBT-based ones. Full backups and restores
-work normally.
+The driver can serve the CSI `SnapshotMetadata` service (KEP-3314): the blocks a snapshot holds
+data in, and the blocks written between two snapshots of a volume, which is what backup tools
+such as Kasten copy in an incremental backup. It is **off by default** because it needs pieces
+outside the driver:
 
-The reason: the SPDK release Velocor ships (v26.09) has no RPC that reports which clusters of a
-snapshot hold data, which is what CBT needs. Reporting changed blocks it can't actually measure
-would let an incremental backup silently miss data, so the feature stays off until it can be
-built correctly (an SPDK extension is planned; see `TODO.md`, item L-2). The appliance's
-`/api/v1/snapshots/{id}/blocks:allocated` and `blocks:changed` endpoints return
-`501 Not Implemented` for the same reason.
+- the appliance's data plane with SPDK patch 0005 (`bdev_lvol_get_fragmap`, ported from
+  Longhorn's SPDK fork), shipped with the appliance image;
+- the cluster's `SnapshotMetadataService` CRD (`cbt.storage.k8s.io/v1beta1`), installed from
+  [kubernetes-csi/external-snapshot-metadata](https://github.com/kubernetes-csi/external-snapshot-metadata)
+  like the VolumeSnapshot CRDs;
+- a TLS certificate for the `external-snapshot-metadata` sidecar's service (on OpenShift the
+  service CA issues it).
+
+Enable it with the chart's `snapshotMetadata.enabled=true` (and, outside OpenShift,
+`snapshotMetadata.tlsSecretName` and `snapshotMetadata.caCert`). Without it the driver doesn't
+advertise the capability and backup tools take full backups, which work normally.
+
+How it's computed: an SPDK snapshot owns exactly the clusters written while it was the newest
+layer of its volume's chain. The blocks a snapshot holds data in are those of its whole chain
+(into a clone's origin); the changes between two snapshots are those of the layers after the
+older one, up to the newer one. Granularity is the pool's cluster size. A data plane that can't
+report the clusters answers `501 Not Implemented` (CSI `Unimplemented`), never a guess.
+`veloctl snapshot allocated-blocks` / `changed-blocks` and the volume page's "Changed blocks"
+show the same answers.
 
 ---
 

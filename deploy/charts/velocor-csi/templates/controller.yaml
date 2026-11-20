@@ -42,6 +42,9 @@ spec:
             - --mode=controller
             - --endpoint=unix:///csi/csi.sock
             - --driver-name={{ .Values.driverName }}
+            {{- if .Values.snapshotMetadata.enabled }}
+            - --snapshot-metadata
+            {{- end }}
           envFrom:
             - secretRef:
                 name: {{ include "velocor-csi.secretName" . }}
@@ -112,6 +115,37 @@ spec:
           resources:
             {{- toYaml . | nindent 12 }}
           {{- end }}
+        {{- if .Values.snapshotMetadata.enabled }}
+        - name: csi-snapshot-metadata
+          image: {{ .Values.snapshotMetadata.image }}
+          args:
+            - --csi-address=/csi/csi.sock
+            - --tls-cert=/certs/tls.crt
+            - --tls-key=/certs/tls.key
+          ports:
+            - name: metadata
+              containerPort: 50051
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 5
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+            - name: snapshot-metadata-certs
+              mountPath: /certs
+              readOnly: true
+          {{- with .Values.snapshotMetadata.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+        {{- end }}
       volumes:
         - name: socket-dir
           emptyDir: {}
+        {{- if .Values.snapshotMetadata.enabled }}
+        - name: snapshot-metadata-certs
+          secret:
+            secretName: {{ include "velocor-csi.snapshotMetadataTLSSecret" . }}
+        {{- end }}

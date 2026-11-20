@@ -47,7 +47,7 @@ This file tracks implementation progress directly inside the Git repository so a
 - [x] CSI v1.x driver (`cmd/velocor-csi`, `internal/csi`) with NVMe-oF/TCP & iSCSI support, online expansion, CoW snapshots, cloning, and usage reporting (`NodeGetVolumeStats`, `GetCapacity`)
 - [x] Per-node Host & InitiatorGroup ACL automation during `ControllerPublishVolume`
 - [x] Volume Group Snapshots (`GroupController` / KEP-3476)
-- [ ] Changed Block Tracking (`SnapshotMetadata` / KEP-3314): deferred until SPDK can report allocated clusters (TODO.md L-2)
+- [x] Changed Block Tracking (`SnapshotMetadata` / KEP-3314), opt-in (SPDK patch 0005; TODO.md L-2)
 - [x] Official CSI sanity suite (`csi-test/v5`: 82 passed, 0 failed) & `k3s` VM lab end-to-end verification
 - [x] Multi-arch (`linux/amd64`, `linux/arm64`) `velocor-csi` container build & Helm chart (`deploy/charts/velocor-csi`)
 - [x] GitHub Actions CI/CD release pipeline (`.github/workflows/ci-release.yml`) with Cosign keyless signing, SPDX SBOMs, SLSA build provenance, and OCI Helm publishing

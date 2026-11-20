@@ -180,50 +180,153 @@ func TestCSISanitySuite(t *testing.T) {
 	sanity.Test(t, cfg)
 }
 
-// TestSnapshotMetadataNotAdvertised guards the CBT deferral (TODO.md P1-9): until SPDK can
-// report allocated clusters, the driver must neither advertise nor serve SnapshotMetadata, or
-// backup tools would try incremental backups against it.
-func TestSnapshotMetadataNotAdvertised(t *testing.T) {
-	for _, mode := range []DriverMode{ModeAll, ModeController} {
-		t.Run(string(mode), func(t *testing.T) {
-			sockPath := filepath.Join(t.TempDir(), "csi.sock")
-			endpoint := "unix://" + sockPath
-			drv, err := NewDriver(DriverConfig{Endpoint: endpoint, Mode: mode, NodeID: "node-1"})
-			if err != nil {
-				t.Fatalf("NewDriver: %v", err)
-			}
-			go func() { _ = drv.Run() }()
-			defer drv.Stop()
-			for i := 0; i < 50; i++ {
-				if _, err := os.Stat(sockPath); err == nil {
-					break
-				}
-				time.Sleep(20 * time.Millisecond)
-			}
-			conn, err := grpc.NewClient(endpoint, grpc.WithTransportCredentials(insecure.NewCredentials()))
-			if err != nil {
-				t.Fatalf("grpc.NewClient: %v", err)
-			}
-			defer func() { _ = conn.Close() }()
+func startDriver(t *testing.T, cfg DriverConfig) *grpc.ClientConn {
+	t.Helper()
+	sockPath := filepath.Join(t.TempDir(), "csi.sock")
+	cfg.Endpoint = "unix://" + sockPath
+	if cfg.NodeID == "" {
+		cfg.NodeID = "node-1"
+	}
+	drv, err := NewDriver(cfg)
+	if err != nil {
+		t.Fatalf("NewDriver: %v", err)
+	}
+	go func() { _ = drv.Run() }()
+	t.Cleanup(drv.Stop)
+	for i := 0; i < 50; i++ {
+		if _, err := os.Stat(sockPath); err == nil {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	conn, err := grpc.NewClient(cfg.Endpoint, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatalf("grpc.NewClient: %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	return conn
+}
 
-			caps, err := csi.NewIdentityClient(conn).GetPluginCapabilities(context.Background(), &csi.GetPluginCapabilitiesRequest{})
-			if err != nil {
-				t.Fatalf("GetPluginCapabilities: %v", err)
+func advertisesSnapshotMetadata(t *testing.T, conn *grpc.ClientConn) bool {
+	t.Helper()
+	caps, err := csi.NewIdentityClient(conn).GetPluginCapabilities(context.Background(), &csi.GetPluginCapabilitiesRequest{})
+	if err != nil {
+		t.Fatalf("GetPluginCapabilities: %v", err)
+	}
+	for _, c := range caps.GetCapabilities() {
+		if c.GetService().GetType() == csi.PluginCapability_Service_SNAPSHOT_METADATA_SERVICE {
+			return true
+		}
+	}
+	return false
+}
+
+// SnapshotMetadata (CBT) is off unless enabled (it needs the external-snapshot-metadata
+// sidecar): neither advertised nor served. A node plugin never serves it.
+func TestSnapshotMetadataOffByDefault(t *testing.T) {
+	for _, cfg := range []DriverConfig{{Mode: ModeAll}, {Mode: ModeController}, {Mode: ModeNode, SnapshotMetadata: true}} {
+		t.Run(string(cfg.Mode), func(t *testing.T) {
+			conn := startDriver(t, cfg)
+			if advertisesSnapshotMetadata(t, conn) {
+				t.Fatal("driver advertises SNAPSHOT_METADATA_SERVICE")
 			}
-			for _, c := range caps.GetCapabilities() {
-				if c.GetService().GetType() == csi.PluginCapability_Service_SNAPSHOT_METADATA_SERVICE {
-					t.Fatal("driver advertises SNAPSHOT_METADATA_SERVICE although CBT is deferred")
-				}
-			}
-			stream, err := csi.NewSnapshotMetadataClient(conn).GetMetadataAllocated(context.Background(),
-				&csi.GetMetadataAllocatedRequest{SnapshotId: "snap-1"})
+			stream, err := csi.NewSnapshotMetadataClient(conn).GetMetadataAllocated(context.Background(), &csi.GetMetadataAllocatedRequest{SnapshotId: "s"})
 			if err == nil {
 				_, err = stream.Recv()
 			}
 			if status.Code(err) != codes.Unimplemented {
-				t.Fatalf("SnapshotMetadata call: got %v, want Unimplemented", err)
+				t.Fatalf("GetMetadataAllocated: %v, want Unimplemented", err)
 			}
 		})
+	}
+}
+
+type mockCBTClient struct {
+	VelocorClient
+	alloc *BlockMetadataResult
+	delta *BlockMetadataResult
+	err   error
+	base  string
+}
+
+func (m *mockCBTClient) GetSnapshotAllocatedBlocks(_ context.Context, _ string) (*BlockMetadataResult, error) {
+	return m.alloc, m.err
+}
+
+func (m *mockCBTClient) GetSnapshotChangedBlocks(_ context.Context, _, base string) (*BlockMetadataResult, error) {
+	m.base = base
+	return m.delta, m.err
+}
+
+func TestSnapshotMetadataCBT(t *testing.T) {
+	mock := &mockCBTClient{
+		alloc: &BlockMetadataResult{SnapshotID: "snap-2", VolumeSizeBytes: 16 << 20, Extents: []BlockExtent{
+			{OffsetBytes: 0, LengthBytes: 4 << 20}, {OffsetBytes: 8 << 20, LengthBytes: 4 << 20}}},
+		delta: &BlockMetadataResult{SnapshotID: "snap-2", VolumeSizeBytes: 16 << 20, Extents: []BlockExtent{
+			{OffsetBytes: 8 << 20, LengthBytes: 4 << 20}}},
+	}
+	conn := startDriver(t, DriverConfig{Mode: ModeController, Client: mock, SnapshotMetadata: true})
+	if !advertisesSnapshotMetadata(t, conn) {
+		t.Fatal("enabled driver doesn't advertise SNAPSHOT_METADATA_SERVICE")
+	}
+	cbt := csi.NewSnapshotMetadataClient(conn)
+
+	// Allocated, one tuple per message (max_results 1).
+	stream, err := cbt.GetMetadataAllocated(context.Background(), &csi.GetMetadataAllocatedRequest{SnapshotId: "snap-2", MaxResults: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []*csi.BlockMetadata
+	for {
+		resp, err := stream.Recv()
+		if err != nil {
+			break
+		}
+		if len(resp.GetBlockMetadata()) > 1 || resp.GetVolumeCapacityBytes() != 16<<20 {
+			t.Fatalf("message: %+v", resp)
+		}
+		got = append(got, resp.GetBlockMetadata()...)
+	}
+	if len(got) != 2 || got[0].GetByteOffset() != 0 || got[1].GetByteOffset() != 8<<20 {
+		t.Fatalf("allocated: %+v", got)
+	}
+
+	// starting_offset inside an extent: the first tuple is clipped to start there.
+	stream, err = cbt.GetMetadataAllocated(context.Background(), &csi.GetMetadataAllocatedRequest{SnapshotId: "snap-2", StartingOffset: 2 << 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := stream.Recv()
+	if err != nil || len(resp.GetBlockMetadata()) != 2 || resp.GetBlockMetadata()[0].GetByteOffset() != 2<<20 || resp.GetBlockMetadata()[0].GetSizeBytes() != 2<<20 {
+		t.Fatalf("allocated from 2 MiB: %+v %v", resp, err)
+	}
+
+	// Delta.
+	dStream, err := cbt.GetMetadataDelta(context.Background(), &csi.GetMetadataDeltaRequest{BaseSnapshotId: "snap-1", TargetSnapshotId: "snap-2"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dResp, err := dStream.Recv()
+	if err != nil || len(dResp.GetBlockMetadata()) != 1 || dResp.GetBlockMetadata()[0].GetByteOffset() != 8<<20 || mock.base != "snap-1" {
+		t.Fatalf("delta: %+v %v (base %q)", dResp, err, mock.base)
+	}
+
+	// A data plane that can't report allocation (velod answers 501): Unimplemented, never data.
+	mock.err = &ErrAPI{StatusCode: 501, Message: "changed block tracking unsupported"}
+	stream, err = cbt.GetMetadataAllocated(context.Background(), &csi.GetMetadataAllocatedRequest{SnapshotId: "snap-2"})
+	if err == nil {
+		_, err = stream.Recv()
+	}
+	if status.Code(err) != codes.Unimplemented {
+		t.Fatalf("501 from velod: %v, want Unimplemented", err)
+	}
+	mock.err = &ErrAPI{StatusCode: 400, Message: "snapshot snap-9 is not an ancestor of snap-2"}
+	dStream, err = cbt.GetMetadataDelta(context.Background(), &csi.GetMetadataDeltaRequest{BaseSnapshotId: "snap-9", TargetSnapshotId: "snap-2"})
+	if err == nil {
+		_, err = dStream.Recv()
+	}
+	if status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("400 from velod: %v, want InvalidArgument", err)
 	}
 }
 

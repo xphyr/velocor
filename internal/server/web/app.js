@@ -837,6 +837,29 @@ function snapshotDialog(v) {
   });
 }
 
+// Changed-block tracking (TODO.md L-2): the regions written between two snapshots of a volume.
+function changedBlocksDialog(snap, older) {
+  openDialog({
+    title: `What changed up to ${snap.name}`,
+    intro: "Changed-block tracking lists the regions written between two snapshots of a volume: what an incremental backup copies.",
+    submit: "Show",
+    fields: [{ name: "base", label: "Since snapshot", value: (older[older.length - 1] || {}).id, options: older.map((s) => ({ value: s.id, label: `${s.name} (${humanTime(s.created_at)})` })) }],
+    action: (x) => api(`/snapshots/${encodeURIComponent(snap.id)}/blocks:changed?base_snapshot_id=${encodeURIComponent(x.base)}`),
+    done: (r) => {
+      const extents = r.extents || [];
+      const total = extents.reduce((sum, e) => sum + e.length_bytes, 0);
+      openDialog({
+        title: "Changed blocks",
+        intro: `${extents.length} regions, ${humanSize(total)} in all, of a ${humanSize(r.volume_size_bytes)} volume.`,
+        warning: table([
+          { title: "Offset", num: true, cell: (e) => humanSize(e.offset_bytes) },
+          { title: "Length", num: true, cell: (e) => humanSize(e.length_bytes) },
+        ], extents, { filter: false, empty: "Nothing changed." }),
+      });
+    },
+  });
+}
+
 function cloneDialog(s) {
   openDialog({
     title: `Clone ${s.name}`,
@@ -1012,6 +1035,8 @@ async function volume(id) {
       { title: "Taken", cell: (s) => humanTime(s.created_at) },
       { title: "Group", cell: (s) => (groupOf[s.id] ? groupOf[s.id].name : "-") },
       { title: "", cell: (s) => el("div", { class: "row-actions" },
+        snaps.some((o) => o.created_at < s.created_at) && el("button", { onclick: () => changedBlocksDialog(s,
+          snaps.filter((o) => o.created_at < s.created_at).sort((a, b) => (a.created_at < b.created_at ? -1 : 1))) }, "Changed blocks"),
         snapshotActions(s, groupOf)) },
     ], snaps, { empty: "No snapshots of this volume.", state: stateOf("volume-snapshots") }),
   ];

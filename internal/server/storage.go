@@ -798,13 +798,20 @@ func (s *Server) handleSnapshotGetOrBlocks(w http.ResponseWriter, r *http.Reques
 	writeJSON(w, http.StatusOK, map[string]any{"snapshot": snap})
 }
 
+// handleSnapshotBlocks answers blocks:allocated (every block of the snapshot that holds data)
+// and blocks:changed (the blocks written between base_snapshot_id and the snapshot) from SPDK's
+// per-layer cluster maps (bdev_lvol_get_fragmap, SPDK patch 0005). An lvol owns only the
+// clusters written while it was the newest layer of its chain, so the snapshot's allocated
+// blocks are the union over its whole chain (into a clone's origin), and the changes since
+// the base the union over the layers after the base, up to the snapshot. The chain is SPDK's
+// own (each lvol's base_snapshot), which is where the clusters are: it includes snapshots velod
+// keeps hidden for clones and reflects the merges SPDK does when a snapshot is deleted.
 func (s *Server) handleSnapshotBlocks(w http.ResponseWriter, r *http.Request, targetID string, changed bool) {
 	target, err := s.liveSnapshot(targetID)
 	if err != nil {
 		writeError(w, err)
 		return
 	}
-	stopAt := ""
 	var base *store.Snapshot
 	if changed {
 		baseID := r.URL.Query().Get("base_snapshot_id")
@@ -816,18 +823,12 @@ func (s *Server) handleSnapshotBlocks(w http.ResponseWriter, r *http.Request, ta
 			writeError(w, err)
 			return
 		}
-		if base.VolumeID != target.VolumeID {
-			writeError(w, fmt.Errorf("%w: snapshots %s and %s belong to different volumes", store.ErrInvalidArgument, baseID, targetID))
+		if base.VolumeID != target.VolumeID || base.ID == target.ID {
+			writeError(w, fmt.Errorf("%w: snapshots %s and %s aren't two snapshots of one volume", store.ErrInvalidArgument, baseID, targetID))
 			return
 		}
-		stopAt = base.ID
 	}
 	pool, err := s.store.GetPool(target.PoolID)
-	if err != nil {
-		writeError(w, err)
-		return
-	}
-	lineage, err := s.collectSnapshotLineage(target, stopAt)
 	if err != nil {
 		writeError(w, err)
 		return
@@ -836,16 +837,47 @@ func (s *Server) handleSnapshotBlocks(w http.ResponseWriter, r *http.Request, ta
 		writeError(w, err)
 		return
 	}
+	ctx := r.Context()
+	baseName := ""
+	if base != nil {
+		baseName = strings.TrimPrefix(base.LvolBdevName, pool.LVSName+"/")
+	}
+	layers := []string{target.UUID}
+	reachedBase := false
+	for cur := target.UUID; ; {
+		parent, err := s.spdk.BdevLvolParent(ctx, cur)
+		if err != nil {
+			writeError(w, fmt.Errorf("snapshot chain of %s: %w", target.ID, err))
+			return
+		}
+		if parent == "" {
+			break
+		}
+		if base != nil && parent == baseName {
+			reachedBase = true
+			break
+		}
+		if len(layers) >= 4096 {
+			writeError(w, fmt.Errorf("snapshot chain of %s is longer than 4096 layers", target.ID))
+			return
+		}
+		cur = pool.LVSName + "/" + parent
+		layers = append(layers, cur)
+	}
+	if base != nil && !reachedBase {
+		writeError(w, fmt.Errorf("%w: snapshot %s is not older than %s in its chain", store.ErrInvalidArgument, base.ID, target.ID))
+		return
+	}
 	var extentSets [][]spdk.BlockExtent
-	for _, layer := range lineage {
-		frag, err := s.spdk.BdevLvolGetFragmap(r.Context(), layer.UUID, 0, layer.SizeBytes)
+	for _, layer := range layers {
+		frag, err := s.spdk.BdevLvolGetFragmap(ctx, layer)
 		if err != nil {
 			writeError(w, err)
 			return
 		}
-		ext, err := spdk.DecodeFragmapExtents(frag)
+		ext, err := spdk.DecodeFragmapExtents(frag, target.SizeBytes)
 		if err != nil {
-			writeError(w, err)
+			writeError(w, fmt.Errorf("fragmap of %s: %w", layer, err))
 			return
 		}
 		extentSets = append(extentSets, ext)

@@ -981,6 +981,35 @@ Everything here was written by Gemini and is in scope to rewrite.
     chart; re-add veloctl `allocated-blocks` / `changed-blocks` and the UI "Changed blocks" view;
   - verification against real SPDK (integration harness) and a Kasten incremental
     backup/restore round trip on NVW, comparing restored data byte-for-byte.
+  **Done (2026-11-20, not yet lab-checked):**
+  - SPDK patch 0005 `bdev_lvol_get_fragmap`: Longhorn's RPC (same name, parameters and result,
+    so tools written for it work), but read from the blob's cluster table with the functions
+    the lvol's SEEK_DATA/SEEK_HOLE use (same semantics, verified: `bs_io_unit_is_allocated`
+    looks at the blob's own clusters only) instead of two seek I/Os per extent whose status
+    the original didn't check; size 0 means "to the end" also with an offset; unit test
+    `ut_lvol_get_fragmap` (Longhorn's patch has only a shell test).
+  - velod: the response shape is the real one; `blocks:allocated` / `blocks:changed` walk
+    SPDK's own chain (`base_snapshot` in `bdev_get_bdevs`) instead of velod's records, which
+    missed a clone's origin (a clone's snapshot's "allocated" left out the origin's data: a
+    full backup from it would have skipped blocks) and broke after a middle snapshot was
+    deleted ("broken lineage"); maps are clipped to the volume size; 501 when SPDK lacks the
+    RPC. The fake SPDK now moves a deleted snapshot's clusters into its clone, like SPDK.
+    Tests: `TestStorageEndToEndAndCBT` (allocated over the chain, deltas, base newer/equal ->
+    400, delta unchanged after deleting the middle snapshot, a clone's snapshot including its
+    origin, 501), `TestSnapshotsAndClones` on real SPDK (exact extents for s1, s2, s1->s2).
+  - CSI: `SnapshotMetadata` restored (from 353aa94^) behind `--snapshot-metadata`
+    (`VELOCOR_SNAPSHOT_METADATA`), advertised only then, never by a node plugin; velod 501 ->
+    Unimplemented, 400 -> InvalidArgument. Tests `TestSnapshotMetadataOffByDefault`,
+    `TestSnapshotMetadataCBT` (chunking, starting_offset, deltas, errors).
+  - Chart: `snapshotMetadata.enabled` (off) adds `csi-snapshot-metadata` v1.1.0 (pinned,
+    multi-arch), its Service, the `SnapshotMetadataService` (cbt.storage.k8s.io/v1beta1) and
+    RBAC; TLS from `tlsSecretName` + `caCert`, or on OpenShift from the service CA (Service
+    annotation, CA from `openshift-service-ca.crt`); clear failures when the CRD, TLS or CA is
+    missing. Static manifest: the sidecar as a commented opt-in block.
+  - veloctl `snapshot allocated-blocks` / `changed-blocks`, UI "Changed blocks" (volume page).
+  *Left:* lab: install the SnapshotMetadataService CRD on a cluster (needs your OK: it's
+  cluster-wide), enable the chart option, then a Kasten incremental backup/restore round trip
+  compared byte for byte; sidecar test on both clusters (arm64 and x86) per the sidecar rule.
 
 - [ ] **L-3. Parity RAID (RAID5/6) for capacity efficiency.** Requested 2026-11-16. SPDK's only
   parity RAID, `raid5f`, accepts full-stripe writes only and the lvol blobstore can't even create
@@ -1016,6 +1045,34 @@ Everything here was written by Gemini and is in scope to rewrite.
   raid (concat, superblock, resize) and lvstore-grow code, then decide on a design and whether
   it needs an SPDK patch (with unit tests, like 0002). Crash safety of an interrupted expansion
   and the pool metadata copies (P0-3) must be part of the design.
+  **Evaluation (2026-11-20, SPDK v26.09 source; for a decision):**
+  - What SPDK has: RAID1 and RAID0 have a `resize` hook (`raid1_resize`/`raid0_resize`) that
+    grows the array to the smallest member's data area and rewrites the superblock's
+    `data_size`; `bdev_lvol_grow_lvstore` (`spdk_lvs_grow_live`) exists. The hook only runs on a
+    member bdev's own resize event (e.g. an NVMe namespace grown in place), never when a member
+    is replaced by a larger disk: a replacement takes the array's existing `data_size`. Concat has
+    no resize, and no RAID can change its member count (slots are allocated once, at creation,
+    and recorded in the superblock).
+  - (b) **Grow after replacing every member with a larger disk** is small: a patch adding
+    `bdev_raid_grow` (re-read the members' sizes and run the same resize path, refusing during a
+    rebuild or while degraded), then `bdev_lvol_grow_lvstore`. Existing data doesn't move
+    (RAID1 mirrors; RAID0 strips are assigned round-robin, so a longer array only adds strips
+    at the end). Crash safety: the superblock is written with a new sequence number, the lvstore
+    grow is idempotent, so velod re-runs whichever step didn't finish; the pool's metadata copy
+    (P0-3) records the new size. velod: "Grow" when every member is larger than the array
+    (after replacements, P0-1), UI/veloctl, capacity accounting. RAID0 can't replace members
+    (no rebuild), so in practice this is for RAID1.
+  - (a) **Add disks** (what was asked) needs a pool layout that can take more members:
+    a concat of RAID1 pairs (RAID10-like) plus a patch that appends a member to a concat (new
+    slot, superblock with the larger member count written to every member, the new range at the
+    end so existing data doesn't move). Substantial: the slot array is fixed today, and changing
+    it under live I/O channels touches the core RAID code; new pools only (existing RAID1 pools
+    can't become concats in place); nested RAID superblocks at boot (the concat waits for its
+    RAID1 members) need testing; a pair is the unit of growth.
+  - (c) Volumes spread across pools: no SPDK change, but not expansion (a volume still lives in
+    one pool).
+  *Recommendation:* (b) first (small, low risk, uses SPDK's own resize path); (a) as a separate
+  design if adding disks is needed, with power-loss tests during the append.
 
 - [ ] **L-5. Delta upgrades for the OS image.** Requested 2026-11-17 (back burner). A
   `bootc upgrade` pulls every changed layer of `velocor-os` in full; with the rolling Fedora base
