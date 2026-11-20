@@ -67,3 +67,11 @@ Open work is tracked in [TODO.md](../TODO.md); finished items in [review-history
 - [ ] Emulated and real disk faults (read errors, failing drives), power-loss tests (TODO.md P2-2, P0-1, P0-4)
 - [ ] API audit log (TODO.md A-1); CHAP and real host identities (TODO.md P2-1)
 - [ ] Initiator resilience: iSCSI multipath, two SAN paths (TODO.md P1-13); single-node scope documented (TODO.md P1-6)
+
+## Phase 9: Kernel data plane (decided 2026-11-20)
+The data plane moves from SPDK to md RAID, LVM thin and the kernel NVMe/TCP and iSCSI targets; the control plane, API, CSI driver and UI keep their shape. Why, what was measured and the plan: [kernel-dataplane.md](design/kernel-dataplane.md).
+- [ ] Design review, QoS and chunk-size decisions (K-0)
+- [ ] Spike behind the data-plane interface with the new test harness (K-1)
+- [ ] Feature parity, including iSCSI via LIO, scrub on md, CBT via `thin_delta` (K-2)
+- [ ] Validation on both clusters, P0-7 scenario, benchmark (K-3)
+- [ ] Cutover: SPDK removed from images and CI (K-4)
