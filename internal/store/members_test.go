@@ -117,6 +117,30 @@ func TestDeletePoolReleasesDetachedDisks(t *testing.T) {
 	}
 }
 
+// A failed or missing member's disk is in neither DiskIDs nor DetachedDiskIDs (it moves to the
+// detached list only when replaced), yet still belongs to the pool: deleting the pool must free
+// it too, or it can never be released or claimed again (found in the lab, 2026-11-20).
+func TestDeletePoolReleasesFailedAndMissingMembers(t *testing.T) {
+	st := memberTestPool(t)
+	if _, err := st.MutatePool("p1", func(p *Pool) error {
+		m := PoolMembers(p)
+		m[0].State = MemberStateFailed
+		m[1].State = MemberStateMissing
+		SetPoolMembers(p, m)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.DeletePool("p1"); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"d1", "d2"} {
+		if d, _ := st.GetDisk(id); d.PoolID != "" {
+			t.Errorf("disk %s still bound after pool delete", id)
+		}
+	}
+}
+
 func TestSettingsDefaultsAndSave(t *testing.T) {
 	st := newTestStore(t)
 	if s, err := st.GetSettings(); err != nil || s.RebuildMaxMBps != 0 {

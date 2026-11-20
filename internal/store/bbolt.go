@@ -783,23 +783,32 @@ func checkPoolDeletableTx(tx *bolt.Tx, id string) (*Pool, error) {
 func (s *BoltStore) DeletePool(id string) error {
 	return s.db.Update(func(tx *bolt.Tx) error {
 		poolsB := tx.Bucket(bucketPools)
-		pool, err := checkPoolDeletableTx(tx, id)
-		if err != nil {
+		if _, err := checkPoolDeletableTx(tx, id); err != nil {
 			return err
 		}
 
-		// Release member and detached disks from this pool.
+		// Release every disk bound to this pool: members in any state (a failed or missing
+		// member's disk is in neither DiskIDs nor DetachedDiskIDs), detached disks, and anything
+		// else still naming the pool, which would otherwise stay bound to a pool that's gone.
 		disksB := tx.Bucket(bucketDisks)
-		for _, diskID := range slices.Concat(pool.DiskIDs, pool.DetachedDiskIDs) {
+		var bound []Disk
+		if err := disksB.ForEach(func(k, v []byte) error {
 			var d Disk
-			if err := getJSON(disksB, []byte(diskID), &d); err == nil {
-				if d.PoolID == id {
-					d.PoolID = ""
-					d.UpdatedAt = time.Now().UTC()
-					if err := putJSON(disksB, []byte(d.ID), &d); err != nil {
-						return err
-					}
-				}
+			if err := json.Unmarshal(v, &d); err != nil {
+				return err
+			}
+			if d.PoolID == id {
+				bound = append(bound, d)
+			}
+			return nil
+		}); err != nil {
+			return err
+		}
+		for _, d := range bound {
+			d.PoolID = ""
+			d.UpdatedAt = time.Now().UTC()
+			if err := putJSON(disksB, []byte(d.ID), &d); err != nil {
+				return err
 			}
 		}
 

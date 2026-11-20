@@ -170,7 +170,9 @@ func TestScrubManualInterruptionsAndStop(t *testing.T) {
 	// A member leaves: the run pauses, and isn't resumed while the pool is degraded.
 	h.expect(h.do("POST", "/api/v1/pools/"+id+"/scrub", h.admin, nil))(http.StatusAccepted)
 	h.fake.FailMedia("0000:02:00.0")
-	h.reconcile()
+	// The scrub notices before the reconciler has recorded the failed member (as on the lab
+	// appliance, where a scrub's failed repair write failed the member): the pool still says
+	// ONLINE, but SPDK's member count must keep the run paused.
 	h.tick(now)
 	rec = h.scrubRecord(id)
 	if rec.State != store.ScrubPaused || !strings.Contains(rec.Note, "member") {
@@ -178,10 +180,15 @@ func TestScrubManualInterruptionsAndStop(t *testing.T) {
 	}
 	h.tick(now)
 	if n := len(h.fake.ScrubStarts(raid)); n != 3 {
+		t.Fatalf("scrub resumed on a degraded RAID before the reconciler noticed (%d starts)", n)
+	}
+	h.reconcile()
+	h.tick(now)
+	if n := len(h.fake.ScrubStarts(raid)); n != 3 {
 		t.Fatalf("scrub resumed on a degraded pool (%d starts)", n)
 	}
 	view := h.expect(h.do("GET", "/api/v1/pools/"+id+"/scrub", h.admin, nil))(http.StatusOK)
-	if !strings.Contains(view["unavailable"].(string), "DEGRADED") {
+	if !strings.Contains(strings.ToLower(view["unavailable"].(string)), "degraded") {
 		t.Fatalf("pool scrub view: %v", view)
 	}
 	h.expect(h.do("POST", "/api/v1/pools/"+id+"/scrub", h.admin, nil))(http.StatusConflict)
