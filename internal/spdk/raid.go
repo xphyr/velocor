@@ -26,9 +26,50 @@ type RaidBdevInfo struct {
 	NumBaseBdevsDiscovered uint32 `json:"num_base_bdevs_discovered"`
 	// NumBaseBdevsOperational is how many members the array is running (or, while
 	// configuring, waiting) with: fewer than NumBaseBdevs means degraded.
-	NumBaseBdevsOperational uint32         `json:"num_base_bdevs_operational"`
-	Process                 *RaidProcess   `json:"process,omitempty"`
-	BaseBdevsList           []RaidBaseBdev `json:"base_bdevs_list"`
+	NumBaseBdevsOperational uint32       `json:"num_base_bdevs_operational"`
+	Process                 *RaidProcess `json:"process,omitempty"`
+	// Scrub is the running or last scrub since the array was configured (patch 0004).
+	Scrub         *RaidScrub     `json:"scrub,omitempty"`
+	BaseBdevsList []RaidBaseBdev `json:"base_bdevs_list"`
+}
+
+// Scrub states reported by SPDK (patch 0004).
+const (
+	ScrubRunning   = "running"
+	ScrubCompleted = "completed"
+	ScrubStopped   = "stopped" // on request, by a member removal or a rebuild
+	ScrubFailed    = "failed"
+)
+
+// RaidScrub is a RAID bdev's running or last scrub (SPDK patch 0004). Offsets and counts are in
+// blocks of the members' data area; the counters cover the run since StartOffsetBlocks.
+type RaidScrub struct {
+	State                  string `json:"state"`
+	Repair                 bool   `json:"repair"`
+	Mirrored               bool   `json:"mirrored"`
+	Status                 int32  `json:"status"`
+	StartOffsetBlocks      uint64 `json:"start_offset_blocks"`
+	OffsetBlocks           uint64 `json:"offset_blocks"`
+	TotalBlocks            uint64 `json:"total_blocks"`
+	RepairedBlocks         uint64 `json:"repaired_blocks"`
+	MismatchedBlocks       uint64 `json:"mismatched_blocks"`
+	MismatchRepairedBlocks uint64 `json:"mismatch_repaired_blocks"`
+	UnrecoverableBlocks    uint64 `json:"unrecoverable_blocks"`
+	WriteErrors            uint64 `json:"write_errors"`
+}
+
+// BdevRaidScrubStart starts a background scrub of a RAID bdev (patch 0004): RAID1 copies are
+// compared, unreadable ones rewritten, and mismatches counted and (with repair) rewritten;
+// other levels get a read-only surface scan. maxMBps 0 is unlimited; startOffset resumes an
+// interrupted scrub.
+func (c *Client) BdevRaidScrubStart(ctx context.Context, name string, repair bool, maxMBps uint32, startOffset uint64) error {
+	params := map[string]any{"name": name, "repair": repair, "max_bandwidth_mb_sec": maxMBps, "start_offset_blocks": startOffset}
+	return c.Call(ctx, "bdev_raid_scrub_start", params, nil)
+}
+
+// BdevRaidScrubStop stops a running scrub after its current window.
+func (c *Client) BdevRaidScrubStop(ctx context.Context, name string) error {
+	return c.Call(ctx, "bdev_raid_scrub_stop", map[string]any{"name": name}, nil)
 }
 
 // RaidProcess is a background process (a rebuild) running on a RAID bdev.

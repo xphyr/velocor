@@ -61,7 +61,138 @@ type Settings struct {
 	// rules are tuned. Its secrets stay in this database (and its backups), never in the pools'
 	// metadata copies, and the API never returns them.
 	Alerting AlertingSettings `json:"alerting,omitempty"`
+	// Scrub schedules the pools' background scrubs (TODO.md P2-2).
+	Scrub ScrubSettings `json:"scrub,omitempty"`
 }
+
+// ScrubSettings schedule the pools' background scrubs. Zero values mean the defaults.
+type ScrubSettings struct {
+	// Disabled turns the schedule off; scrubs can still be started by hand.
+	Disabled bool `json:"disabled,omitempty"`
+	// IntervalDays is how often each pool is scrubbed (default 30).
+	IntervalDays uint32 `json:"interval_days,omitempty"`
+	// WindowStartHour and WindowEndHour (0-23, appliance local time) bound when scheduled
+	// scrubs run; a scrub still running at the end pauses and resumes in the next window. Equal
+	// hours mean any time. nil: 1 and 6 (01:00-06:00).
+	WindowStartHour *uint8 `json:"window_start_hour,omitempty"`
+	WindowEndHour   *uint8 `json:"window_end_hour,omitempty"`
+	// MaxMBps limits a scrub's read bandwidth per pool; nil means 200, 0 unlimited.
+	MaxMBps *uint32 `json:"max_mb_per_sec,omitempty"`
+}
+
+// Scrub defaults.
+const (
+	DefaultScrubIntervalDays = 30
+	DefaultScrubWindowStart  = 1
+	DefaultScrubWindowEnd    = 6
+	DefaultScrubMaxMBps      = 200
+)
+
+// Effective returns the settings with defaults filled in.
+func (s ScrubSettings) Effective() ScrubSettings {
+	out := s
+	if out.IntervalDays == 0 {
+		out.IntervalDays = DefaultScrubIntervalDays
+	}
+	if out.WindowStartHour == nil {
+		v := uint8(DefaultScrubWindowStart)
+		out.WindowStartHour = &v
+	}
+	if out.WindowEndHour == nil {
+		v := uint8(DefaultScrubWindowEnd)
+		out.WindowEndHour = &v
+	}
+	if out.MaxMBps == nil {
+		v := uint32(DefaultScrubMaxMBps)
+		out.MaxMBps = &v
+	}
+	return out
+}
+
+// InWindow reports whether t (local time) falls in the scrub window of effective settings.
+func (s ScrubSettings) InWindow(t time.Time) bool {
+	start, end, h := int(*s.WindowStartHour), int(*s.WindowEndHour), t.Hour()
+	switch {
+	case start == end:
+		return true
+	case start < end:
+		return h >= start && h < end
+	default: // across midnight
+		return h >= start || h < end
+	}
+}
+
+// ScrubState is the state of a pool's current or last scrub run.
+type ScrubState string
+
+const (
+	ScrubRunning ScrubState = "RUNNING"
+	// ScrubPaused: a run that will resume where it stopped (its window ended, velod or SPDK
+	// restarted, a member was removed or a rebuild started).
+	ScrubPaused    ScrubState = "PAUSED"
+	ScrubCompleted ScrubState = "COMPLETED"
+	ScrubStopped   ScrubState = "STOPPED" // stopped by an operator; the next run starts afresh
+	ScrubFailed    ScrubState = "FAILED"
+)
+
+// ScrubCounts are what a scrub found, in blocks of the members' data area.
+type ScrubCounts struct {
+	// RepairedBlocks were unreadable on a member and rewritten from a good copy.
+	RepairedBlocks uint64 `json:"repaired_blocks"`
+	// MismatchedBlocks differed between members; MismatchRepairedBlocks were rewritten.
+	MismatchedBlocks       uint64 `json:"mismatched_blocks"`
+	MismatchRepairedBlocks uint64 `json:"mismatch_repaired_blocks"`
+	// UnrecoverableBlocks could be read from no member: data there is lost.
+	UnrecoverableBlocks uint64 `json:"unrecoverable_blocks"`
+	// WriteErrors are failed repair writes (the member was failed out of the RAID).
+	WriteErrors uint64 `json:"write_errors"`
+}
+
+// Add returns c + o.
+func (c ScrubCounts) Add(o ScrubCounts) ScrubCounts {
+	return ScrubCounts{
+		RepairedBlocks:         c.RepairedBlocks + o.RepairedBlocks,
+		MismatchedBlocks:       c.MismatchedBlocks + o.MismatchedBlocks,
+		MismatchRepairedBlocks: c.MismatchRepairedBlocks + o.MismatchRepairedBlocks,
+		UnrecoverableBlocks:    c.UnrecoverableBlocks + o.UnrecoverableBlocks,
+		WriteErrors:            c.WriteErrors + o.WriteErrors,
+	}
+}
+
+// ScrubRecord is a pool's current or last scrub run. A run can span several SPDK scrubs
+// ("segments"): each resumes at the offset the previous one reached.
+type ScrubRecord struct {
+	PoolID string     `json:"pool_id"`
+	State  ScrubState `json:"state"`
+	// Manual runs were started by an operator and ignore the schedule's window.
+	Manual    bool      `json:"manual,omitempty"`
+	Repair    bool      `json:"repair"`
+	MaxMBps   uint32    `json:"max_mb_per_sec"`
+	StartedAt time.Time `json:"started_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+	// FinishedAt is when the run completed, failed or was stopped.
+	FinishedAt time.Time `json:"finished_at,omitzero"`
+	// Progress, in blocks of the members' data area.
+	OffsetBlocks uint64 `json:"offset_blocks"`
+	TotalBlocks  uint64 `json:"total_blocks"`
+	// SegmentStartBlocks is where the current SPDK scrub started; Counts covers the finished
+	// segments and Segment the current one.
+	SegmentStartBlocks uint64      `json:"segment_start_blocks"`
+	Counts             ScrubCounts `json:"counts"`
+	Segment            ScrubCounts `json:"segment"`
+	// Stopping is the state velod asked SPDK's scrub to stop into (PAUSED at the end of the
+	// window, STOPPED by an operator); it takes effect once SPDK reports the scrub stopped.
+	Stopping ScrubState `json:"stopping,omitempty"`
+	// Note explains a pause, a stop or a failure.
+	Note string `json:"note,omitempty"`
+	// LastCompletedAt is when a run last covered the whole pool, and LastCompleted what it
+	// found (kept while later runs are in progress).
+	LastCompletedAt time.Time    `json:"last_completed_at,omitzero"`
+	LastCompleted   *ScrubCounts `json:"last_completed,omitempty"`
+}
+
+// Total returns the counts of the whole run so far.
+func (r *ScrubRecord) Total() ScrubCounts { return r.Counts.Add(r.Segment) }
 
 // OSUpgradeRecord is an OS image staged (or a rollback queued) for the next boot.
 type OSUpgradeRecord struct {

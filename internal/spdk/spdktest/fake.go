@@ -115,6 +115,8 @@ type Fake struct {
 	uuidCounter  int
 
 	rebuildStep    uint32 // percent a rebuild advances per bdev_raid_get_bdevs (0: manual)
+	scrubStep      uint64 // blocks a scrub advances per bdev_raid_get_bdevs (0: completes at once)
+	scrubStarts    map[string][]uint64
 	rebuildMaxMBps uint32
 }
 

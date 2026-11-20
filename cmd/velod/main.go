@@ -195,6 +195,7 @@ func main() {
 	go srv.StartMonitoring(ctx)
 	// Did the OS image staged before the last reboot take effect? (TODO.md P1-7)
 	go srv.CheckOSUpgrade(ctx)
+	go srv.RunScrubScheduler(ctx)
 
 	errCh := make(chan error, 1)
 	go func() {

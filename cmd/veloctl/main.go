@@ -340,7 +340,7 @@ func runToken(cfg *cliConfig, args []string) error {
 
 func runSystem(cfg *cliConfig, args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("subcommand required: status | os | reconcile | iostats | upgrade | rollback | reboot | containers | rebuild | volume-retention | monitoring | network | backup | backups | restore")
+		return fmt.Errorf("subcommand required: status | os | reconcile | iostats | upgrade | rollback | reboot | containers | rebuild | scrub | volume-retention | monitoring | network | backup | backups | restore")
 	}
 	switch args[0] {
 	case "backup", "backups", "restore":
@@ -368,6 +368,9 @@ func runSystem(cfg *cliConfig, args []string) error {
 			fmt.Printf("Rebuild speed: at most %d MB/s per pool\n", v)
 		}
 		return nil
+
+	case "scrub":
+		return runSystemScrub(cfg, args[1:])
 
 	case "volume-retention":
 		fs := flag.NewFlagSet("system volume-retention", flag.ExitOnError)
@@ -774,7 +777,7 @@ func runDisk(cfg *cliConfig, args []string) error {
 
 func runPool(cfg *cliConfig, args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("subcommand required: list | get | create | set-space | replace | start-degraded | release-disk | importable | import | delete")
+		return fmt.Errorf("subcommand required: list | get | create | set-space | replace | start-degraded | release-disk | scrub | importable | import | delete")
 	}
 	switch args[0] {
 	case "importable", "import":
@@ -939,6 +942,9 @@ func runPool(cfg *cliConfig, args []string) error {
 		p, _ := resp["pool"].(map[string]any)
 		fmt.Printf("Pool %v started: %v %v\nReplace the missing disk with `veloctl pool replace %v --new-disk <disk-id>`.\n", id, p["health_status"], strOrEmpty(p["status_message"]), id)
 		return nil
+
+	case "scrub":
+		return runPoolScrub(cfg, args[1:])
 
 	case "release-disk":
 		if len(args) < 3 {
@@ -1944,4 +1950,138 @@ func orDefault(v any, def float64) any {
 		return def
 	}
 	return v
+}
+
+// runPoolScrub: veloctl pool scrub <pool-id> [--start [--check-only] [--max-mb-per-sec N] | --stop]
+// (TODO.md P2-2). Without --start or --stop it shows the pool's current or last scrub.
+func runPoolScrub(cfg *cliConfig, args []string) error {
+	fs := flag.NewFlagSet("pool scrub", flag.ExitOnError)
+	start := fs.Bool("start", false, "Start a scrub now (outside the schedule's window)")
+	stop := fs.Bool("stop", false, "Stop the running scrub; the schedule starts the next one afresh")
+	checkOnly := fs.Bool("check-only", false, "With --start: count differing mirror copies without rewriting them (unreadable copies are always rewritten)")
+	maxMBps := fs.Int("max-mb-per-sec", -1, "With --start: read bandwidth limit (0 = unlimited; default: the schedule's)")
+	id, err := parseWithID(fs, args)
+	if err != nil || (*start && *stop) {
+		return fmt.Errorf("usage: veloctl pool scrub <pool-id> [--start [--check-only] [--max-mb-per-sec N] | --stop]")
+	}
+	var resp map[string]any
+	switch {
+	case *start:
+		body := map[string]any{"repair": !*checkOnly}
+		if *maxMBps >= 0 {
+			body["max_mb_per_sec"] = *maxMBps
+		}
+		resp, err = cfg.request("POST", "/api/v1/pools/"+id+"/scrub", body)
+	case *stop:
+		resp, err = cfg.request("DELETE", "/api/v1/pools/"+id+"/scrub", nil)
+	default:
+		resp, err = cfg.request("GET", "/api/v1/pools/"+id+"/scrub", nil)
+	}
+	if err != nil {
+		return err
+	}
+	if cfg.jsonOutput {
+		return printJSON(resp)
+	}
+	if *stop {
+		fmt.Printf("Stopping the scrub of pool %s (it ends after its current window).\n", id)
+		return nil
+	}
+	printScrub(resp)
+	return nil
+}
+
+func printScrub(resp map[string]any) {
+	if why, ok := resp["unavailable"].(string); ok {
+		fmt.Printf("Note: %s\n", why)
+	}
+	sc, _ := resp["scrub"].(map[string]any)
+	if sc == nil {
+		fmt.Println("Never scrubbed.")
+	} else {
+		kind := "scheduled"
+		if sc["manual"] == true {
+			kind = "operator-started"
+		}
+		pct, _ := sc["percent"].(float64)
+		mode := "compare and repair"
+		if sc["repair"] != true {
+			mode = "check only"
+		}
+		fmt.Printf("Scrub: %v (%s, %s), %.1f%% done, started %v\n", sc["state"], kind, mode, pct, sc["started_at"])
+		if note := strOrEmpty(sc["note"]); note != "" {
+			fmt.Printf("  %s\n", note)
+		}
+		if t, _ := sc["total"].(map[string]any); t != nil {
+			fmt.Printf("  Found so far: %d repaired (unreadable copies rewritten), %d differing (%d rewritten), %d unrecoverable, %d failed repair writes (blocks)\n",
+				uint64FromAny(t["repaired_blocks"]), uint64FromAny(t["mismatched_blocks"]), uint64FromAny(t["mismatch_repaired_blocks"]),
+				uint64FromAny(t["unrecoverable_blocks"]), uint64FromAny(t["write_errors"]))
+		}
+		if last := strOrEmpty(sc["last_completed_at"]); last != "" {
+			fmt.Printf("  Last complete pass: %s\n", last)
+		}
+	}
+	if due, ok := resp["next_due"].(string); ok {
+		fmt.Printf("Next scheduled scrub due: %s (it runs in the scrub window)\n", due)
+	}
+}
+
+// runSystemScrub: veloctl system scrub [--enable | --disable] [--interval-days N] [--window H-H]
+// [--max-mb-per-sec N] shows or changes the pools' scrub schedule.
+func runSystemScrub(cfg *cliConfig, args []string) error {
+	fs := flag.NewFlagSet("system scrub", flag.ExitOnError)
+	enable := fs.Bool("enable", false, "Turn scheduled scrubs on")
+	disable := fs.Bool("disable", false, "Turn scheduled scrubs off (scrubs can still be started by hand)")
+	interval := fs.Int("interval-days", 0, "Scrub each pool every N days")
+	window := fs.String("window", "", "Hours (appliance local time) scheduled scrubs run in, e.g. 1-6; equal hours (0-0) mean any time")
+	maxMBps := fs.Int("max-mb-per-sec", -1, "Read bandwidth limit of scheduled scrubs, per pool (0 = unlimited)")
+	_ = fs.Parse(args)
+	if *enable && *disable {
+		return fmt.Errorf("--enable and --disable exclude each other")
+	}
+	body := map[string]any{}
+	if *enable || *disable {
+		body["disabled"] = *disable
+	}
+	if *interval > 0 {
+		body["interval_days"] = *interval
+	}
+	if *maxMBps >= 0 {
+		body["max_mb_per_sec"] = *maxMBps
+	}
+	if *window != "" {
+		var a, b int
+		if _, err := fmt.Sscanf(*window, "%d-%d", &a, &b); err != nil {
+			return fmt.Errorf("--window: want START-END hours, e.g. 1-6")
+		}
+		body["window_start_hour"], body["window_end_hour"] = a, b
+	}
+	var resp map[string]any
+	var err error
+	if len(body) == 0 {
+		resp, err = cfg.request("GET", "/api/v1/system/scrub", nil)
+	} else {
+		resp, err = cfg.request("PUT", "/api/v1/system/scrub", body)
+	}
+	if err != nil {
+		return err
+	}
+	if cfg.jsonOutput {
+		return printJSON(resp)
+	}
+	sc, _ := resp["scrub"].(map[string]any)
+	if sc["disabled"] == true {
+		fmt.Println("Scheduled scrubs: off")
+		return nil
+	}
+	speed := "unlimited"
+	if v := uint64FromAny(sc["max_mb_per_sec"]); v > 0 {
+		speed = fmt.Sprintf("at most %d MB/s per pool", v)
+	}
+	when := fmt.Sprintf("%02d:00-%02d:00", uint64FromAny(sc["window_start_hour"]), uint64FromAny(sc["window_end_hour"]))
+	if sc["window_start_hour"] == sc["window_end_hour"] {
+		when = "any time"
+	}
+	fmt.Printf("Scheduled scrubs: every %d days, %s (appliance time), %s\n", uint64FromAny(sc["interval_days"]), when, speed)
+	return nil
 }

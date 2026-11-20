@@ -660,9 +660,59 @@ function spacePolicyDialog(p) {
   });
 }
 
+// A pool's scrub (TODO.md P2-2): the current or last run and what it found.
+function scrubFact(p, sv) {
+  if (!sv) return null;
+  const sc = sv.scrub;
+  const t = (sc && sc.total) || {};
+  const found = [
+    t.repaired_blocks && `${t.repaired_blocks} unreadable block(s) rewritten from a good copy`,
+    t.mismatched_blocks && `${t.mismatched_blocks} differing block(s)${t.mismatch_repaired_blocks ? `, ${t.mismatch_repaired_blocks} made equal` : ", not changed (check only)"}`,
+    t.unrecoverable_blocks && `${t.unrecoverable_blocks} block(s) no copy could supply: data there is lost`,
+    t.write_errors && `${t.write_errors} repair write(s) failed; the disk was failed out`,
+  ].filter(Boolean);
+  const tone = t.unrecoverable_blocks || t.write_errors ? "bad" : found.length ? "warn" : "ok";
+  const running = sc && sc.state === "RUNNING";
+  const state = !sc ? el("span", { class: "muted" }, "never scrubbed")
+    : [pill(running ? `running, ${(sc.percent || 0).toFixed(1)}%` : sc.state.toLowerCase(), running ? "quiet" : sc.state === "FAILED" ? "bad" : sc.state === "COMPLETED" ? tone : "warn"),
+      el("span", { class: "sub" }, [sc.manual ? "Started by hand" : "Scheduled", sc.repair ? "compare and repair" : "check only", `started ${humanTime(sc.started_at)}`].join(", ")),
+      sc.note && el("span", { class: "sub" }, sc.note),
+      el("span", { class: "sub" }, found.length ? found.join("; ") : "Nothing found so far."),
+      sc.last_completed_at && el("span", { class: "sub" }, `Last complete pass ${humanTime(sc.last_completed_at)}.`)];
+  return fact("Scrub", [state,
+    sv.next_due && el("span", { class: "sub" }, `Next scheduled scrub due ${humanTime(sv.next_due)}.`),
+    sv.unavailable && !running && el("span", { class: "sub" }, sv.unavailable),
+    can.admin && (running
+      ? el("button", { id: "stop-scrub", onclick: async () => { try { await send("DELETE", "/pools/" + encodeURIComponent(p.id) + "/scrub"); notify("Stopping after the current window."); rerender(); } catch (err) { notify(err.message); } } }, "Stop")
+      : el("button", { id: "start-scrub", disabled: !!sv.unavailable, onclick: () => startScrubDialog(p) }, "Scrub now"))]);
+}
+
+function startScrubDialog(p) {
+  openDialog({
+    title: `Scrub ${p.name}`,
+    intro: "Reads every disk of the pool. Mirror copies are compared; a copy a disk can't read is rewritten from a good one. Hosts keep working; their I/O to the part being checked waits briefly.",
+    submit: "Start",
+    fields: [
+      { name: "check", kind: "tick", text: "Check only: count differing copies without making them equal" },
+      { name: "limit", label: "Read limit (MB/s, 0 = unlimited; empty: the schedule's)", value: "" },
+    ],
+    action: (v) => {
+      const body = { repair: !v.check };
+      if (v.limit !== "") {
+        const n = Number(v.limit);
+        if (!Number.isInteger(n) || n < 0) throw new Error("Enter a whole number of MB/s, or 0 for unlimited.");
+        body.max_mb_per_sec = n;
+      }
+      return send("POST", "/pools/" + encodeURIComponent(p.id) + "/scrub", body);
+    },
+    done: () => { notify("Scrub started."); rerender(); },
+  });
+}
+
 async function pool(id) {
-  const [p, disksAll, volumes] = await Promise.all([
+  const [p, disksAll, volumes, scrubView] = await Promise.all([
     api("/pools/" + encodeURIComponent(id)).then((r) => r.pool), list("/disks", "disks"), list("/volumes?pool_id=" + encodeURIComponent(id), "volumes"),
+    api("/pools/" + encodeURIComponent(id) + "/scrub").catch((err) => { if (err instanceof Unauthorized) throw err; return null; }),
   ]);
   const diskOf = (did) => disksAll.find((d) => d.id === did) || {};
   const slots = (p.members && p.members.length ? p.members : (p.disk_ids || []).map((did, i) => ({ slot: i, disk_id: did, state: "ACTIVE" })))
@@ -688,6 +738,7 @@ async function pool(id) {
         can.admin && el("button", { id: "edit-space-policy", onclick: () => spacePolicyDialog(p) }, "Change")]),
       fact("RAID", `${p.raid_level}${p.raid_level !== "RAID1" ? `, ${p.strip_size_kb} KiB strips` : ""}`),
       DURABILITY[p.durability] && fact("Durability", [durabilityPill(p), el("span", { class: "sub" }, DURABILITY[p.durability][2])]),
+      scrubFact(p, scrubView),
       fact("Cluster size", humanSize(p.cluster_size_bytes)),
       fact("RAID bdev", mono(p.base_bdev_name)),
       fact("Volume store", [mono(p.lvs_name), el("span", { class: "sub mono" }, p.lvs_uuid)]),
@@ -1537,8 +1588,9 @@ function rebootDialog(hostname) {
 
 async function system() {
   const soft = (err) => { if (err instanceof Unauthorized) throw err; return null; };
-  const [st, os, containers, rebuild, backups, retention, mon, upg] = await Promise.all([api("/system/status"), api("/system/os").catch(soft), api("/system/containers").catch(soft), api("/system/rebuild").catch(soft),
-    can.admin ? api("/system/backups").catch(soft) : null, api("/system/volume-retention").catch(soft), api("/system/monitoring").catch(soft), api("/system/upgrade").catch(soft)]);
+  const [st, os, containers, rebuild, backups, retention, mon, upg, scrubCfg] = await Promise.all([api("/system/status"), api("/system/os").catch(soft), api("/system/containers").catch(soft), api("/system/rebuild").catch(soft),
+    can.admin ? api("/system/backups").catch(soft) : null, api("/system/volume-retention").catch(soft), api("/system/monitoring").catch(soft), api("/system/upgrade").catch(soft),
+    api("/system/scrub").then((r) => r.scrub).catch(soft)]);
   const ctr = containers || { available: false };
   const rec = st.reconciler || {};
   const dep = (d) => (d ? [mono(d.image || "-"), el("span", { class: "sub" }, [d.version, d.timestamp && humanTime(d.timestamp)].filter(Boolean).join(", "))] : "-");
@@ -1582,6 +1634,13 @@ async function system() {
         action(can.admin, { id: "rebuild-speed", onclick: () => rebuildSpeedDialog(rebuild.max_mb_per_sec) }, "Change")),
       el("p", {}, rebuild.max_mb_per_sec ? `Each rebuilding pool uses at most ${rebuild.max_mb_per_sec} MB/s.` : "Unlimited: rebuilds run as fast as the disks allow."),
       el("p", { class: "muted" }, "A limit leaves more bandwidth for hosts while a disk is rebuilt, but the pool stays without full redundancy for longer. A change applies to rebuilds that start after it; one already running keeps its speed."),
+    ],
+    scrubCfg && [
+      el("div", { class: "section-head" }, el("h2", {}, "Scrubs"),
+        action(can.admin, { id: "scrub-schedule", onclick: () => scrubScheduleDialog(scrubCfg) }, "Change")),
+      el("p", {}, scrubCfg.disabled ? "Scheduled scrubs are off. Pools can still be scrubbed by hand from their page."
+        : `Each pool is scrubbed every ${scrubCfg.interval_days} days, ${scrubCfg.window_start_hour === scrubCfg.window_end_hour ? "at any time" : `between ${String(scrubCfg.window_start_hour).padStart(2, "0")}:00 and ${String(scrubCfg.window_end_hour).padStart(2, "0")}:00 (appliance time)`}, ${scrubCfg.max_mb_per_sec ? `reading at most ${scrubCfg.max_mb_per_sec} MB/s` : "as fast as the disks allow"}.`),
+      el("p", { class: "muted" }, "A scrub reads every disk of a pool so that a damaged copy is found and rewritten while a good one exists, not discovered during a rebuild. Mirror copies that differ (after an unclean shutdown) are made equal. One pool is scrubbed at a time; a scrub still running when the window ends pauses and resumes in the next one."),
     ],
     retention && [
       el("div", { class: "section-head" }, el("h2", {}, "Deleted volumes"),
@@ -1697,6 +1756,27 @@ function retentionDialog(current) {
       const n = Number(v.hours);
       if (!Number.isInteger(n) || n < 0 || n > 720) throw new Error("Enter a whole number of hours from 0 to 720.");
       return send("PUT", "/system/volume-retention", { hours: n });
+    },
+    done: () => { notify("Saved."); rerender(); },
+  });
+}
+
+function scrubScheduleDialog(cur) {
+  openDialog({
+    title: "Scrub schedule",
+    submit: "Save",
+    fields: [
+      { name: "enabled", kind: "tick", text: "Scrub pools on a schedule", value: !cur.disabled },
+      { name: "interval", label: "Every (days)", value: String(cur.interval_days), required: true },
+      { name: "start", label: "Window start (hour, 0-23, appliance time)", value: String(cur.window_start_hour), required: true },
+      { name: "end", label: "Window end (hour, 0-23; same as start: any time)", value: String(cur.window_end_hour), required: true },
+      { name: "limit", label: "Read limit per pool (MB/s, 0 = unlimited)", value: String(cur.max_mb_per_sec), required: true },
+    ],
+    action: (v) => {
+      const n = (x, lo, hi, what) => { const f = Number(x); if (!Number.isInteger(f) || f < lo || f > hi) throw new Error(`${what} must be a whole number from ${lo} to ${hi}.`); return f; };
+      return send("PUT", "/system/scrub", { disabled: !v.enabled, interval_days: n(v.interval, 1, 365, "The interval"),
+        window_start_hour: n(v.start, 0, 23, "The window start"), window_end_hour: n(v.end, 0, 23, "The window end"),
+        max_mb_per_sec: n(v.limit, 0, 100000, "The limit") });
     },
     done: () => { notify("Saved."); rerender(); },
   });

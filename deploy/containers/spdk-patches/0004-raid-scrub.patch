@@ -1,0 +1,1428 @@
+From: Velocor <noreply@velocor.invalid>
+Subject: [PATCH] bdev/raid: add a background scrub
+
+A raid bdev's copies are only read when a host reads them, and then only one of them, so a
+latent sector error on another member surfaces during a rebuild, when it turns a degraded
+array into a lost one. RAID1 also has no resync after an unclean shutdown: members can differ
+where writes were in flight, and a read then returns either version depending on the read
+balancer.
+
+Add a scrub, started and stopped with bdev_raid_scrub_start / bdev_raid_scrub_stop and
+reported under "scrub" by bdev_raid_get_bdevs. It runs on the app thread, window by window
+(process_window_size_kb), over every operational base bdev's data area:
+
+- RAID1: the window's LBA range of the raid bdev is quiesced (user I/O to it waits) and read
+  from every member. A member whose read fails is rewritten from the first readable copy; the
+  other copies are compared with it block by block, and differing blocks are counted and, in
+  repair mode (the default), rewritten from it, like Linux md's "repair". A failed rewrite
+  fails the member, like raid1's read-error correction. A window no member can read is counted
+  as unrecoverable.
+- Other levels: a surface scan of each member without quiescing; read errors are counted as
+  unrecoverable.
+
+It can be rate-limited (max_bandwidth_mb_sec) and started at an offset (to resume). It stops
+after the current window on request, when a base bdev is removed (the removal's quiesce waits
+for that window) or a rebuild starts (the target holds stale data beyond the rebuild window),
+and destructing the raid bdev waits for it to stop. It is refused while a background process
+runs and on raid bdevs with separate metadata.
+
+Also: the schema entries, rpc.py commands and RPC documentation.
+
+Unit tests: test_raid_scrub, test_raid_scrub_stops_for_rebuild (with memory-backed base bdevs).
+
+Applies to SPDK v26.09 (0bbb7fe4dccfb31e8d446da8822360704949d1e9) after 0001-0003.
+---
+diff --git a/doc/jsonrpc.md.jinja2 b/doc/jsonrpc.md.jinja2
+index 6d7a764..229d8bc 100644
+--- a/doc/jsonrpc.md.jinja2
++++ b/doc/jsonrpc.md.jinja2
+@@ -8519,8 +8519,65 @@ Example response:
+ }
+ ~~~
+ 
++### bdev_raid_scrub_start {#rpc_bdev_raid_scrub_start}
++
++{{ bdev_raid_scrub_start_description }}
++
++#### Parameters
++
++{{ bdev_raid_scrub_start_params }}
++
++#### Response
++
++{{ bdev_raid_scrub_start_response }}
++
++#### Example
++
++Example request:
++
++{{ example_request("bdev_raid_scrub_start", "Raid1", "-b", "200") }}
++
++Example response:
++
++~~~json
++{
++  "jsonrpc": "2.0",
++  "id": 1,
++  "result": true
++}
++~~~
++
++### bdev_raid_scrub_stop {#rpc_bdev_raid_scrub_stop}
++
++{{ bdev_raid_scrub_stop_description }}
++
++#### Parameters
++
++{{ bdev_raid_scrub_stop_params }}
++
++#### Response
++
++{{ bdev_raid_scrub_stop_response }}
++
++#### Example
++
++Example request:
++
++{{ example_request("bdev_raid_scrub_stop", "Raid1") }}
++
++Example response:
++
++~~~json
++{
++  "jsonrpc": "2.0",
++  "id": 1,
++  "result": true
++}
++~~~
++
+ ## SPLIT {#jsonrpc_components_split}
+ 
++
+ ### bdev_split_create {#rpc_bdev_split_create}
+ 
+ {{ bdev_split_create_description }}
+diff --git a/module/bdev/raid/bdev_raid.c b/module/bdev/raid/bdev_raid.c
+index a3c140b..10cc121 100644
+--- a/module/bdev/raid/bdev_raid.c
++++ b/module/bdev/raid/bdev_raid.c
+@@ -88,6 +88,9 @@ struct raid_process_finish_action {
+ 	TAILQ_ENTRY(raid_process_finish_action) link;
+ };
+ 
++static void raid_bdev_scrub_request_stop(struct raid_bdev *raid_bdev, int status);
++static int raid_bdev_scrub_stop_then(struct raid_bdev *raid_bdev, spdk_msg_fn cb, void *cb_ctx);
++
+ static struct spdk_raid_bdev_opts g_opts = {
+ 	.process_window_size_kb = RAID_BDEV_PROCESS_WINDOW_SIZE_KB_DEFAULT,
+ 	.process_max_bandwidth_mb_sec = RAID_BDEV_PROCESS_MAX_BANDWIDTH_MB_SEC_DEFAULT,
+@@ -490,6 +493,12 @@ _raid_bdev_destruct(void *ctxt)
+ 
+ 	SPDK_DEBUGLOG(bdev_raid, "raid_bdev_destruct\n");
+ 
++	/* A scrub uses the base bdevs: let it finish its window and stop first. */
++	if (raid_bdev->scrub != NULL &&
++	    raid_bdev_scrub_stop_then(raid_bdev, _raid_bdev_destruct, raid_bdev) == 0) {
++		return;
++	}
++
+ 	assert(raid_bdev->process == NULL);
+ 
+ 	RAID_FOR_EACH_BASE_BDEV(raid_bdev, base_info) {
+@@ -1118,6 +1127,24 @@ raid_bdev_write_info_json(struct raid_bdev *raid_bdev, struct spdk_json_write_ct
+ 		spdk_json_write_object_end(w);
+ 		spdk_json_write_object_end(w);
+ 	}
++	if (raid_bdev->scrub_stats.state != RAID_SCRUB_NONE) {
++		struct raid_bdev_scrub_stats *st = &raid_bdev->scrub_stats;
++
++		spdk_json_write_named_object_begin(w, "scrub");
++		spdk_json_write_named_string(w, "state", raid_bdev_scrub_state_to_str(st->state));
++		spdk_json_write_named_bool(w, "repair", st->repair);
++		spdk_json_write_named_bool(w, "mirrored", st->mirrored);
++		spdk_json_write_named_int32(w, "status", st->status);
++		spdk_json_write_named_uint64(w, "start_offset_blocks", st->start_offset_blocks);
++		spdk_json_write_named_uint64(w, "offset_blocks", st->offset_blocks);
++		spdk_json_write_named_uint64(w, "total_blocks", st->total_blocks);
++		spdk_json_write_named_uint64(w, "repaired_blocks", st->repaired_blocks);
++		spdk_json_write_named_uint64(w, "mismatched_blocks", st->mismatched_blocks);
++		spdk_json_write_named_uint64(w, "mismatch_repaired_blocks", st->mismatch_repaired_blocks);
++		spdk_json_write_named_uint64(w, "unrecoverable_blocks", st->unrecoverable_blocks);
++		spdk_json_write_named_uint64(w, "write_errors", st->write_errors);
++		spdk_json_write_object_end(w);
++	}
+ 	spdk_json_write_name(w, "base_bdevs_list");
+ 	spdk_json_write_array_begin(w);
+ 	RAID_FOR_EACH_BASE_BDEV(raid_bdev, base_info) {
+@@ -2313,6 +2340,9 @@ _raid_bdev_remove_base_bdev(struct raid_base_bdev_info *base_info,
+ 	assert(base_info->desc);
+ 	base_info->remove_scheduled = true;
+ 
++	/* A running scrub stops after its current window (the removal's quiesce waits for it). */
++	raid_bdev_scrub_request_stop(raid_bdev, -ENODEV);
++
+ 	if (raid_bdev->state != SPDK_BDEV_RAID_STATE_ONLINE) {
+ 		/*
+ 		 * As raid bdev is not registered yet or already unregistered,
+@@ -3285,6 +3315,9 @@ raid_bdev_start_rebuild(struct raid_base_bdev_info *target)
+ 
+ 	assert(spdk_get_thread() == spdk_thread_get_app_thread());
+ 
++	/* The rebuild target holds stale data beyond the rebuild window: never scrub against it. */
++	raid_bdev_scrub_request_stop(target->raid_bdev, -EBUSY);
++
+ 	process = raid_bdev_process_alloc(target->raid_bdev, RAID_PROCESS_REBUILD, target);
+ 	if (process == NULL) {
+ 		return -ENOMEM;
+@@ -4207,6 +4240,591 @@ done:
+ }
+ 
+ /* Log component for bdev raid bdev module */
++
++/*
++ * Scrub: read every operational member's data area window by window. For RAID1 the copies are
++ * compared while the window's LBA range of the raid bdev is quiesced (no user write can race the
++ * comparison or a repair): a member whose read fails is rewritten from the first readable copy,
++ * and mismatched copies are counted and, in repair mode, rewritten from it (like Linux md's
++ * "repair"). Other levels get a surface scan (reads only; errors are unrecoverable). Runs on the
++ * app thread, the thread that changes raid membership, so membership can't change under it
++ * unnoticed: a member removal or a rebuild stops it after the current window, and destructing
++ * the raid bdev waits for it.
++ */
++struct raid_scrub_member {
++	struct raid_bdev_scrub		*scrub;
++	struct raid_base_bdev_info	*base_info;
++	struct spdk_io_channel		*ch;
++	void				*buf;
++	struct iovec			iov;
++	bool				read_ok;
++	/* What a write to this member repairs: read error (true) or mismatch (false). */
++	bool				repair_read_error;
++	uint64_t			mismatched;
++};
++
++struct raid_scrub_stop_waiter {
++	spdk_msg_fn			cb;
++	void				*cb_ctx;
++	TAILQ_ENTRY(raid_scrub_stop_waiter) link;
++};
++
++struct raid_bdev_scrub {
++	struct raid_bdev		*raid_bdev;
++	struct raid_scrub_member	*members;
++	uint8_t				num_members;
++	/* Compare copies under a range lock (RAID1 with more than one readable member). */
++	bool				compare;
++	uint64_t			max_window_blocks;
++	uint64_t			window_offset;
++	uint64_t			window_blocks;
++	bool				window_locked;
++	/* Member I/Os in flight. */
++	uint32_t			outstanding;
++	/* An I/O couldn't be submitted (e.g. -ENOMEM): redo the window after a pause. */
++	bool				retry;
++	bool				stopping;
++	int				stop_status;
++	struct spdk_poller		*delay_poller;
++	uint64_t			bytes_per_sec;
++	uint64_t			start_tsc;
++	uint64_t			bytes_done;
++	TAILQ_HEAD(, raid_scrub_stop_waiter) waiters;
++};
++
++#define RAID_SCRUB_RETRY_DELAY_US 1000
++
++static void raid_scrub_next_window(struct raid_bdev_scrub *scrub);
++
++const char *
++raid_bdev_scrub_state_to_str(enum raid_scrub_state state)
++{
++	switch (state) {
++	case RAID_SCRUB_NONE:
++		return "none";
++	case RAID_SCRUB_RUNNING:
++		return "running";
++	case RAID_SCRUB_COMPLETED:
++		return "completed";
++	case RAID_SCRUB_STOPPED:
++		return "stopped";
++	case RAID_SCRUB_FAILED:
++		return "failed";
++	}
++	return "unknown";
++}
++
++static bool
++raid_scrub_member_usable(struct raid_base_bdev_info *base_info)
++{
++	return base_info->desc != NULL && base_info->is_configured && !base_info->remove_scheduled &&
++	       !base_info->is_process_target;
++}
++
++static void
++raid_scrub_free(struct raid_bdev_scrub *scrub)
++{
++	uint8_t i;
++
++	for (i = 0; i < scrub->num_members; i++) {
++		if (scrub->members[i].ch != NULL) {
++			spdk_put_io_channel(scrub->members[i].ch);
++		}
++		spdk_dma_free(scrub->members[i].buf);
++	}
++	free(scrub->members);
++	free(scrub);
++}
++
++static void
++raid_scrub_finish(struct raid_bdev_scrub *scrub, int status)
++{
++	struct raid_bdev *raid_bdev = scrub->raid_bdev;
++	struct raid_bdev_scrub_stats *st = &raid_bdev->scrub_stats;
++	struct raid_scrub_stop_waiter *waiter;
++	TAILQ_HEAD(, raid_scrub_stop_waiter) waiters;
++
++	assert(!scrub->window_locked && scrub->outstanding == 0);
++	spdk_poller_unregister(&scrub->delay_poller);
++
++	if (status == 0 && st->offset_blocks >= st->total_blocks) {
++		st->state = RAID_SCRUB_COMPLETED;
++	} else if (scrub->stopping) {
++		st->state = RAID_SCRUB_STOPPED;
++		st->status = scrub->stop_status;
++	} else {
++		st->state = RAID_SCRUB_FAILED;
++		st->status = status != 0 ? status : -EIO;
++	}
++	SPDK_NOTICELOG("raid bdev %s: scrub %s at block %" PRIu64 " of %" PRIu64 " (%s): repaired %"
++		       PRIu64 ", mismatched %" PRIu64 " (repaired %" PRIu64 "), unrecoverable %" PRIu64
++		       ", write errors %" PRIu64 "\n", raid_bdev->bdev.name,
++		       raid_bdev_scrub_state_to_str(st->state), st->offset_blocks, st->total_blocks,
++		       st->status ? spdk_strerror(-st->status) : "ok", st->repaired_blocks,
++		       st->mismatched_blocks, st->mismatch_repaired_blocks, st->unrecoverable_blocks,
++		       st->write_errors);
++
++	TAILQ_INIT(&waiters);
++	TAILQ_CONCAT(&waiters, &scrub->waiters, link);
++	raid_bdev->scrub = NULL;
++	raid_scrub_free(scrub);
++
++	while ((waiter = TAILQ_FIRST(&waiters)) != NULL) {
++		TAILQ_REMOVE(&waiters, waiter, link);
++		waiter->cb(waiter->cb_ctx);
++		free(waiter);
++	}
++}
++
++static int
++raid_scrub_delay_poll(void *arg)
++{
++	struct raid_bdev_scrub *scrub = arg;
++
++	spdk_poller_unregister(&scrub->delay_poller);
++	raid_scrub_next_window(scrub);
++	return SPDK_POLLER_BUSY;
++}
++
++static void
++raid_scrub_delay(struct raid_bdev_scrub *scrub, uint64_t delay_us)
++{
++	assert(scrub->delay_poller == NULL);
++	scrub->delay_poller = SPDK_POLLER_REGISTER(raid_scrub_delay_poll, scrub, delay_us);
++	if (scrub->delay_poller == NULL) {
++		raid_scrub_finish(scrub, -ENOMEM);
++	}
++}
++
++static void
++raid_scrub_continue(struct raid_bdev_scrub *scrub)
++{
++	if (scrub->retry && !scrub->stopping) {
++		scrub->retry = false;
++		raid_scrub_delay(scrub, RAID_SCRUB_RETRY_DELAY_US);
++		return;
++	}
++	raid_scrub_next_window(scrub);
++}
++
++static void
++raid_scrub_window_unlocked(void *ctx, int status)
++{
++	struct raid_bdev_scrub *scrub = ctx;
++
++	scrub->window_locked = false;
++	if (status != 0) {
++		SPDK_ERRLOG("raid bdev %s: scrub can't unlock blocks %" PRIu64 "+%" PRIu64 ": %s\n",
++			    scrub->raid_bdev->bdev.name, scrub->window_offset, scrub->window_blocks,
++			    spdk_strerror(-status));
++		raid_scrub_finish(scrub, status);
++		return;
++	}
++	raid_scrub_continue(scrub);
++}
++
++/* The window is done (advance), or must be redone or abandoned: unlock, go on. */
++static void
++raid_scrub_window_end(struct raid_bdev_scrub *scrub, bool advance)
++{
++	struct raid_bdev *raid_bdev = scrub->raid_bdev;
++	int rc;
++
++	if (advance) {
++		raid_bdev->scrub_stats.offset_blocks = scrub->window_offset + scrub->window_blocks;
++		scrub->bytes_done += scrub->window_blocks * raid_bdev->bdev.blocklen;
++	}
++	if (!scrub->window_locked) {
++		raid_scrub_continue(scrub);
++		return;
++	}
++	rc = spdk_bdev_unquiesce_range(&raid_bdev->bdev, &g_raid_if, scrub->window_offset,
++				       scrub->window_blocks, raid_scrub_window_unlocked, scrub);
++	if (rc != 0) {
++		raid_scrub_window_unlocked(scrub, rc);
++	}
++}
++
++static void
++raid_scrub_write_done(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
++{
++	struct raid_scrub_member *member = cb_arg;
++	struct raid_bdev_scrub *scrub = member->scrub;
++	struct raid_bdev_scrub_stats *st = &scrub->raid_bdev->scrub_stats;
++
++	spdk_bdev_free_io(bdev_io);
++	assert(scrub->outstanding > 0);
++	scrub->outstanding--;
++
++	if (success) {
++		if (member->repair_read_error) {
++			st->repaired_blocks += scrub->window_blocks;
++		} else {
++			st->mismatch_repaired_blocks += member->mismatched;
++		}
++	} else {
++		SPDK_ERRLOG("raid bdev %s: scrub can't rewrite blocks %" PRIu64 "+%" PRIu64 " on %s; "
++			    "failing it\n", scrub->raid_bdev->bdev.name, scrub->window_offset,
++			    scrub->window_blocks, member->base_info->name);
++		st->write_errors++;
++		/* Like raid1's read-error correction. The removal stops this scrub. */
++		raid_bdev_fail_base_bdev(member->base_info);
++	}
++	if (scrub->outstanding == 0) {
++		raid_scrub_window_end(scrub, !scrub->retry);
++	}
++}
++
++static void
++raid_scrub_write(struct raid_bdev_scrub *scrub, struct raid_scrub_member *member,
++		 struct raid_scrub_member *src)
++{
++	int rc;
++
++	member->iov.iov_base = src->buf;
++	member->iov.iov_len = scrub->window_blocks * scrub->raid_bdev->bdev.blocklen;
++	scrub->outstanding++;
++	rc = raid_bdev_writev_blocks_ext(member->base_info, member->ch, &member->iov, 1,
++					 scrub->window_offset, scrub->window_blocks,
++					 raid_scrub_write_done, member, NULL);
++	if (rc != 0) {
++		scrub->outstanding--;
++		scrub->retry = true;
++	}
++}
++
++static uint64_t
++raid_scrub_count_mismatches(struct raid_bdev_scrub *scrub, const void *a, const void *b)
++{
++	uint32_t blocklen = scrub->raid_bdev->bdev.blocklen;
++	uint64_t i, n = 0;
++
++	for (i = 0; i < scrub->window_blocks; i++) {
++		if (memcmp((const char *)a + i * blocklen, (const char *)b + i * blocklen, blocklen) != 0) {
++			n++;
++		}
++	}
++	return n;
++}
++
++static void
++raid_scrub_evaluate(struct raid_bdev_scrub *scrub)
++{
++	struct raid_bdev_scrub_stats *st = &scrub->raid_bdev->scrub_stats;
++	struct raid_scrub_member *src = NULL, *member;
++	uint8_t i;
++
++	if (scrub->retry || scrub->stopping) {
++		/* Redo the window (or stop) without counting a partial result. */
++		raid_scrub_window_end(scrub, false);
++		return;
++	}
++
++	if (!scrub->compare) {
++		for (i = 0; i < scrub->num_members; i++) {
++			if (!scrub->members[i].read_ok) {
++				SPDK_ERRLOG("raid bdev %s: scrub can't read blocks %" PRIu64 "+%" PRIu64
++					    " of %s\n", scrub->raid_bdev->bdev.name, scrub->window_offset,
++					    scrub->window_blocks, scrub->members[i].base_info->name);
++				st->unrecoverable_blocks += scrub->window_blocks;
++			}
++		}
++		raid_scrub_window_end(scrub, true);
++		return;
++	}
++
++	for (i = 0; i < scrub->num_members && src == NULL; i++) {
++		if (scrub->members[i].read_ok) {
++			src = &scrub->members[i];
++		}
++	}
++	if (src == NULL) {
++		SPDK_ERRLOG("raid bdev %s: scrub can't read blocks %" PRIu64 "+%" PRIu64
++			    " from any member\n", scrub->raid_bdev->bdev.name, scrub->window_offset,
++			    scrub->window_blocks);
++		st->unrecoverable_blocks += scrub->window_blocks;
++		raid_scrub_window_end(scrub, true);
++		return;
++	}
++
++	for (i = 0; i < scrub->num_members; i++) {
++		member = &scrub->members[i];
++		if (member == src) {
++			continue;
++		}
++		if (!member->read_ok) {
++			SPDK_NOTICELOG("raid bdev %s: scrub rewrites blocks %" PRIu64 "+%" PRIu64
++				       " of %s from %s after a read error\n", scrub->raid_bdev->bdev.name,
++				       scrub->window_offset, scrub->window_blocks, member->base_info->name,
++				       src->base_info->name);
++			member->repair_read_error = true;
++			raid_scrub_write(scrub, member, src);
++			continue;
++		}
++		member->mismatched = raid_scrub_count_mismatches(scrub, src->buf, member->buf);
++		if (member->mismatched == 0) {
++			continue;
++		}
++		st->mismatched_blocks += member->mismatched;
++		SPDK_NOTICELOG("raid bdev %s: scrub found %" PRIu64 " blocks in %" PRIu64 "+%" PRIu64
++			       " of %s differing from %s%s\n", scrub->raid_bdev->bdev.name,
++			       member->mismatched, scrub->window_offset, scrub->window_blocks,
++			       member->base_info->name, src->base_info->name,
++			       st->repair ? "; rewriting them" : "");
++		if (st->repair) {
++			member->repair_read_error = false;
++			raid_scrub_write(scrub, member, src);
++		}
++	}
++	if (scrub->outstanding == 0) {
++		raid_scrub_window_end(scrub, !scrub->retry);
++	}
++}
++
++static void
++raid_scrub_read_done(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
++{
++	struct raid_scrub_member *member = cb_arg;
++	struct raid_bdev_scrub *scrub = member->scrub;
++
++	spdk_bdev_free_io(bdev_io);
++	member->read_ok = success;
++	assert(scrub->outstanding > 0);
++	if (--scrub->outstanding == 0) {
++		raid_scrub_evaluate(scrub);
++	}
++}
++
++static void
++raid_scrub_read(struct raid_bdev_scrub *scrub)
++{
++	struct raid_scrub_member *member;
++	uint8_t i;
++	int rc;
++
++	scrub->outstanding = 1;	/* held while submitting */
++	for (i = 0; i < scrub->num_members; i++) {
++		member = &scrub->members[i];
++		member->read_ok = false;
++		member->mismatched = 0;
++		member->iov.iov_base = member->buf;
++		member->iov.iov_len = scrub->window_blocks * scrub->raid_bdev->bdev.blocklen;
++		scrub->outstanding++;
++		rc = raid_bdev_readv_blocks_ext(member->base_info, member->ch, &member->iov, 1,
++						scrub->window_offset, scrub->window_blocks,
++						raid_scrub_read_done, member, NULL);
++		if (rc != 0) {
++			scrub->outstanding--;
++			scrub->retry = true;
++		}
++	}
++	if (--scrub->outstanding == 0) {
++		raid_scrub_evaluate(scrub);
++	}
++}
++
++static void
++raid_scrub_window_locked(void *ctx, int status)
++{
++	struct raid_bdev_scrub *scrub = ctx;
++
++	if (status != 0) {
++		SPDK_ERRLOG("raid bdev %s: scrub can't lock blocks %" PRIu64 "+%" PRIu64 ": %s\n",
++			    scrub->raid_bdev->bdev.name, scrub->window_offset, scrub->window_blocks,
++			    spdk_strerror(-status));
++		raid_scrub_finish(scrub, status);
++		return;
++	}
++	scrub->window_locked = true;
++	if (scrub->stopping) {
++		raid_scrub_window_end(scrub, false);
++		return;
++	}
++	raid_scrub_read(scrub);
++}
++
++static void
++raid_scrub_next_window(struct raid_bdev_scrub *scrub)
++{
++	struct raid_bdev *raid_bdev = scrub->raid_bdev;
++	struct raid_bdev_scrub_stats *st = &raid_bdev->scrub_stats;
++	int rc;
++
++	if (scrub->stopping) {
++		raid_scrub_finish(scrub, scrub->stop_status);
++		return;
++	}
++	if (st->offset_blocks >= st->total_blocks) {
++		raid_scrub_finish(scrub, 0);
++		return;
++	}
++	if (scrub->bytes_per_sec != 0) {
++		uint64_t hz = spdk_get_ticks_hz();
++		uint64_t due = scrub->start_tsc + scrub->bytes_done * hz / scrub->bytes_per_sec;
++		uint64_t now = spdk_get_ticks();
++
++		if (now < due) {
++			raid_scrub_delay(scrub, spdk_max((due - now) * SPDK_SEC_TO_USEC / hz, 1));
++			return;
++		}
++	}
++
++	scrub->window_offset = st->offset_blocks;
++	scrub->window_blocks = spdk_min(scrub->max_window_blocks, st->total_blocks - st->offset_blocks);
++	if (!scrub->compare) {
++		raid_scrub_read(scrub);
++		return;
++	}
++	rc = spdk_bdev_quiesce_range(&raid_bdev->bdev, &g_raid_if, scrub->window_offset,
++				     scrub->window_blocks, raid_scrub_window_locked, scrub);
++	if (rc != 0) {
++		raid_scrub_window_locked(scrub, rc);
++	}
++}
++
++static void
++raid_scrub_start_msg(void *ctx)
++{
++	raid_scrub_next_window(ctx);
++}
++
++int
++raid_bdev_scrub_start(struct raid_bdev *raid_bdev, bool repair, uint32_t max_bandwidth_mb_sec,
++		      uint64_t start_offset_blocks)
++{
++	struct raid_bdev_scrub *scrub;
++	struct raid_bdev_scrub_stats *st = &raid_bdev->scrub_stats;
++	struct raid_base_bdev_info *base_info;
++	uint64_t total = UINT64_MAX, buf_size;
++	uint8_t n = 0;
++
++	assert(spdk_get_thread() == spdk_thread_get_app_thread());
++
++	if (raid_bdev->state != SPDK_BDEV_RAID_STATE_ONLINE) {
++		return -ENODEV;
++	}
++	if (raid_bdev->scrub != NULL || raid_bdev->process != NULL) {
++		return -EBUSY;
++	}
++	if (raid_bdev->bdev.md_len != 0) {
++		return -ENOTSUP;
++	}
++	RAID_FOR_EACH_BASE_BDEV(raid_bdev, base_info) {
++		if (raid_scrub_member_usable(base_info)) {
++			total = spdk_min(total, base_info->data_size);
++			n++;
++		}
++	}
++	if (n == 0) {
++		return -ENODEV;
++	}
++	if (raid_bdev->level == SPDK_BDEV_RAID_LEVEL_RAID1) {
++		total = spdk_min(total, raid_bdev->bdev.blockcnt);
++	}
++	if (start_offset_blocks >= total) {
++		return -EINVAL;
++	}
++
++	scrub = calloc(1, sizeof(*scrub));
++	if (scrub == NULL) {
++		return -ENOMEM;
++	}
++	scrub->members = calloc(n, sizeof(*scrub->members));
++	if (scrub->members == NULL) {
++		free(scrub);
++		return -ENOMEM;
++	}
++	scrub->raid_bdev = raid_bdev;
++	TAILQ_INIT(&scrub->waiters);
++	scrub->max_window_blocks = spdk_max((uint64_t)g_opts.process_window_size_kb * 1024 /
++					    raid_bdev->bdev.blocklen, 1);
++	buf_size = scrub->max_window_blocks * raid_bdev->bdev.blocklen;
++	RAID_FOR_EACH_BASE_BDEV(raid_bdev, base_info) {
++		struct raid_scrub_member *member;
++
++		if (!raid_scrub_member_usable(base_info)) {
++			continue;
++		}
++		member = &scrub->members[scrub->num_members++];
++		member->scrub = scrub;
++		member->base_info = base_info;
++		member->ch = spdk_bdev_get_io_channel(base_info->desc);
++		member->buf = spdk_dma_malloc(buf_size, 0x1000, NULL);
++		if (member->ch == NULL || member->buf == NULL) {
++			raid_scrub_free(scrub);
++			return -ENOMEM;
++		}
++	}
++	scrub->compare = raid_bdev->level == SPDK_BDEV_RAID_LEVEL_RAID1 && n > 1;
++	scrub->bytes_per_sec = (uint64_t)max_bandwidth_mb_sec * 1024 * 1024;
++	scrub->start_tsc = spdk_get_ticks();
++
++	memset(st, 0, sizeof(*st));
++	st->state = RAID_SCRUB_RUNNING;
++	st->repair = repair;
++	st->mirrored = scrub->compare;
++	st->start_offset_blocks = start_offset_blocks;
++	st->offset_blocks = start_offset_blocks;
++	st->total_blocks = total;
++	raid_bdev->scrub = scrub;
++
++	SPDK_NOTICELOG("raid bdev %s: scrub started at block %" PRIu64 " of %" PRIu64 " (%s, %u "
++		       "members%s)\n", raid_bdev->bdev.name, start_offset_blocks, total,
++		       scrub->compare ? (repair ? "compare and repair" : "compare") : "read only", n,
++		       max_bandwidth_mb_sec ? ", rate-limited" : "");
++	spdk_thread_send_msg(spdk_get_thread(), raid_scrub_start_msg, scrub);
++	return 0;
++}
++
++/* Ask a running scrub to stop; it stops after the current window. */
++static void
++raid_bdev_scrub_request_stop(struct raid_bdev *raid_bdev, int status)
++{
++	struct raid_bdev_scrub *scrub = raid_bdev->scrub;
++
++	if (scrub == NULL || scrub->stopping) {
++		return;
++	}
++	scrub->stopping = true;
++	scrub->stop_status = status;
++	if (scrub->delay_poller != NULL) {
++		/* Between windows: nothing in flight. */
++		raid_scrub_finish(scrub, status);
++	}
++}
++
++/* Stop a running scrub and call cb once it has stopped. -ENOENT if none runs. */
++static int
++raid_bdev_scrub_stop_then(struct raid_bdev *raid_bdev, spdk_msg_fn cb, void *cb_ctx)
++{
++	struct raid_scrub_stop_waiter *waiter;
++
++	if (raid_bdev->scrub == NULL) {
++		return -ENOENT;
++	}
++	waiter = calloc(1, sizeof(*waiter));
++	if (waiter == NULL) {
++		return -ENOMEM;
++	}
++	waiter->cb = cb;
++	waiter->cb_ctx = cb_ctx;
++	TAILQ_INSERT_TAIL(&raid_bdev->scrub->waiters, waiter, link);
++	raid_bdev_scrub_request_stop(raid_bdev, -ECANCELED);
++	return 0;
++}
++
++int
++raid_bdev_scrub_stop(struct raid_bdev *raid_bdev)
++{
++	assert(spdk_get_thread() == spdk_thread_get_app_thread());
++
++	if (raid_bdev->scrub == NULL) {
++		return -ENOENT;
++	}
++	raid_bdev_scrub_request_stop(raid_bdev, -ECANCELED);
++	return 0;
++}
++
+ SPDK_LOG_REGISTER_COMPONENT(bdev_raid)
+ 
+ static void
+diff --git a/module/bdev/raid/bdev_raid.h b/module/bdev/raid/bdev_raid.h
+index 43f7b6c..5003604 100644
+--- a/module/bdev/raid/bdev_raid.h
++++ b/module/bdev/raid/bdev_raid.h
+@@ -145,6 +145,41 @@ struct raid_bdev_process_request {
+ 	TAILQ_ENTRY(raid_bdev_process_request) link;
+ };
+ 
++enum raid_scrub_state {
++	RAID_SCRUB_NONE,	/* never run since the raid bdev was configured */
++	RAID_SCRUB_RUNNING,
++	RAID_SCRUB_COMPLETED,	/* reached the end */
++	RAID_SCRUB_STOPPED,	/* stopped on request, or by a member removal or a rebuild */
++	RAID_SCRUB_FAILED,
++};
++
++/* Progress and results of the running or last scrub of a raid bdev. */
++struct raid_bdev_scrub_stats {
++	enum raid_scrub_state	state;
++	/* Rewrite mismatched copies (read errors are always rewritten). */
++	bool			repair;
++	/* Members are compared (RAID1), or only read (surface scan). */
++	bool			mirrored;
++	/* Why the scrub ended, if it didn't complete (negative errno). */
++	int			status;
++	/* Range covered, in blocks of the members' data area. */
++	uint64_t		start_offset_blocks;
++	uint64_t		offset_blocks;
++	uint64_t		total_blocks;
++	/* Member blocks that couldn't be read and were rewritten from a good copy. */
++	uint64_t		repaired_blocks;
++	/* Member blocks that differed from the first readable copy. */
++	uint64_t		mismatched_blocks;
++	/* Of those, rewritten from the first readable copy (repair mode). */
++	uint64_t		mismatch_repaired_blocks;
++	/* Blocks no member could supply (all copies unreadable, or a surface scan read error). */
++	uint64_t		unrecoverable_blocks;
++	/* Repair writes that failed; the member is failed, like a raid1 read-error correction. */
++	uint64_t		write_errors;
++};
++
++struct raid_bdev_scrub;
++
+ /*
+  * raid_bdev is the single entity structure which contains SPDK block device
+  * and the information related to any raid bdev either configured or
+@@ -215,6 +250,10 @@ struct raid_bdev {
+ 	/* Raid bdev background process, e.g. rebuild */
+ 	struct raid_bdev_process	*process;
+ 
++	/* Running scrub, if any, and the counters of the running or last one */
++	struct raid_bdev_scrub		*scrub;
++	struct raid_bdev_scrub_stats	scrub_stats;
++
+ 	/* Callback and context for raid_bdev configuration */
+ 	raid_bdev_action_cb		configure_cb;
+ 	void				*configure_cb_ctx;
+@@ -245,6 +284,10 @@ int raid_bdev_add_base_bdev(struct raid_bdev *raid_bdev, const char *name,
+ int raid_bdev_start_degraded(struct raid_bdev *raid_bdev, raid_bdev_action_cb cb_fn,
+ 			     void *cb_ctx);
+ struct raid_bdev *raid_bdev_find_by_name(const char *name);
++int raid_bdev_scrub_start(struct raid_bdev *raid_bdev, bool repair, uint32_t max_bandwidth_mb_sec,
++			  uint64_t start_offset_blocks);
++int raid_bdev_scrub_stop(struct raid_bdev *raid_bdev);
++const char *raid_bdev_scrub_state_to_str(enum raid_scrub_state state);
+ enum spdk_bdev_raid_level raid_bdev_str_to_level(const char *str);
+ const char *raid_bdev_level_to_str(enum spdk_bdev_raid_level level);
+ const char *raid_bdev_state_to_str(enum spdk_bdev_raid_state state);
+diff --git a/module/bdev/raid/bdev_raid_rpc.c b/module/bdev/raid/bdev_raid_rpc.c
+index 41b7662..9c086c5 100644
+--- a/module/bdev/raid/bdev_raid_rpc.c
++++ b/module/bdev/raid/bdev_raid_rpc.c
+@@ -400,6 +400,85 @@ cleanup:
+ }
+ SPDK_RPC_REGISTER("bdev_raid_start_degraded", rpc_bdev_raid_start_degraded, SPDK_RPC_RUNTIME)
+ 
++/*
++ * brief:
++ * bdev_raid_scrub_start starts reading (RAID1: comparing and repairing) every member of a raid
++ * bdev in the background.
++ */
++static void
++rpc_bdev_raid_scrub_start(struct spdk_jsonrpc_request *request, const struct spdk_json_val *params)
++{
++	struct rpc_bdev_raid_scrub_start_ctx req = {};
++	struct raid_bdev *raid_bdev;
++	int rc;
++
++	req.repair = true;
++	if (spdk_json_decode_object(params, rpc_bdev_raid_scrub_start_decoders,
++				    SPDK_COUNTOF(rpc_bdev_raid_scrub_start_decoders), &req)) {
++		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_PARSE_ERROR,
++						 "spdk_json_decode_object failed");
++		goto cleanup;
++	}
++
++	raid_bdev = raid_bdev_find_by_name(req.name);
++	if (raid_bdev == NULL) {
++		spdk_jsonrpc_send_error_response_fmt(request, -ENODEV, "raid bdev %s is not found in config",
++						     req.name);
++		goto cleanup;
++	}
++
++	rc = raid_bdev_scrub_start(raid_bdev, req.repair, req.max_bandwidth_mb_sec,
++				   req.start_offset_blocks);
++	if (rc != 0) {
++		spdk_jsonrpc_send_error_response_fmt(request, rc, "Failed to start a scrub of %s: %s",
++						     req.name, spdk_strerror(-rc));
++		goto cleanup;
++	}
++	spdk_jsonrpc_send_bool_response(request, true);
++
++cleanup:
++	free_rpc_bdev_raid_scrub_start(&req);
++}
++SPDK_RPC_REGISTER("bdev_raid_scrub_start", rpc_bdev_raid_scrub_start, SPDK_RPC_RUNTIME)
++
++/*
++ * brief:
++ * bdev_raid_scrub_stop stops a running scrub after its current window.
++ */
++static void
++rpc_bdev_raid_scrub_stop(struct spdk_jsonrpc_request *request, const struct spdk_json_val *params)
++{
++	struct rpc_bdev_raid_scrub_stop_ctx req = {};
++	struct raid_bdev *raid_bdev;
++	int rc;
++
++	if (spdk_json_decode_object(params, rpc_bdev_raid_scrub_stop_decoders,
++				    SPDK_COUNTOF(rpc_bdev_raid_scrub_stop_decoders), &req)) {
++		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_PARSE_ERROR,
++						 "spdk_json_decode_object failed");
++		goto cleanup;
++	}
++
++	raid_bdev = raid_bdev_find_by_name(req.name);
++	if (raid_bdev == NULL) {
++		spdk_jsonrpc_send_error_response_fmt(request, -ENODEV, "raid bdev %s is not found in config",
++						     req.name);
++		goto cleanup;
++	}
++
++	rc = raid_bdev_scrub_stop(raid_bdev);
++	if (rc != 0) {
++		spdk_jsonrpc_send_error_response_fmt(request, rc, "No scrub of %s to stop: %s",
++						     req.name, spdk_strerror(-rc));
++		goto cleanup;
++	}
++	spdk_jsonrpc_send_bool_response(request, true);
++
++cleanup:
++	free_rpc_bdev_raid_scrub_stop(&req);
++}
++SPDK_RPC_REGISTER("bdev_raid_scrub_stop", rpc_bdev_raid_scrub_stop, SPDK_RPC_RUNTIME)
++
+ static void
+ rpc_bdev_raid_set_options(struct spdk_jsonrpc_request *request, const struct spdk_json_val *params)
+ {
+diff --git a/python/spdk/cli/bdev.py b/python/spdk/cli/bdev.py
+index 1478d19..74d2495 100644
+--- a/python/spdk/cli/bdev.py
++++ b/python/spdk/cli/bdev.py
+@@ -833,6 +833,26 @@ def add_parser(subparsers):
+     p.add_argument('name', help='raid bdev name')
+     p.set_defaults(func=bdev_raid_start_degraded)
+ 
++    def bdev_raid_scrub_start(args):
++        print_json(args.client.bdev_raid_scrub_start(name=args.name,
++                                                     repair=args.repair,
++                                                     max_bandwidth_mb_sec=args.max_bandwidth_mb_sec,
++                                                     start_offset_blocks=args.start_offset_blocks))
++    p = subparsers.add_parser('bdev_raid_scrub_start',
++                              help='Start a background scrub of a raid bdev')
++    p.add_argument('name', help='raid bdev name')
++    p.add_argument('--check-only', dest='repair', action='store_false', default=None,
++                   help='Count differing copies without rewriting them')
++    p.add_argument('-b', '--max-bandwidth-mb-sec', type=int, help='Maximum bandwidth in MiB/s')
++    p.add_argument('-o', '--start-offset-blocks', type=int, help='Block to start at')
++    p.set_defaults(func=bdev_raid_scrub_start)
++
++    def bdev_raid_scrub_stop(args):
++        print_json(args.client.bdev_raid_scrub_stop(name=args.name))
++    p = subparsers.add_parser('bdev_raid_scrub_stop', help='Stop a running scrub of a raid bdev')
++    p.add_argument('name', help='raid bdev name')
++    p.set_defaults(func=bdev_raid_scrub_stop)
++
+     # split
+     def bdev_split_create(args):
+         print_array(args.client.bdev_split_create(
+diff --git a/schema/schema.yaml b/schema/schema.yaml
+index c087269..c69bcc0 100644
+--- a/schema/schema.yaml
++++ b/schema/schema.yaml
+@@ -4879,6 +4879,41 @@ methods:
+         type: string
+         required: true
+         description: Raid bdev name
++  - name: bdev_raid_scrub_start
++    description: |
++      Start a background scrub of a raid bdev: every operational base bdev's data area is read
++      window by window. For RAID1 the copies are compared while the window is quiesced; a base
++      bdev that fails to read is rewritten from the first readable copy, and differing copies are
++      counted and, with repair, rewritten from it. For other levels it is a read-only surface
++      scan. Progress and counters are reported under "scrub" by bdev_raid_get_bdevs. The scrub
++      stops when a base bdev is removed or a rebuild starts.
++    result:
++      type: boolean
++      description: true on success
++    params:
++      - name: name
++        type: string
++        required: true
++        description: Raid bdev name
++      - name: repair
++        type: boolean
++        description: Rewrite differing copies from the first readable one (default true)
++      - name: max_bandwidth_mb_sec
++        type: uint32
++        description: Maximum bandwidth in MiB/s (default 0, unlimited)
++      - name: start_offset_blocks
++        type: uint64
++        description: Block to start at, e.g. to resume an interrupted scrub (default 0)
++  - name: bdev_raid_scrub_stop
++    description: Stop a running scrub of a raid bdev after its current window.
++    result:
++      type: boolean
++      description: true on success
++    params:
++      - name: name
++        type: string
++        required: true
++        description: Raid bdev name
+   - name: bdev_split_create
+     description: This is used to split an underlying block device and create several smaller equal-sized vbdevs.
+     params:
+diff --git a/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c b/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c
+index 46a60ed..6e92aed 100644
+--- a/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c
++++ b/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c
+@@ -191,14 +191,111 @@ DEFINE_STUB(spdk_json_write_named_uuid, int, (struct spdk_json_write_ctx *w, con
+ DEFINE_STUB_V(raid_bdev_init_superblock, (struct raid_bdev *raid_bdev));
+ DEFINE_STUB(raid_bdev_alloc_superblock, int, (struct raid_bdev *raid_bdev, uint32_t block_size), 0);
+ DEFINE_STUB_V(raid_bdev_free_superblock, (struct raid_bdev *raid_bdev));
+-DEFINE_STUB(spdk_bdev_readv_blocks_ext, int, (struct spdk_bdev_desc *desc,
+-		struct spdk_io_channel *ch, struct iovec *iov, int iovcnt, uint64_t offset_blocks,
+-		uint64_t num_blocks, spdk_bdev_io_completion_cb cb, void *cb_arg,
+-		struct spdk_bdev_ext_io_opts *opts), 0);
+-DEFINE_STUB(spdk_bdev_writev_blocks_ext, int, (struct spdk_bdev_desc *desc,
+-		struct spdk_io_channel *ch, struct iovec *iov, int iovcnt, uint64_t offset_blocks,
+-		uint64_t num_blocks, spdk_bdev_io_completion_cb cb, void *cb_arg,
+-		struct spdk_bdev_ext_io_opts *opts), 0);
++DEFINE_STUB(spdk_json_write_named_int32, int, (struct spdk_json_write_ctx *w, const char *name,
++		int32_t val), 0);
++
++/*
++ * Memory-backed base bdevs for the scrub test: reads and writes of a registered bdev complete
++ * through a message; a read overlapping its bad range fails until a write covers that range,
++ * like a drive remapping a sector. Unregistered bdevs keep the old stub behaviour (accepted,
++ * never completed).
++ */
++#define UT_SCRUB_MEMBERS 3
++struct ut_scrub_mem {
++	struct spdk_bdev	*bdev;
++	uint8_t			*data;
++	uint64_t		bad_offset;
++	uint64_t		bad_blocks;
++	bool			fail_writes;
++};
++static struct ut_scrub_mem g_scrub_mem[UT_SCRUB_MEMBERS];
++static uint32_t g_quiesce_range_count;
++static uint32_t g_unquiesce_range_count;
++
++struct ut_scrub_cpl {
++	spdk_bdev_io_completion_cb	cb;
++	void				*cb_arg;
++	bool				success;
++};
++
++static void
++ut_scrub_cpl_msg(void *ctx)
++{
++	struct ut_scrub_cpl *cpl = ctx;
++	struct spdk_bdev_io *bdev_io = calloc(1, sizeof(*bdev_io));
++
++	SPDK_CU_ASSERT_FATAL(bdev_io != NULL);
++	cpl->cb(bdev_io, cpl->success, cpl->cb_arg);
++	free(cpl);
++}
++
++static struct ut_scrub_mem *
++ut_scrub_mem_get(struct spdk_bdev_desc *desc)
++{
++	int i;
++
++	for (i = 0; i < UT_SCRUB_MEMBERS; i++) {
++		if (g_scrub_mem[i].bdev != NULL && (void *)g_scrub_mem[i].bdev == (void *)desc) {
++			return &g_scrub_mem[i];
++		}
++	}
++	return NULL;
++}
++
++static int
++ut_scrub_io(struct spdk_bdev_desc *desc, struct iovec *iov, int iovcnt, uint64_t offset_blocks,
++	    uint64_t num_blocks, spdk_bdev_io_completion_cb cb, void *cb_arg, bool write)
++{
++	struct ut_scrub_mem *mem = ut_scrub_mem_get(desc);
++	struct ut_scrub_cpl *cpl;
++	uint8_t *p;
++	bool overlaps_bad;
++
++	if (mem == NULL) {
++		return 0;
++	}
++	CU_ASSERT(iovcnt == 1);
++	CU_ASSERT(iov[0].iov_len == num_blocks * g_block_len);
++	p = mem->data + offset_blocks * g_block_len;
++	overlaps_bad = mem->bad_blocks != 0 && offset_blocks < mem->bad_offset + mem->bad_blocks &&
++		       mem->bad_offset < offset_blocks + num_blocks;
++	cpl = calloc(1, sizeof(*cpl));
++	SPDK_CU_ASSERT_FATAL(cpl != NULL);
++	cpl->cb = cb;
++	cpl->cb_arg = cb_arg;
++	if (write) {
++		cpl->success = !mem->fail_writes;
++		if (cpl->success) {
++			memcpy(p, iov[0].iov_base, iov[0].iov_len);
++			if (overlaps_bad) {
++				mem->bad_blocks = 0;
++			}
++		}
++	} else {
++		cpl->success = !overlaps_bad;
++		if (cpl->success) {
++			memcpy(iov[0].iov_base, p, iov[0].iov_len);
++		}
++	}
++	spdk_thread_send_msg(spdk_get_thread(), ut_scrub_cpl_msg, cpl);
++	return 0;
++}
++
++int
++spdk_bdev_readv_blocks_ext(struct spdk_bdev_desc *desc, struct spdk_io_channel *ch,
++			   struct iovec *iov, int iovcnt, uint64_t offset_blocks, uint64_t num_blocks,
++			   spdk_bdev_io_completion_cb cb, void *cb_arg, struct spdk_bdev_ext_io_opts *opts)
++{
++	return ut_scrub_io(desc, iov, iovcnt, offset_blocks, num_blocks, cb, cb_arg, false);
++}
++
++int
++spdk_bdev_writev_blocks_ext(struct spdk_bdev_desc *desc, struct spdk_io_channel *ch,
++			    struct iovec *iov, int iovcnt, uint64_t offset_blocks, uint64_t num_blocks,
++			    spdk_bdev_io_completion_cb cb, void *cb_arg, struct spdk_bdev_ext_io_opts *opts)
++{
++	return ut_scrub_io(desc, iov, iovcnt, offset_blocks, num_blocks, cb, cb_arg, true);
++}
+ 
+ uint32_t
+ spdk_bdev_get_data_block_size(const struct spdk_bdev *bdev)
+@@ -614,6 +711,7 @@ spdk_bdev_quiesce_range(struct spdk_bdev *bdev, struct spdk_bdev_module *module,
+ 			uint64_t offset, uint64_t length,
+ 			spdk_bdev_quiesce_cb cb_fn, void *cb_arg)
+ {
++	g_quiesce_range_count++;
+ 	if (cb_fn) {
+ 		cb_fn(cb_arg, 0);
+ 	}
+@@ -626,6 +724,7 @@ spdk_bdev_unquiesce_range(struct spdk_bdev *bdev, struct spdk_bdev_module *modul
+ 			  uint64_t offset, uint64_t length,
+ 			  spdk_bdev_quiesce_cb cb_fn, void *cb_arg)
+ {
++	g_unquiesce_range_count++;
+ 	if (cb_fn) {
+ 		cb_fn(cb_arg, 0);
+ 	}
+@@ -1902,6 +2001,275 @@ test_bdev_ioch_destroy(void *io_device, void *ctx_buf)
+ {
+ }
+ 
++static struct raid_bdev *
++ut_scrub_setup(uint64_t blockcnt)
++{
++	struct rpc_bdev_raid_create_ctx req;
++	struct raid_bdev *pbdev;
++	struct spdk_bdev *base_bdev;
++	int i = 0;
++
++	struct spdk_raid_bdev_opts opts = {
++		.process_window_size_kb = RAID_BDEV_PROCESS_WINDOW_SIZE_KB_DEFAULT,
++		.process_max_bandwidth_mb_sec = RAID_BDEV_PROCESS_MAX_BANDWIDTH_MB_SEC_DEFAULT,
++	};
++
++	set_globals();
++	/* Earlier tests may leave a process bandwidth limit; the test clock doesn't advance. */
++	CU_ASSERT(raid_bdev_set_opts(&opts) == 0);
++	g_max_base_drives = UT_SCRUB_MEMBERS;
++	MOCK_SET(spdk_bdev_get_md_size, 0);
++	MOCK_SET(spdk_bdev_is_md_separate, false);
++	CU_ASSERT(raid_bdev_init() == 0);
++
++	create_raid_bdev_create_req(&req, "scrub", 0, true, 0, false);
++	TAILQ_FOREACH(base_bdev, &g_bdev_list, internal.link) {
++		base_bdev->blockcnt = blockcnt;
++		base_bdev->blocklen = g_block_len;
++		SPDK_CU_ASSERT_FATAL(i < UT_SCRUB_MEMBERS);
++		g_scrub_mem[i].bdev = base_bdev;
++		g_scrub_mem[i].data = calloc(blockcnt, g_block_len);
++		SPDK_CU_ASSERT_FATAL(g_scrub_mem[i].data != NULL);
++		i++;
++	}
++	rpc_bdev_raid_create(NULL, NULL);
++	CU_ASSERT(g_rpc_err == 0);
++	free_test_req(&req);
++
++	pbdev = raid_bdev_find_by_name("scrub");
++	SPDK_CU_ASSERT_FATAL(pbdev != NULL);
++	CU_ASSERT(pbdev->state == SPDK_BDEV_RAID_STATE_ONLINE);
++	/* Compare copies like RAID1 (the test module stands in for raid1). */
++	pbdev->level = SPDK_BDEV_RAID_LEVEL_RAID1;
++	pbdev->min_base_bdevs_operational = 1;
++	return pbdev;
++}
++
++static void
++ut_scrub_teardown(void)
++{
++	struct rpc_bdev_raid_delete_ctx destroy_req;
++	int i;
++
++	if (raid_bdev_find_by_name("scrub") != NULL) {
++		create_raid_bdev_delete_req(&destroy_req, "scrub", 0);
++		rpc_bdev_raid_delete(NULL, NULL);
++		CU_ASSERT(g_rpc_err == 0);
++		poll_app_thread();
++	}
++	verify_raid_bdev_present("scrub", false);
++	raid_bdev_exit();
++	base_bdevs_cleanup();
++	reset_globals();
++	MOCK_CLEAR(spdk_bdev_get_md_size);
++	MOCK_CLEAR(spdk_bdev_is_md_separate);
++	for (i = 0; i < UT_SCRUB_MEMBERS; i++) {
++		free(g_scrub_mem[i].data);
++	}
++	memset(g_scrub_mem, 0, sizeof(g_scrub_mem));
++}
++
++static void
++ut_scrub_fill(uint64_t blockcnt)
++{
++	uint64_t i;
++	int m;
++
++	for (i = 0; i < blockcnt * g_block_len; i++) {
++		uint8_t v = (uint8_t)(i * 7 + i / 4096);
++
++		for (m = 0; m < UT_SCRUB_MEMBERS; m++) {
++			g_scrub_mem[m].data[i] = v;
++		}
++	}
++}
++
++static bool
++ut_scrub_members_equal(uint64_t blockcnt)
++{
++	return memcmp(g_scrub_mem[0].data, g_scrub_mem[1].data, blockcnt * g_block_len) == 0 &&
++	       memcmp(g_scrub_mem[0].data, g_scrub_mem[2].data, blockcnt * g_block_len) == 0;
++}
++
++static void
++test_raid_scrub(void)
++{
++	const uint64_t blockcnt = 1024;	/* 4 windows of 1 MiB at 4 KiB blocks */
++	struct raid_bdev *pbdev;
++	struct raid_bdev_scrub_stats *st;
++	uint64_t window;
++
++	pbdev = ut_scrub_setup(blockcnt);
++	st = &pbdev->scrub_stats;
++	window = g_opts.process_window_size_kb * 1024 / g_block_len;
++	SPDK_CU_ASSERT_FATAL(window == 256);
++	CU_ASSERT(st->state == RAID_SCRUB_NONE);
++
++	/*
++	 * A mismatch on member 1 (block 300, window 1) and an unreadable range on member 2 (window
++	 * 2): the first is rewritten from member 0 in repair mode, the second always. Each window
++	 * is compared under a range quiesce.
++	 */
++	ut_scrub_fill(blockcnt);
++	g_scrub_mem[1].data[300 * g_block_len + 17] ^= 0xff;
++	g_scrub_mem[2].bad_offset = 600;
++	g_scrub_mem[2].bad_blocks = 8;
++	g_quiesce_range_count = g_unquiesce_range_count = 0;
++	CU_ASSERT(raid_bdev_scrub_start(pbdev, true, 0, 0) == 0);
++	CU_ASSERT(raid_bdev_scrub_start(pbdev, true, 0, 0) == -EBUSY);
++	CU_ASSERT(st->state == RAID_SCRUB_RUNNING);
++	poll_app_thread();
++	CU_ASSERT(pbdev->scrub == NULL);
++	CU_ASSERT(st->state == RAID_SCRUB_COMPLETED);
++	CU_ASSERT(st->status == 0);
++	CU_ASSERT(st->mirrored == true);
++	CU_ASSERT(st->offset_blocks == blockcnt);
++	CU_ASSERT(st->total_blocks == blockcnt);
++	CU_ASSERT(st->mismatched_blocks == 1);
++	CU_ASSERT(st->mismatch_repaired_blocks == 1);
++	CU_ASSERT(st->repaired_blocks == window);
++	CU_ASSERT(st->unrecoverable_blocks == 0);
++	CU_ASSERT(st->write_errors == 0);
++	CU_ASSERT(g_scrub_mem[2].bad_blocks == 0);
++	CU_ASSERT(ut_scrub_members_equal(blockcnt));
++	CU_ASSERT(g_quiesce_range_count == 4);
++	CU_ASSERT(g_unquiesce_range_count == 4);
++
++	/* Check only: a mismatch is counted, not rewritten. */
++	g_scrub_mem[2].data[5 * g_block_len] ^= 0x01;
++	g_scrub_mem[2].data[6 * g_block_len] ^= 0x01;
++	CU_ASSERT(raid_bdev_scrub_start(pbdev, false, 0, 0) == 0);
++	poll_app_thread();
++	CU_ASSERT(st->state == RAID_SCRUB_COMPLETED);
++	CU_ASSERT(st->mismatched_blocks == 2);
++	CU_ASSERT(st->mismatch_repaired_blocks == 0);
++	CU_ASSERT(!ut_scrub_members_equal(blockcnt));
++	g_scrub_mem[2].data[5 * g_block_len] ^= 0x01;
++	g_scrub_mem[2].data[6 * g_block_len] ^= 0x01;
++
++	/* No member readable: unrecoverable, nothing written. */
++	g_scrub_mem[0].bad_offset = g_scrub_mem[1].bad_offset = g_scrub_mem[2].bad_offset = 10;
++	g_scrub_mem[0].bad_blocks = g_scrub_mem[1].bad_blocks = g_scrub_mem[2].bad_blocks = 1;
++	CU_ASSERT(raid_bdev_scrub_start(pbdev, true, 0, 0) == 0);
++	poll_app_thread();
++	CU_ASSERT(st->state == RAID_SCRUB_COMPLETED);
++	CU_ASSERT(st->unrecoverable_blocks == window);
++	CU_ASSERT(st->repaired_blocks == 0);
++	CU_ASSERT(g_scrub_mem[0].bad_blocks == 1);
++	g_scrub_mem[0].bad_blocks = g_scrub_mem[1].bad_blocks = g_scrub_mem[2].bad_blocks = 0;
++
++	/*
++	 * Rate-limited to 1 MiB/s: after the first window it waits. A stop then ends it at once;
++	 * a scrub started at that offset resumes there and completes.
++	 */
++	CU_ASSERT(raid_bdev_scrub_start(pbdev, true, 1, 0) == 0);
++	poll_app_thread();
++	CU_ASSERT(pbdev->scrub != NULL);
++	CU_ASSERT(st->offset_blocks == window);
++	CU_ASSERT(raid_bdev_scrub_stop(pbdev) == 0);
++	CU_ASSERT(pbdev->scrub == NULL);
++	CU_ASSERT(st->state == RAID_SCRUB_STOPPED);
++	CU_ASSERT(st->status == -ECANCELED);
++	CU_ASSERT(raid_bdev_scrub_stop(pbdev) == -ENOENT);
++	CU_ASSERT(raid_bdev_scrub_start(pbdev, true, 0, blockcnt) == -EINVAL);
++	CU_ASSERT(raid_bdev_scrub_start(pbdev, true, 0, window) == 0);
++	poll_app_thread();
++	CU_ASSERT(st->state == RAID_SCRUB_COMPLETED);
++	CU_ASSERT(st->start_offset_blocks == window);
++	CU_ASSERT(st->offset_blocks == blockcnt);
++
++	/* A stop requested while a window is in flight takes effect after it, uncounted. */
++	CU_ASSERT(raid_bdev_scrub_start(pbdev, true, 0, 0) == 0);
++	spdk_thread_poll(g_app_thread, 1, 0);	/* start message: the first window's reads are submitted */
++	CU_ASSERT(raid_bdev_scrub_stop(pbdev) == 0);
++	CU_ASSERT(pbdev->scrub != NULL);
++	poll_app_thread();
++	CU_ASSERT(pbdev->scrub == NULL);
++	CU_ASSERT(st->state == RAID_SCRUB_STOPPED);
++	CU_ASSERT(st->offset_blocks == 0);
++
++	/* Refused with separate metadata, and while a rebuild runs. */
++	pbdev->bdev.md_len = 8;
++	CU_ASSERT(raid_bdev_scrub_start(pbdev, true, 0, 0) == -ENOTSUP);
++	pbdev->bdev.md_len = 0;
++
++	/* A member removal stops a running scrub. */
++	CU_ASSERT(raid_bdev_scrub_start(pbdev, true, 1, 0) == 0);
++	poll_app_thread();
++	CU_ASSERT(pbdev->scrub != NULL);
++	CU_ASSERT(raid_bdev_remove_base_bdev(g_scrub_mem[2].bdev, NULL, NULL) == 0);
++	poll_app_thread();
++	CU_ASSERT(pbdev->scrub == NULL);
++	CU_ASSERT(st->state == RAID_SCRUB_STOPPED);
++	CU_ASSERT(st->status == -ENODEV);
++
++	/* With two members left, a failed repair write fails the member and stops the scrub. */
++	g_scrub_mem[1].bad_offset = 0;
++	g_scrub_mem[1].bad_blocks = 1;
++	g_scrub_mem[1].fail_writes = true;
++	CU_ASSERT(raid_bdev_scrub_start(pbdev, true, 0, 0) == 0);
++	poll_app_thread();
++	CU_ASSERT(pbdev->scrub == NULL);
++	CU_ASSERT(st->write_errors == 1);
++	CU_ASSERT(st->state == RAID_SCRUB_STOPPED);
++	CU_ASSERT(st->status == -ENODEV);
++	CU_ASSERT(pbdev->base_bdev_info[1].desc == NULL);
++
++	/* One member left: a read-only scan. */
++	CU_ASSERT(raid_bdev_scrub_start(pbdev, true, 0, 0) == 0);
++	CU_ASSERT(st->mirrored == false);
++	poll_app_thread();
++	CU_ASSERT(st->state == RAID_SCRUB_COMPLETED);
++	CU_ASSERT(g_quiesce_range_count == g_unquiesce_range_count);
++
++	/* Deleting the raid bdev while a (rate-limited) scrub runs stops it first. */
++	CU_ASSERT(raid_bdev_scrub_start(pbdev, true, 1, 0) == 0);
++	poll_app_thread();
++	CU_ASSERT(pbdev->scrub != NULL);
++	ut_scrub_teardown();
++}
++
++static void
++test_raid_scrub_stops_for_rebuild(void)
++{
++	struct raid_bdev *pbdev;
++	struct spdk_thread *process_thread;
++	uint64_t num_blocks_processed = 0;
++
++	pbdev = ut_scrub_setup(1024);
++	ut_scrub_fill(1024);
++	pbdev->module_private = &num_blocks_processed;
++
++	CU_ASSERT(raid_bdev_scrub_start(pbdev, true, 1, 0) == 0);
++	poll_app_thread();
++	CU_ASSERT(pbdev->scrub != NULL);
++
++	CU_ASSERT(raid_bdev_start_rebuild(&pbdev->base_bdev_info[0]) == 0);
++	CU_ASSERT(pbdev->scrub == NULL);
++	CU_ASSERT(pbdev->scrub_stats.state == RAID_SCRUB_STOPPED);
++	CU_ASSERT(pbdev->scrub_stats.status == -EBUSY);
++	poll_app_thread();
++	SPDK_CU_ASSERT_FATAL(pbdev->process != NULL);
++	CU_ASSERT(raid_bdev_scrub_start(pbdev, true, 0, 0) == -EBUSY);
++
++	process_thread = g_latest_thread;
++	for (int i = 0; i < 10000 && pbdev->process != NULL; i++) {
++		spdk_thread_poll(process_thread, 0, 0);
++		poll_app_thread();
++	}
++	/* Let the process thread release its channel and exit. */
++	while (spdk_thread_poll(process_thread, 0, 0) > 0) {
++		poll_app_thread();
++	}
++	CU_ASSERT(pbdev->process == NULL);
++	CU_ASSERT(num_blocks_processed == pbdev->bdev.blockcnt);
++	/* The scrub can run again once the rebuild is done. */
++	CU_ASSERT(raid_bdev_scrub_start(pbdev, true, 0, 0) == 0);
++	poll_app_thread();
++	CU_ASSERT(pbdev->scrub_stats.state == RAID_SCRUB_COMPLETED);
++	ut_scrub_teardown();
++}
++
+ int
+ main(int argc, char **argv)
+ {
+@@ -1927,6 +2295,8 @@ main(int argc, char **argv)
+ 	CU_ADD_TEST(suite, test_raid_process);
+ 	CU_ADD_TEST(suite, test_raid_start_degraded);
+ 	CU_ADD_TEST(suite, test_raid_process_with_qos);
++	CU_ADD_TEST(suite, test_raid_scrub);
++	CU_ADD_TEST(suite, test_raid_scrub_stops_for_rebuild);
+ 
+ 	spdk_thread_lib_init(test_new_thread_fn, 0);
+ 	g_app_thread = spdk_thread_create("app_thread", NULL);

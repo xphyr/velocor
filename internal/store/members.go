@@ -2,6 +2,7 @@ package store
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"slices"
 	"time"
@@ -200,4 +201,39 @@ func (s *BoltStore) SaveSettings(st *Settings) error {
 	return s.db.Update(func(tx *bolt.Tx) error {
 		return putJSON(tx.Bucket(bucketSystem), keySettings, st)
 	})
+}
+
+// GetScrubRecord returns a pool's scrub record.
+func (s *BoltStore) GetScrubRecord(poolID string) (*ScrubRecord, error) {
+	var out ScrubRecord
+	err := s.db.View(func(tx *bolt.Tx) error {
+		return getJSON(tx.Bucket(bucketScrubs), []byte(poolID), &out)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// MutateScrubRecord applies fn to a pool's scrub record in one transaction.
+func (s *BoltStore) MutateScrubRecord(poolID string, fn func(*ScrubRecord) error) (*ScrubRecord, error) {
+	var out ScrubRecord
+	err := s.db.Update(func(tx *bolt.Tx) error {
+		if tx.Bucket(bucketPools).Get([]byte(poolID)) == nil {
+			return fmt.Errorf("%w: pool %s", ErrNotFound, poolID)
+		}
+		b := tx.Bucket(bucketScrubs)
+		if err := getJSON(b, []byte(poolID), &out); err != nil && !errors.Is(err, ErrNotFound) {
+			return err
+		}
+		out.PoolID = poolID
+		if err := fn(&out); err != nil {
+			return err
+		}
+		return putJSON(b, []byte(poolID), &out)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &out, nil
 }

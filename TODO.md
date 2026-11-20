@@ -697,7 +697,53 @@ work still open, ranked by risk to data, how fixes are verified, and what has be
   iSCSI CHAP auth groups and NVMe DH-HMAC-CHAP with encrypted secrets; the CSI node plugin
   should register the host's real hostnqn/IQN instead of names derived from the node name.
 - [ ] **P2-2. No background scrub.** Mirrors are never read and compared, so latent sector
-  errors surface only during a rebuild, when they turn a degraded pool into a lost one.
+  errors surface only during a rebuild, when they turn a degraded pool into a lost one. SPDK's
+  RAID1 also has no resync after an unclean stop: mirrors can differ where writes were in flight,
+  and reads then return either version depending on the read balancer.
+  **Design (2026-11-20):** SPDK v26.09 has no scrub, so SPDK patch 0004 adds one to the RAID
+  module, separate from the rebuild "process" (which is built around a single target member).
+  It runs on the app thread, window by window (the RAID process window size, 1 MiB by default):
+  - RAID1: quiesce the window's LBA range of the RAID bdev (user I/O to it waits; a member
+    removal's full quiesce waits for the window, so a member can't vanish under the scrub), read
+    it from every operational member directly, then:
+    - a member whose read fails is rewritten from a good copy (always, even when checking only;
+      the drive remaps the sector), counted as repaired;
+    - members that read fine are compared block by block with the first good one; mismatches
+      are counted and, in repair mode (default), rewritten from that copy, as Linux md's
+      "repair" does (after an unclean stop either version is valid; they must agree);
+    - a failed repair write fails the member, like raid1's own read-error correction;
+    - no member readable: counted as unrecoverable.
+  - Other levels (RAID0): a surface scan of each member's data area without locking; read
+    errors are counted as unrecoverable (no redundancy).
+  - Rate-limited (MB/s); can start at an offset (velod resumes after a restart); stops on
+    request, when a member is removed, when a rebuild starts (a rebuild target holds stale data
+    beyond its window), and before the RAID bdev is destructed. Refused during a rebuild and on
+    bdevs with separate metadata (DIF).
+  - RPCs `bdev_raid_scrub_start` / `bdev_raid_scrub_stop`; progress and the last run's counters
+    in `bdev_raid_get_bdevs` (`scrub` object).
+  velod: per-pool scrub schedule (default monthly, off-peak window, bandwidth limit), start/stop
+  from API/UI/`veloctl`, progress and last result per pool persisted (resumes after restarts),
+  metrics and alerts (repairs, mismatches, unrecoverable blocks).
+  **Done (2026-11-20, not yet lab-checked):**
+  - SPDK patch 0004 as designed, with unit tests `test_raid_scrub` (repair of a mismatch and of an
+    unreadable range, check only, unrecoverable, rate limit with stop and resume at an offset, a
+    stop mid-window not counting it, member removal, a failed repair write failing the member,
+    destruct while running) and `test_raid_scrub_stops_for_rebuild`, on memory-backed members;
+    the existing RAID unit tests still pass.
+  - velod (`internal/server/scrub.go`): settings `GET|PUT /system/scrub` (default every 30
+    days, 01:00-06:00 appliance time, 200 MB/s; off switch), per-pool record in a `scrubs` bucket
+    (`GET|POST|DELETE /pools/{id}/scrub`); a run spans SPDK scrubs ("segments") and resumes at
+    its offset after the window ends, a velod/spdk_tgt restart, a member removal or a rebuild
+    (once the pool is ONLINE again); one scheduled scrub at a time, operator ones at once;
+    findings logged. Metrics `velocor_pool_scrub_*`; alerts `VelocorScrubFoundLostData`,
+    `VelocorScrubRepairFailed` (critical), `VelocorScrubRepaired`, `VelocorScrubOverdue`.
+    UI: pool page "Scrub" (state, findings, Scrub now / Stop), System page "Scrubs" schedule.
+    `veloctl pool scrub` / `veloctl system scrub`. Tests: `TestScrubScheduleWindowAndResume`,
+    `TestScrubManualInterruptionsAndStop`, `TestScrubRecordGoesWithThePool` (fake SPDK), and
+    `TestScrubRepairsDifferingMirrorCopies` on real SPDK (a copy changed behind SPDK's back is
+    found, rewritten from the first member, data intact; a second check-only pass is clean).
+  *Left:* lab check on the test appliance (a scrub of a real pool under host I/O, its effect on
+  latency, the window and resume over a night) and on hardware with a failing disk.
 - [ ] **P2-3. Reconciler cost.** `EnsureExport` lists subsystems/target nodes per export
   (O(n²) RPCs); prefetch once per pass (was F5).
 - [ ] **P2-4. SPDK sizing.** One core and 1 GiB of memory; sizing isn't documented or

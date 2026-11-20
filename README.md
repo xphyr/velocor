@@ -354,6 +354,20 @@ veloctl portal create --name iscsi-0    --protocol ISCSI      --ip <appliance-sa
 veloctl portal list
 ```
 
+Pools are scrubbed in the background: every disk is read so that a copy a disk can no longer
+read is rewritten from a good one while one exists, instead of being discovered during a
+rebuild, and RAID1 copies that differ (after an unclean shutdown) are made equal. By default
+each pool is scrubbed every 30 days between 01:00 and 06:00 (appliance time) at up to
+200 MB/s, one pool at a time; a scrub still running at 06:00 pauses and resumes the next night.
+Results are on the pool's page and in the `VelocorScrub*` alerts.
+
+```bash
+veloctl system scrub                                   # show the schedule
+veloctl system scrub --window 22-5 --max-mb-per-sec 100
+veloctl pool scrub <pool-id>                           # current or last scrub and its findings
+veloctl pool scrub <pool-id> --start                   # scrub now, outside the window
+```
+
 ### 4. Provision Volumes, Snapshots & Manual SAN Exports
 
 ```bash

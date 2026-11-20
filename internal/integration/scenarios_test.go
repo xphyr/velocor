@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"slices"
 	"testing"
 	"time"
@@ -395,5 +396,77 @@ func TestGroupSnapshots(t *testing.T) {
 		a.initiator(a.exportTo(otherClone["id"].(string), "wc", hostB), hostB).mustRead(0, otherData)
 		in.mustRead(0, newData)
 		return
+	}
+}
+
+// Scrub on real SPDK (TODO.md P2-2, SPDK patch 0004): a mirror copy changed behind SPDK's back
+// (as after an unclean shutdown or silent corruption) is found by the scrub and rewritten from
+// the first member, the volume's data still reads back, and a second, check-only pass finds
+// nothing.
+func TestScrubRepairsDifferingMirrorCopies(t *testing.T) {
+	a, pool, _, in := setup(t, "RAID1", 2)
+	data := randomData(t, 1<<20)
+	if err := in.write(0, data); err != nil {
+		t.Fatal(err)
+	}
+
+	// Change 4 KiB of the second member's data area (well past the RAID superblock).
+	const off = 64 << 20
+	b := filepath.Join(a.tg.dir, "diskb.img")
+	f, err := os.OpenFile(b, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteAt(randomData(t, 4096), off); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	_ = f.Close()
+
+	id := pool["id"].(string)
+	scrub := func(body map[string]any) map[string]any {
+		a.t.Helper()
+		a.must("POST", "/pools/"+id+"/scrub", body, "")
+		deadline := time.Now().Add(2 * time.Minute)
+		for {
+			v := a.must("GET", "/pools/"+id+"/scrub", nil, "scrub")
+			if v["state"] != "RUNNING" {
+				return v
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("scrub still running: %v", v)
+			}
+			time.Sleep(200 * time.Millisecond)
+		}
+	}
+	v := scrub(map[string]any{"repair": true})
+	total := v["total"].(map[string]any)
+	t.Logf("scrub: %v %v", v["state"], total)
+	if v["state"] != "COMPLETED" || total["mismatched_blocks"] == float64(0) || total["mismatch_repaired_blocks"] != total["mismatched_blocks"] ||
+		total["repaired_blocks"] != float64(0) || total["unrecoverable_blocks"] != float64(0) {
+		t.Fatalf("scrub of a pool with one changed copy: %v", v)
+	}
+	readAt := func(path string) []byte {
+		buf := make([]byte, 4096)
+		f, err := os.Open(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = f.Close() }()
+		if _, err := f.ReadAt(buf, off); err != nil {
+			t.Fatal(err)
+		}
+		return buf
+	}
+	if !bytes.Equal(readAt(filepath.Join(a.tg.dir, "diska.img")), readAt(b)) {
+		t.Fatal("the differing copy wasn't rewritten from the first member")
+	}
+	in.mustRead(0, data)
+
+	v = scrub(map[string]any{"repair": false})
+	if total := v["total"].(map[string]any); v["state"] != "COMPLETED" || total["mismatched_blocks"] != float64(0) {
+		t.Fatalf("second scrub: %v", v)
 	}
 }

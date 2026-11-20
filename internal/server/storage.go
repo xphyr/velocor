@@ -16,6 +16,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"slices"
 	"strings"
@@ -51,6 +52,16 @@ func validateDisplayName(kind, name string) error {
 
 func decodeJSON(r *http.Request, dst any) error {
 	if err := json.NewDecoder(r.Body).Decode(dst); err != nil {
+		return fmt.Errorf("%w: invalid json body: %v", store.ErrInvalidArgument, err)
+	}
+	return nil
+}
+
+// decodeOptionalJSON is decodeJSON for requests whose fields are all optional: an empty body
+// means the defaults.
+func decodeOptionalJSON(r *http.Request, dst any) error {
+	err := json.NewDecoder(r.Body).Decode(dst)
+	if err != nil && !errors.Is(err, io.EOF) {
 		return fmt.Errorf("%w: invalid json body: %v", store.ErrInvalidArgument, err)
 	}
 	return nil
