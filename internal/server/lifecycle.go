@@ -10,10 +10,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
-	"time"
 
-	"github.com/velocor/velocor/internal/backup"
-	"github.com/velocor/velocor/internal/store"
 )
 
 // OSDeployment describes a single bootc OS deployment entry (booted, staged, or rollback).
@@ -127,66 +124,6 @@ func convertBootcSlot(slot *rawBootcSlot) *OSDeployment {
 		ImageDigest: slot.Image.ImageDigest,
 		Timestamp:   slot.Image.Timestamp,
 	}
-}
-
-func (s *Server) handleStageUpgrade(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		ImageRef string `json:"image_ref"`
-	}
-	_ = json.NewDecoder(r.Body).Decode(&req)
-	imageRef := strings.TrimSpace(req.ImageRef)
-	// The reference reaches bootc's command line: anything that could be read as an option
-	// (or carries whitespace / control characters) is refused.
-	if imageRef != "" && !imageRefRe.MatchString(imageRef) {
-		writeError(w, fmt.Errorf("%w: %q is not a container image reference", store.ErrInvalidArgument, imageRef))
-		return
-	}
-
-	if s.backups != nil {
-		if _, err := s.backups.Take(backup.KindPreUpgrade); err != nil {
-			writeError(w, fmt.Errorf("back up the database before the upgrade: %w", err))
-			return
-		}
-	}
-	var cmd *exec.Cmd
-	if imageRef == "" {
-		cmd = hostCommand(r.Context(), "bootc", "upgrade")
-	} else {
-		cmd = hostCommand(r.Context(), "bootc", "switch", imageRef)
-	}
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		writeError(w, fmt.Errorf("bootc update failed: %v (%s)", err, strings.TrimSpace(string(out))))
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"staged_image_ref": imageRef,
-		"output":           strings.TrimSpace(string(out)),
-		"reboot_required":  true,
-	})
-}
-
-func (s *Server) handleRollbackUpgrade(w http.ResponseWriter, r *http.Request) {
-	out, err := hostCommand(r.Context(), "bootc", "rollback").CombinedOutput()
-	if err != nil {
-		writeError(w, fmt.Errorf("bootc rollback failed: %v (%s)", err, strings.TrimSpace(string(out))))
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"output":          strings.TrimSpace(string(out)),
-		"reboot_required": true,
-	})
-}
-
-func (s *Server) handleRebootSystem(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusAccepted, map[string]any{
-		"status":  "rebooting",
-		"message": "Appliance reboot scheduled in 1 second",
-	})
-	go func() {
-		time.Sleep(1 * time.Second)
-		_ = hostCommand(context.Background(), "systemctl", "reboot").Run()
-	}()
 }
 
 func (s *Server) handleListContainers(w http.ResponseWriter, r *http.Request) {

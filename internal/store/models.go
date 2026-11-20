@@ -54,10 +54,24 @@ type Settings struct {
 	VolumeRetentionHours *uint32 `json:"volume_retention_hours,omitempty"`
 	// MonitoringEnabled runs the built-in Prometheus and Alertmanager (TODO.md P1-1).
 	MonitoringEnabled bool `json:"monitoring_enabled,omitempty"`
+	// OSUpgrade records the OS image velod last staged, so that after the reboot it can tell
+	// whether the appliance actually booted it (TODO.md P1-7). nil: nothing pending.
+	OSUpgrade *OSUpgradeRecord `json:"os_upgrade,omitempty"`
 	// Alerting configures where the built-in Alertmanager sends alerts and how the shipped
 	// rules are tuned. Its secrets stay in this database (and its backups), never in the pools'
 	// metadata copies, and the API never returns them.
 	Alerting AlertingSettings `json:"alerting,omitempty"`
+}
+
+// OSUpgradeRecord is an OS image staged (or a rollback queued) for the next boot.
+type OSUpgradeRecord struct {
+	Image    string    `json:"image"`
+	Digest   string    `json:"digest"`
+	StagedAt time.Time `json:"staged_at"`
+	By       string    `json:"by"`
+	// BootID is the kernel's boot ID when it was staged: a different one means the appliance
+	// has rebooted since.
+	BootID string `json:"boot_id"`
 }
 
 // AlertingSettings are the built-in Alertmanager's receivers and the rules' tuning.

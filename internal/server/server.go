@@ -59,6 +59,7 @@ type Server struct {
 	monitoring    *monitoring.Manager
 	mon           monitoringState
 	net           *netChanges
+	os            osLifecycle
 	netQuery      func(context.Context) NetworkStatus // tests
 }
 
@@ -120,6 +121,9 @@ func (s *Server) warnings() []string {
 		out = append(out, "Unsafe no-IOMMU mode is allowed: SPDK can DMA anywhere in host memory. Use this only in lab VMs.")
 	}
 	if w := s.monitoringWarning(); w != "" {
+		out = append(out, w)
+	}
+	if w := s.osWarning(); w != "" {
 		out = append(out, w)
 	}
 	return out
@@ -206,6 +210,8 @@ func (s *Server) Handler() http.Handler {
 }
 
 func (s *Server) registerRoutes() {
+	s.mux.HandleFunc("GET /healthz", s.handleHealthz)
+	s.mux.HandleFunc("GET /readyz", s.handleReadyz)
 	// Public routes (UI, OpenAPI spec, login, Prometheus scrape)
 	s.mux.HandleFunc("GET /{$}", s.handleDashboard)
 	s.mux.Handle("GET /assets/", s.handleWebAssets())
@@ -319,6 +325,8 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("POST /api/v1/system/backups", s.withAuth(store.RoleAdmin, s.handleTakeBackup))
 	s.mux.HandleFunc("POST "+restorePath, s.withAuth(store.RoleAdmin, s.handleRestore))
 	s.mux.HandleFunc("POST /api/v1/system/upgrade", s.withAuth(store.RoleAdmin, s.handleStageUpgrade))
+	s.mux.HandleFunc("GET /api/v1/system/upgrade", s.withAuth(store.RoleReadOnly, s.handleGetUpgrade))
+	s.mux.HandleFunc("DELETE /api/v1/system/upgrade/warning", s.withAuth(store.RoleAdmin, s.handleDismissUpgradeWarning))
 	s.mux.HandleFunc("POST /api/v1/system/rollback", s.withAuth(store.RoleAdmin, s.handleRollbackUpgrade))
 	s.mux.HandleFunc("POST /api/v1/system/reboot", s.withAuth(store.RoleAdmin, s.handleRebootSystem))
 	s.mux.HandleFunc("GET /api/v1/system/containers", s.withAuth(store.RoleReadOnly, s.handleListContainers))

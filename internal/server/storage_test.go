@@ -43,6 +43,7 @@ func newHarness(t *testing.T) *harness {
 	rec := reconciler.New(st, f.Client(), nil, nil)
 	rec.SetSPDKInstance(func() string { return "" }) // not whatever spdk_tgt runs on this machine
 	srv := New(st, f.Client(), nil, authMgr, rec, nil)
+	srv.os.reboot = func() { t.Log("reboot requested (fake)") } // never the real one
 	h := &harness{t: t, st: st, fake: f, srv: srv, rec: rec, ts: httptest.NewServer(srv.Handler())}
 	t.Cleanup(h.ts.Close)
 	code, resp := h.do("POST", "/api/v1/auth/login", "", map[string]any{"username": "admin", "password": "admin-pass-123"})

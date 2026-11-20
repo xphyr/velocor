@@ -28,6 +28,11 @@ import (
 )
 
 func main() {
+	// "velod healthcheck [-listen :8443] [-insecure-http]": the quadlet's HealthCmd (TODO.md
+	// P2-6). Asks this velod's /healthz on the loopback interface; exit 0 when it answers.
+	if len(os.Args) > 1 && os.Args[1] == "healthcheck" {
+		os.Exit(healthcheck(os.Args[2:]))
+	}
 	// "velod meta-io ...": the helper that does the on-pool metadata I/O (internal/meta).
 	if len(os.Args) > 1 && os.Args[1] == "meta-io" {
 		if err := meta.RunHelper(os.Args[2:], os.Stdin, os.Stdout, true); err != nil {
@@ -188,6 +193,8 @@ func main() {
 
 	// The built-in Prometheus/Alertmanager have no [Install]: velod starts them when they're on.
 	go srv.StartMonitoring(ctx)
+	// Did the OS image staged before the last reboot take effect? (TODO.md P1-7)
+	go srv.CheckOSUpgrade(ctx)
 
 	errCh := make(chan error, 1)
 	go func() {
@@ -241,3 +248,32 @@ func envOrDefault(key, def string) string {
 
 // metaUblkID is the ublk device ID reserved for metadata I/O (/dev/ublkb<id>).
 const metaUblkID = 100
+
+// healthcheck GETs /healthz from the velod listening on -listen (on the loopback interface).
+func healthcheck(args []string) int {
+	fs := flag.NewFlagSet("healthcheck", flag.ContinueOnError)
+	listen := fs.String("listen", envOrDefault("VELOCOR_LISTEN", ":8443"), "velod's listen address")
+	plain := fs.Bool("insecure-http", os.Getenv("VELOCOR_INSECURE_HTTP") == "true", "velod serves plain HTTP")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	scheme := "https"
+	if *plain {
+		scheme = "http"
+	}
+	client := &http.Client{Timeout: 5 * time.Second, Transport: &http.Transport{
+		// Our own process on the loopback interface, with whatever certificate it serves.
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, //nolint:gosec
+	}}
+	resp, err := client.Get(scheme + "://" + monitoring.LocalTarget(*listen) + "/healthz")
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "healthcheck:", err)
+		return 1
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		fmt.Fprintln(os.Stderr, "healthcheck:", resp.Status)
+		return 1
+	}
+	return 0
+}

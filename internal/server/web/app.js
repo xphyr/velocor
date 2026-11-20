@@ -1493,11 +1493,23 @@ function upgradeDialog(os) {
   openDialog({
     title: "Upgrade the OS",
     intro: "bootc downloads the new image and stages it for the next boot. Nothing changes until the appliance reboots, and the current image stays available to roll back to.",
-    submit: "Stage upgrade",
+    submit: "Start upgrade",
     fields: [{ name: "image", label: "Image", placeholder: (os.booted || {}).image || "", hint: "Leave empty to update to the newest build of the image it's running." }],
     action: (x) => send("POST", "/system/upgrade", { image_ref: x.image }),
-    done: (r) => { notify(r.message || "Upgrade staged."); rerender(); },
+    done: () => { notify("Upgrade started: it downloads in the background; follow it below."); rerender(); },
   });
+}
+
+// upgradeJobView shows the running or last OS upgrade (TODO.md P1-7).
+function upgradeJobView(j) {
+  const state = j.state === "RUNNING" ? pill("Downloading", "warn") : j.state === "SUCCEEDED" ? pill("Staged", "ok") : pill("Failed", "bad");
+  const lines = (j.output || "").split("\n");
+  return el("details", { class: "upgrade-job", open: j.state !== "SUCCEEDED" },
+    el("summary", {}, "Upgrade ", state, " ", el("span", { class: "sub" },
+      [j.image || "newest build", `started ${humanTime(j.started_at)} by ${j.by}`, j.finished_at && `finished ${humanTime(j.finished_at)}`].filter(Boolean).join(" · "))),
+    j.error && el("div", { class: "panel-notice bad" }, j.error),
+    j.state === "SUCCEEDED" && el("p", {}, j.staged ? "It takes effect at the next reboot." : "Nothing new to stage: already on the newest image."),
+    el("pre", { class: "job-output" }, lines.slice(-15).join("\n")));
 }
 
 function rollbackDialog() {
@@ -1516,7 +1528,8 @@ function rebootDialog(hostname) {
     intro: "All SAN I/O stops until it's back. Hosts reconnect on their own if their timeouts allow.",
     submit: "Reboot",
     confirmText: hostname || "reboot",
-    action: () => send("POST", "/system/reboot"),
+    fields: [{ name: "force", kind: "tick", text: "Reboot even if hosts are connected (they lose their storage until it's back)", value: false }],
+    action: (x) => send("POST", "/system/reboot", { force: !!x.force }),
     done: () => notify("Rebooting."),
   });
 }
@@ -1524,8 +1537,8 @@ function rebootDialog(hostname) {
 
 async function system() {
   const soft = (err) => { if (err instanceof Unauthorized) throw err; return null; };
-  const [st, os, containers, rebuild, backups, retention, mon] = await Promise.all([api("/system/status"), api("/system/os").catch(soft), api("/system/containers").catch(soft), api("/system/rebuild").catch(soft),
-    can.admin ? api("/system/backups").catch(soft) : null, api("/system/volume-retention").catch(soft), api("/system/monitoring").catch(soft)]);
+  const [st, os, containers, rebuild, backups, retention, mon, upg] = await Promise.all([api("/system/status"), api("/system/os").catch(soft), api("/system/containers").catch(soft), api("/system/rebuild").catch(soft),
+    can.admin ? api("/system/backups").catch(soft) : null, api("/system/volume-retention").catch(soft), api("/system/monitoring").catch(soft), api("/system/upgrade").catch(soft)]);
   const ctr = containers || { available: false };
   const rec = st.reconciler || {};
   const dep = (d) => (d ? [mono(d.image || "-"), el("span", { class: "sub" }, [d.version, d.timestamp && humanTime(d.timestamp)].filter(Boolean).join(", "))] : "-");
@@ -1545,12 +1558,15 @@ async function system() {
       el("div", {},
         el("div", { class: "section-head" }, el("h2", {}, "Operating system"),
           el("div", { class: "row-actions" },
-            can.admin && os && os.available && el("button", { onclick: () => upgradeDialog(os) }, "Upgrade"),
+            can.admin && os && os.available && el("button", { disabled: !!(upg && upg.job && upg.job.state === "RUNNING"), onclick: () => upgradeDialog(os) }, "Upgrade"),
             can.admin && os && os.rollback && el("button", { class: "danger-quiet", onclick: rollbackDialog }, "Roll back"),
             can.admin && el("button", { class: "danger-quiet", onclick: () => rebootDialog(st.node && st.node.hostname) }, "Reboot"))),
         os && os.available
           ? el("dl", { class: "facts" }, fact("Booted", dep(os.booted)), fact("Staged", dep(os.staged)), fact("Rollback", dep(os.rollback)))
-          : el("div", { class: "panel-notice" }, (os && os.message) || "bootc isn't available on this host."))),
+          : el("div", { class: "panel-notice" }, (os && os.message) || "bootc isn't available on this host."),
+        upg && upg.warning && el("div", { class: "panel-notice warn" }, upg.warning, " ",
+          action(can.admin, { onclick: async () => { try { await send("DELETE", "/system/upgrade/warning"); rerender(); } catch (err) { notify(err.message); } } }, "Dismiss")),
+        upg && upg.job && upgradeJobView(upg.job))),
     (rec.unmanaged_objects || []).length > 0 && [
       el("div", { class: "section-head" }, el("h2", { id: "unmanaged" }, "Not managed by Velocor")),
       el("div", { class: "panel-notice warn" }, "spdk_tgt holds these, but no Velocor record accounts for them. Velocor leaves them alone. They may be leftovers of a failed operation, or, after the database was lost, the only copy of data: import the pool or restore a database backup if they're yours. Subsystems and targets may give hosts access that no export controls."),
