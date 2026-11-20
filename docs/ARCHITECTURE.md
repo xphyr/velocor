@@ -1,5 +1,11 @@
 # Velocor Architecture
 
+> **Direction (2026-11-20):** the data plane described below (SPDK RAID, lvol, SPDK targets,
+> ublk) is being replaced by the kernel storage stack (md, LVM thin, nvmet, LIO). This document
+> describes what runs today and is updated as the phases in
+> [design/kernel-dataplane.md](design/kernel-dataplane.md) land.
+
+
 **Velocor** is an open-source, API-first, all-flash SAN/NAS storage appliance distribution built on **SPDK** (Storage Performance Development Kit) and **Fedora Image Mode (`bootc`)**, written in Go.
 
 ## 1. Key Architectural Decisions

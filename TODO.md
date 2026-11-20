@@ -11,12 +11,32 @@ commit. Keep entries short: the problem, where it stands, the next step.
 
 ---
 
-## Before release
+## Direction change (2026-11-20): kernel data plane
+
+Decided 2026-11-20 after P0-7 and the three-way benchmark: the data plane moves from SPDK to
+md RAID + LVM thin + kernel nvmet/LIO. The reasons, the alternatives (incl. the hybrids and a
+GPL port of md/LVM into SPDK), the numbers and the plan are in
+[docs/design/kernel-dataplane.md](docs/design/kernel-dataplane.md). SPDK stays in the lab until
+phase 3. Items below marked **(K)** are resolved by the move and close at the cutover; they stay
+listed until then so nothing is lost if the plan changes.
+
+- [ ] **K-0. Design review** of the note; decide QoS (proposal: drop at cutover) and the thin
+  chunk size (proposal: 256 KiB, measured first).
+- [ ] **K-1. Spike** behind the data-plane interface: md RAID1 + thin LV + nvmet, crash/restart,
+  a rebuild, a group snapshot through the dm-linear wrapper; the fake command layer for unit
+  tests; the privileged integration harness in CI.
+- [ ] **K-2. Parity:** every row of the feature table (iSCSI via LIO, scrub on md, metadata copy
+  on an LV, import, CBT via `thin_delta`, metrics, alerts, veloctl/UI wording, docs).
+- [ ] **K-3. Validation:** CSI matrix on both clusters, KubeVirt, the P0-7 scenario (an
+  unreadable sector on the last copy keeps the pool up), the benchmark, soak.
+- [ ] **K-4. Cutover:** remove SPDK (images, patches, client, fake, CI stage); rebuild the lab
+  appliances; archive the (K) items.
+
 
 The first final release waits for these. Hardware validation (below) is part of the gate but
 doesn't block the rest.
 
-- [ ] **P0-7. One unreadable sector on the last good copy takes a mirror pool offline.**
+- [ ] **(K) P0-7. One unreadable sector on the last good copy takes a mirror pool offline.**
   Found 2026-11-20 with emulated disk errors (QEMU `blkdebug`, lab VM). SPDK v26.09's RAID1
   fails a member whenever none of the other copies can supply a read, and the rebuild process
   does the same on a source read error. So in a degraded mirror (one disk failed or being
@@ -71,17 +91,17 @@ doesn't block the rest.
   last member and the RAID bdev disappears, the pool turns UNAVAILABLE but its members still
   read ACTIVE / REBUILDING (with "rebuilding 0%"), because member states are only read from a
   RAID that exists. Show them as unknown or failed, and say why the pool is unavailable.
-- [ ] **L-7. Pools can't be expanded.** Evaluated 2026-11-20 against SPDK v26.09; *needs a
+- [ ] **(K) L-7. Pools can't be expanded.** Evaluated 2026-11-20 against SPDK v26.09; *needs a
   decision.* (b) **Grow a RAID1 after every member was replaced by a larger disk** is small: a
   patch adding `bdev_raid_grow` (SPDK's own resize path, refused while degraded or rebuilding),
   then `bdev_lvol_grow_lvstore`; data doesn't move; both steps can be re-run after a crash.
   (a) **Add disks** needs a new pool layout (a concat of RAID1 pairs) and a patch appending a
   member to a concat: substantial, new pools only, growth by pairs. (c) spreading volumes over
   pools isn't expansion. *Recommendation:* (b) first; (a) as its own design if needed.
-- [ ] **L-6. A full pool should give hosts ENOSPC, not EIO.** SPDK fails writes to a full thin
+- [ ] **(K) L-6. A full pool should give hosts ENOSPC, not EIO.** SPDK fails writes to a full thin
   pool with NVMe Internal Error (EIO; filesystems shut down). Patch lvol ENOSPC to complete with
   NVMe Capacity Exceeded (0x81). Test with ext4 and XFS hosts.
-- [ ] **U-1. Send our SPDK patches upstream** and drop each once merged: 0001 WRITE SAME fan-out
+- [ ] **(K, optional goodwill) U-1. Send our SPDK patches upstream** and drop each once merged: 0001 WRITE SAME fan-out
   ([guide](docs/upstream/spdk-scsi-write-same.md)), 0002 degraded start, 0003 group snapshot,
   0004 scrub, 0005 fragmap (coordinate with Longhorn, whose RPC it matches), and the uring
   channel crash ([report](docs/upstream/spdk-uring-channel-crash.md); carry it as a patch once
@@ -93,10 +113,10 @@ doesn't block the rest.
 - [ ] **P2-13. virtio-blk disks are invisible.** Discovery drops `vdX` devices (`rotational=1`, no
   model). Treat `virtio_blk` as an SSD candidate; require a serial for pool members and say why
   a disk without one can't be used.
-- [ ] **P2-14. iSCSI splits 128K writes into two 64K disk writes** (177–209 vs 300 MB/s for
+- [ ] **(K) P2-14. iSCSI splits 128K writes into two 64K disk writes** (177–209 vs 300 MB/s for
   NVMe/TCP). Find where (data segment or buffer size) and whether a larger
   `MaxRecvDataSegmentLength` or iobuf size avoids it.
-- [ ] **P2-10. Recovery after an unclean SPDK stop.** About 1 min per 500 GB on lab disks.
+- [ ] **P2-10 (re-measure in the kernel stack). Recovery after an unclean stop.** About 1 min per 500 GB on lab disks.
   Report a "recovering" state instead of DEGRADED while volume stores load; iSCSI hosts give up
   after `replacement_timeout` (120 s) where NVMe/TCP hosts wait, so raise it from the CSI node.
   Measure on real hardware before lowering the lvstore metadata reservation.
@@ -117,18 +137,18 @@ doesn't block the rest.
 
 ## Later
 
-- [ ] **L-1. Patch SPDK so flushes reach the drives** (the real fix for P0-4). lvols support FLUSH
+- [ ] **(K) L-1. Patch SPDK so flushes reach the drives** (the real fix for P0-4). lvols support FLUSH
   and pass it to the blobstore's device; RAID reports `write_cache` when a member has one, so
   NVMe-oF advertises a volatile cache and hosts send FLUSH/FUA. Then drive caches can stay on
   and the per-disk policy relaxes. Aim upstream; nvweaver's durability patch is prior art.
   `TestWriteCacheAndFlushAdvertised` is skipped as a known issue until then.
-- [ ] **P2-4. SPDK core sizing.** One core today; on lab disks a second gained nothing. Plan
+- [ ] **(K) P2-4. SPDK core sizing.** One core today; on lab disks a second gained nothing. Plan
   (2026-11-19): a boot step picks the core count (1 on a VM; about a quarter of the cores on
   hardware, never CPU 0, NUMA-local to NICs and NVMe), an operator override applied at the next
   SPDK restart, maybe SPDK's dynamic scheduler later. Tune on NVMe hardware.
-- [ ] **L-4. RAID10.** SPDK has no raid10; refused today. Build it as raid0 over raid1 pairs with
+- [ ] **(K) L-4. RAID10.** SPDK has no raid10; refused today. Build it as raid0 over raid1 pairs with
   superblocks; handle assembly after restart, a degraded pair, rebuild, deletion.
-- [ ] **L-3. Parity RAID (RAID5/6).** raid5f takes full-stripe writes only and can't hold a
+- [ ] **(K) L-3. Parity RAID (RAID5/6).** raid5f takes full-stripe writes only and can't hold a
   volume store. Options: a write-gathering layer, a read-modify-write RAID5 with a journal, or
   kernel md RAID5/6 underneath SPDK. Needs a design decision, then power-loss and rebuild tests.
 - [ ] **P1-6 (feature). High availability.** Two appliances, ANA paths; after the release.
