@@ -636,8 +636,13 @@ work still open, ranked by risk to data, how fixes are verified, and what has be
   through the API while it ran (127 ms each), each member cloned and read back on the cluster:
   all nine consistent (B = A or A-1, both seen), and the writer never saw an error in ~22,000
   pairs.
-  *Left:* a Kubernetes VolumeGroupSnapshot of PVCs in use on the Arm cluster (the x86 one has no
-  group snapshot CRDs).
+  Kubernetes (dev-3705715, 2026-11-20): on the Arm cluster, a pod wrote the same dependent
+  counters to an NVMe/TCP and an iSCSI PVC (same pool) and VolumeGroupSnapshots (v1) were taken
+  through the external-snapshotter: six rounds, each member restored to a new PVC and read back,
+  all consistent (4 KiB `O_DIRECT|O_DSYNC` writes: B = A-1; 512-byte `O_DIRECT`: B = A).
+  *Test pitfall:* busybox `dd oflag=direct` silently drops `O_DIRECT` on a device whose DMA
+  alignment its buffer misses (the iSCSI disk wants 64 bytes) and writes through the page cache,
+  so its "completed" writes reach the target late: that writer showed B = A-2. Use GNU dd.
   **Found alongside:** velod's `bdev_get_iostat` call sent `name`, which SPDK v26.09 rejects (it
   takes `names`, an array), so `GET /api/v1/system/iostats?bdev_name=...` failed on real SPDK (the
   unfiltered metrics path was fine). Fixed; the fake now rejects `name` like SPDK and the client
@@ -742,8 +747,21 @@ work still open, ranked by risk to data, how fixes are verified, and what has be
     `TestScrubManualInterruptionsAndStop`, `TestScrubRecordGoesWithThePool` (fake SPDK), and
     `TestScrubRepairsDifferingMirrorCopies` on real SPDK (a copy changed behind SPDK's back is
     found, rewritten from the first member, data intact; a second check-only pass is clean).
-  *Left:* lab check on the test appliance (a scrub of a real pool under host I/O, its effect on
-  latency, the window and resume over a night) and on hardware with a failing disk.
+  Lab (dev-3705715 on the test appliance, 2026-11-20; virtio-SCSI disks, one SPDK core):
+  - All three pools (268 + 537 + 268 GB) scrubbed clean, repair on, with no findings; a manual
+    scrub while a pod wrote 16 GiB with fio CRC32C checksums, then a second pass, then fio's
+    verify: no mismatches and every block verified.
+  - Window: a scheduled run started inside it, paused when it was moved away ("the scrub window
+    ended"), resumed at the exact block when it came back, completed; the next pool started
+    after it (one at a time). Metrics and the pool record followed.
+  - Host I/O (4 KiB random 70/30, iSCSI PVC on the pool): qd1 1053 / 449 IOPS (read / write,
+    p99 1.6 / 1.1 ms) alone, 443 / 189 (p99 3.7 / 3.4 ms) under an unthrottled scrub at
+    ~1.17 GB/s; qd16 11.3k / 4.8k -> 5.2k / 2.2k. Hence the rate limit, which was broken:
+  - **Found:** the rate limit computed `bytes_done * ticks_hz`, which overflows 64 bits after
+    ~7 GB at a GHz tick rate, so a scrub ran at 200 MB/s for ~35 s and then unthrottled. Fixed in
+    patch 0004 (`raid_scrub_due_tsc`, whole seconds counted apart; unit test
+    `test_raid_scrub_due_tsc`); needs a build and a rerun of the latency test at 200 MB/s.
+  *Left:* that rerun, and hardware with a failing disk.
 - [ ] **P2-3. Reconciler cost.** `EnsureExport` lists subsystems/target nodes per export
   (O(n²) RPCs); prefetch once per pass (was F5).
 - [ ] **P2-4. SPDK sizing.** One core and 1 GiB of memory; sizing isn't documented or

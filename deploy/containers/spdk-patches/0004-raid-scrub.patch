@@ -28,7 +28,8 @@ runs and on raid bdevs with separate metadata.
 
 Also: the schema entries, rpc.py commands and RPC documentation.
 
-Unit tests: test_raid_scrub, test_raid_scrub_stops_for_rebuild (with memory-backed base bdevs).
+Unit tests: test_raid_scrub, test_raid_scrub_stops_for_rebuild (with memory-backed base bdevs),
+test_raid_scrub_due_tsc (the rate limit past 64-bit products).
 
 Applies to SPDK v26.09 (0bbb7fe4dccfb31e8d446da8822360704949d1e9) after 0001-0003.
 ---
@@ -103,7 +104,7 @@ index 6d7a764..229d8bc 100644
  
  {{ bdev_split_create_description }}
 diff --git a/module/bdev/raid/bdev_raid.c b/module/bdev/raid/bdev_raid.c
-index a3c140b..10cc121 100644
+index a3c140b..cd326c8 100644
 --- a/module/bdev/raid/bdev_raid.c
 +++ b/module/bdev/raid/bdev_raid.c
 @@ -88,6 +88,9 @@ struct raid_process_finish_action {
@@ -174,7 +175,7 @@ index a3c140b..10cc121 100644
  	process = raid_bdev_process_alloc(target->raid_bdev, RAID_PROCESS_REBUILD, target);
  	if (process == NULL) {
  		return -ENOMEM;
-@@ -4207,6 +4240,591 @@ done:
+@@ -4207,6 +4240,605 @@ done:
  }
  
  /* Log component for bdev raid bdev module */
@@ -581,6 +582,19 @@ index a3c140b..10cc121 100644
 +	raid_scrub_read(scrub);
 +}
 +
++/*
++ * The tick by which bytes_done may have been scrubbed at bytes_per_sec. bytes_done * hz would
++ * overflow 64 bits after a few GB at a GHz tick rate, so whole seconds are counted apart.
++ */
++static uint64_t
++raid_scrub_due_tsc(uint64_t start_tsc, uint64_t bytes_done, uint64_t bytes_per_sec, uint64_t hz)
++{
++	uint64_t secs = bytes_done / bytes_per_sec;
++	uint64_t rem = bytes_done % bytes_per_sec;
++
++	return start_tsc + secs * hz + (uint64_t)((double)rem * (double)hz / (double)bytes_per_sec);
++}
++
 +static void
 +raid_scrub_next_window(struct raid_bdev_scrub *scrub)
 +{
@@ -598,7 +612,8 @@ index a3c140b..10cc121 100644
 +	}
 +	if (scrub->bytes_per_sec != 0) {
 +		uint64_t hz = spdk_get_ticks_hz();
-+		uint64_t due = scrub->start_tsc + scrub->bytes_done * hz / scrub->bytes_per_sec;
++		uint64_t due = raid_scrub_due_tsc(scrub->start_tsc, scrub->bytes_done,
++						  scrub->bytes_per_sec, hz);
 +		uint64_t now = spdk_get_ticks();
 +
 +		if (now < due) {
@@ -1002,7 +1017,7 @@ index c087269..c69bcc0 100644
      description: This is used to split an underlying block device and create several smaller equal-sized vbdevs.
      params:
 diff --git a/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c b/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c
-index 46a60ed..6e92aed 100644
+index 46a60ed..e7c6861 100644
 --- a/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c
 +++ b/test/unit/lib/bdev/raid/bdev_raid.c/bdev_raid_ut.c
 @@ -191,14 +191,111 @@ DEFINE_STUB(spdk_json_write_named_uuid, int, (struct spdk_json_write_ctx *w, con
@@ -1141,7 +1156,7 @@ index 46a60ed..6e92aed 100644
  	if (cb_fn) {
  		cb_fn(cb_arg, 0);
  	}
-@@ -1902,6 +2001,275 @@ test_bdev_ioch_destroy(void *io_device, void *ctx_buf)
+@@ -1902,6 +2001,289 @@ test_bdev_ioch_destroy(void *io_device, void *ctx_buf)
  {
  }
  
@@ -1373,6 +1388,20 @@ index 46a60ed..6e92aed 100644
 +	ut_scrub_teardown();
 +}
 +
++/* The rate limit's deadline doesn't overflow when bytes_done * hz exceeds 64 bits. */
++static void
++test_raid_scrub_due_tsc(void)
++{
++	uint64_t hz = 3000000000ULL, bps = 200ULL * 1024 * 1024;
++
++	CU_ASSERT(raid_scrub_due_tsc(7, 0, bps, hz) == 7);
++	CU_ASSERT(raid_scrub_due_tsc(0, bps / 2, bps, hz) == hz / 2);
++	/* 100 GiB at 200 MiB/s: 512 s, far past the 64-bit limit of bytes_done * hz. */
++	CU_ASSERT(raid_scrub_due_tsc(1000, 100ULL << 30, bps, hz) == 1000 + 512 * hz);
++	/* 250 GiB plus half a second's worth. */
++	CU_ASSERT(raid_scrub_due_tsc(0, (250ULL << 30) + bps / 2, bps, hz) == 1280 * hz + hz / 2);
++}
++
 +static void
 +test_raid_scrub_stops_for_rebuild(void)
 +{
@@ -1417,12 +1446,13 @@ index 46a60ed..6e92aed 100644
  int
  main(int argc, char **argv)
  {
-@@ -1927,6 +2295,8 @@ main(int argc, char **argv)
+@@ -1927,6 +2309,9 @@ main(int argc, char **argv)
  	CU_ADD_TEST(suite, test_raid_process);
  	CU_ADD_TEST(suite, test_raid_start_degraded);
  	CU_ADD_TEST(suite, test_raid_process_with_qos);
 +	CU_ADD_TEST(suite, test_raid_scrub);
 +	CU_ADD_TEST(suite, test_raid_scrub_stops_for_rebuild);
++	CU_ADD_TEST(suite, test_raid_scrub_due_tsc);
  
  	spdk_thread_lib_init(test_new_thread_fn, 0);
  	g_app_thread = spdk_thread_create("app_thread", NULL);
