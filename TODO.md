@@ -1045,8 +1045,12 @@ Everything here was written by Gemini and is in scope to rewrite.
     render (nil pointer), CBT on or off. Fixed: the templates read the release's values over the
     chart's own `values.yaml` defaults (`velocor-csi.snapshotMetadata` helper, still one pin);
     README recommends `--reset-then-reuse-values`.
-  *Left:* Kasten incremental backup/restore round trip compared byte for byte, and the sidecar
-  on the x86 cluster, per the sidecar rule.
+  Same test on the x86 cluster (same build, 2026-11-20): identical block lists, both verifier
+  runs pass, devices identical; the sidecar now runs on both clusters.
+  - Kasten (9.0.10) doesn't use the SnapshotMetadata API for generic CSI drivers: its CBT paths
+    are Azure Disk, AWS EBS direct and vSphere, plus KubeVirt's VM-level CBT (9.0.6+, independent
+    of the storage). A Kasten export of a Velocor volume reads the whole snapshot. Not tested.
+  *Left:* a backup tool that consumes the API, when one does (Kasten, Velero, ...).
 
 - [ ] **L-3. Parity RAID (RAID5/6) for capacity efficiency.** Requested 2026-11-16. SPDK's only
   parity RAID, `raid5f`, accepts full-stripe writes only and the lvol blobstore can't even create
