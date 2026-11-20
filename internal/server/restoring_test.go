@@ -8,7 +8,7 @@ import (
 )
 
 // After spdk_tgt restarts, status mustn't say ONLINE on the strength of a pass that reconciled
-// the previous process (TODO.md P2-11): it says RECONCILING until a pass covers the new one.
+// the previous process (docs/review-history.md P2-11): it says RECONCILING until a pass covers the new one.
 func TestStatusAfterDataPlaneRestart(t *testing.T) {
 	h := newHarness(t)
 	var inst atomic.Value

@@ -9,7 +9,7 @@ import (
 	"github.com/velocor/velocor/internal/store"
 )
 
-// The volatile write cache of NVMe drives SPDK owns (TODO.md P0-4, steps 1 and 4 for NVMe).
+// The volatile write cache of NVMe drives SPDK owns (docs/review-history.md P0-4, steps 1 and 4 for NVMe).
 // The kernel can't see a drive bound to vfio-pci, so the cache is read and set with admin
 // commands through SPDK:
 //   - Identify Controller (CNS 01h): VWC (byte 525, bit 0) says whether the drive has a

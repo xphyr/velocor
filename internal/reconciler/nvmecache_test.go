@@ -9,7 +9,7 @@ import (
 )
 
 // The reconciler reads the write cache of NVMe drives SPDK owns, keeps it off where the policy
-// says so, and rates the pool by its weakest member (TODO.md P0-4).
+// says so, and rates the pool by its weakest member (docs/review-history.md P0-4).
 func TestNVMeWriteCacheKeptOffAndPoolDurability(t *testing.T) {
 	e := newEnv(t)
 	e.fake.SetNVMeCache("0000:01:00.0", spdktest.NVMeCache{Present: true, Enabled: true, Saveable: true})

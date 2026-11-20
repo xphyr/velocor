@@ -16,7 +16,7 @@ import (
 )
 
 // The metrics below are what the shipped alert rules (deploy/monitoring) and the UI's history
-// graphs use (TODO.md P1-1). Health metrics carry the current state as a label with the value
+// graphs use (docs/review-history.md P1-1). Health metrics carry the current state as a label with the value
 // 1 (velocor_pool_health{pool="p",status="DEGRADED"} 1), so a rule selects the states it
 // cares about; when the state changes, the old series ends.
 
@@ -422,7 +422,7 @@ func (s *Server) ioMetrics(ctx context.Context, m *metricSet, pools []*store.Poo
 	}
 }
 
-// scrubMetrics reports each pool's scrub (TODO.md P2-2). The finding counters are the current
+// scrubMetrics reports each pool's scrub (docs/review-history.md P2-2). The finding counters are the current
 // run's so far, or the last run's: a new run starts them at 0 again.
 func (s *Server) scrubMetrics(m *metricSet, pools []*store.Pool, now time.Time) {
 	const (

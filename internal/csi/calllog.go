@@ -10,7 +10,7 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-// logCalls logs every CSI call that changes something (TODO.md P2-7): method, the volume,
+// logCalls logs every CSI call that changes something (docs/review-history.md P2-7): method, the volume,
 // snapshot or node it concerns, duration and result, so failures show in the driver's log and
 // not only as Kubernetes events. Frequent read-only calls are logged only when they fail.
 // Requests themselves are never logged: they can carry secrets.

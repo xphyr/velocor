@@ -13,7 +13,7 @@ import (
 )
 
 // paramPortals is the StorageClass parameter naming the portals a class's volumes are exported
-// on (TODO.md P1-13): Velocor portal names or IDs, comma-separated, all of the class's
+// on (docs/review-history.md P1-13): Velocor portal names or IDs, comma-separated, all of the class's
 // protocol. Nodes connect to every one (NVMe/TCP multipath; iSCSI fails over between them).
 // Without it the driver's --default-portals apply, and without those the protocol's only
 // portal; with several portals and no choice, provisioning is refused rather than guessed.

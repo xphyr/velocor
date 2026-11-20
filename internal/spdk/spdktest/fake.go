@@ -1297,7 +1297,7 @@ var handlers = map[string]handler{
 		s.AllowAnyHost = boolean(p, "allow_any_host")
 		return true, nil
 	},
-	// No nvmf_subsystem_pause/resume: SPDK v26.09 has no such RPCs (TODO.md P1-15), and a fake
+	// No nvmf_subsystem_pause/resume: SPDK v26.09 has no such RPCs (docs/review-history.md P1-15), and a fake
 	// that answers what the real one can't hides exactly that kind of bug.
 	"nvmf_subsystem_get_controllers": func(f *Fake, p map[string]any) (any, *rpcErr) {
 		if _, ok := f.subsystems[str(p, "nqn")]; !ok {

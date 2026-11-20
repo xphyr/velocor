@@ -29,6 +29,24 @@ While the jobs ran, a sampler on the appliance recorded every 10 s: CPU time, pe
 utilisation (`/proc/diskstats`), SAN NIC bytes, and each SPDK thread's busy/idle ticks
 (`thread_get_stats`).
 
+## 2026-11-20: host I/O during a scrub
+
+**Setup.** The appliance on virtio-scsi disks (one SPDK core), build dev-8311b3a; one 20 GiB raw
+block iSCSI PVC on a RAID1 pool, filled first; 4K random 70% read / 30% write for 60 s with
+`direct=1`, `libaio`, one job; a single run each, so differences of a few percent are noise.
+
+| Scrub on the pool | QD1 read / write IOPS | QD1 read p99 | QD16 read / write IOPS |
+|---|---|---|---|
+| none | 1,075 / 458 | 1.5 ms | 11,236 / 4,819 |
+| 200 MiB/s (the default limit) | 856 / 367 | 4.0 ms | 9,490 / 4,075 |
+| unthrottled (~1.17 GB/s) | 443 / 189 | 3.7 ms | 5,225 / 2,243 |
+
+- At the default limit a scrub costs about a sixth of the pool's IOPS; unthrottled it halves them.
+- Tail latency at QD1 rises about as much either way: each 1 MiB window briefly holds host I/O
+  to that range; the limit only spaces the windows out.
+- The unthrottled row was taken before the rate-limit fix (dev-3705715), when the limit stopped
+  working after ~7 GB.
+
 ## 2026-11-19: baseline before the next Fedora release (Fedora 45)
 
 **Setup.** The same appliance and client as the virtio-scsi run below, on build dev-cdf1064
@@ -166,7 +184,7 @@ p99 0.89 ms.
   iSCSI target writes each 128K request to the disks as two 64K writes.
 - **The durable variants (`dsync`, `fsync`) match the plain writes.** The volumes advertise no
   volatile write cache, so the client sends no flushes. Advertising and honouring a cache is
-  P0-4 in [TODO.md](../TODO.md).
+  L-1 in [TODO.md](../TODO.md).
 - **Emulated SATA caps this setup.** The same SSDs reach several times these numbers from a
   client that reaches them without the extra virtual disk layer (deep random reads around 61k
   IOPS, against 17–19k here). QEMU's AHCI emulation has a shallow queue and processes all I/O in

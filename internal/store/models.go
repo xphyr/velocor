@@ -52,16 +52,16 @@ type Settings struct {
 	// intact) before the reconciler purges it; nil means DefaultVolumeRetention, 0 deletes at
 	// once.
 	VolumeRetentionHours *uint32 `json:"volume_retention_hours,omitempty"`
-	// MonitoringEnabled runs the built-in Prometheus and Alertmanager (TODO.md P1-1).
+	// MonitoringEnabled runs the built-in Prometheus and Alertmanager (docs/review-history.md P1-1).
 	MonitoringEnabled bool `json:"monitoring_enabled,omitempty"`
 	// OSUpgrade records the OS image velod last staged, so that after the reboot it can tell
-	// whether the appliance actually booted it (TODO.md P1-7). nil: nothing pending.
+	// whether the appliance actually booted it (docs/review-history.md P1-7). nil: nothing pending.
 	OSUpgrade *OSUpgradeRecord `json:"os_upgrade,omitempty"`
 	// Alerting configures where the built-in Alertmanager sends alerts and how the shipped
 	// rules are tuned. Its secrets stay in this database (and its backups), never in the pools'
 	// metadata copies, and the API never returns them.
 	Alerting AlertingSettings `json:"alerting,omitempty"`
-	// Scrub schedules the pools' background scrubs (TODO.md P2-2).
+	// Scrub schedules the pools' background scrubs (docs/review-history.md P2-2).
 	Scrub ScrubSettings `json:"scrub,omitempty"`
 }
 
@@ -385,7 +385,7 @@ type Disk struct {
 	SPDKBdevName     string          `json:"spdk_bdev_name,omitempty"`
 	// BdevUUID is the UUID of the disk's SPDK base bdev when it differs from the one derived
 	// from the disk ID: a pool member that came back under a new ID keeps the UUID its RAID
-	// superblock knows it by (TODO.md P1-14). Empty: derived from the ID.
+	// superblock knows it by (docs/review-history.md P1-14). Empty: derived from the ID.
 	BdevUUID     string       `json:"bdev_uuid,omitempty"`
 	HealthStatus HealthStatus `json:"health_status"`
 	Smart        SmartHealth  `json:"smart"`
@@ -464,7 +464,7 @@ type Pool struct {
 	// DiskIDs are the disks in the pool's RAID slots (ACTIVE or REBUILDING), in slot order.
 	DiskIDs []string `json:"disk_ids"`
 	// Durability is the weakest of the member disks' (maintained by the reconciler): AT_RISK
-	// when any member can lose acknowledged writes on power loss (TODO.md P0-4).
+	// when any member can lose acknowledged writes on power loss (docs/review-history.md P0-4).
 	Durability Durability `json:"durability,omitempty"`
 	// Members is the state of every RAID slot (maintained by the reconciler from SPDK).
 	Members []PoolMember `json:"members,omitempty"`

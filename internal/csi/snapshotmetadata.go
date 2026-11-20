@@ -16,7 +16,7 @@ const defaultMetadataChunkSize = 256
 // allocated blocks of a snapshot are the clusters of its whole chain, the changed blocks
 // between two snapshots of a volume those of the layers after the base, up to the target. The
 // driver registers and advertises it only when enabled (--snapshot-metadata), since it also
-// needs the external-snapshot-metadata sidecar (TODO.md L-2).
+// needs the external-snapshot-metadata sidecar (docs/review-history.md L-2).
 type SnapshotMetadataServer struct {
 	csi.UnimplementedSnapshotMetadataServer
 	client VelocorClient

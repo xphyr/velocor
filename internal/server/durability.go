@@ -14,7 +14,7 @@ import (
 )
 
 // handleUpdateDisk changes a disk's operator settings: the power-loss-protection declaration and
-// the write cache policy (TODO.md P0-4). Disabling the cache takes effect at once and is then
+// the write cache policy (docs/review-history.md P0-4). Disabling the cache takes effect at once and is then
 // enforced on every reconciler pass; going back to "leave" switches the cache on again.
 func (s *Server) handleUpdateDisk(w http.ResponseWriter, r *http.Request) {
 	var req struct {

@@ -6,7 +6,7 @@ import (
 	"time"
 )
 
-// Health endpoints (TODO.md P2-6), unauthenticated and without detail: what failed is in the
+// Health endpoints (docs/review-history.md P2-6), unauthenticated and without detail: what failed is in the
 // authenticated status and velod's log, not something to hand anyone who can reach the port.
 //
 //   GET /healthz  velod is serving requests (liveness: the quadlet's HealthCmd uses it).

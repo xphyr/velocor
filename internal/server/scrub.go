@@ -11,7 +11,7 @@ import (
 	"github.com/velocor/velocor/internal/store"
 )
 
-// Background scrubs of the pools (TODO.md P2-2). SPDK patch 0004 does the reading, comparing and
+// Background scrubs of the pools (docs/review-history.md P2-2). SPDK patch 0004 does the reading, comparing and
 // repairing; velod schedules it, follows it and keeps the results:
 //
 //   - a run covers a pool once. It can span several SPDK scrubs ("segments"): a scheduled run

@@ -16,7 +16,7 @@ import (
 // status warns that nothing would alert anyone.
 const noScrapeGrace = 15 * time.Minute
 
-// WithMonitoring enables the built-in Prometheus/Alertmanager setting (TODO.md P1-1). Without
+// WithMonitoring enables the built-in Prometheus/Alertmanager setting (docs/review-history.md P1-1). Without
 // it, the monitoring API reports the feature as unavailable.
 func WithMonitoring(m *monitoring.Manager) Option {
 	return func(s *Server) { s.monitoring = m }

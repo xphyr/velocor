@@ -10,7 +10,7 @@ import (
 
 // NVMe admin commands sent through SPDK (bdev_nvme_send_cmd) to a controller SPDK owns: the
 // kernel can't reach a drive bound to vfio-pci, so this is the only way to ask it anything
-// SPDK has no RPC for, such as the volatile write cache (TODO.md P0-4).
+// SPDK has no RPC for, such as the volatile write cache (docs/review-history.md P0-4).
 
 // NvmeCmd is a 64-byte NVMe submission queue entry. SPDK fills in the command ID and the data
 // pointer.

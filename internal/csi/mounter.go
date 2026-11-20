@@ -128,7 +128,7 @@ type targetAddr struct{ ip, port string }
 
 // targetAddrs lists where a volume can be reached, in the controller's order:
 // VELOCOR_PORTAL_OVERRIDE (one address, deprecated), else the publish context's "portals",
-// else portal_ip/portal_port (controllers from before "portals", TODO.md P1-13).
+// else portal_ip/portal_port (controllers from before "portals", docs/review-history.md P1-13).
 func targetAddrs(publishCtx map[string]string) ([]targetAddr, error) {
 	if override := strings.TrimSpace(os.Getenv("VELOCOR_PORTAL_OVERRIDE")); override != "" {
 		if h, p, ok := strings.Cut(override, ":"); ok && h != "" && p != "" {

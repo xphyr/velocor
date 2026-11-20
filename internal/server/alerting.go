@@ -14,7 +14,7 @@ import (
 	"github.com/velocor/velocor/internal/store"
 )
 
-// Alerting settings (TODO.md P1-1 step 3). Secrets (SMTP password, webhook and heartbeat URLs)
+// Alerting settings (docs/review-history.md P1-1 step 3). Secrets (SMTP password, webhook and heartbeat URLs)
 // are never returned: the API reports whether each is set.
 
 type emailView struct {

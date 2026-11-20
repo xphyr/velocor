@@ -12,7 +12,7 @@ import (
 	"github.com/velocor/velocor/internal/store"
 )
 
-// relinkMovedMembers finds pool members that came back under a new disk ID (TODO.md P1-14)
+// relinkMovedMembers finds pool members that came back under a new disk ID (docs/review-history.md P1-14)
 // and moves them to their new disk records, keeping the bdev UUID their RAID superblock knows
 // them by; reconcileDisks then attaches them and SPDK examine assembles the array. It looks
 // only at pools whose RAID isn't online and members whose disk the last scan didn't find, and

@@ -61,7 +61,7 @@ type Server struct {
 	mon           monitoringState
 	net           *netChanges
 	os            osLifecycle
-	// scrubMu serializes the scrub scheduler and the scrub API (TODO.md P2-2).
+	// scrubMu serializes the scrub scheduler and the scrub API (docs/review-history.md P2-2).
 	scrubMu  sync.Mutex
 	netQuery func(context.Context) NetworkStatus // tests
 }
@@ -996,7 +996,7 @@ func (s *Server) handleSystemStatus(w http.ResponseWriter, r *http.Request) {
 		overall = store.HealthStatusDegraded
 	case restoring:
 		// spdk_tgt answers, but it was (re)started after the last completed pass: pools,
-		// volumes and exports aren't back yet (TODO.md P2-11).
+		// volumes and exports aren't back yet (docs/review-history.md P2-11).
 		overall = store.HealthStatusReconciling
 	}
 

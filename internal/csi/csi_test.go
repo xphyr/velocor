@@ -540,7 +540,7 @@ func seedBackend(t *testing.T, st *store.BoltStore, poolID string) *spdktest.Fak
 }
 
 // A protected volume's DeleteVolume fails with FailedPrecondition (the provisioner retries);
-// an unprotected one is deleted, kept by velod until its retention ends (TODO.md P1-4).
+// an unprotected one is deleted, kept by velod until its retention ends (docs/review-history.md P1-4).
 func TestDeleteVolumeProtectionAndRetention(t *testing.T) {
 	tmp := t.TempDir()
 	db, err := store.OpenBoltStore(filepath.Join(tmp, "velocor.db"))

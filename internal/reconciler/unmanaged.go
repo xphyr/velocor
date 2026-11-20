@@ -9,7 +9,7 @@ import (
 	"github.com/velocor/velocor/internal/meta"
 )
 
-// UnmanagedObject is something in spdk_tgt that no store record accounts for (TODO.md P1-5):
+// UnmanagedObject is something in spdk_tgt that no store record accounts for (docs/review-history.md P1-5):
 // left behind by a failed rollback, a crash between an SPDK call and the store write, or a
 // manual change, or, after the database was lost, the only trace of data that still exists.
 // The reconciler reports these and never deletes them.

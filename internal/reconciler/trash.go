@@ -11,7 +11,7 @@ import (
 )
 
 // purgeDeletedVolumes deletes the data of deleted volumes whose retention period has ended
-// (TODO.md P1-4). Only in pools that are online, so a pool that is still assembling never
+// (docs/review-history.md P1-4). Only in pools that are online, so a pool that is still assembling never
 // loses a volume to a lookup that failed; a failed delete is retried next pass.
 func (r *Reconciler) purgeDeletedVolumes(ctx context.Context, p *pass, poolOnline map[string]bool) {
 	volumes, err := r.store.ListVolumes("")

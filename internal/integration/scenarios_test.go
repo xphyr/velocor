@@ -151,7 +151,7 @@ func TestSnapshotsAndClones(t *testing.T) {
 	a.must("DELETE", "/deleted-volumes/"+vol["id"].(string), nil, "") // purge: the lvol goes from SPDK
 	cin.mustRead(0, first)
 
-	// Changed-block tracking from SPDK's cluster maps (patch 0005, TODO.md L-2): cluster 0 was
+	// Changed-block tracking from SPDK's cluster maps (patch 0005, docs/review-history.md L-2): cluster 0 was
 	// written before s1, cluster 3 between s1 and s2. Still right with the source volume gone.
 	extentsOf := func(path string) [][2]int {
 		t.Helper()
@@ -221,9 +221,9 @@ func TestWriteCacheAndFlushAdvertised(t *testing.T) {
 		types, _ := raw["supported_io_types"].(map[string]any)
 		t.Logf("%-16s %-40s write_cache=%v flush=%v", b.what, b.name, raw["write_cache"], types["flush"])
 		if types["flush"] != true {
-			// Known issue TODO.md P0-4: SPDK's lvol module doesn't support FLUSH and RAID
+			// Known issue TODO.md L-1 (P0-4): SPDK's lvol module doesn't support FLUSH and RAID
 			// reports no write cache, so hosts are told writes are durable on completion.
-			t.Skipf("KNOWN ISSUE (TODO.md P0-4): %s bdev %s does not support FLUSH, so a host's flush cannot reach the disks", b.what, b.name)
+			t.Skipf("KNOWN ISSUE (TODO.md L-1): %s bdev %s does not support FLUSH, so a host's flush cannot reach the disks", b.what, b.name)
 		}
 	}
 }
@@ -320,7 +320,7 @@ func TestRAID5FRefused(t *testing.T) {
 	}
 }
 
-// Group snapshots on real SPDK (TODO.md P1-15, SPDK patch 0003) of exported volumes, one of
+// Group snapshots on real SPDK (docs/review-history.md P1-15, SPDK patch 0003) of exported volumes, one of
 // them being written: SPDK quiesces both, snapshots them and resumes I/O in one RPC. The writer
 // runs at queue depth 1 with 4 KiB blocks, so its writes are strictly sequential and any point
 // in time shows a prefix of new blocks followed by old ones; the snapshot must show exactly that
@@ -417,7 +417,7 @@ func TestGroupSnapshots(t *testing.T) {
 	}
 }
 
-// Scrub on real SPDK (TODO.md P2-2, SPDK patch 0004): a mirror copy changed behind SPDK's back
+// Scrub on real SPDK (docs/review-history.md P2-2, SPDK patch 0004): a mirror copy changed behind SPDK's back
 // (as after an unclean shutdown or silent corruption) is found by the scrub and rewritten from
 // the first member, the volume's data still reads back, and a second, check-only pass finds
 // nothing.

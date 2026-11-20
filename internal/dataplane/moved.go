@@ -9,7 +9,7 @@ import (
 	"github.com/velocor/velocor/internal/store"
 )
 
-// Pool members under new disk IDs (TODO.md P1-14). A disk's ID comes from what its controller
+// Pool members under new disk IDs (docs/review-history.md P1-14). A disk's ID comes from what its controller
 // reports (WWN, serial), so the same disk gets a new ID when it moves to another controller
 // (SATA to virtio-scsi, another HBA, a changed controller mode). Its SSD bdev UUID is derived
 // from the ID, and SPDK's RAID superblock knows members only by bdev UUID, so the array no

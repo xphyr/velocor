@@ -15,7 +15,7 @@ import (
 	"github.com/velocor/velocor/internal/store"
 )
 
-// Network changes are applied with NetworkManager's checkpoints (TODO.md P1-3): velod takes a
+// Network changes are applied with NetworkManager's checkpoints (docs/review-history.md P1-3): velod takes a
 // checkpoint of the interface, applies the change in memory only (nmcli --temporary), and an
 // administrator must confirm within the timeout from a connection that still works. Without a
 // confirmation NetworkManager itself restores the checkpoint, so an appliance that a change cut
