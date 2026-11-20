@@ -656,6 +656,13 @@ work still open, ranked by risk to data, how fixes are verified, and what has be
   nodes) and snoarm (arm64) with dev-867ddaa: iSCSI raw-block attach, write/read and detach;
   no Velocor sessions or node records left on any node afterwards (real iscsiadm: logout by
   session ID and `-m node -T <iqn> -o delete` both work on RHCOS 9.8).
+- [ ] **P2-16. Writes are slower than on 2026-11-18.** The 2026-11-19 baseline
+  ([docs/performance.md](docs/performance.md)) has QD1 writes at about half (3,900 to 2,000
+  IOPS) and deep writes about 20% lower than the virtio-scsi run a day earlier, with reads
+  unchanged. Candidates: build changes in between (P0-4's write-cache handling), the built-in
+  monitoring now running on the appliance, the NAS behind the virtual disks. *Next:* repeat the
+  write jobs with monitoring off, then on dev-a548637, to find which; only then decide whether
+  it's a regression.
 - [ ] **P2-1. CHAP and real host identities** (was S10). Any host that can spoof an allowed NQN
   or IQN gets access. The API rejects `chap_user` rather than silently ignoring it. *Needed:*
   iSCSI CHAP auth groups and NVMe DH-HMAC-CHAP with encrypted secrets; the CSI node plugin
