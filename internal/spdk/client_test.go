@@ -90,13 +90,13 @@ func TestSPDKClientTypedRPCs(t *testing.T) {
 		case "bdev_lvol_snapshot":
 			return "snap-uuid-9999", nil
 		case "bdev_lvol_get_fragmap":
-			return FragmapResponse{
-				ClusterSize: 65536,
-				Offset:      0,
-				Size:        8 * 65536,
-				NumClusters: 5,
-				Bitmask:     bitmaskB64,
-			}, nil
+			// Longhorn's / patch 0005's result for the whole lvol (no offset or size sent).
+			if params["name"] != "lvs_pool0/snap1" || params["offset"] != nil || params["size"] != nil {
+				return nil, &RPCError{Code: -32602, Message: "Invalid parameters"}
+			}
+			return map[string]any{"cluster_size": 65536, "num_clusters": 8, "num_allocated_clusters": 5, "fragmap": bitmaskB64}, nil
+		case "bdev_get_bdevs":
+			return []map[string]any{{"name": "u", "driver_specific": map[string]any{"lvol": map[string]any{"clone": true, "base_snapshot": "snap0"}}}}, nil
 		case "nvmf_create_subsystem":
 			return true, nil
 		case "nvmf_subsystem_add_ns":
@@ -174,11 +174,18 @@ func TestSPDKClientTypedRPCs(t *testing.T) {
 		t.Fatalf("BdevLvolSnapshot failed: %q, %v", snapUUID, err)
 	}
 
-	frag, err := client.BdevLvolGetFragmap(ctx, "lvs_pool0/snap1", 0, 8*65536)
+	frag, err := client.BdevLvolGetFragmap(ctx, "lvs_pool0/snap1")
 	if err != nil {
 		t.Fatalf("BdevLvolGetFragmap failed: %v", err)
 	}
-	extents, err := DecodeFragmapExtents(frag)
+	if parent, err := client.BdevLvolParent(ctx, "lvs_pool0/snap1"); err != nil || parent != "snap0" {
+		t.Fatalf("BdevLvolParent: %q, %v", parent, err)
+	}
+	// Clipped to the lvol's usable size: 5.5 clusters cut the last extent in half.
+	if clipped, err := DecodeFragmapExtents(frag, 5*65536+32768); err != nil || len(clipped) != 2 || clipped[1].SizeBytes != 65536+32768 {
+		t.Fatalf("clipped extents: %+v, %v", clipped, err)
+	}
+	extents, err := DecodeFragmapExtents(frag, 0)
 	if err != nil {
 		t.Fatalf("DecodeFragmapExtents failed: %v", err)
 	}

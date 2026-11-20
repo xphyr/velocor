@@ -71,6 +71,24 @@ sidecars:
     image: registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.18.0@sha256:b7fefd08651f00ac4df1a196ed4c621c2451fbb899297fe9fad9e36c667af0c0
     resources: {}
 
+# Changed-block tracking for incremental backups (CSI SnapshotMetadata, KEP-3314; TODO.md L-2).
+# Off by default. Needs the appliance's data plane with SPDK patch 0005 (bdev_lvol_get_fragmap),
+# the cluster's SnapshotMetadataService CRD (cbt.storage.k8s.io/v1beta1, installed from
+# kubernetes-csi/external-snapshot-metadata, like the VolumeSnapshot CRDs), and a TLS
+# certificate for the sidecar's service. The sidecar is pinned like the others above.
+snapshotMetadata:
+  enabled: false
+  image: registry.k8s.io/sig-storage/csi-snapshot-metadata:v1.1.0@sha256:8069b3bc03f21fe804f6f362c26037598b9f947a9e3e9d60336988ca7c07f61e
+  resources: {}
+  # Secret with tls.crt and tls.key, valid for velocor-csi-snapshot-metadata.<namespace>.svc.
+  # Empty: on OpenShift the service CA issues one; elsewhere it is required.
+  tlsSecretName: ""
+  # PEM CA certificate that issued it, given to backup clients through the
+  # SnapshotMetadataService. Empty: on OpenShift the service CA bundle.
+  caCert: ""
+  # Audience backup clients' tokens must be issued for. Empty: the driver name.
+  audience: ""
+
 storageClasses:
   nvmeTcp:
     enabled: true

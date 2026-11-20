@@ -67,6 +67,7 @@ type raidBdev struct {
 	failed      bool // lost too many members while online
 	operational int
 	rebuild     *raidRebuild
+	scrub       *spdk.RaidScrub // running or last scrub (patch 0004)
 	sb          *raidSuperblock // the array's current superblock (nil without one)
 	// deleting: bdev_raid_delete was called while an lvstore was loaded on top. Real spdk_tgt
 	// then leaves the RAID half-deleted ("offline") until the lvstore goes away.
@@ -142,6 +143,7 @@ func (f *Fake) goOnlineLocked(r *raidBdev) {
 // memberGoneLocked handles a member leaving a running array: hot-removed (failed) or removed
 // with bdev_raid_remove_base_bdev.
 func (f *Fake) memberGoneLocked(r *raidBdev, slot int, state string) {
+	stopScrubLocked(r, -19) // ENODEV, as SPDK does when a member is removed
 	r.Members[slot] = ""
 	if !r.online {
 		return // configuring: the slot simply isn't discovered (yet)
@@ -189,6 +191,56 @@ func (f *Fake) FailMedia(key string) {
 			}
 		}
 	}
+}
+
+// fakeScrubBlocks is the size every fake scrub covers.
+const fakeScrubBlocks = 1 << 20
+
+func stopScrubLocked(r *raidBdev, status int32) {
+	if r.scrub != nil && r.scrub.State == spdk.ScrubRunning {
+		r.scrub.State, r.scrub.Status = spdk.ScrubStopped, status
+	}
+}
+
+// SetScrubStep makes a running scrub advance by blocks per bdev_raid_get_bdevs call (of
+// fakeScrubBlocks); 0, the default, completes it at the next call.
+func (f *Fake) SetScrubStep(blocks uint64) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.scrubStep = blocks
+}
+
+// SetScrubFindings adds to the counters of the scrub running on raid, as if it had found
+// unreadable copies (repaired), differing ones and unrecoverable blocks.
+func (f *Fake) SetScrubFindings(raid string, repaired, mismatched, unrecoverable uint64) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	r := f.raids[raid]
+	if r == nil || r.scrub == nil || r.scrub.State != spdk.ScrubRunning {
+		f.t.Fatalf("spdktest: SetScrubFindings: no scrub running on %s", raid)
+	}
+	r.scrub.RepairedBlocks += repaired
+	r.scrub.MismatchedBlocks += mismatched
+	if r.scrub.Repair {
+		r.scrub.MismatchRepairedBlocks += mismatched
+	}
+	r.scrub.UnrecoverableBlocks += unrecoverable
+}
+
+// ForgetScrubs drops every RAID's scrub state, as a restarted spdk_tgt would.
+func (f *Fake) ForgetScrubs() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, r := range f.raids {
+		r.scrub = nil
+	}
+}
+
+// ScrubStarts returns the start offsets of the bdev_raid_scrub_start calls on raid so far.
+func (f *Fake) ScrubStarts(raid string) []uint64 {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]uint64(nil), f.scrubStarts[raid]...)
 }
 
 // SetRebuildProgress sets the progress of the rebuild running on raid; 100 completes it.
@@ -339,6 +391,16 @@ func init() {
 			if r.rebuild != nil && f.rebuildStep > 0 {
 				f.advanceRebuildLocked(r, r.rebuild.Percent+f.rebuildStep)
 			}
+			if r.rebuild != nil {
+				stopScrubLocked(r, -16) // EBUSY: a rebuild stops the scrub
+			}
+			if sc := r.scrub; sc != nil && sc.State == spdk.ScrubRunning {
+				if f.scrubStep == 0 || sc.OffsetBlocks+f.scrubStep >= sc.TotalBlocks {
+					sc.OffsetBlocks, sc.State = sc.TotalBlocks, spdk.ScrubCompleted
+				} else {
+					sc.OffsetBlocks += f.scrubStep
+				}
+			}
 			var list []spdk.RaidBaseBdev
 			for i, m := range r.Members {
 				b := spdk.RaidBaseBdev{Name: m, IsConfigured: m != ""}
@@ -357,6 +419,10 @@ func init() {
 			if r.rebuild != nil {
 				info.Process = &spdk.RaidProcess{Type: "rebuild", Target: r.Members[r.rebuild.Slot]}
 				info.Process.Progress.Percent = r.rebuild.Percent
+			}
+			if r.scrub != nil {
+				sc := *r.scrub
+				info.Scrub = &sc
 			}
 			out = append(out, info)
 		}
@@ -441,6 +507,45 @@ func init() {
 			return nil, errf(codeENODEV, "No such device")
 		}
 		f.memberGoneLocked(r, slot, sbMissing)
+		return true, nil
+	}
+
+	handlers["bdev_raid_scrub_start"] = func(f *Fake, p map[string]any) (any, *rpcErr) {
+		r := f.raids[str(p, "name")]
+		switch {
+		case r == nil:
+			return nil, errf(codeENODEV, "raid bdev %s is not found in config", str(p, "name"))
+		case !r.online:
+			return nil, errf(codeENODEV, "Failed to start a scrub of %s: No such device", r.Name)
+		case r.rebuild != nil || (r.scrub != nil && r.scrub.State == spdk.ScrubRunning):
+			return nil, errf(codeEBUSY, "Failed to start a scrub of %s: Device or resource busy", r.Name)
+		}
+		start := num(p, "start_offset_blocks")
+		if start >= fakeScrubBlocks {
+			return nil, errf(codeEINVAL, "Failed to start a scrub of %s: Invalid argument", r.Name)
+		}
+		repair := true
+		if v, ok := p["repair"].(bool); ok {
+			repair = v
+		}
+		r.scrub = &spdk.RaidScrub{State: spdk.ScrubRunning, Repair: repair, Mirrored: strings.EqualFold(r.Level, "raid1") && r.operational > 1,
+			StartOffsetBlocks: start, OffsetBlocks: start, TotalBlocks: fakeScrubBlocks}
+		if f.scrubStarts == nil {
+			f.scrubStarts = map[string][]uint64{}
+		}
+		f.scrubStarts[r.Name] = append(f.scrubStarts[r.Name], start)
+		return true, nil
+	}
+
+	handlers["bdev_raid_scrub_stop"] = func(f *Fake, p map[string]any) (any, *rpcErr) {
+		r := f.raids[str(p, "name")]
+		if r == nil {
+			return nil, errf(codeENODEV, "raid bdev %s is not found in config", str(p, "name"))
+		}
+		if r.scrub == nil || r.scrub.State != spdk.ScrubRunning {
+			return nil, errf(-2, "No scrub of %s to stop: No such file or directory", r.Name)
+		}
+		stopScrubLocked(r, -125) // ECANCELED
 		return true, nil
 	}
 

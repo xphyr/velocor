@@ -39,6 +39,20 @@ func IsAlreadyExists(err error) bool {
 	return errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusConflict
 }
 
+// BlockExtent describes a contiguous allocated or changed byte range.
+type BlockExtent struct {
+	OffsetBytes uint64 `json:"offset_bytes"`
+	LengthBytes uint64 `json:"length_bytes"`
+}
+
+// BlockMetadataResult is velod's answer to blocks:allocated / blocks:changed (CBT).
+type BlockMetadataResult struct {
+	SnapshotID       string        `json:"snapshot_id"`
+	VolumeSizeBytes  uint64        `json:"volume_size_bytes"`
+	ClusterSizeBytes uint64        `json:"cluster_size_bytes"`
+	Extents          []BlockExtent `json:"extents"`
+}
+
 // VolumeGroupSnapshotResult represents a VolumeGroupSnapshot and its member Snapshots.
 type VolumeGroupSnapshotResult struct {
 	GroupSnapshot *store.VolumeGroupSnapshot `json:"volume_group_snapshot"`
@@ -90,6 +104,8 @@ type VelocorClient interface {
 	CreateSnapshot(ctx context.Context, volumeID, name string, labels map[string]string) (*store.Snapshot, error)
 	DeleteSnapshot(ctx context.Context, id string) error
 	CloneSnapshot(ctx context.Context, snapID, cloneName string, labels map[string]string) (*store.Volume, error)
+	GetSnapshotAllocatedBlocks(ctx context.Context, snapID string) (*BlockMetadataResult, error)
+	GetSnapshotChangedBlocks(ctx context.Context, targetSnapID, baseSnapID string) (*BlockMetadataResult, error)
 
 	CreateVolumeGroupSnapshot(ctx context.Context, name string, volumeIDs []string) (*VolumeGroupSnapshotResult, error)
 	GetVolumeGroupSnapshot(ctx context.Context, id string) (*VolumeGroupSnapshotResult, error)
@@ -311,6 +327,20 @@ func (c *HTTPClient) CloneSnapshot(ctx context.Context, snapID, cloneName string
 		"labels":     labels,
 	}, &resp)
 	return resp.Volume, err
+}
+
+func (c *HTTPClient) GetSnapshotAllocatedBlocks(ctx context.Context, snapID string) (*BlockMetadataResult, error) {
+	var resp BlockMetadataResult
+	err := c.doJSON(ctx, http.MethodGet, "/api/v1/snapshots/"+url.PathEscape(snapID)+"/blocks:allocated", nil, &resp)
+	return &resp, err
+}
+
+func (c *HTTPClient) GetSnapshotChangedBlocks(ctx context.Context, targetSnapID, baseSnapID string) (*BlockMetadataResult, error) {
+	var resp BlockMetadataResult
+	q := url.Values{}
+	q.Set("base_snapshot_id", baseSnapID)
+	err := c.doJSON(ctx, http.MethodGet, "/api/v1/snapshots/"+url.PathEscape(targetSnapID)+"/blocks:changed?"+q.Encode(), nil, &resp)
+	return &resp, err
 }
 
 func (c *HTTPClient) ListPortals(ctx context.Context) ([]*store.Portal, error) {

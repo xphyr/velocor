@@ -174,13 +174,13 @@ func (c *Client) BdevLvolDecoupleParent(ctx context.Context, name string) error 
 	return c.Call(ctx, "bdev_lvol_decouple_parent", params, nil)
 }
 
-// FragmapResponse represents the output of bdev_lvol_get_fragmap used for Changed Block Tracking (CBT).
+// FragmapResponse is bdev_lvol_get_fragmap's result: one bit per cluster of the lvol, cluster i
+// at bit i % 8 of byte i / 8 of the base64-decoded Fragmap, 1 where the lvol owns the cluster.
 type FragmapResponse struct {
-	ClusterSize uint32 `json:"cluster_size"`
-	Offset      uint64 `json:"offset"`
-	Size        uint64 `json:"size"`
-	NumClusters uint64 `json:"num_allocated_clusters"`
-	Bitmask     string `json:"bitmask"`
+	ClusterSize          uint64 `json:"cluster_size"`
+	NumClusters          uint64 `json:"num_clusters"`
+	NumAllocatedClusters uint64 `json:"num_allocated_clusters"`
+	Fragmap              string `json:"fragmap"`
 }
 
 // BlockExtent represents a contiguous range of allocated clusters in bytes.
@@ -213,22 +213,13 @@ func (c *Client) BdevLvolGetLvols(ctx context.Context) ([]LvolInfo, error) {
 	return res, nil
 }
 
-// BdevLvolGetFragmap queries the cluster allocation bitmask of a logical volume or snapshot
-// over the byte range [offset, offset+size).
-// In SPDK's thin-provisioned lvol chain, a snapshot's fragmap marks only the clusters
-// allocated specifically in that snapshot layer (delta since its parent), enabling O(metadata) CBT.
-func (c *Client) BdevLvolGetFragmap(ctx context.Context, name string, offset, size uint64) (*FragmapResponse, error) {
-	params := map[string]any{
-		"name": name,
-	}
-	if offset > 0 {
-		params["offset"] = offset
-	}
-	if size > 0 {
-		params["size"] = size
-	}
+// BdevLvolGetFragmap returns which clusters of an lvol the lvol has allocated itself (SPDK patch
+// 0005, the RPC of Longhorn's SPDK fork). Clusters it reads through from its parent are not
+// set, so a snapshot's map is what was written while it was the newest layer of its chain.
+// The whole lvol is mapped.
+func (c *Client) BdevLvolGetFragmap(ctx context.Context, name string) (*FragmapResponse, error) {
 	var res FragmapResponse
-	if err := c.Call(ctx, "bdev_lvol_get_fragmap", params, &res); err != nil {
+	if err := c.Call(ctx, "bdev_lvol_get_fragmap", map[string]any{"name": name}, &res); err != nil {
 		var rpcErr *RPCError
 		if errors.As(err, &rpcErr) && rpcErr.Code == -32601 {
 			// Never synthesise allocation data: a guessed bitmap would make incremental
@@ -240,62 +231,61 @@ func (c *Client) BdevLvolGetFragmap(ctx context.Context, name string, offset, si
 	return &res, nil
 }
 
+// BdevLvolParent returns the name (within its volume store) of the snapshot an lvol reads
+// through to, or "" if it has none (bdev_get_bdevs reports it as driver_specific.lvol
+// .base_snapshot).
+func (c *Client) BdevLvolParent(ctx context.Context, name string) (string, error) {
+	bdevs, err := c.BdevGetBdevs(ctx, name)
+	if err != nil {
+		return "", err
+	}
+	if len(bdevs) != 1 {
+		return "", fmt.Errorf("bdev_get_bdevs %s returned %d bdevs", name, len(bdevs))
+	}
+	lvol, ok := bdevs[0].DriverSpecific["lvol"].(map[string]any)
+	if !ok {
+		return "", fmt.Errorf("bdev %s is not an lvol", name)
+	}
+	parent, _ := lvol["base_snapshot"].(string)
+	return parent, nil
+}
+
 // ErrCBTUnsupported is returned when the running spdk_tgt cannot report per-cluster allocation.
 var ErrCBTUnsupported = errors.New("changed block tracking unsupported")
 
-// DecodeFragmapExtents decodes the base64-encoded bitmask from FragmapResponse into
-// coalesced contiguous BlockExtent ranges.
-func DecodeFragmapExtents(resp *FragmapResponse) ([]BlockExtent, error) {
-	if resp == nil || resp.ClusterSize == 0 || resp.Bitmask == "" {
-		return nil, nil
+// DecodeFragmapExtents turns a fragmap into coalesced byte extents, limited to the first
+// limitBytes of the lvol (its usable size; 0 for no limit).
+func DecodeFragmapExtents(resp *FragmapResponse, limitBytes uint64) ([]BlockExtent, error) {
+	if resp == nil || resp.ClusterSize == 0 {
+		return nil, fmt.Errorf("fragmap without a cluster size")
 	}
-	rawBytes, err := base64.StdEncoding.DecodeString(resp.Bitmask)
+	raw, err := base64.StdEncoding.DecodeString(resp.Fragmap)
 	if err != nil {
-		return nil, fmt.Errorf("decode fragmap base64 bitmask: %w", err)
+		return nil, fmt.Errorf("decode fragmap: %w", err)
 	}
-
-	clusterSz := uint64(resp.ClusterSize)
-	totalClusters := resp.Size / clusterSz
-	maxBits := uint64(len(rawBytes)) * 8
-	if totalClusters == 0 || totalClusters > maxBits {
-		totalClusters = maxBits
+	if uint64(len(raw))*8 < resp.NumClusters {
+		return nil, fmt.Errorf("fragmap of %d bytes for %d clusters", len(raw), resp.NumClusters)
 	}
-
-	var extents []BlockExtent
-	var inRun bool
-	var runStart uint64
-	var runLen uint64
-
-	for i := uint64(0); i < totalClusters; i++ {
-		byteIdx := i / 8
-		bitIdx := i % 8
-		allocated := (rawBytes[byteIdx] & (1 << bitIdx)) != 0
-
-		if allocated {
-			if !inRun {
-				inRun = true
-				runStart = resp.Offset + i*clusterSz
-				runLen = clusterSz
-			} else {
-				runLen += clusterSz
-			}
-		} else if inRun {
-			extents = append(extents, BlockExtent{
-				OffsetBytes: runStart,
-				SizeBytes:   runLen,
-			})
-			inRun = false
+	var out []BlockExtent
+	for i := uint64(0); i < resp.NumClusters; i++ {
+		if raw[i/8]&(1<<(i%8)) == 0 {
+			continue
+		}
+		off := i * resp.ClusterSize
+		if limitBytes > 0 && off >= limitBytes {
+			break
+		}
+		size := resp.ClusterSize
+		if limitBytes > 0 && off+size > limitBytes {
+			size = limitBytes - off
+		}
+		if n := len(out); n > 0 && out[n-1].OffsetBytes+out[n-1].SizeBytes == off {
+			out[n-1].SizeBytes += size
+		} else {
+			out = append(out, BlockExtent{OffsetBytes: off, SizeBytes: size})
 		}
 	}
-
-	if inRun {
-		extents = append(extents, BlockExtent{
-			OffsetBytes: runStart,
-			SizeBytes:   runLen,
-		})
-	}
-
-	return extents, nil
+	return out, nil
 }
 
 // MergeBlockExtents merges and coalesces multiple BlockExtent slices (e.g., across a snapshot delta chain)

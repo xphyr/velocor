@@ -71,6 +71,11 @@ type Store interface {
 	RelinkPoolMember(poolID, oldDiskID, newDiskID, bdevUUID string) (*Pool, error)
 	GetSettings() (*Settings, error)
 	SaveSettings(st *Settings) error
+	// GetScrubRecord returns a pool's scrub record (ErrNotFound if it was never scrubbed).
+	GetScrubRecord(poolID string) (*ScrubRecord, error)
+	// MutateScrubRecord applies fn to a pool's scrub record (a new one if none exists) in one
+	// transaction; ErrNotFound if the pool doesn't exist.
+	MutateScrubRecord(poolID string, fn func(*ScrubRecord) error) (*ScrubRecord, error)
 
 	// Volumes
 	CreateVolume(vol *Volume) error

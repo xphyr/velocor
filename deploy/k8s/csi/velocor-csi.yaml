@@ -128,6 +128,13 @@ spec:
           volumeMounts:
             - name: socket-dir
               mountPath: /csi
+        # Changed-block tracking (off): add --snapshot-metadata to the velocor-csi container,
+        # uncomment this sidecar, mount a TLS secret at /certs, and create a Service and a
+        # SnapshotMetadataService for it (the Helm chart's snapshotMetadata.enabled does all of
+        # that; see TODO.md L-2).
+        # - name: csi-snapshot-metadata
+        #   image: registry.k8s.io/sig-storage/csi-snapshot-metadata:v1.1.0@sha256:8069b3bc03f21fe804f6f362c26037598b9f947a9e3e9d60336988ca7c07f61e
+        #   args: [--csi-address=/csi/csi.sock, --tls-cert=/certs/tls.crt, --tls-key=/certs/tls.key]
       volumes:
         - name: socket-dir
           emptyDir: {}

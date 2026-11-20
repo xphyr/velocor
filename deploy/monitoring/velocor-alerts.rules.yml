@@ -115,6 +115,35 @@ groups:
           summary: "Pool {{ $labels.pool }}'s metadata copy can't be written"
           description: "The copy of Velocor's database kept on the pool is out of date; recovering the pool without the appliance's database would lose recent changes."
 
+      - alert: VelocorScrubFoundLostData
+        expr: velocor_pool_scrub_unrecoverable_blocks > 0
+        labels: {severity: critical}
+        annotations:
+          summary: "Scrub of pool {{ $labels.pool }} found {{ $value }} block(s) no copy could supply"
+          description: "Every member failed to read these blocks: data stored there is lost. Volumes on the pool may return read errors there; restore them from a backup or snapshot, and check the disks' SMART data."
+
+      - alert: VelocorScrubRepairFailed
+        expr: velocor_pool_scrub_write_errors > 0
+        labels: {severity: critical}
+        annotations:
+          summary: "Scrub of pool {{ $labels.pool }} couldn't rewrite a damaged copy"
+          description: "Rewriting an unreadable copy failed, so the member was failed out of the RAID. Replace the disk."
+
+      - alert: VelocorScrubRepaired
+        expr: velocor_pool_scrub_repaired_blocks > 0 or velocor_pool_scrub_mismatched_blocks > 0
+        labels: {severity: warning}
+        annotations:
+          summary: "Scrub of pool {{ $labels.pool }} found damaged or differing copies"
+          description: "Unreadable copies were rewritten from a good one, or mirror copies differed (expected after an unclean shutdown; made equal unless the scrub only checked). Repeated findings on one disk mean it is failing: check its SMART data. Clears when the next scrub finds nothing."
+
+      - alert: VelocorScrubOverdue
+        expr: velocor_pool_scrub_overdue == 1
+        for: 1h
+        labels: {severity: warning}
+        annotations:
+          summary: "Pool {{ $labels.pool }} hasn't been scrubbed for twice the scrub interval"
+          description: "Its copies haven't all been read recently, so latent disk errors could go unnoticed until a rebuild needs them. Check the pool's scrub status: it may keep being paused, or its window may be too short."
+
       - alert: VelocorPoolSpaceWarning
         expr: velocor_pool_space_state == 1
         for: 10m

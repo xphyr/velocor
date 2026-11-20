@@ -25,6 +25,7 @@ var (
 	bucketHosts                = []byte("hosts")
 	bucketInitiatorGroups      = []byte("initiator_groups")
 	bucketExports              = []byte("exports")
+	bucketScrubs               = []byte("scrubs") // per-pool ScrubRecord, keyed by pool ID
 
 	keySystemConfig = []byte("config")
 )
@@ -42,6 +43,7 @@ var allBuckets = [][]byte{
 	bucketHosts,
 	bucketInitiatorGroups,
 	bucketExports,
+	bucketScrubs,
 }
 
 var _ Store = (*BoltStore)(nil)
@@ -801,6 +803,9 @@ func (s *BoltStore) DeletePool(id string) error {
 			}
 		}
 
+		if err := tx.Bucket(bucketScrubs).Delete([]byte(id)); err != nil {
+			return err
+		}
 		return poolsB.Delete([]byte(id))
 	})
 }

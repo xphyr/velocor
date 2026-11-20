@@ -33,13 +33,13 @@ type DriverConfig struct {
 	Mounter    Mounter
 	// DefaultPortals applies to StorageClasses without a "portals" parameter.
 	DefaultPortals string
+	// SnapshotMetadata serves and advertises the CSI SnapshotMetadata service (changed-block
+	// tracking, KEP-3314) in the controller. It needs the external-snapshot-metadata sidecar.
+	SnapshotMetadata bool
 }
 
-// Driver hosts the CSI Identity, Controller, GroupController and Node gRPC services.
-//
-// The SnapshotMetadata service (changed-block tracking, KEP-3314) is deliberately absent:
-// SPDK has no RPC that reports a snapshot's allocated clusters, so the driver must not tell
-// backup tools it can answer. See TODO.md P1-9 / L-2.
+// Driver hosts the CSI Identity, Controller, GroupController and Node gRPC services, and the
+// SnapshotMetadata service (changed-block tracking) when configured to.
 type Driver struct {
 	cfg    DriverConfig
 	server *grpc.Server
@@ -62,7 +62,13 @@ func NewDriver(cfg DriverConfig) (*Driver, error) {
 	}
 
 	srv := grpc.NewServer(grpc.UnaryInterceptor(logCalls))
-	csi.RegisterIdentityServer(srv, NewIdentityServer(cfg.DriverName, cfg.Client))
+	metadata := cfg.SnapshotMetadata && cfg.Mode != ModeNode
+	ids := NewIdentityServer(cfg.DriverName, cfg.Client)
+	ids.snapshotMetadata = metadata
+	csi.RegisterIdentityServer(srv, ids)
+	if metadata {
+		csi.RegisterSnapshotMetadataServer(srv, NewSnapshotMetadataServer(cfg.Client))
+	}
 
 	switch cfg.Mode {
 	case ModeAll:

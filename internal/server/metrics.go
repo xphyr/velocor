@@ -155,6 +155,7 @@ func (s *Server) collectMetrics(ctx context.Context) *metricSet {
 		poolName[p.ID] = p.Name
 	}
 	poolMetrics(m, pools, vols)
+	s.scrubMetrics(m, pools, time.Now())
 	diskMetrics(m, disks, poolName)
 	volumeMetrics(m, vols, poolName)
 	if snaps, err := s.store.ListSnapshots("", ""); err == nil {
@@ -418,5 +419,47 @@ func (s *Server) ioMetrics(ctx context.Context, m *metricSet, pools []*store.Poo
 			m.counter(p+"write_seconds_total", "Time spent on writes (sum over all writes; divide its rate by the write rate for the average latency).",
 				float64(b.WriteLatencyTicks)/tick, l...)
 		}
+	}
+}
+
+// scrubMetrics reports each pool's scrub (TODO.md P2-2). The finding counters are the current
+// run's so far, or the last run's: a new run starts them at 0 again.
+func (s *Server) scrubMetrics(m *metricSet, pools []*store.Pool, now time.Time) {
+	const (
+		hRunning  = "Whether a pool is being scrubbed."
+		hProgress = "Progress of a pool's current (or paused) scrub run, 0 to 1."
+		hLast     = "When a scrub last covered the whole pool."
+		hOverdue  = "Whether a pool's scheduled scrub hasn't completed for twice the scrub interval."
+		hRepaired = "Blocks the current or last scrub found unreadable on a member and rewrote from a good copy."
+		hMismatch = "Blocks the current or last scrub found differing between a pool's mirror copies."
+		hLost     = "Blocks the current or last scrub could read from no member: data there is lost."
+		hWriteErr = "Repair writes of the current or last scrub that failed (the member was failed out)."
+	)
+	st, err := s.store.GetSettings()
+	if err != nil {
+		return
+	}
+	cfg := st.Scrub.Effective()
+	interval := time.Duration(cfg.IntervalDays) * 24 * time.Hour
+	for _, p := range pools {
+		l := []string{"pool", p.Name}
+		rec, err := s.store.GetScrubRecord(p.ID)
+		if err != nil {
+			rec = &store.ScrubRecord{}
+		}
+		m.gauge("velocor_pool_scrub_running", hRunning, b2f(rec.State == store.ScrubRunning), l...)
+		if (rec.State == store.ScrubRunning || rec.State == store.ScrubPaused) && rec.TotalBlocks > 0 {
+			m.gauge("velocor_pool_scrub_progress_ratio", hProgress, float64(rec.OffsetBlocks)/float64(rec.TotalBlocks), l...)
+		}
+		if !rec.LastCompletedAt.IsZero() {
+			m.gauge("velocor_pool_scrub_last_completed_timestamp_seconds", hLast, unixSeconds(rec.LastCompletedAt), l...)
+		}
+		since := maxTime(rec.LastCompletedAt, p.CreatedAt)
+		m.gauge("velocor_pool_scrub_overdue", hOverdue, b2f(!cfg.Disabled && now.Sub(since) > 2*interval), l...)
+		c := rec.Total()
+		m.gauge("velocor_pool_scrub_repaired_blocks", hRepaired, float64(c.RepairedBlocks), l...)
+		m.gauge("velocor_pool_scrub_mismatched_blocks", hMismatch, float64(c.MismatchedBlocks), l...)
+		m.gauge("velocor_pool_scrub_unrecoverable_blocks", hLost, float64(c.UnrecoverableBlocks), l...)
+		m.gauge("velocor_pool_scrub_write_errors", hWriteErr, float64(c.WriteErrors), l...)
 	}
 }

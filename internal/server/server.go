@@ -21,6 +21,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/velocor/velocor/internal/auth"
@@ -60,7 +61,9 @@ type Server struct {
 	mon           monitoringState
 	net           *netChanges
 	os            osLifecycle
-	netQuery      func(context.Context) NetworkStatus // tests
+	// scrubMu serializes the scrub scheduler and the scrub API (TODO.md P2-2).
+	scrubMu  sync.Mutex
+	netQuery func(context.Context) NetworkStatus // tests
 }
 
 // WithInsecureHTTP records that the API is served over plain HTTP, so status can warn about it.
@@ -249,6 +252,9 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("PATCH /api/v1/pools/{id}", s.withAuth(store.RoleAdmin, s.handleUpdatePool))
 	s.mux.HandleFunc("POST /api/v1/pools/{id}/replace", s.withAuth(store.RoleAdmin, s.handleReplacePoolDisk))
 	s.mux.HandleFunc("POST /api/v1/pools/{id}/start-degraded", s.withAuth(store.RoleAdmin, s.handleStartPoolDegraded))
+	s.mux.HandleFunc("GET /api/v1/pools/{id}/scrub", s.withAuth(store.RoleReadOnly, s.handleGetPoolScrub))
+	s.mux.HandleFunc("POST /api/v1/pools/{id}/scrub", s.withAuth(store.RoleAdmin, s.handleStartPoolScrub))
+	s.mux.HandleFunc("DELETE /api/v1/pools/{id}/scrub", s.withAuth(store.RoleAdmin, s.handleStopPoolScrub))
 	s.mux.HandleFunc("DELETE /api/v1/pools/{id}/disks/{disk_id}", s.withAuth(store.RoleAdmin, s.handleReleasePoolDisk))
 
 	// Volumes & Snapshots (CSI_PROVISIONER / READONLY)
@@ -316,6 +322,8 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("POST /api/v1/system/reconcile", s.withAuth(store.RoleAdmin, s.handleTriggerReconcile))
 	s.mux.HandleFunc("GET /api/v1/system/rebuild", s.withAuth(store.RoleReadOnly, s.handleGetRebuildSettings))
 	s.mux.HandleFunc("PUT /api/v1/system/rebuild", s.withAuth(store.RoleAdmin, s.handlePutRebuildSettings))
+	s.mux.HandleFunc("GET /api/v1/system/scrub", s.withAuth(store.RoleReadOnly, s.handleGetScrubSettings))
+	s.mux.HandleFunc("PUT /api/v1/system/scrub", s.withAuth(store.RoleAdmin, s.handlePutScrubSettings))
 	s.mux.HandleFunc("GET /api/v1/system/iostats", s.withAuth(store.RoleReadOnly, s.handleGetIoStats))
 	s.mux.HandleFunc("GET /api/v1/system/os", s.withAuth(store.RoleReadOnly, s.handleGetOSStatus))
 	s.mux.HandleFunc("GET /api/v1/pool-imports", s.withAuth(store.RoleAdmin, s.handleListImportCandidates))
@@ -688,26 +696,6 @@ func (s *Server) handleListSnapshots(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"snapshots": snaps})
-}
-
-func (s *Server) collectSnapshotLineage(target *store.Snapshot, stopAtParentID string) ([]*store.Snapshot, error) {
-	var chain []*store.Snapshot
-	cur := target
-	for cur != nil {
-		chain = append(chain, cur)
-		if cur.ParentSnapshotID == "" || cur.ParentSnapshotID == stopAtParentID {
-			if stopAtParentID != "" && cur.ParentSnapshotID != stopAtParentID {
-				return nil, fmt.Errorf("%w: snapshot %s is not an ancestor of %s", store.ErrInvalidArgument, stopAtParentID, target.ID)
-			}
-			break
-		}
-		parent, err := s.store.GetSnapshot(cur.ParentSnapshotID)
-		if err != nil {
-			return nil, fmt.Errorf("broken snapshot lineage at %s: %w", cur.ParentSnapshotID, err)
-		}
-		cur = parent
-	}
-	return chain, nil
 }
 
 func formatBlockExtents(extents []spdk.BlockExtent) []map[string]uint64 {

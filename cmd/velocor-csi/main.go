@@ -31,6 +31,8 @@ func main() {
 		caCert     = flag.String("velocor-ca-cert", os.Getenv("VELOCOR_CA_CERT"), "PEM CA/server certificate used to verify the Velocor API")
 		portals    = flag.String("default-portals", os.Getenv("VELOCOR_DEFAULT_PORTALS"),
 			"Velocor portals (names or IDs, comma-separated, either protocol) for StorageClasses without a \"portals\" parameter")
+		metadata = flag.Bool("snapshot-metadata", os.Getenv("VELOCOR_SNAPSHOT_METADATA") == "true",
+			"Serve the SnapshotMetadata service (changed-block tracking) in the controller; needs the external-snapshot-metadata sidecar")
 	)
 	flag.Parse()
 
@@ -53,7 +55,8 @@ func main() {
 		Mode:       csi.DriverMode(*mode),
 		Client:     client,
 
-		DefaultPortals: *portals,
+		DefaultPortals:   *portals,
+		SnapshotMetadata: *metadata,
 	})
 	if err != nil {
 		log.Fatalf("init velocor-csi: %v", err)

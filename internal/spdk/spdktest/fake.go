@@ -115,6 +115,8 @@ type Fake struct {
 	uuidCounter  int
 
 	rebuildStep    uint32 // percent a rebuild advances per bdev_raid_get_bdevs (0: manual)
+	scrubStep      uint64 // blocks a scrub advances per bdev_raid_get_bdevs (0: completes at once)
+	scrubStarts    map[string][]uint64
 	rebuildMaxMBps uint32
 }
 
@@ -614,11 +616,18 @@ var handlers = map[string]handler{
 			}
 		}
 		for key, lvsName := range f.loadedLvsByKey() {
-			for _, l := range f.lvsMedia[key].Lvols {
+			lvs := f.lvsMedia[key]
+			for _, l := range lvs.Lvols {
+				// driver_specific.lvol as SPDK reports it; base_snapshot names the parent.
+				lv := map[string]any{"thin_provision": l.Thin, "snapshot": l.IsSnapshot, "clone": l.Parent != "",
+					"num_allocated_clusters": l.Allocated, "lvol_store_uuid": lvs.UUID}
+				if parent := lvs.Lvols[l.Parent]; parent != nil {
+					lv["base_snapshot"] = parent.Name
+				}
 				out = append(out, spdk.BdevInfo{
 					Name: l.UUID, UUID: l.UUID, Aliases: []string{lvsName + "/" + l.Name},
 					BlockSize: 512, NumBlocks: l.SizeMiB * 2048, ProductName: "Logical Volume",
-					AssignedRateLimits: f.qos[l.UUID],
+					AssignedRateLimits: f.qos[l.UUID], DriverSpecific: map[string]any{"lvol": lv},
 				})
 			}
 		}
@@ -888,7 +897,18 @@ var handlers = map[string]handler{
 			return nil, errf(codeEBUSY, "snapshot %s has more than one clone", l.Name)
 		}
 		for _, c := range clones {
-			c.Parent = l.Parent // SPDK merges a single-clone snapshot into its clone
+			// SPDK merges a single-clone snapshot into its clone: the clone takes over the
+			// snapshot's clusters it doesn't have itself, and the snapshot's parent.
+			c.Parent = l.Parent
+			for idx := range l.Clusters {
+				if !c.Clusters[idx] {
+					if c.Clusters == nil {
+						c.Clusters = map[uint64]bool{}
+					}
+					c.Clusters[idx] = true
+					c.Allocated++
+				}
+			}
 		}
 		delete(lvs.Lvols, l.UUID)
 		delete(f.qos, l.UUID)
@@ -990,13 +1010,18 @@ var handlers = map[string]handler{
 		if l == nil {
 			return nil, errf(codeENODEV, "No such device")
 		}
+		// Patch 0005: offset and size in whole clusters, size 0 to the end.
 		cs := uint64(lvs.ClusterSize)
+		total := (l.SizeMiB<<20 + cs - 1) / cs * cs
 		off, size := num(p, "offset"), num(p, "size")
-		if size == 0 {
-			size = l.SizeMiB << 20
+		if size == 0 && off <= total {
+			size = total - off
+		}
+		if off%cs != 0 || size%cs != 0 || off+size > total {
+			return nil, errf(codeEINVAL, "Invalid argument")
 		}
 		n := size / cs
-		mask := make([]byte, (n+7)/8)
+		mask := make([]byte, max((n+7)/8, 1))
 		var count uint64
 		for i := uint64(0); i < n; i++ {
 			if l.Clusters[off/cs+i] {
@@ -1004,7 +1029,7 @@ var handlers = map[string]handler{
 				count++
 			}
 		}
-		return spdk.FragmapResponse{ClusterSize: uint32(cs), Offset: off, Size: size, NumClusters: count, Bitmask: base64.StdEncoding.EncodeToString(mask)}, nil
+		return spdk.FragmapResponse{ClusterSize: cs, NumClusters: n, NumAllocatedClusters: count, Fragmap: base64.StdEncoding.EncodeToString(mask)}, nil
 	},
 	"bdev_set_qos_limit": func(f *Fake, p map[string]any) (any, *rpcErr) {
 		name := str(p, "name")

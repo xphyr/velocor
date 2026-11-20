@@ -15,6 +15,8 @@ type IdentityServer struct {
 	csi.UnimplementedIdentityServer
 	driverName string
 	client     VelocorClient
+	// snapshotMetadata advertises SNAPSHOT_METADATA_SERVICE (served by this process).
+	snapshotMetadata bool
 }
 
 // NewIdentityServer creates a CSI IdentityServer.
@@ -40,7 +42,7 @@ func (s *IdentityServer) GetPluginInfo(_ context.Context, _ *csi.GetPluginInfoRe
 }
 
 func (s *IdentityServer) GetPluginCapabilities(_ context.Context, _ *csi.GetPluginCapabilitiesRequest) (*csi.GetPluginCapabilitiesResponse, error) {
-	return &csi.GetPluginCapabilitiesResponse{
+	resp := &csi.GetPluginCapabilitiesResponse{
 		Capabilities: []*csi.PluginCapability{
 			{
 				Type: &csi.PluginCapability_Service_{
@@ -71,7 +73,15 @@ func (s *IdentityServer) GetPluginCapabilities(_ context.Context, _ *csi.GetPlug
 				},
 			},
 		},
-	}, nil
+	}
+	if s.snapshotMetadata {
+		resp.Capabilities = append(resp.Capabilities, &csi.PluginCapability{
+			Type: &csi.PluginCapability_Service_{
+				Service: &csi.PluginCapability_Service{Type: csi.PluginCapability_Service_SNAPSHOT_METADATA_SERVICE},
+			},
+		})
+	}
+	return resp, nil
 }
 
 func (s *IdentityServer) Probe(ctx context.Context, _ *csi.ProbeRequest) (*csi.ProbeResponse, error) {

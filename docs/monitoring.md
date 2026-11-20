@@ -101,10 +101,14 @@ selector plus an `Endpoints` and a `ServiceMonitor`) with `job: velocor`, the to
 | `VelocorDiskFailed` | critical | A disk in a pool is FAULTED, OFFLINE or UNAVAILABLE |
 | `VelocorDiskSmartCritical` | critical | A disk reports a SMART critical warning |
 | `VelocorDiskSpareLow` | critical | An NVMe drive's spare capacity is at or below its own threshold |
+| `VelocorScrubFoundLostData` | critical | A scrub found blocks no copy could supply (data lost there) |
+| `VelocorScrubRepairFailed` | critical | A scrub couldn't rewrite a damaged copy (the member was failed) |
 | `VelocorPoolRebuilding` | warning | A pool is rebuilding (no redundancy until it finishes) |
 | `VelocorRebuildStalled` | warning | A rebuild has made no progress for two hours |
 | `VelocorPoolDurabilityAtRisk` | warning | A pool may lose acknowledged writes on power loss (P0-4) |
 | `VelocorPoolMetadataCopyFailing` | warning | The on-pool copy of the database can't be written for 30 minutes |
+| `VelocorScrubRepaired` | warning | The current or last scrub rewrote unreadable copies or found differing ones |
+| `VelocorScrubOverdue` | warning | A pool hasn't completed a scheduled scrub for twice the interval |
 | `VelocorPoolSpaceWarning` | warning | A pool is at WARNING for 10 minutes |
 | `VelocorPoolFillsWithin24h` | warning | A pool over 50% used will be full within a day at the rate of the last 6 hours |
 | `VelocorDiskMediaErrors` | warning | A disk reported new media errors in the last hour |

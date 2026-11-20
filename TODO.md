@@ -636,8 +636,13 @@ work still open, ranked by risk to data, how fixes are verified, and what has be
   through the API while it ran (127 ms each), each member cloned and read back on the cluster:
   all nine consistent (B = A or A-1, both seen), and the writer never saw an error in ~22,000
   pairs.
-  *Left:* a Kubernetes VolumeGroupSnapshot of PVCs in use on the Arm cluster (the x86 one has no
-  group snapshot CRDs).
+  Kubernetes (dev-3705715, 2026-11-20): on the Arm cluster, a pod wrote the same dependent
+  counters to an NVMe/TCP and an iSCSI PVC (same pool) and VolumeGroupSnapshots (v1) were taken
+  through the external-snapshotter: six rounds, each member restored to a new PVC and read back,
+  all consistent (4 KiB `O_DIRECT|O_DSYNC` writes: B = A-1; 512-byte `O_DIRECT`: B = A).
+  *Test pitfall:* busybox `dd oflag=direct` silently drops `O_DIRECT` on a device whose DMA
+  alignment its buffer misses (the iSCSI disk wants 64 bytes) and writes through the page cache,
+  so its "completed" writes reach the target late: that writer showed B = A-2. Use GNU dd.
   **Found alongside:** velod's `bdev_get_iostat` call sent `name`, which SPDK v26.09 rejects (it
   takes `names`, an array), so `GET /api/v1/system/iostats?bdev_name=...` failed on real SPDK (the
   unfiltered metrics path was fine). Fixed; the fake now rejects `name` like SPDK and the client
@@ -697,7 +702,68 @@ work still open, ranked by risk to data, how fixes are verified, and what has be
   iSCSI CHAP auth groups and NVMe DH-HMAC-CHAP with encrypted secrets; the CSI node plugin
   should register the host's real hostnqn/IQN instead of names derived from the node name.
 - [ ] **P2-2. No background scrub.** Mirrors are never read and compared, so latent sector
-  errors surface only during a rebuild, when they turn a degraded pool into a lost one.
+  errors surface only during a rebuild, when they turn a degraded pool into a lost one. SPDK's
+  RAID1 also has no resync after an unclean stop: mirrors can differ where writes were in flight,
+  and reads then return either version depending on the read balancer.
+  **Design (2026-11-20):** SPDK v26.09 has no scrub, so SPDK patch 0004 adds one to the RAID
+  module, separate from the rebuild "process" (which is built around a single target member).
+  It runs on the app thread, window by window (the RAID process window size, 1 MiB by default):
+  - RAID1: quiesce the window's LBA range of the RAID bdev (user I/O to it waits; a member
+    removal's full quiesce waits for the window, so a member can't vanish under the scrub), read
+    it from every operational member directly, then:
+    - a member whose read fails is rewritten from a good copy (always, even when checking only;
+      the drive remaps the sector), counted as repaired;
+    - members that read fine are compared block by block with the first good one; mismatches
+      are counted and, in repair mode (default), rewritten from that copy, as Linux md's
+      "repair" does (after an unclean stop either version is valid; they must agree);
+    - a failed repair write fails the member, like raid1's own read-error correction;
+    - no member readable: counted as unrecoverable.
+  - Other levels (RAID0): a surface scan of each member's data area without locking; read
+    errors are counted as unrecoverable (no redundancy).
+  - Rate-limited (MB/s); can start at an offset (velod resumes after a restart); stops on
+    request, when a member is removed, when a rebuild starts (a rebuild target holds stale data
+    beyond its window), and before the RAID bdev is destructed. Refused during a rebuild and on
+    bdevs with separate metadata (DIF).
+  - RPCs `bdev_raid_scrub_start` / `bdev_raid_scrub_stop`; progress and the last run's counters
+    in `bdev_raid_get_bdevs` (`scrub` object).
+  velod: per-pool scrub schedule (default monthly, off-peak window, bandwidth limit), start/stop
+  from API/UI/`veloctl`, progress and last result per pool persisted (resumes after restarts),
+  metrics and alerts (repairs, mismatches, unrecoverable blocks).
+  **Done (2026-11-20, not yet lab-checked):**
+  - SPDK patch 0004 as designed, with unit tests `test_raid_scrub` (repair of a mismatch and of an
+    unreadable range, check only, unrecoverable, rate limit with stop and resume at an offset, a
+    stop mid-window not counting it, member removal, a failed repair write failing the member,
+    destruct while running) and `test_raid_scrub_stops_for_rebuild`, on memory-backed members;
+    the existing RAID unit tests still pass.
+  - velod (`internal/server/scrub.go`): settings `GET|PUT /system/scrub` (default every 30
+    days, 01:00-06:00 appliance time, 200 MB/s; off switch), per-pool record in a `scrubs` bucket
+    (`GET|POST|DELETE /pools/{id}/scrub`); a run spans SPDK scrubs ("segments") and resumes at
+    its offset after the window ends, a velod/spdk_tgt restart, a member removal or a rebuild
+    (once the pool is ONLINE again); one scheduled scrub at a time, operator ones at once;
+    findings logged. Metrics `velocor_pool_scrub_*`; alerts `VelocorScrubFoundLostData`,
+    `VelocorScrubRepairFailed` (critical), `VelocorScrubRepaired`, `VelocorScrubOverdue`.
+    UI: pool page "Scrub" (state, findings, Scrub now / Stop), System page "Scrubs" schedule.
+    `veloctl pool scrub` / `veloctl system scrub`. Tests: `TestScrubScheduleWindowAndResume`,
+    `TestScrubManualInterruptionsAndStop`, `TestScrubRecordGoesWithThePool` (fake SPDK), and
+    `TestScrubRepairsDifferingMirrorCopies` on real SPDK (a copy changed behind SPDK's back is
+    found, rewritten from the first member, data intact; a second check-only pass is clean).
+  Lab (dev-3705715 on the test appliance, 2026-11-20; virtio-SCSI disks, one SPDK core):
+  - All three pools (268 + 537 + 268 GB) scrubbed clean, repair on, with no findings; a manual
+    scrub while a pod wrote 16 GiB with fio CRC32C checksums, then a second pass, then fio's
+    verify: no mismatches and every block verified.
+  - Window: a scheduled run started inside it, paused when it was moved away ("the scrub window
+    ended"), resumed at the exact block when it came back, completed; the next pool started
+    after it (one at a time). Metrics and the pool record followed.
+  - Host I/O (4 KiB random 70/30, iSCSI PVC on the pool): qd1 1053 / 449 IOPS (read / write,
+    p99 1.6 / 1.1 ms) alone, 443 / 189 (p99 3.7 / 3.4 ms) under an unthrottled scrub at
+    ~1.17 GB/s; qd16 11.3k / 4.8k -> 5.2k / 2.2k. Hence the rate limit, which was broken:
+  - **Found:** the rate limit computed `bytes_done * ticks_hz`, which overflows 64 bits after
+    ~7 GB at a GHz tick rate, so a scrub ran at 200 MB/s for ~35 s and then unthrottled. Fixed in
+    patch 0004 (`raid_scrub_due_tsc`, whole seconds counted apart; unit test
+    `test_raid_scrub_due_tsc`). Rerun on dev-8311b3a: 210 MB/s (200 MiB/s) from the start and
+    still at 35 GB; host I/O under it: qd1 856 / 367 IOPS (p99 4.0 / 2.0 ms), qd16 9.5k / 4.1k
+    (-16% against 11.2k / 4.8k alone).
+  *Left:* hardware with a failing disk.
 - [ ] **P2-3. Reconciler cost.** `EnsureExport` lists subsystems/target nodes per export
   (O(n²) RPCs); prefetch once per pass (was F5).
 - [ ] **P2-4. SPDK sizing.** One core and 1 GiB of memory; sizing isn't documented or
@@ -935,6 +1001,56 @@ Everything here was written by Gemini and is in scope to rewrite.
     chart; re-add veloctl `allocated-blocks` / `changed-blocks` and the UI "Changed blocks" view;
   - verification against real SPDK (integration harness) and a Kasten incremental
     backup/restore round trip on NVW, comparing restored data byte-for-byte.
+  **Done (2026-11-20, not yet lab-checked):**
+  - SPDK patch 0005 `bdev_lvol_get_fragmap`: Longhorn's RPC (same name, parameters and result,
+    so tools written for it work), but read from the blob's cluster table with the functions
+    the lvol's SEEK_DATA/SEEK_HOLE use (same semantics, verified: `bs_io_unit_is_allocated`
+    looks at the blob's own clusters only) instead of two seek I/Os per extent whose status
+    the original didn't check; size 0 means "to the end" also with an offset; unit test
+    `ut_lvol_get_fragmap` (Longhorn's patch has only a shell test).
+  - velod: the response shape is the real one; `blocks:allocated` / `blocks:changed` walk
+    SPDK's own chain (`base_snapshot` in `bdev_get_bdevs`) instead of velod's records, which
+    missed a clone's origin (a clone's snapshot's "allocated" left out the origin's data: a
+    full backup from it would have skipped blocks) and broke after a middle snapshot was
+    deleted ("broken lineage"); maps are clipped to the volume size; 501 when SPDK lacks the
+    RPC. The fake SPDK now moves a deleted snapshot's clusters into its clone, like SPDK.
+    Tests: `TestStorageEndToEndAndCBT` (allocated over the chain, deltas, base newer/equal ->
+    400, delta unchanged after deleting the middle snapshot, a clone's snapshot including its
+    origin, 501), `TestSnapshotsAndClones` on real SPDK (exact extents for s1, s2, s1->s2).
+  - CSI: `SnapshotMetadata` restored (from 353aa94^) behind `--snapshot-metadata`
+    (`VELOCOR_SNAPSHOT_METADATA`), advertised only then, never by a node plugin; velod 501 ->
+    Unimplemented, 400 -> InvalidArgument. Tests `TestSnapshotMetadataOffByDefault`,
+    `TestSnapshotMetadataCBT` (chunking, starting_offset, deltas, errors).
+  - Chart: `snapshotMetadata.enabled` (off) adds `csi-snapshot-metadata` v1.1.0 (pinned,
+    multi-arch), its Service, the `SnapshotMetadataService` (cbt.storage.k8s.io/v1beta1) and
+    RBAC; TLS from `tlsSecretName` + `caCert`, or on OpenShift from the service CA (Service
+    annotation, CA from `openshift-service-ca.crt`); clear failures when the CRD, TLS or CA is
+    missing. Static manifest: the sidecar as a commented opt-in block.
+  - veloctl `snapshot allocated-blocks` / `changed-blocks`, UI "Changed blocks" (volume page).
+  Lab, Arm cluster (dev-8311b3a, 2026-11-20): the CRD was already there (v1beta1, identical to
+  v1.1.0's); the chart option brought up the sidecar with the OpenShift serving certificate and
+  the SnapshotMetadataService. Upstream's `snapshot-metadata-lister` and `-verifier` (v1.1.0) as
+  a ServiceAccount: a 1 GiB NVMe/TCP block PVC written in regions of 4 KiB to 4 MiB (inside and
+  across 1 MiB clusters, the last block), two snapshots; allocated and changed blocks were
+  exactly the written clusters, and applying them (allocated onto an empty volume, changed onto
+  a restore of the first snapshot) gave volumes identical to the restores (sha256 of the whole
+  device).
+  - Upstream pitfall: the v1.1.0 tag's lister pins client v0.x (v1alpha1) and gets a 404
+    against the v1beta1 CRD; build it with replace directives to the tag's tree. The verifier is
+    fine.
+  - **Found:** `helm upgrade --reuse-values` from a release made before this chart change
+    renders the sidecar without an image (new key, old values) and the Deployment is refused
+    after the DaemonSet was already updated; `--reset-then-reuse-values` works. Worse, from a
+    release without the `snapshotMetadata` map at all, any `--reuse-values` upgrade failed to
+    render (nil pointer), CBT on or off. Fixed: the templates read the release's values over the
+    chart's own `values.yaml` defaults (`velocor-csi.snapshotMetadata` helper, still one pin);
+    README recommends `--reset-then-reuse-values`.
+  Same test on the x86 cluster (same build, 2026-11-20): identical block lists, both verifier
+  runs pass, devices identical; the sidecar now runs on both clusters.
+  - Kasten (9.0.10) doesn't use the SnapshotMetadata API for generic CSI drivers: its CBT paths
+    are Azure Disk, AWS EBS direct and vSphere, plus KubeVirt's VM-level CBT (9.0.6+, independent
+    of the storage). A Kasten export of a Velocor volume reads the whole snapshot. Not tested.
+  *Left:* a backup tool that consumes the API, when one does (Kasten, Velero, ...).
 
 - [ ] **L-3. Parity RAID (RAID5/6) for capacity efficiency.** Requested 2026-11-16. SPDK's only
   parity RAID, `raid5f`, accepts full-stripe writes only and the lvol blobstore can't even create
@@ -970,6 +1086,34 @@ Everything here was written by Gemini and is in scope to rewrite.
   raid (concat, superblock, resize) and lvstore-grow code, then decide on a design and whether
   it needs an SPDK patch (with unit tests, like 0002). Crash safety of an interrupted expansion
   and the pool metadata copies (P0-3) must be part of the design.
+  **Evaluation (2026-11-20, SPDK v26.09 source; for a decision):**
+  - What SPDK has: RAID1 and RAID0 have a `resize` hook (`raid1_resize`/`raid0_resize`) that
+    grows the array to the smallest member's data area and rewrites the superblock's
+    `data_size`; `bdev_lvol_grow_lvstore` (`spdk_lvs_grow_live`) exists. The hook only runs on a
+    member bdev's own resize event (e.g. an NVMe namespace grown in place), never when a member
+    is replaced by a larger disk: a replacement takes the array's existing `data_size`. Concat has
+    no resize, and no RAID can change its member count (slots are allocated once, at creation,
+    and recorded in the superblock).
+  - (b) **Grow after replacing every member with a larger disk** is small: a patch adding
+    `bdev_raid_grow` (re-read the members' sizes and run the same resize path, refusing during a
+    rebuild or while degraded), then `bdev_lvol_grow_lvstore`. Existing data doesn't move
+    (RAID1 mirrors; RAID0 strips are assigned round-robin, so a longer array only adds strips
+    at the end). Crash safety: the superblock is written with a new sequence number, the lvstore
+    grow is idempotent, so velod re-runs whichever step didn't finish; the pool's metadata copy
+    (P0-3) records the new size. velod: "Grow" when every member is larger than the array
+    (after replacements, P0-1), UI/veloctl, capacity accounting. RAID0 can't replace members
+    (no rebuild), so in practice this is for RAID1.
+  - (a) **Add disks** (what was asked) needs a pool layout that can take more members:
+    a concat of RAID1 pairs (RAID10-like) plus a patch that appends a member to a concat (new
+    slot, superblock with the larger member count written to every member, the new range at the
+    end so existing data doesn't move). Substantial: the slot array is fixed today, and changing
+    it under live I/O channels touches the core RAID code; new pools only (existing RAID1 pools
+    can't become concats in place); nested RAID superblocks at boot (the concat waits for its
+    RAID1 members) need testing; a pair is the unit of growth.
+  - (c) Volumes spread across pools: no SPDK change, but not expansion (a volume still lives in
+    one pool).
+  *Recommendation:* (b) first (small, low risk, uses SPDK's own resize path); (a) as a separate
+  design if adding disks is needed, with power-loss tests during the append.
 
 - [ ] **L-5. Delta upgrades for the OS image.** Requested 2026-11-17 (back burner). A
   `bootc upgrade` pulls every changed layer of `velocor-os` in full; with the rolling Fedora base
