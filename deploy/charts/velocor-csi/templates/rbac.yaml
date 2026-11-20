@@ -1,3 +1,4 @@
+{{- $sm := include "velocor-csi.snapshotMetadata" . | fromYaml }}
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -40,7 +41,7 @@ rules:
   - apiGroups: ["groupsnapshot.storage.k8s.io"]
     resources: ["volumegroupsnapshotclasses", "volumegroupsnapshotcontents", "volumegroupsnapshotcontents/status", "volumegroupsnapshots"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
-  {{- if .Values.snapshotMetadata.enabled }}
+  {{- if $sm.enabled }}
   # external-snapshot-metadata: authenticate and authorize backup clients, read its CR.
   - apiGroups: ["authentication.k8s.io"]
     resources: ["tokenreviews"]

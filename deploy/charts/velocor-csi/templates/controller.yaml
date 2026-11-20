@@ -1,3 +1,4 @@
+{{- $sm := include "velocor-csi.snapshotMetadata" . | fromYaml }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -42,7 +43,7 @@ spec:
             - --mode=controller
             - --endpoint=unix:///csi/csi.sock
             - --driver-name={{ .Values.driverName }}
-            {{- if .Values.snapshotMetadata.enabled }}
+            {{- if $sm.enabled }}
             - --snapshot-metadata
             {{- end }}
           envFrom:
@@ -115,9 +116,9 @@ spec:
           resources:
             {{- toYaml . | nindent 12 }}
           {{- end }}
-        {{- if .Values.snapshotMetadata.enabled }}
+        {{- if $sm.enabled }}
         - name: csi-snapshot-metadata
-          image: {{ .Values.snapshotMetadata.image }}
+          image: {{ $sm.image }}
           args:
             - --csi-address=/csi/csi.sock
             - --tls-cert=/certs/tls.crt
@@ -136,7 +137,7 @@ spec:
             - name: snapshot-metadata-certs
               mountPath: /certs
               readOnly: true
-          {{- with .Values.snapshotMetadata.resources }}
+          {{- with $sm.resources }}
           resources:
             {{- toYaml . | nindent 12 }}
           {{- end }}
@@ -144,7 +145,7 @@ spec:
       volumes:
         - name: socket-dir
           emptyDir: {}
-        {{- if .Values.snapshotMetadata.enabled }}
+        {{- if $sm.enabled }}
         - name: snapshot-metadata-certs
           secret:
             secretName: {{ include "velocor-csi.snapshotMetadataTLSSecret" . }}

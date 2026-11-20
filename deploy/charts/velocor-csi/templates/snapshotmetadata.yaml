@@ -1,9 +1,10 @@
-{{- if .Values.snapshotMetadata.enabled }}
+{{- $sm := include "velocor-csi.snapshotMetadata" . | fromYaml }}
+{{- if $sm.enabled }}
 {{- if not (.Capabilities.APIVersions.Has "cbt.storage.k8s.io/v1beta1/SnapshotMetadataService") }}
 {{- fail "snapshotMetadata.enabled needs the SnapshotMetadataService CRD (cbt.storage.k8s.io/v1beta1) from kubernetes-csi/external-snapshot-metadata installed first" }}
 {{- end }}
 {{- $ca := include "velocor-csi.snapshotMetadataCA" . }}
-{{- if and (not .Values.snapshotMetadata.tlsSecretName) (not (.Capabilities.APIVersions.Has "route.openshift.io/v1")) }}
+{{- if and (not $sm.tlsSecretName) (not (.Capabilities.APIVersions.Has "route.openshift.io/v1")) }}
 {{- fail "snapshotMetadata.tlsSecretName is required outside OpenShift (a secret with tls.crt and tls.key for the sidecar's service)" }}
 {{- end }}
 # The external-snapshot-metadata sidecar's gRPC endpoint, which backup tools call.
@@ -14,7 +15,7 @@ metadata:
   namespace: {{ .Release.Namespace }}
   labels:
     {{- include "velocor-csi.labels" . | nindent 4 }}
-  {{- if not .Values.snapshotMetadata.tlsSecretName }}
+  {{- if not $sm.tlsSecretName }}
   annotations:
     service.beta.openshift.io/serving-cert-secret-name: {{ include "velocor-csi.snapshotMetadataTLSSecret" . }}
   {{- end }}
@@ -41,5 +42,5 @@ spec:
   {{- else }}
   {{- fail "snapshotMetadata.caCert is required: the PEM CA that issued the sidecar's certificate (found no OpenShift service CA bundle)" }}
   {{- end }}
-  audience: {{ default .Values.driverName .Values.snapshotMetadata.audience }}
+  audience: {{ default .Values.driverName $sm.audience }}
 {{- end }}

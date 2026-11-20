@@ -760,8 +760,10 @@ work still open, ranked by risk to data, how fixes are verified, and what has be
   - **Found:** the rate limit computed `bytes_done * ticks_hz`, which overflows 64 bits after
     ~7 GB at a GHz tick rate, so a scrub ran at 200 MB/s for ~35 s and then unthrottled. Fixed in
     patch 0004 (`raid_scrub_due_tsc`, whole seconds counted apart; unit test
-    `test_raid_scrub_due_tsc`); needs a build and a rerun of the latency test at 200 MB/s.
-  *Left:* that rerun, and hardware with a failing disk.
+    `test_raid_scrub_due_tsc`). Rerun on dev-8311b3a: 210 MB/s (200 MiB/s) from the start and
+    still at 35 GB; host I/O under it: qd1 856 / 367 IOPS (p99 4.0 / 2.0 ms), qd16 9.5k / 4.1k
+    (-16% against 11.2k / 4.8k alone).
+  *Left:* hardware with a failing disk.
 - [ ] **P2-3. Reconciler cost.** `EnsureExport` lists subsystems/target nodes per export
   (O(n²) RPCs); prefetch once per pass (was F5).
 - [ ] **P2-4. SPDK sizing.** One core and 1 GiB of memory; sizing isn't documented or
@@ -1025,9 +1027,26 @@ Everything here was written by Gemini and is in scope to rewrite.
     annotation, CA from `openshift-service-ca.crt`); clear failures when the CRD, TLS or CA is
     missing. Static manifest: the sidecar as a commented opt-in block.
   - veloctl `snapshot allocated-blocks` / `changed-blocks`, UI "Changed blocks" (volume page).
-  *Left:* lab: install the SnapshotMetadataService CRD on a cluster (needs your OK: it's
-  cluster-wide), enable the chart option, then a Kasten incremental backup/restore round trip
-  compared byte for byte; sidecar test on both clusters (arm64 and x86) per the sidecar rule.
+  Lab, Arm cluster (dev-8311b3a, 2026-11-20): the CRD was already there (v1beta1, identical to
+  v1.1.0's); the chart option brought up the sidecar with the OpenShift serving certificate and
+  the SnapshotMetadataService. Upstream's `snapshot-metadata-lister` and `-verifier` (v1.1.0) as
+  a ServiceAccount: a 1 GiB NVMe/TCP block PVC written in regions of 4 KiB to 4 MiB (inside and
+  across 1 MiB clusters, the last block), two snapshots; allocated and changed blocks were
+  exactly the written clusters, and applying them (allocated onto an empty volume, changed onto
+  a restore of the first snapshot) gave volumes identical to the restores (sha256 of the whole
+  device).
+  - Upstream pitfall: the v1.1.0 tag's lister pins client v0.x (v1alpha1) and gets a 404
+    against the v1beta1 CRD; build it with replace directives to the tag's tree. The verifier is
+    fine.
+  - **Found:** `helm upgrade --reuse-values` from a release made before this chart change
+    renders the sidecar without an image (new key, old values) and the Deployment is refused
+    after the DaemonSet was already updated; `--reset-then-reuse-values` works. Worse, from a
+    release without the `snapshotMetadata` map at all, any `--reuse-values` upgrade failed to
+    render (nil pointer), CBT on or off. Fixed: the templates read the release's values over the
+    chart's own `values.yaml` defaults (`velocor-csi.snapshotMetadata` helper, still one pin);
+    README recommends `--reset-then-reuse-values`.
+  *Left:* Kasten incremental backup/restore round trip compared byte for byte, and the sidecar
+  on the x86 cluster, per the sidecar rule.
 
 - [ ] **L-3. Parity RAID (RAID5/6) for capacity efficiency.** Requested 2026-11-16. SPDK's only
   parity RAID, `raid5f`, accepts full-stripe writes only and the lvol blobstore can't even create

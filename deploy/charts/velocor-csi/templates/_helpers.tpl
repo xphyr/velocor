@@ -52,17 +52,30 @@ groupsnapshot.storage.k8s.io/v1beta1
 {{- end }}
 
 {{/*
+The effective snapshotMetadata settings: the release's values over this chart's own defaults.
+`helm upgrade --reuse-values` keeps only the old release's values, which lack keys a newer chart
+added (the whole map, or its pinned image), so read the defaults from values.yaml itself rather
+than repeating them here; values.yaml stays the one place the sidecar is pinned (check-pins).
+*/}}
+{{- define "velocor-csi.snapshotMetadata" -}}
+{{- $defaults := (.Files.Get "values.yaml" | fromYaml).snapshotMetadata | default dict -}}
+{{- toYaml (mustMergeOverwrite (deepCopy $defaults) (.Values.snapshotMetadata | default dict)) -}}
+{{- end -}}
+
+{{/*
 Changed-block tracking (snapshotMetadata): the sidecar's TLS secret, and the CA (PEM) clients
 verify it with. On OpenShift the service CA issues the certificate (annotation on the Service)
 and its bundle is in every namespace's openshift-service-ca.crt ConfigMap.
 */}}
 {{- define "velocor-csi.snapshotMetadataTLSSecret" -}}
-{{- default "velocor-csi-snapshot-metadata-tls" .Values.snapshotMetadata.tlsSecretName -}}
+{{- $sm := include "velocor-csi.snapshotMetadata" . | fromYaml -}}
+{{- default "velocor-csi-snapshot-metadata-tls" $sm.tlsSecretName -}}
 {{- end -}}
 
 {{- define "velocor-csi.snapshotMetadataCA" -}}
-{{- if .Values.snapshotMetadata.caCert -}}
-{{- .Values.snapshotMetadata.caCert -}}
+{{- $sm := include "velocor-csi.snapshotMetadata" . | fromYaml -}}
+{{- if $sm.caCert -}}
+{{- $sm.caCert -}}
 {{- else -}}
 {{- $cm := lookup "v1" "ConfigMap" .Release.Namespace "openshift-service-ca.crt" -}}
 {{- if and $cm (index $cm.data "service-ca.crt") -}}

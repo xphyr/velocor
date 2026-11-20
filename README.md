@@ -557,6 +557,14 @@ helm install velocor-csi deploy/charts/velocor-csi \
   --set auth.existingSecret=velocor-csi-auth
 ```
 
+To upgrade, prefer `--reset-then-reuse-values` (Helm 3.14+) over `--reuse-values`: the latter
+keeps only the old release's values, so settings a newer chart adds (such as pinned sidecar
+images) are missing. The chart fills in its `snapshotMetadata` defaults itself either way.
+
+```bash
+helm upgrade velocor-csi deploy/charts/velocor-csi --namespace velocor-csi --reset-then-reuse-values
+```
+
 Optionally, install the `VolumeSnapshotClass` and `VolumeGroupSnapshotClass`:
 
 ```bash
