@@ -46,6 +46,11 @@ doesn't block the rest.
   20% lower than a day earlier, reads unchanged. Candidates: P0-4's write-cache handling, the
   built-in monitoring, the NAS behind the lab's virtual disks. *Next:* repeat the write jobs with
   monitoring off, then on the build of 2026-11-18, before calling it a regression.
+  *Lead (2026-11-20):* the three-way benchmark ([docs/performance.md](docs/performance.md)), with
+  monitoring **on**, got 3,705 QD1 random writes from the same pool through a client that
+  connected to the SAN portal alone; the 2026-11-19 baseline went through the CSI driver, whose
+  NVMe/TCP volumes then had two live paths (SAN and the 1500-MTU management network, P1-13
+  check). Check whether the slow writes went over the management path; monitoring is cleared.
 - [ ] **P1-6. State the single-node scope.** One appliance, one copy of each pool, no HA (ANA
   states are modelled but unused). Document it, with what hosts see during an appliance reboot
   (NVMe/TCP I/O stalls; the CSI driver never gives up the controller) and during an SPDK restart.
