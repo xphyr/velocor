@@ -16,6 +16,23 @@ commit. Keep entries short: the problem, where it stands, the next step.
 The first final release waits for these. Hardware validation (below) is part of the gate but
 doesn't block the rest.
 
+- [ ] **P0-7. One unreadable sector on the last good copy takes a mirror pool offline.**
+  Found 2026-11-20 with emulated disk errors (QEMU `blkdebug`, lab VM). SPDK v26.09's RAID1
+  fails a member whenever none of the other copies can supply a read, and the rebuild process
+  does the same on a source read error. So in a degraded mirror (one disk failed or being
+  replaced), a host read or the rebuild hitting a single bad sector fails the **last** member:
+  the RAID goes offline, the volume store closes, every volume in the pool is gone. After an
+  SPDK restart the array re-assembles, velod restarts the rebuild, it hits the same sector, and
+  the pool goes offline again; `start-degraded` doesn't apply (the RAID isn't assembled), so an
+  operator can't even bring it up to copy the data off. Linux md fails just that read (EIO)
+  and keeps the array running. Bad sectors during a rebuild are common on large drives.
+  *Needed:* an SPDK patch so RAID1 fails the I/O, not the last member, on an unreadable read,
+  and the rebuild records the unreadable range (counted, alerted, like the scrub's
+  `unrecoverable_blocks`) and carries on instead of failing its source; velod stops
+  restarting a rebuild that failed on source read errors and offers a way to bring such a pool
+  online degraded; real-SPDK tests (the blkdebug lab recipe in
+  [docs/testing.md](docs/testing.md) reproduces both cases). Scrub (P2-2) lowers the odds by
+  rewriting bad sectors while both copies exist, but doesn't remove the failure mode.
 - [ ] **P2-1. CHAP and real host identities.** Any host that can spoof an allowed NQN or IQN gets
   access (the API refuses `chap_user` rather than ignoring it). *Needed:* iSCSI CHAP auth groups
   and NVMe DH-HMAC-CHAP with secrets stored encrypted (and kept out of pool metadata copies, like
@@ -38,11 +55,17 @@ doesn't block the rest.
 
 ## Next
 
-- [ ] **P2-2 (rest). Failing disks, emulated.** QEMU's `blkdebug` driver can return read and
-  write errors at chosen sectors of a lab VM disk. Check: scrub rewrites an unreadable range from
-  the other copy (repaired count, data intact); a disk whose rewrite fails is failed out of the
-  mirror (pool DEGRADED, replace works); a rebuild whose source hits a read error; RAID0 scan
-  counts unrecoverable blocks; alerts fire. Real drives stay under hardware validation.
+- [ ] **P2-2 (rest). Failing disks, emulated: RAID0 and repeat after P0-7.** Done on the lab
+  VM (2026-11-20, dev-8311b3a, QEMU `blkdebug`): host reads over bad sectors are served from the
+  other copy and the bad copy rewritten; a scrub repaired both bad windows (4096 blocks), failed
+  the member whose repair write failed (pool DEGRADED, scrub paused), and the alerts fired
+  (`VelocorScrubRepaired`, `VelocorScrubRepairFailed`, `VelocorPoolFaulted`). Found: P0-7, and
+  two velod bugs fixed on the spot (archive). *Left:* a RAID0 scan counting unrecoverable
+  blocks, and the rebuild cases again once P0-7 is fixed.
+- [ ] **V-1. velod keeps stale member states when a RAID goes offline.** When SPDK fails the
+  last member and the RAID bdev disappears, the pool turns UNAVAILABLE but its members still
+  read ACTIVE / REBUILDING (with "rebuilding 0%"), because member states are only read from a
+  RAID that exists. Show them as unknown or failed, and say why the pool is unavailable.
 - [ ] **L-7. Pools can't be expanded.** Evaluated 2026-11-20 against SPDK v26.09; *needs a
   decision.* (b) **Grow a RAID1 after every member was replaced by a larger disk** is small: a
   patch adding `bdev_raid_grow` (SPDK's own resize path, refused while degraded or rebuilding),

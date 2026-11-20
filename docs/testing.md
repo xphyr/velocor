@@ -51,6 +51,28 @@ data through real exports, verified by reading back. No root, hugepages or NVMe 
   (I/O stalls ~70 s and resumes, nothing lost).
 - **Performance:** [performance.md](performance.md).
 
+## Emulated disk errors
+
+QEMU's `blkdebug` driver fails chosen I/O on a lab VM disk, which is how scrub, RAID1 read-error
+handling and rebuilds were tested against real SPDK in an appliance. Give the disk a raw file
+and a rules file, and attach it as
+`-drive if=none,id=D,cache=none,rerror=report,werror=report,driver=raw,file.driver=blkdebug,file.config=D.dbg,file.image.driver=file,file.image.filename=D.raw`
+with a `scsi-hd` device. A rule fails reads (or writes) touching one sector, every time:
+
+```
+[inject-error]
+event = "read_aio"
+iotype = "read"
+sector = "2097152"
+errno = "5"
+```
+
+Always set `iotype`: without it, a rule armed by any read also fails writes at its offset
+until another error rule fires, which looks like a failed repair write. Check rules with
+`qemu-io -c "read 1G 4k" "json:{...}"` before booting a VM with them. The errors persist (a real
+drive remaps a sector once it's rewritten), so a rewritten bad sector is still bad the next
+time it's read.
+
 ## Pitfalls
 
 - **busybox `dd oflag=direct` isn't always direct.** On a device whose DMA alignment its buffer

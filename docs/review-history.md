@@ -136,6 +136,15 @@ How things are tested: [testing.md](testing.md).
   (2026-11-18).
 - **P2-15. iSCSI sessions could outlive their volumes on a node.** Logout by session ID for every
   session of the target; unstage fails while one remains. 867ddaa (2026-11-19).
+- **Deleting a pool left a failed member's disk bound to it** (found with emulated disk errors,
+  2026-11-20): a FAILED or MISSING member's disk is in neither `DiskIDs` nor `DetachedDiskIDs`,
+  so `DeletePool` skipped it and the disk could never be released or claimed again. It now frees
+  every disk naming the pool. `TestDeletePoolReleasesFailedAndMissingMembers`.
+- **A paused scrub resumed on a degraded pool** (same lab run): when a scrub's failed repair
+  write failed a member, the next scrub tick still saw the pool ONLINE (the reconciler records
+  member changes a pass later) and resumed it as a single-copy scan that then counted as a
+  complete scrub. Eligibility now also checks SPDK's operational member count;
+  `TestScrubManualInterruptionsAndStop` ticks before the reconciler runs.
 - **Data-plane restarts failed I/O on hosts** (2026-11-16): 64 KiB clusters meant 16 minutes of
   lvstore recovery. Default cluster size 1 MiB; CSI connects with `--ctrl-loss-tmo=-1`. 194b99c.
   Open: iSCSI `replacement_timeout`, a "recovering" state (TODO.md P2-10).
