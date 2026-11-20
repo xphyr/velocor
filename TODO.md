@@ -630,7 +630,14 @@ work still open, ranked by risk to data, how fixes are verified, and what has be
   an exact point in time (a prefix of new blocks, the rest old; e.g. 14 of 4096 new), the writer
   sees no errors, and the idle member's clone holds its data. Schema entry, `rpc.py` command and
   RPC docs are in the patch, ready to send upstream.
-  *Left:* lab check on snoarm/NVW with a VolumeGroupSnapshot of PVCs in use.
+  Lab (dev-01e8a55 on the test appliance, 2026-11-20): a pod on the OpenShift test cluster
+  wrote dependent counters to two PVCs in use, one NVMe/TCP and one iSCSI on different pools
+  (n to A, then once that completed n to B, each `O_DIRECT|O_DSYNC`); nine group snapshots
+  through the API while it ran (127 ms each), each member cloned and read back on the cluster:
+  all nine consistent (B = A or A-1, both seen), and the writer never saw an error in ~22,000
+  pairs.
+  *Left:* a Kubernetes VolumeGroupSnapshot of PVCs in use on the Arm cluster (the x86 one has no
+  group snapshot CRDs).
   **Found alongside:** velod's `bdev_get_iostat` call sent `name`, which SPDK v26.09 rejects (it
   takes `names`, an array), so `GET /api/v1/system/iostats?bdev_name=...` failed on real SPDK (the
   unfiltered metrics path was fine). Fixed; the fake now rejects `name` like SPDK and the client
