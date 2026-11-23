@@ -586,7 +586,7 @@ func TestSettleAfterReboot(t *testing.T) {
 		}
 	}
 	reboot()
-	if err := e.p.Settle(e.ctx); err != nil {
+	if err := e.p.Settle(e.ctx, e.disks); err != nil {
 		t.Fatal(err)
 	}
 	if a := e.arrayOf(); a.State != dataplane.ArrayOnline || a.Operational != 2 {
@@ -601,7 +601,7 @@ func TestSettleAfterReboot(t *testing.T) {
 	reboot()
 	lost := e.run("losetup", "--noheadings", "-O", "BACK-FILE", e.disks[1])
 	e.run("losetup", "-d", e.disks[1])
-	if err := e.p.Settle(e.ctx); err != nil {
+	if err := e.p.Settle(e.ctx, e.disks); err != nil {
 		t.Fatal(err)
 	}
 	a := e.arrayOf()
@@ -611,7 +611,7 @@ func TestSettleAfterReboot(t *testing.T) {
 	if err := e.p.StartDegraded(e.ctx, e.array); err != nil {
 		t.Fatal(err)
 	}
-	if err := e.p.Settle(e.ctx); err != nil {
+	if err := e.p.Settle(e.ctx, e.disks); err != nil {
 		t.Fatal(err)
 	}
 	if a := e.arrayOf(); a.State != dataplane.ArrayOnline || a.Operational != 1 {
@@ -619,4 +619,122 @@ func TestSettleAfterReboot(t *testing.T) {
 	}
 	verify(t, dev, 0, 32*mib, 6)
 	_, _ = e.k.Run.Run(e.ctx, "losetup", e.disks[1], lost) // back, for the cleanup
+}
+
+// ExamineDisks finds a stopped pool's array on its disks, each member in its slot, and a member
+// replaced earlier as stale. Settle assembles only arrays on claimed disks, from the claimed
+// ones: an unclaimed copy takes no part.
+func TestExamineDisksAndClaimedSettle(t *testing.T) {
+	e := newEnv(t)
+	e.pool()
+	dev, _ := e.volume("vol-e", 16*mib)
+	fill(t, dev, 0, 16*mib, 7)
+	disk := func(h string) *store.Disk {
+		return &store.Disk{ID: "d-" + filepath.Base(h), Type: store.DiskTypeSSD, DevicePath: h}
+	}
+
+	// Replace slot 1: the old disk keeps an older copy of the metadata.
+	old := e.disks[1]
+	if err := e.p.RemoveMember(e.ctx, old); err != nil {
+		t.Fatal(err)
+	}
+	c, _ := e.disk(1 << 30)
+	if err := e.p.AddMember(e.ctx, e.array, c); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the rebuild", 180*time.Second, func() bool { return e.arrayOf().Operational == 2 && e.arrayOf().Rebuild == nil })
+
+	stop := func() {
+		t.Helper()
+		e.run("dmsetup", "remove", "--retry", kernel.WrapperName("vol-e"))
+		if err := e.k.DeactivatePool(e.ctx, e.vg); err != nil {
+			t.Fatal(err)
+		}
+		if err := e.k.StopArray(e.ctx, e.array); err != nil {
+			t.Fatal(err)
+		}
+	}
+	stop()
+	arrays, err := e.p.ExamineDisks(e.ctx, []*store.Disk{disk(e.disks[0]), disk(old), disk(c)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(arrays) != 1 {
+		t.Fatalf("arrays %+v", arrays)
+	}
+	a := arrays[0]
+	if a.Name != e.array || a.Level != store.RaidLevel1 || a.Slots != 2 || a.Current != 2 || a.SizeBytes == 0 {
+		t.Fatalf("array %+v", a)
+	}
+	got := map[string]dataplane.DiskMember{}
+	for _, m := range a.Members {
+		got[m.Disk.DevicePath] = m
+	}
+	if m := got[e.disks[0]]; m.Slot != 0 || m.Stale {
+		t.Errorf("first member %+v", m)
+	}
+	if m := got[c]; m.Slot != 1 || m.Stale {
+		t.Errorf("replacement %+v", m)
+	}
+	if m := got[old]; !m.Stale {
+		t.Errorf("the replaced disk isn't stale: %+v", m)
+	}
+
+	// Nothing claimed: nothing assembled.
+	if err := e.p.Settle(e.ctx, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(e.k.ArrayPath(e.array)); err == nil {
+		t.Fatal("assembled an array on unclaimed disks")
+	}
+	// The current members claimed (and the old disk not): assembled from them, data intact.
+	if err := e.p.Settle(e.ctx, []string{e.disks[0], c}); err != nil {
+		t.Fatal(err)
+	}
+	if a := e.arrayOf(); a.State != dataplane.ArrayOnline || a.Operational != 2 || a.Members[1].Name != c {
+		t.Fatalf("after settle: %+v", a)
+	}
+	verify(t, dev, 0, 16*mib, 7)
+	e.disks = []string{e.disks[0], c}
+}
+
+// RAID10 over four disks: a thin volume's data survives losing a disk and the rebuild onto a
+// new one.
+func TestRAID10(t *testing.T) {
+	e := newEnv(t)
+	if err := e.p.CheckLevel(store.RaidLevel10, 3); err == nil {
+		t.Error("RAID10 on three disks accepted")
+	}
+	for range 4 {
+		h, _ := e.disk(512 << 20)
+		e.disks = append(e.disks, h)
+	}
+	if err := e.p.CheckLevel(store.RaidLevel10, len(e.disks)); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.p.CreateArray(e.ctx, e.array, store.RaidLevel10, 64, e.disks); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(e.destroy)
+	if _, err := e.p.CreateThinPool(e.ctx, e.array, e.vg, 1<<20); err != nil {
+		t.Fatal(err)
+	}
+	if a := e.arrayOf(); a.Level != "raid10" || a.Slots != 4 || a.State != dataplane.ArrayOnline {
+		t.Fatalf("array %+v", a)
+	}
+	dev, _ := e.volume("vol-10", 64*mib)
+	fill(t, dev, 0, 64*mib, 9)
+	if err := e.p.RemoveMember(e.ctx, e.disks[2]); err != nil {
+		t.Fatal(err)
+	}
+	verify(t, dev, 0, 64*mib, 9)
+	n, _ := e.disk(512 << 20)
+	if err := e.p.AddMember(e.ctx, e.array, n); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the rebuild", 180*time.Second, func() bool {
+		a := e.arrayOf()
+		return a.Operational == 4 && a.Rebuild == nil && a.Members[2].Name == n
+	})
+	verify(t, dev, 0, 64*mib, 9)
 }

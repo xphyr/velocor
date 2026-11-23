@@ -19,7 +19,7 @@ import (
 const maxRebuildMBps = 100_000
 
 func redundant(level store.RaidLevel) bool {
-	return strings.EqualFold(string(level), string(store.RaidLevel1))
+	return strings.EqualFold(string(level), string(store.RaidLevel1)) || strings.EqualFold(string(level), string(store.RaidLevel10))
 }
 
 // poolRaid returns the data plane's view of the pool's array and of all arrays.

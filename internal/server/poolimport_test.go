@@ -31,17 +31,18 @@ func appliance(t *testing.T, f *spdktest.Fake, dev meta.Device) *harness {
 		t.Fatal(err)
 	}
 	clearMustChange(t, st)
-	rec := reconciler.New(st, spdkplane.New(f.Client(), nil), nil, nil)
-	if dev != nil {
-		rec.SetMetaDevice(dev, "node-1", "test")
-	}
-	srv := New(st, spdkplane.New(f.Client(), nil), nil, authMgr, rec, nil, WithMetaDevice(dev))
-	srv.sbReader = func(d *store.Disk) (*hardware.RaidSuperblock, error) {
+	dp := spdkplane.New(f.Client(), nil)
+	dp.ReadSuperblock = func(d *store.Disk) (*hardware.RaidSuperblock, error) {
 		if d.PCIAddress == "" {
 			return f.SuperblockOf(d.DevicePath), nil
 		}
 		return f.SuperblockOf(d.PCIAddress), nil
 	}
+	rec := reconciler.New(st, dp, nil, nil)
+	if dev != nil {
+		rec.SetMetaDevice(dev, "node-1", "test")
+	}
+	srv := New(st, dp, nil, authMgr, rec, nil, WithMetaDevice(dev))
 	h := &harness{t: t, st: st, fake: f, ts: httptest.NewServer(srv.Handler())}
 	t.Cleanup(h.ts.Close)
 	_, resp := h.do("POST", "/api/v1/auth/login", "", map[string]any{"username": "admin", "password": "admin-pass-123"})

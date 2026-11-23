@@ -78,9 +78,16 @@ listed until then so nothing is lost if the plan changes.
       operator;
     - a member reported MISSING whose disk is back can't be put back: release refuses (not
       detached) and replace refuses (still in the pool). Needs a re-add path (P0-1 follow-up);
-    - pool import and moved members (P1-14) still read SPDK RAID superblocks
-      (`hardware.ReadRaidSuperblock`): md's own metadata (`mdadm --examine`) replaces them;
-    - RAID10 is refused by the API's level check ("SPDK has no raid10"); md has it;
+    - pool import and moved members (P1-14) on md (**done 2026-11-23**): `Plane.ExamineDisks`
+      groups disks by the array metadata on them (SPDK: the superblock and
+      `MatchMovedMembers`, moved from the server; md: each member's own `mdadm --examine`,
+      which names its slot, so nothing needs matching). `Settle` takes the claimed disks and
+      assembles only arrays on them, from them (an unclaimed copy, an import candidate or a
+      member that left, takes no part). Lab appliance: a fresh velod after a lost database
+      imported a pool from its metadata copy (volume, snapshot, data); a member re-plugged
+      under a new serial was relinked to its slot and the pool came back ONLINE;
+    - RAID10 (**done 2026-11-23**): the level check is the data plane's (`Plane.CheckLevel`):
+      the kernel builds md RAID10 (four disks or more), SPDK still refuses it;
     - claimed disks stay claimed across scans (the store keeps `Claimed`), checked;
     - iSCSI ACLs are by IQN only (**decided 2026-11-23**): LIO can't restrict an initiator by
       address, so a host's IP (which CSI registers) isn't enforced and an address-only ACL is
@@ -95,7 +102,7 @@ listed until then so nothing is lost if the plan changes.
       bound covers the snapshots too; per-disk I/O counters aren't reported; the scrub's start
       and stopped/completed state live in memory (lost on a velod restart); the chunk size is
       always 64 KiB whatever the pool asks for;
-    - the on-pool metadata copy needs an LV-backed `meta.Device` (no ublk).
+    - the on-pool metadata copy on an LV: done (`meta.BlockDevice`).
     Then every row of the feature table (iSCSI via LIO, scrub on md, metadata copy
   on an LV, import, CBT via `thin_delta`, metrics, alerts, veloctl/UI wording, docs).
 - [ ] **K-3. Validation:** CSI matrix on both clusters, KubeVirt, the P0-7 scenario (an

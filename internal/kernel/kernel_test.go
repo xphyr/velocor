@@ -340,3 +340,26 @@ func TestParseVGsAndTags(t *testing.T) {
 		t.Fatalf("lvs %+v %v", lvs, err)
 	}
 }
+
+func TestParseExamine(t *testing.T) {
+	a, err := parseExamine(probeSection(t, "mdadm-examine-active"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := MemberInfo{ArrayUUID: "4009d12d:f41d8d3a:ac2d1e26:a4757ed6", Name: "raid_pool-mdex", Level: "raid1", RaidDevices: 2,
+		ArrayKiB: 203776, DeviceUUID: "abc0d854:f6cd4475:57c73c73:8b94c9ad", Events: 0, Role: 0, ArrayState: "AA"}
+	if *a != want {
+		t.Errorf("active member %+v, want %+v", *a, want)
+	}
+	r, err := parseExamine(probeSection(t, "mdadm-examine-removed"))
+	if err != nil || r.Role != 1 || r.ArrayUUID != want.ArrayUUID {
+		t.Errorf("removed member %+v %v", r, err)
+	}
+	if _, err := parseExamine("garbage"); err == nil {
+		t.Error("garbage parsed")
+	}
+	s := &Script{Steps: []Step{{Prefix: "mdadm --examine /dev/vda1", Err: &CommandError{Code: 1, Stderr: "mdadm: No md superblock detected on /dev/vda1.\n"}}}}
+	if m, err := New(s).ExamineMember(context.Background(), "/dev/vda1"); m != nil || err != nil {
+		t.Errorf("no metadata: %v %v", m, err)
+	}
+}

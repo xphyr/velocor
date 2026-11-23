@@ -27,8 +27,10 @@ type Plane interface {
 	// Version returns the data plane's version; an error means it isn't reachable.
 	Version(ctx context.Context) (string, error)
 	// Settle waits until the data plane has examined its disks: arrays assembled from their
-	// on-disk metadata and thin pools loaded from the arrays.
-	Settle(ctx context.Context) error
+	// on-disk metadata and thin pools loaded from the arrays. claimed are the handles of the
+	// disks velod has claimed: only arrays on those are assembled, never one on disks velod
+	// doesn't own.
+	Settle(ctx context.Context, claimed []string) error
 	// Endpoint describes how velod reaches the data plane (a socket path), for status output.
 	Endpoint() string
 	// PollingCPUs lists the CPUs the data plane busy-polls on, so other workloads can avoid
@@ -48,12 +50,20 @@ type Plane interface {
 	NVMeWriteCache(ctx context.Context, d *store.Disk) (store.WriteCacheState, error)
 	SetNVMeWriteCache(ctx context.Context, d *store.Disk, enabled bool) (store.WriteCacheState, error)
 
+	// ExamineDisks reads the array metadata on disks and groups them by array: which array each
+	// belongs to, its slot, and whether its copy is current. For pool import and for pool
+	// members that come back under a new disk ID (docs/review-history.md P1-14). Disks without
+	// array metadata are left out.
+	ExamineDisks(ctx context.Context, disks []*store.Disk) ([]DiskArray, error)
+
 	// Devices lists the block devices the data plane holds: attached disks, arrays, volumes
 	// and snapshots, and anything else it has open.
 	Devices(ctx context.Context) ([]Device, error)
 
 	// Arrays lists the RAID arrays the data plane has assembled or is assembling.
 	Arrays(ctx context.Context) ([]Array, error)
+	// CheckLevel says whether the data plane can build an array of level from disks disks.
+	CheckLevel(level store.RaidLevel, disks int) error
 	// CreateArray builds an array from attached disks (by handle), with on-disk metadata.
 	CreateArray(ctx context.Context, name string, level store.RaidLevel, stripKB uint32, members []string) error
 	// DeleteArray stops an array and erases its metadata from the members.
@@ -124,6 +134,35 @@ type Plane interface {
 	// Unmanaged lists data-plane objects velod has no record of, given what it does know.
 	// It never changes anything.
 	Unmanaged(ctx context.Context, known Known) ([]UnmanagedObject, error)
+}
+
+// DiskArray is an array as the metadata on a set of disks describes it.
+type DiskArray struct {
+	UUID string
+	Name string
+	// Level is the store's name for it (RAID0, RAID1, ...); unknown levels as LEVEL-<n>.
+	Level store.RaidLevel
+	// Slots is the array's member count; Current how many its newest metadata has in use.
+	Slots   int
+	Current int
+	// Generation orders metadata copies: a member that left the array has an older one.
+	Generation uint64
+	SizeBytes  uint64
+	Members    []DiskMember
+	// Unplaced says why some disks couldn't be given their slots ("" when none).
+	Unplaced string
+}
+
+// DiskMember is one disk carrying an array's metadata.
+type DiskMember struct {
+	Disk *store.Disk
+	Slot int // -1 when its metadata doesn't say
+	// Stale: the disk left the array (an older copy, or not one of its current members).
+	Stale bool
+	// Identity is how the array knows this disk when that differs from the disk's own: a
+	// member that came back under a new disk ID keeps the SPDK bdev UUID it was created with
+	// (Disk.BdevUUID). "" when no such thing is needed (md knows its members itself).
+	Identity string
 }
 
 // Device is a block device the data plane holds.
@@ -296,3 +335,18 @@ var (
 
 // IsNotFound reports whether err is for a data-plane object that doesn't exist.
 func IsNotFound(err error) bool { return errors.Is(err, ErrNotFound) }
+
+// ClaimedHandles lists the handles of the disks velod has claimed, for Plane.Settle.
+func ClaimedHandles(st store.Store) []string {
+	disks, err := st.ListDisks()
+	if err != nil {
+		return nil
+	}
+	var out []string
+	for _, d := range disks {
+		if d.Claimed && d.SPDKBdevName != "" {
+			out = append(out, d.SPDKBdevName)
+		}
+	}
+	return out
+}

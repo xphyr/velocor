@@ -20,6 +20,8 @@ import (
 type Plane struct {
 	c  *spdk.Client
 	hw *hardware.Manager
+	// ReadSuperblock replaces reading a disk's RAID superblock from it (tests).
+	ReadSuperblock func(*store.Disk) (*hardware.RaidSuperblock, error)
 }
 
 var _ dataplane.Plane = (*Plane)(nil)
@@ -50,7 +52,9 @@ func wrap(err error) error {
 
 func (p *Plane) Version(ctx context.Context) (string, error) { return p.c.GetVersion(ctx) }
 
-func (p *Plane) Settle(ctx context.Context) error { return p.c.BdevWaitForExamine(ctx) }
+// Settle waits for SPDK's examine. SPDK assembles only arrays on bdevs velod attached, which are
+// the claimed disks, so claimed isn't needed.
+func (p *Plane) Settle(ctx context.Context, _ []string) error { return p.c.BdevWaitForExamine(ctx) }
 
 func (p *Plane) Endpoint() string { return p.c.SocketPath() }
 

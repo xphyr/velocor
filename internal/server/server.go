@@ -55,7 +55,6 @@ type Server struct {
 	backups       *backup.Manager
 	restart       func()
 	metaDev       meta.Device
-	sbReader      func(*store.Disk) (*hardware.RaidSuperblock, error) // tests
 	monitoring    *monitoring.Manager
 	mon           monitoringState
 	net           *netChanges
