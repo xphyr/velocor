@@ -76,8 +76,11 @@ listed until then so nothing is lost if the plan changes.
       to `nvme` (it took both drives from the P0-1 lab VM's running SPDK, 2026-11-23: nvmepool
       lost slot 0). Fixed: with the kernel data plane such a drive is claimed only by an
       operator;
-    - a member reported MISSING whose disk is back can't be put back: release refuses (not
-      detached) and replace refuses (still in the pool). Needs a re-add path (P0-1 follow-up);
+    - a member whose own disk came back (MISSING, or left a running array) is put back with
+      `replace` naming that disk (**done 2026-11-23**): attached if needed, added back, the
+      array rebuilds onto it (md re-adds with its bitmap: only what changed). The array still
+      never takes a returning member back by itself. Lab appliance: sdb unplugged, pool
+      started degraded, data written, sdb re-plugged and put back: ONLINE, data intact;
     - pool import and moved members (P1-14) on md (**done 2026-11-23**): `Plane.ExamineDisks`
       groups disks by the array metadata on them (SPDK: the superblock and
       `MatchMovedMembers`, moved from the server; md: each member's own `mdadm --examine`,

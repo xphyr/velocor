@@ -159,6 +159,38 @@ func TestStartPoolDegraded(t *testing.T) {
 	h.expect(h.do("POST", "/api/v1/pools/"+id+"/replace", h.admin, map[string]any{"new_disk_id": "d3"}))(http.StatusAccepted)
 }
 
+// A missing member's own disk comes back: replace with it puts it back and rebuilds onto it
+// (neither release nor replace with another disk is needed).
+func TestPutMissingMemberBack(t *testing.T) {
+	h := newHarness(t)
+	h.addDisk("d1", "0000:01:00.0")
+	h.addDisk("d2", "0000:02:00.0")
+	h.addDisk("d3", "0000:03:00.0")
+	id := h.pool("p1", "RAID1", "d1", "d2")
+	h.fake.Restart()
+	h.fake.RemoveMedia("0000:02:00.0")
+	h.reconcile()
+	h.expect(h.do("POST", "/api/v1/pools/"+id+"/start-degraded", h.admin, map[string]any{"confirm": "p1"}))(http.StatusOK)
+
+	// d2 is back; the running array doesn't take it by itself.
+	h.fake.AddNVMe("0000:02:00.0")
+	h.reconcile()
+	if p := h.getPool(id); member(p, 1)["state"] == "ACTIVE" || member(p, 1)["disk_id"] != "d2" {
+		t.Fatalf("returned member taken back implicitly: %v", p["members"])
+	}
+	// Not d3 for d2's slot by naming d3's slot; not d1, which is working.
+	h.expect(h.do("POST", "/api/v1/pools/"+id+"/replace", h.admin, map[string]any{"new_disk_id": "d2", "old_disk_id": "d1"}))(http.StatusBadRequest)
+	h.expect(h.do("POST", "/api/v1/pools/"+id+"/replace", h.admin, map[string]any{"new_disk_id": "d1"}))(http.StatusBadRequest)
+
+	p := h.expect(h.do("POST", "/api/v1/pools/"+id+"/replace", h.admin, map[string]any{"new_disk_id": "d2"}))(http.StatusAccepted)["pool"].(map[string]any)
+	if s := member(p, 1)["state"]; s != "REBUILDING" && s != "ACTIVE" {
+		t.Fatalf("after putting d2 back: %v", p["members"])
+	}
+	if d := h.expect(h.do("GET", "/api/v1/disks/d2", h.admin, nil))(http.StatusOK)["disk"].(map[string]any); d["pool_id"] != id || d["claimed"] != true {
+		t.Errorf("d2 after putting it back: %v", d)
+	}
+}
+
 func TestRebuildSpeedSetting(t *testing.T) {
 	h := newHarness(t)
 	if v := h.expect(h.do("GET", "/api/v1/system/rebuild", h.admin, nil))(http.StatusOK)["max_mb_per_sec"]; v != float64(0) {

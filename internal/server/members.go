@@ -136,6 +136,22 @@ func (s *Server) handleReplacePoolDisk(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
+	if newDisk.PoolID == pool.ID {
+		// The slot's own disk came back (it was missing, or failed and was left out): put it
+		// back and rebuild onto it. The array never takes a returning member back by itself.
+		own := slices.IndexFunc(members, func(m store.PoolMember) bool { return m.DiskID == newDisk.ID })
+		switch {
+		case own < 0:
+			writeError(w, fmt.Errorf("%w: disk %s belongs to pool %s but holds none of its slots; release it first", store.ErrInUse, newDisk.ID, pool.ID))
+		case req.OldDiskID != "" && req.OldDiskID != newDisk.ID:
+			writeError(w, fmt.Errorf("%w: disk %s holds slot %d of pool %s, not %s's", store.ErrInvalidArgument, newDisk.ID, own, pool.ID, req.OldDiskID))
+		case rb.Members[own].Name != "":
+			writeError(w, fmt.Errorf("%w: disk %s is already in RAID %s", store.ErrInvalidArgument, newDisk.ID, rb.Name))
+		default:
+			s.putBack(w, r, pool, rb, raids, newDisk)
+		}
+		return
+	}
 	switch {
 	case newDisk.IsBootDevice:
 		writeError(w, store.ErrBootDeviceProtected)
@@ -193,6 +209,51 @@ func (s *Server) handleReplacePoolDisk(w http.ResponseWriter, r *http.Request) {
 		updated = p
 	}
 	writeJSON(w, http.StatusAccepted, map[string]any{"pool": updated})
+}
+
+// putBack adds a member's own disk back to its array, which rebuilds onto it: attached to the
+// data plane first if it isn't (the reconciler leaves a disk that left a running array alone).
+func (s *Server) putBack(w http.ResponseWriter, r *http.Request, pool *store.Pool, rb *dataplane.Array, raids []dataplane.Array, d *store.Disk) {
+	ctx := r.Context()
+	if other := memberOf(raids, d.SPDKBdevName); other != "" {
+		writeError(w, fmt.Errorf("%w: disk %s is in RAID %s", store.ErrInUse, d.ID, other))
+		return
+	}
+	devs, err := s.dp.Devices(ctx)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	present := d.SPDKBdevName != "" && slices.ContainsFunc(devs, func(x dataplane.Device) bool {
+		return x.Name == d.SPDKBdevName || slices.Contains(x.Aliases, d.SPDKBdevName)
+	})
+	if !present {
+		h, drv, err := s.dp.AttachDisk(ctx, d)
+		if err != nil {
+			writeError(w, fmt.Errorf("attach disk %s: %w", d.ID, err))
+			return
+		}
+		if d, err = s.store.MutateDisk(d.ID, func(cur *store.Disk) error {
+			cur.SPDKBdevName, cur.DriverState = h, drv
+			return nil
+		}); err != nil {
+			writeError(w, err)
+			return
+		}
+	}
+	// SPDK's examine may already have put an attached member back into its slot.
+	if now, err := s.dp.Arrays(ctx); err != nil || memberOf(now, d.SPDKBdevName) != rb.Name {
+		if err := s.dp.AddMember(ctx, rb.Name, d.SPDKBdevName); err != nil {
+			writeError(w, fmt.Errorf("add disk %s back to RAID %s: %w", d.ID, rb.Name, err))
+			return
+		}
+	}
+	s.logger.Warn("pool member put back; rebuilding onto it", "pool", pool.ID, "disk", d.ID)
+	s.reconcileNow(ctx)
+	if p, err := s.store.GetPool(pool.ID); err == nil {
+		pool = p
+	}
+	writeJSON(w, http.StatusAccepted, map[string]any{"pool": pool})
 }
 
 // undoReplace restores a slot after SPDK refused the new disk; the disk stays claimed.
