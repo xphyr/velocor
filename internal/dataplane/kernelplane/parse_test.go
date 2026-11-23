@@ -60,3 +60,25 @@ func TestSerial(t *testing.T) {
 		t.Errorf("serial %q", s)
 	}
 }
+
+func TestScrubStateKept(t *testing.T) {
+	dir := t.TempDir()
+	p := New(nil, nil)
+	p.StateDir = dir
+	p.mu.Lock()
+	p.scrubs["raid_pool-x"] = &scrubRun{Repair: true, Start: 2048}
+	p.saveScrubsLocked()
+	p.mu.Unlock()
+
+	q := New(nil, nil)
+	q.StateDir = dir
+	if err := q.LoadState(); err != nil {
+		t.Fatal(err)
+	}
+	if r := q.scrubs["raid_pool-x"]; r == nil || !r.Repair || r.Start != 2048 || r.Stopped {
+		t.Fatalf("scrub after reload: %+v", r)
+	}
+	if err := New(nil, nil).LoadState(); err != nil { // no StateDir: nothing to do
+		t.Fatal(err)
+	}
+}

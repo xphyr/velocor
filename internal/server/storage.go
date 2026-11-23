@@ -326,6 +326,10 @@ func (s *Server) handleCreatePool(w http.ResponseWriter, r *http.Request) {
 		p.HealthStatus, p.StatusMessage = store.HealthStatusOnline, ""
 		if stores, err := s.dp.ThinPools(ctx, "", lvsUUID); err == nil && len(stores) > 0 {
 			p.TotalBytes, p.FreeBytes = stores[0].TotalBytes, stores[0].FreeBytes
+			if stores[0].ChunkBytes > 0 {
+				// What the data plane used: the kernel one's thin pools always take 64 KiB.
+				p.ClusterSizeBytes = stores[0].ChunkBytes
+			}
 			p.AllocatedBytes = p.TotalBytes - p.FreeBytes
 		}
 		p.SpaceState = store.SpaceStateOf(p)

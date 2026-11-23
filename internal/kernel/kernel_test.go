@@ -211,7 +211,7 @@ func TestGroupSnapshotOrder(t *testing.T) {
 	if len(s.Steps) != 0 {
 		t.Fatalf("steps left: %v (calls %v)", s.Steps, s.Calls)
 	}
-	if !strings.HasSuffix(s.Calls[2], "--snapshot --name sa vg/a") || !strings.HasSuffix(s.Calls[3], "--snapshot --name sb vg/b") {
+	if !strings.HasSuffix(s.Calls[2], "--snapshot --permission r --name sa vg/a") || !strings.HasSuffix(s.Calls[3], "--snapshot --permission r --name sb vg/b") {
 		t.Errorf("snapshot calls %v", s.Calls[2:4])
 	}
 }

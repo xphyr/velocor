@@ -136,17 +136,17 @@ func (p *Plane) ResizeVolume(ctx context.Context, vg, name string, sizeBytes uin
 	return err
 }
 
-// Snapshot takes a thin snapshot of a thin volume. LVM gives it the skip-activation flag, so it
-// has no device until ActivateLV with ignoreSkip.
+// Snapshot takes a read-only thin snapshot of a thin volume. LVM gives it the skip-activation
+// flag, so it has no device until ActivateLV with ignoreSkip.
 func (p *Plane) Snapshot(ctx context.Context, vg, origin, name string, tags ...string) error {
-	_, err := p.lvm(ctx, "lvcreate", append(append([]string{"--quiet", "--snapshot", "--name", name}, tagArgs(tags)...), vg+"/"+origin)...)
+	_, err := p.lvm(ctx, "lvcreate", append(append([]string{"--quiet", "--snapshot", "--permission", "r", "--name", name}, tagArgs(tags)...), vg+"/"+origin)...)
 	return err
 }
 
 // Clone creates a writable thin volume from a snapshot (a thin snapshot of it without the
 // skip-activation flag) and activates it.
 func (p *Plane) Clone(ctx context.Context, vg, snapshot, name string, tags ...string) error {
-	if _, err := p.lvm(ctx, "lvcreate", append(append([]string{"--quiet", "--snapshot", "--setactivationskip", "n", "--name", name}, tagArgs(tags)...), vg+"/"+snapshot)...); err != nil {
+	if _, err := p.lvm(ctx, "lvcreate", append(append([]string{"--quiet", "--snapshot", "--permission", "rw", "--setactivationskip", "n", "--name", name}, tagArgs(tags)...), vg+"/"+snapshot)...); err != nil {
 		return err
 	}
 	return p.ActivateLV(ctx, vg, name, false)

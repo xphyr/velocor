@@ -53,6 +53,9 @@ const (
 type Plane struct {
 	k  *kernel.Plane
 	hw *hardware.Manager
+	// StateDir, if set, keeps the scrubs started (scrubs.json) across velod restarts; md itself
+	// keeps only its last action. A directory cleared at boot (/run/velocor), as md's is.
+	StateDir string
 
 	mu sync.Mutex
 	// waiting are arrays Settle found incomplete: md doesn't assemble an array with members
@@ -65,9 +68,9 @@ type Plane struct {
 }
 
 type scrubRun struct {
-	repair  bool
-	start   uint64 // sectors
-	stopped bool
+	Repair  bool   `json:"repair"`
+	Start   uint64 `json:"start"` // sectors
+	Stopped bool   `json:"stopped"`
 }
 
 var _ dataplane.Plane = (*Plane)(nil)
@@ -326,17 +329,26 @@ func (p *Plane) Devices(ctx context.Context) ([]dataplane.Device, error) {
 			SizeBytes: lv.Size, ParentSnapshot: lv.Origin}
 		out = append(out, dev)
 	}
-	// Whole disks (not partitions, arrays or device-mapper devices), by their handles.
+	for _, kname := range p.wholeDisks() {
+		out = append(out, dataplane.Device{Name: p.diskHandle(kname), Aliases: []string{filepath.Join(p.k.DevRoot, kname)},
+			Product: "disk", SizeBytes: p.sizeOf(kname)})
+	}
+	return out, nil
+}
+
+// wholeDisks lists the host's whole disks by kernel name: not partitions (sysfs lists those
+// under their disk), arrays, device-mapper devices, zram or optical drives.
+func (p *Plane) wholeDisks() []string {
 	es, _ := os.ReadDir(filepath.Join(p.k.SysRoot, "block"))
+	var out []string
 	for _, e := range es {
 		kname := e.Name()
 		if strings.HasPrefix(kname, "md") || strings.HasPrefix(kname, "dm-") || strings.HasPrefix(kname, "zram") || strings.HasPrefix(kname, "sr") {
 			continue
 		}
-		out = append(out, dataplane.Device{Name: p.diskHandle(kname), Aliases: []string{filepath.Join(p.k.DevRoot, kname)},
-			Product: "disk", SizeBytes: p.sizeOf(kname)})
+		out = append(out, kname)
 	}
-	return out, nil
+	return out
 }
 
 func (p *Plane) sizeOf(kname string) uint64 {
@@ -345,7 +357,8 @@ func (p *Plane) sizeOf(kname string) uint64 {
 	return n * 512
 }
 
-// IOStats reads /sys/block/*/stat for arrays (by name) and volumes (their wrappers, by alias).
+// IOStats reads /sys/block/*/stat for arrays (by name), volumes (their wrappers, by alias) and
+// whole disks (by handle).
 // Times are in milliseconds, so the tick rate is 1000.
 func (p *Plane) IOStats(ctx context.Context, device string) (*dataplane.IOStats, error) {
 	out := &dataplane.IOStats{TickRate: 1000, Devices: []dataplane.DeviceIO{}}
@@ -369,6 +382,9 @@ func (p *Plane) IOStats(ctx context.Context, device string) (*dataplane.IOStats,
 		if isVolume(lv) && !isSnapshot(lv) {
 			add(lv.VG+"/"+lv.Name, kernelName(p.k.WrapperPath(lv.Name)))
 		}
+	}
+	for _, kname := range p.wholeDisks() {
+		add(p.diskHandle(kname), kname)
 	}
 	if device != "" && len(out.Devices) == 0 {
 		return nil, notFound("device %s not found", device)

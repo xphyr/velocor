@@ -250,8 +250,8 @@ func (p *Plane) Snapshot(ctx context.Context, volume, name string) (string, erro
 }
 
 // SnapshotGroup suspends every member's wrapper, snapshots them all, and resumes them
-// (kernel.GroupSnapshot). quiesce bounds the whole operation; running out fails it with
-// ErrQuiesceTimeout and leaves no snapshot.
+// (kernel.GroupSnapshotWithin). quiesce bounds the pause (in-flight I/O draining): running out
+// fails it with ErrQuiesceTimeout and leaves no snapshot.
 func (p *Plane) SnapshotGroup(ctx context.Context, entries []dataplane.GroupEntry, quiesce time.Duration) ([]string, error) {
 	members := make([]kernel.GroupMember, len(entries))
 	uuids := make([]string, len(entries))
@@ -266,10 +266,8 @@ func (p *Plane) SnapshotGroup(ctx context.Context, entries []dataplane.GroupEntr
 		uuids[i] = newUUID()
 		members[i] = kernel.GroupMember{Volume: lv.Name, VG: lv.VG, LV: lv.Name, Snap: e.Snapshot, Tags: []string{tagUUID + uuids[i], tagSnapshot}}
 	}
-	gctx, cancel := context.WithTimeout(ctx, quiesce)
-	defer cancel()
-	if err := p.k.GroupSnapshot(gctx, members); err != nil {
-		if errors.Is(gctx.Err(), context.DeadlineExceeded) {
+	if err := p.k.GroupSnapshotWithin(ctx, members, quiesce); err != nil {
+		if errors.Is(err, context.DeadlineExceeded) {
 			return nil, &tagged{err: err, kind: dataplane.ErrQuiesceTimeout}
 		}
 		return nil, err

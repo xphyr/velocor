@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // WrapperName is the device-mapper name of a volume's wrapper; its device is
@@ -88,9 +89,16 @@ type GroupMember struct {
 // suspended, then resumes them all. No write that completed before the call is missing from its
 // volume's snapshot, and no write submitted after the first suspend is in any. On failure the
 // snapshots already taken are removed and every wrapper is resumed; the error names the step.
-// The context's deadline bounds the whole operation (velod gives it a few seconds, as SPDK patch
-// 0003 did).
+// The context's deadline bounds the whole operation.
 func (p *Plane) GroupSnapshot(ctx context.Context, members []GroupMember) error {
+	return p.GroupSnapshotWithin(ctx, members, 0)
+}
+
+// GroupSnapshotWithin is GroupSnapshot with quiesce (if > 0) bounding only the pause: in-flight
+// I/O must drain from every member within it (velod gives it a few seconds, as SPDK patch 0003
+// did), or no snapshot is taken and the error wraps context.DeadlineExceeded. Taking the
+// snapshots afterwards is bounded by ctx alone.
+func (p *Plane) GroupSnapshotWithin(ctx context.Context, members []GroupMember, quiesce time.Duration) error {
 	var suspended []string
 	var taken []GroupMember
 	resumeAll := func() error {
@@ -112,8 +120,16 @@ func (p *Plane) GroupSnapshot(ctx context.Context, members []GroupMember) error 
 		}
 		return errors.Join(err, rerr)
 	}
+	sctx, cancel := ctx, context.CancelFunc(func() {})
+	if quiesce > 0 {
+		sctx, cancel = context.WithTimeout(ctx, quiesce)
+	}
+	defer cancel()
 	for _, m := range members {
-		if err := p.SuspendWrapper(ctx, m.Volume); err != nil {
+		if err := p.SuspendWrapper(sctx, m.Volume); err != nil {
+			if sctx.Err() != nil {
+				err = fmt.Errorf("%w: %v", sctx.Err(), err)
+			}
 			return fail(fmt.Errorf("suspend %s: %w", m.Volume, err))
 		}
 		suspended = append(suspended, m.Volume)

@@ -62,6 +62,7 @@ func newEnv(t *testing.T) *env {
 	}
 	k := kernel.New(kernel.Exec{})
 	e := &env{t: t, k: k, p: New(k, nil), ctx: context.Background(), id: fmt.Sprintf("kp%06d", rand.IntN(1000000)), dir: dir}
+	e.p.StateDir = t.TempDir()
 	e.array, e.vg = "raid_pool-"+e.id, "lvs_pool-"+e.id
 	_, _ = k.Run.Run(e.ctx, "modprobe", "-a", "nvme_tcp", "iscsi_tcp")
 	return e
@@ -313,6 +314,18 @@ func TestVolumeLifecycle(t *testing.T) {
 		t.Fatal(err)
 	}
 	verify(t, e.k.WrapperPath("vol-clone"), 0, 16*mib, 1)
+	// Snapshots are read-only, clones writable.
+	if lvs, err := e.k.ListVolumes(e.ctx, e.vg); err == nil {
+		for _, lv := range lvs {
+			if (lv.Name == "snap-1" || lv.Name == "gsnap-a") && lv.Attr[1] != 'r' {
+				t.Errorf("snapshot %s is writable (%s)", lv.Name, lv.Attr)
+			}
+			if lv.Name == "vol-clone" && lv.Attr[1] != 'w' {
+				t.Errorf("the clone isn't writable (%s)", lv.Attr)
+			}
+		}
+	}
+	fill(t, e.k.WrapperPath("vol-clone"), 40*mib, mib, 8)
 	b := aligned(mib)
 	if err := rw(e.k.WrapperPath("vol-clone"), 32*mib, b, false); err != nil || !bytes.Equal(b, make([]byte, mib)) {
 		t.Errorf("the clone has data written after its snapshot (%v)", err)
@@ -556,6 +569,19 @@ func TestReplaceAndScrub(t *testing.T) {
 	})
 	if sc := e.arrayOf().Scrub; sc.MismatchedBlocks != 0 || sc.OffsetBlocks != sc.TotalBlocks || sc.TotalBlocks == 0 {
 		t.Errorf("scrub %+v", sc)
+	}
+	// After a velod restart (a new plane on the same state), the scrub is still known.
+	restarted := New(e.k, nil)
+	restarted.StateDir = e.p.StateDir
+	if err := restarted.LoadState(); err != nil {
+		t.Fatal(err)
+	}
+	arrays, err := restarted.Arrays(e.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if i := slices.IndexFunc(arrays, func(a dataplane.Array) bool { return a.Name == e.array }); i < 0 || arrays[i].Scrub == nil || arrays[i].Scrub.State != dataplane.ScrubCompleted {
+		t.Errorf("scrub after a restart: %+v", arrays)
 	}
 }
 

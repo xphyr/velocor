@@ -94,17 +94,18 @@ listed until then so nothing is lost if the plan changes.
     - claimed disks stay claimed across scans (the store keeps `Claimed`), checked;
     - iSCSI ACLs are by IQN only (**decided 2026-11-23**): LIO can't restrict an initiator by
       address, so a host's IP (which CSI registers) isn't enforced and an address-only ACL is
-      refused; document it in the API and CSI docs;
+      refused; documented (ARCHITECTURE.md, the design note);
     - NVMe connections (**decided 2026-11-23**): nvmet lists controllers only in debugfs, built
       into `nvmet.ko` with `CONFIG_NVME_TARGET_DEBUGFS`, which Fedora's kernel has off. Keep the
       fallback (the listeners' TCP peers via `ss`: never misses a host, over-reports when
       exports share a listener) and ask Fedora to enable the option; rebuild `nvmet.ko` in the
       OS image (signed with our own MOK-enrolled key) only if exact per-export connections
       become a requirement;
-    - snapshots are writable LVs (only velod's tag marks them); the group snapshot's quiesce
-      bound covers the snapshots too; per-disk I/O counters aren't reported; the scrub's start
-      and stopped/completed state live in memory (lost on a velod restart); the chunk size is
-      always 64 KiB whatever the pool asks for;
+    - **done 2026-11-23:** snapshots are read-only LVs (clones writable); the group snapshot's
+      quiesce bound covers only the pause, not taking the snapshots; per-disk I/O counters are
+      reported (by handle); the scrub's start and stopped/completed state is kept in
+      `/run/velocor/scrubs.json` across velod restarts (cleared at boot, as md's is); the pool
+      records the chunk size the data plane used (always 64 KiB on the kernel one);
     - the on-pool metadata copy on an LV: done (`meta.BlockDevice`).
     Then every row of the feature table (iSCSI via LIO, scrub on md, metadata copy
   on an LV, import, CBT via `thin_delta`, metrics, alerts, veloctl/UI wording, docs).
