@@ -12,6 +12,7 @@ import (
 
 	"github.com/velocor/velocor/internal/auth"
 	"github.com/velocor/velocor/internal/dataplane"
+	"github.com/velocor/velocor/internal/dataplane/spdkplane"
 	"github.com/velocor/velocor/internal/server"
 	"github.com/velocor/velocor/internal/spdk/spdktest"
 	"github.com/velocor/velocor/internal/store"
@@ -40,7 +41,7 @@ func newFixture(t *testing.T) *fixture {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ts := httptest.NewServer(server.New(st, fake.Client(), nil, authMgr, nil, nil).Handler())
+	ts := httptest.NewServer(server.New(st, spdkplane.New(fake.Client(), nil), nil, authMgr, nil, nil).Handler())
 	t.Cleanup(ts.Close)
 
 	ctx, c := context.Background(), fake.Client()
@@ -62,7 +63,7 @@ func newFixture(t *testing.T) *fixture {
 	exp := &store.Export{ID: "e1", Name: "e1", VolumeID: "v1", Protocol: store.ExportProtocolNVMeoFTCP, SubsystemNQN: "nqn.test:e1",
 		NamespaceID: 1, PortalIDs: []string{"pt"}, InitiatorGroupIDs: []string{"ig1"}}
 	_ = st.CreateExport(exp)
-	if err := dataplane.EnsureExport(ctx, c, st, exp, vol); err != nil {
+	if err := dataplane.EnsureExport(ctx, spdkplane.New(c, nil), st, exp, vol); err != nil {
 		t.Fatal(err)
 	}
 
@@ -235,7 +236,7 @@ func TestPoolReplaceStartDegradedReleaseAndRebuildCommands(t *testing.T) {
 	m3, _ := f.st.GetDisk("m3")
 	f.fake.Restart()
 	f.fake.RemoveMedia(m3.PCIAddress)
-	if _, err := f.fake.Client().BdevNvmeAttachController(ctx, dataplane.NVMeControllerName(m1.PCIAddress), "PCIe", m1.PCIAddress); err != nil {
+	if _, err := f.fake.Client().BdevNvmeAttachController(ctx, spdkplane.NVMeControllerName(m1.PCIAddress), "PCIe", m1.PCIAddress); err != nil {
 		t.Fatal(err)
 	}
 	if err := f.run(t, "pool", "start-degraded", pool.ID, "--confirm", "wrong"); err == nil {

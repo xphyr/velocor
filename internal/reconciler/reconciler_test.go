@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/velocor/velocor/internal/dataplane"
+	"github.com/velocor/velocor/internal/dataplane/spdkplane"
 	"github.com/velocor/velocor/internal/spdk/spdktest"
 	"github.com/velocor/velocor/internal/store"
 )
@@ -28,7 +28,7 @@ func newEnv(t *testing.T) *env {
 	}
 	t.Cleanup(func() { _ = st.Close() })
 	f := spdktest.New(t)
-	return &env{t: t, ctx: context.Background(), fake: f, st: st, rec: New(st, f.Client(), nil, nil)}
+	return &env{t: t, ctx: context.Background(), fake: f, st: st, rec: New(st, spdkplane.New(f.Client(), nil), nil, nil)}
 }
 
 // provision builds a pool + volume through the real SPDK client calls, exactly the way the
@@ -43,7 +43,7 @@ func (e *env) provision(level store.RaidLevel, pcis ...string) (*store.Pool, *st
 		if err := e.st.UpsertDisk(d); err != nil {
 			e.t.Fatal(err)
 		}
-		bdev, drv, err := dataplane.AttachDisk(e.ctx, c, nil, d)
+		bdev, drv, err := spdkplane.AttachDisk(e.ctx, c, nil, d)
 		if err != nil {
 			e.t.Fatal(err)
 		}
@@ -264,7 +264,7 @@ func TestSSDPoolReassemblesAfterRestart(t *testing.T) {
 		if err := e.st.UpsertDisk(d); err != nil {
 			t.Fatal(err)
 		}
-		bdev, drv, err := dataplane.AttachDisk(e.ctx, c, nil, d)
+		bdev, drv, err := spdkplane.AttachDisk(e.ctx, c, nil, d)
 		if err != nil {
 			t.Fatal(err)
 		}

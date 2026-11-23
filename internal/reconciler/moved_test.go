@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/velocor/velocor/internal/dataplane"
+	"github.com/velocor/velocor/internal/dataplane/spdkplane"
 	"github.com/velocor/velocor/internal/hardware"
 	"github.com/velocor/velocor/internal/store"
 )
@@ -21,7 +22,7 @@ func (e *env) ssdPool(level store.RaidLevel, paths ...string) *store.Pool {
 		if err := e.st.UpsertDisk(d); err != nil {
 			e.t.Fatal(err)
 		}
-		bdev, drv, err := dataplane.AttachDisk(e.ctx, c, nil, d)
+		bdev, drv, err := spdkplane.AttachDisk(e.ctx, c, nil, d)
 		if err != nil {
 			e.t.Fatal(err)
 		}

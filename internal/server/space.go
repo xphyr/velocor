@@ -91,22 +91,21 @@ func (s *Server) reserveSpace(ctx context.Context, poolID string, delta uint64,
 	}, nil
 }
 
-// refreshFree updates the pool copy with the volume store's current size and free space from
-// SPDK (the stored values are as old as the last reconciler pass). Best effort.
+// refreshFree updates the pool copy with the thin pool's current size and free space from the
+// data plane (the stored values are as old as the last reconciler pass). Best effort.
 func (s *Server) refreshFree(ctx context.Context, pool *store.Pool) {
-	if s.spdk == nil || pool.LVSUUID == "" {
+	if s.dp == nil || pool.LVSUUID == "" {
 		return
 	}
-	stores, err := s.spdk.BdevLvolGetLvstores(ctx, "", pool.LVSUUID)
+	stores, err := s.dp.ThinPools(ctx, "", pool.LVSUUID)
 	if err != nil || len(stores) != 1 {
 		return
 	}
-	cs := uint64(stores[0].ClusterSize)
-	pool.TotalBytes, pool.FreeBytes = stores[0].TotalDataClusters*cs, stores[0].FreeClusters*cs
+	pool.TotalBytes, pool.FreeBytes = stores[0].TotalBytes, stores[0].FreeBytes
 }
 
-// updatePoolSpace recomputes a pool's size, committed and available space (from SPDK and the
-// store), so the API shows the effect of a create or delete before the next reconciler pass.
+// updatePoolSpace recomputes a pool's size, committed and available space (from the data plane and
+// the store), so the API shows the effect of a create or delete before the next reconciler pass.
 func (s *Server) updatePoolSpace(poolID string) {
 	pool, err := s.store.GetPool(poolID)
 	if err != nil {
@@ -138,23 +137,15 @@ func (s *Server) updatePoolSpace(poolID string) {
 	})
 }
 
-// lvolHeldBytes returns how many bytes an lvol holds now (its allocated clusters).
+// lvolHeldBytes returns how many bytes a volume holds now (its allocated space).
 func (s *Server) lvolHeldBytes(ctx context.Context, uuid string) (uint64, error) {
-	lvols, err := s.spdk.BdevLvolGetLvols(ctx)
+	lvols, err := s.dp.Volumes(ctx)
 	if err != nil {
 		return 0, fmt.Errorf("list lvols: %w", err)
 	}
-	stores, err := s.spdk.BdevLvolGetLvstores(ctx, "", "")
-	if err != nil {
-		return 0, fmt.Errorf("list lvstores: %w", err)
-	}
-	cs := map[string]uint64{}
-	for _, l := range stores {
-		cs[l.UUID] = uint64(l.ClusterSize)
-	}
 	for _, l := range lvols {
 		if l.UUID == uuid {
-			return l.NumAllocatedClusters * cs[l.LVS.UUID], nil
+			return l.AllocatedBytes, nil
 		}
 	}
 	return 0, fmt.Errorf("%w: lvol %s", store.ErrNotFound, uuid)

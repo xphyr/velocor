@@ -207,22 +207,3 @@ func IsNotFound(err error) bool {
 
 // MaxLvolNameLen is the longest lvol / lvstore name SPDK accepts (SPDK_LVOL_NAME_MAX - 1).
 const MaxLvolNameLen = 63
-
-// ValidateObjectName checks that name is safe to embed in SPDK bdev, lvstore, lvol,
-// NQN and IQN identifiers: 1..MaxLvolNameLen characters from [A-Za-z0-9._-].
-func ValidateObjectName(name string) error {
-	if name == "" {
-		return errors.New("name must not be empty")
-	}
-	if len(name) > MaxLvolNameLen {
-		return fmt.Errorf("name %q is longer than %d characters", name, MaxLvolNameLen)
-	}
-	for _, r := range name {
-		switch {
-		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '_', r == '.':
-		default:
-			return fmt.Errorf("name %q contains invalid character %q (allowed: A-Z a-z 0-9 . _ -)", name, r)
-		}
-	}
-	return nil
-}

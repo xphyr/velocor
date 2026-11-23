@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/velocor/velocor/internal/spdk"
+	"github.com/velocor/velocor/internal/dataplane"
 	"github.com/velocor/velocor/internal/store"
 )
 
@@ -29,8 +29,8 @@ func (r *Reconciler) purgeDeletedVolumes(ctx context.Context, p *pass, poolOnlin
 			continue // restored or purged since the listing
 		}
 		if err == nil {
-			err = r.spdk.BdevLvolDelete(ctx, vol.UUID)
-			if spdk.IsNotFound(err) {
+			err = r.dp.DeleteVolume(ctx, vol.UUID)
+			if dataplane.IsNotFound(err) {
 				err = nil
 			}
 		}
@@ -61,8 +61,8 @@ func (r *Reconciler) purgeDeletedSnapshots(ctx context.Context, p *pass, poolOnl
 		if ok, err := r.store.PurgeableSnapshot(sn.ID); err != nil || !ok {
 			continue
 		}
-		err := r.spdk.BdevLvolDelete(ctx, sn.UUID)
-		if spdk.IsNotFound(err) {
+		err := r.dp.DeleteVolume(ctx, sn.UUID)
+		if dataplane.IsNotFound(err) {
 			err = nil
 		}
 		if err == nil {

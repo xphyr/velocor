@@ -12,7 +12,6 @@ import (
 	"github.com/velocor/velocor/internal/dataplane"
 	"github.com/velocor/velocor/internal/hardware"
 	"github.com/velocor/velocor/internal/meta"
-	"github.com/velocor/velocor/internal/spdk"
 	"github.com/velocor/velocor/internal/store"
 )
 
@@ -94,11 +93,11 @@ func (s *Server) importCandidates() ([]ImportCandidate, map[string][]foundSB, er
 	}
 	// An import that failed after claiming its disks leaves them claimed with the array
 	// assembled (undoing that would degrade it): such arrays are candidates too.
-	assembled := map[string]*spdk.RaidBdevInfo{} // by member bdev name
-	if s.spdk != nil {
-		if raids, err := s.spdk.BdevRaidGetBdevs(context.Background(), "all"); err == nil {
+	assembled := map[string]*dataplane.Array{} // by member bdev name
+	if s.dp != nil {
+		if raids, err := s.dp.Arrays(context.Background()); err == nil {
 			for i := range raids {
-				for _, b := range raids[i].BaseBdevsList {
+				for _, b := range raids[i].Members {
 					if b.Name != "" {
 						assembled[b.Name] = &raids[i]
 					}
@@ -219,9 +218,9 @@ func (s *Server) importCandidates() ([]ImportCandidate, map[string][]foundSB, er
 
 // superblockOf describes an assembled array the way its superblock would (seq 0: the kernel
 // read superblocks of other members take precedence).
-func superblockOf(r *spdk.RaidBdevInfo) *hardware.RaidSuperblock {
-	sb := &hardware.RaidSuperblock{UUID: r.UUID, Name: r.Name, NumMembers: int(r.NumBaseBdevs)}
-	switch strings.ToLower(r.RaidLevel) {
+func superblockOf(r *dataplane.Array) *hardware.RaidSuperblock {
+	sb := &hardware.RaidSuperblock{UUID: r.UUID, Name: r.Name, NumMembers: int(r.Slots)}
+	switch strings.ToLower(r.Level) {
 	case "raid0":
 		sb.Level = 0
 	case "raid1":
@@ -229,9 +228,9 @@ func superblockOf(r *spdk.RaidBdevInfo) *hardware.RaidSuperblock {
 	default:
 		sb.Level = 99
 	}
-	for i, b := range r.BaseBdevsList {
+	for i, b := range r.Members {
 		st := uint32(hardware.RaidSBMemberMissing)
-		if b.IsConfigured {
+		if b.Configured {
 			st = hardware.RaidSBMemberConfigured
 		}
 		sb.Members = append(sb.Members, hardware.RaidSBMember{Slot: i, BdevUUID: b.UUID, State: st})
@@ -277,7 +276,7 @@ func (s *Server) handleImportPool(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
-	if err := s.requireSPDK(); err != nil {
+	if err := s.requireDataPlane(); err != nil {
 		writeError(w, err)
 		return
 	}
@@ -364,10 +363,10 @@ func (s *Server) importPool(ctx context.Context, poolID, rename string, allowDeg
 		return nil, err
 	}
 	lvsName := "lvs_" + poolID
-	var lvs *spdk.LvolStoreInfo
+	var lvs *dataplane.ThinPool
 	for deadline := time.Now().Add(30 * time.Second); ; {
-		_ = s.spdk.BdevWaitForExamine(ctx)
-		if stores, lerr := s.spdk.BdevLvolGetLvstores(ctx, lvsName, ""); lerr == nil && len(stores) > 0 {
+		_ = s.dp.Settle(ctx)
+		if stores, lerr := s.dp.ThinPools(ctx, lvsName, ""); lerr == nil && len(stores) > 0 {
 			lvs = &stores[0]
 			break
 		}
@@ -378,13 +377,13 @@ func (s *Server) importPool(ctx context.Context, poolID, rename string, allowDeg
 	}
 
 	// 3. What SPDK has in the volume store.
-	lvols, err := s.spdk.BdevLvolGetLvols(ctx)
+	lvols, err := s.dp.Volumes(ctx)
 	if err != nil {
 		return nil, err
 	}
-	inLvs := map[string]spdk.LvolInfo{} // by lvol name
+	inLvs := map[string]dataplane.Volume{} // by lvol name
 	for _, l := range lvols {
-		if l.LVS.UUID == lvs.UUID {
+		if l.Pool == lvs.UUID {
 			inLvs[l.Name] = l
 		}
 	}
@@ -435,17 +434,16 @@ func (s *Server) importPool(ctx context.Context, poolID, rename string, allowDeg
 		diskByBdev[d.SPDKBdevName] = d.ID
 	}
 	pool.DiskIDs, pool.DetachedDiskIDs, pool.Members = nil, nil, nil
-	for _, b := range raid.BaseBdevsList {
+	for _, b := range raid.Members {
 		if id, ok := diskByBdev[b.Name]; ok {
 			pool.DiskIDs = append(pool.DiskIDs, id)
 		}
 	}
 	pool.BaseBdevName, pool.EffectiveBdevName, pool.LVSName, pool.LVSUUID = cand.RaidName, cand.RaidName, lvsName, lvs.UUID
-	pool.RaidLevel = store.RaidLevel(strings.ToUpper(raid.RaidLevel))
-	pool.StripSizeKB = raid.StripSizeKb
-	pool.ClusterSizeBytes = lvs.ClusterSize
-	cs := uint64(lvs.ClusterSize)
-	pool.TotalBytes, pool.FreeBytes = lvs.TotalDataClusters*cs, lvs.FreeClusters*cs
+	pool.RaidLevel = store.RaidLevel(strings.ToUpper(raid.Level))
+	pool.StripSizeKB = raid.StripKB
+	pool.ClusterSizeBytes = lvs.ChunkBytes
+	pool.TotalBytes, pool.FreeBytes = lvs.TotalBytes, lvs.FreeBytes
 	pool.AllocatedBytes = pool.TotalBytes - pool.FreeBytes
 	pool.CommittedBytes, pool.AvailableBytes, pool.SpaceState = 0, 0, ""
 	pool.HealthStatus, pool.StatusMessage = store.HealthStatusReconciling, "imported"
@@ -571,11 +569,11 @@ func (s *Server) recordLvols(vols []*store.Volume, snaps []*store.Snapshot) erro
 }
 
 // waitForRaid waits for SPDK to assemble name from its members' superblocks.
-func (s *Server) waitForRaid(ctx context.Context, name string, allowDegraded bool) (*spdk.RaidBdevInfo, error) {
+func (s *Server) waitForRaid(ctx context.Context, name string, allowDegraded bool) (*dataplane.Array, error) {
 	startedDegraded := false
 	for deadline := time.Now().Add(30 * time.Second); ; {
-		_ = s.spdk.BdevWaitForExamine(ctx)
-		raids, err := s.spdk.BdevRaidGetBdevs(ctx, "all")
+		_ = s.dp.Settle(ctx)
+		raids, err := s.dp.Arrays(ctx)
 		if err != nil {
 			return nil, err
 		}
@@ -587,8 +585,8 @@ func (s *Server) waitForRaid(ctx context.Context, name string, allowDegraded boo
 			case "online":
 				return &r, nil
 			case "configuring":
-				if allowDegraded && !startedDegraded && r.NumBaseBdevsDiscovered > 0 {
-					if err := s.spdk.BdevRaidStartDegraded(ctx, name); err != nil {
+				if allowDegraded && !startedDegraded && r.Discovered > 0 {
+					if err := s.dp.StartDegraded(ctx, name); err != nil {
 						return nil, fmt.Errorf("start RAID %s degraded: %w", name, err)
 					}
 					s.logger.Warn("imported pool started degraded", "raid", name)
@@ -607,13 +605,13 @@ func (s *Server) waitForRaid(ctx context.Context, name string, allowDegraded boo
 }
 
 // importableLvols returns the plan's volumes and snapshots whose lvols exist, ready to record.
-func (s *Server) importableLvols(plan *meta.Manifest, inLvs map[string]spdk.LvolInfo, res *ImportResult) ([]*store.Volume, []*store.Snapshot) {
+func (s *Server) importableLvols(plan *meta.Manifest, inLvs map[string]dataplane.Volume, res *ImportResult) ([]*store.Volume, []*store.Snapshot) {
 	lvsName := "lvs_" + plan.Pool.ID
 	var vols []*store.Volume
 	present := map[string]bool{}
 	for _, v := range plan.Volumes {
 		l, ok := inLvs[v.ID]
-		if !ok || l.IsSnapshot {
+		if !ok || l.Snapshot {
 			res.MissingVolumeIDs = append(res.MissingVolumeIDs, v.ID)
 			res.Warnings = append(res.Warnings, fmt.Sprintf("volume %s (%s) has no lvol in the pool; not restored", v.ID, v.Name))
 			continue
@@ -762,13 +760,13 @@ func (s *Server) importAccess(plan *meta.Manifest, vols []*store.Volume, res *Im
 
 // importSkeleton rebuilds a pool from what SPDK knows when the pool has no readable copy:
 // volumes and snapshots named by their IDs, with sizes and parentage; no exports.
-func (s *Server) importSkeleton(ctx context.Context, poolID string, inLvs map[string]spdk.LvolInfo, raid *spdk.RaidBdevInfo, res *ImportResult) (*meta.Manifest, error) {
-	bdevs, err := s.spdk.BdevGetBdevs(ctx, "")
+func (s *Server) importSkeleton(ctx context.Context, poolID string, inLvs map[string]dataplane.Volume, raid *dataplane.Array, res *ImportResult) (*meta.Manifest, error) {
+	bdevs, err := s.dp.Devices(ctx)
 	if err != nil {
 		return nil, err
 	}
 	type node struct {
-		l      spdk.LvolInfo
+		l      dataplane.Volume
 		size   uint64
 		parent string // base snapshot's lvol name
 	}
@@ -782,10 +780,7 @@ func (s *Server) importSkeleton(ctx context.Context, poolID string, inLvs map[st
 			if b.UUID != l.UUID {
 				continue
 			}
-			n.size = b.NumBlocks * uint64(b.BlockSize)
-			if lv, ok := b.DriverSpecific["lvol"].(map[string]any); ok {
-				n.parent, _ = lv["base_snapshot"].(string)
-			}
+			n.size, n.parent = b.SizeBytes, b.ParentSnapshot
 		}
 		nodes[name] = n
 	}
@@ -806,7 +801,7 @@ func (s *Server) importSkeleton(ctx context.Context, poolID string, inLvs map[st
 	var owner func(snap string) string
 	owner = func(snap string) string {
 		for _, c := range children[snap] {
-			if nodes[c].l.IsSnapshot {
+			if nodes[c].l.Snapshot {
 				if o := owner(c); o != "" {
 					return o
 				}
@@ -814,7 +809,7 @@ func (s *Server) importSkeleton(ctx context.Context, poolID string, inLvs map[st
 		}
 		var vols []string
 		for _, c := range children[snap] {
-			if !nodes[c].l.IsSnapshot {
+			if !nodes[c].l.Snapshot {
 				vols = append(vols, c)
 			}
 		}
@@ -830,21 +825,21 @@ func (s *Server) importSkeleton(ctx context.Context, poolID string, inLvs map[st
 		return ""
 	}
 	m := &meta.Manifest{Format: meta.FormatVersion, Pool: store.Pool{
-		ID: poolID, Name: poolID, RaidLevel: store.RaidLevel(strings.ToUpper(raid.RaidLevel)), CreatedAt: time.Now().UTC(),
+		ID: poolID, Name: poolID, RaidLevel: store.RaidLevel(strings.ToUpper(raid.Level)), CreatedAt: time.Now().UTC(),
 	}}
 	snapOwner := map[string]string{}
 	for _, name := range names {
-		if nodes[name].l.IsSnapshot {
+		if nodes[name].l.Snapshot {
 			snapOwner[name] = owner(name)
 		}
 	}
 	res.Warnings = append(res.Warnings, "recovered from SPDK only: names, labels, QoS, exports and access control are not restored; volumes and snapshots are named by their IDs")
 	for _, name := range names {
 		n := nodes[name]
-		if n.l.IsSnapshot {
+		if n.l.Snapshot {
 			continue
 		}
-		v := store.Volume{ID: name, Name: name, PoolID: poolID, SizeBytes: n.size, ThinProvision: n.l.IsThinProvisioned}
+		v := store.Volume{ID: name, Name: name, PoolID: poolID, SizeBytes: n.size, ThinProvision: n.l.Thin}
 		if n.parent != "" && snapOwner[n.parent] != name {
 			v.ParentSnapshotID = n.parent // a clone
 		}
@@ -853,7 +848,7 @@ func (s *Server) importSkeleton(ctx context.Context, poolID string, inLvs map[st
 	seq := uint64(0)
 	for _, name := range names {
 		n := nodes[name]
-		if !n.l.IsSnapshot || snapOwner[name] == "" {
+		if !n.l.Snapshot || snapOwner[name] == "" {
 			continue
 		}
 		seq++

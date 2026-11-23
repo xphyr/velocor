@@ -13,6 +13,7 @@ import (
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/kubernetes-csi/csi-test/v5/pkg/sanity"
 	"github.com/velocor/velocor/internal/auth"
+	"github.com/velocor/velocor/internal/dataplane/spdkplane"
 	"github.com/velocor/velocor/internal/server"
 	"github.com/velocor/velocor/internal/spdk/spdktest"
 	"github.com/velocor/velocor/internal/store"
@@ -140,7 +141,7 @@ func TestCSISanitySuite(t *testing.T) {
 		t.Fatalf("CreateApiToken: %v", err)
 	}
 
-	srv := server.New(st, fake.Client(), nil, authMgr, nil, nil)
+	srv := server.New(st, spdkplane.New(fake.Client(), nil), nil, authMgr, nil, nil)
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
 
@@ -366,7 +367,7 @@ func TestVolumeGroupSnapshot(t *testing.T) {
 		t.Fatalf("CreateApiToken: %v", err)
 	}
 
-	srv := server.New(db, fake.Client(), nil, authMgr, nil, nil)
+	srv := server.New(db, spdkplane.New(fake.Client(), nil), nil, authMgr, nil, nil)
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
 
@@ -566,7 +567,7 @@ func TestDeleteVolumeProtectionAndRetention(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ts := httptest.NewServer(server.New(db, fake.Client(), nil, authMgr, nil, nil).Handler())
+	ts := httptest.NewServer(server.New(db, spdkplane.New(fake.Client(), nil), nil, authMgr, nil, nil).Handler())
 	defer ts.Close()
 	cs := &ControllerServer{client: NewHTTPClient(ts.URL, rawToken, true)}
 	ctx := context.Background()

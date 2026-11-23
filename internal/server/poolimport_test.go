@@ -9,6 +9,7 @@ import (
 
 	"github.com/velocor/velocor/internal/auth"
 	"github.com/velocor/velocor/internal/dataplane"
+	"github.com/velocor/velocor/internal/dataplane/spdkplane"
 	"github.com/velocor/velocor/internal/hardware"
 	"github.com/velocor/velocor/internal/meta"
 	"github.com/velocor/velocor/internal/reconciler"
@@ -30,11 +31,11 @@ func appliance(t *testing.T, f *spdktest.Fake, dev meta.Device) *harness {
 		t.Fatal(err)
 	}
 	clearMustChange(t, st)
-	rec := reconciler.New(st, f.Client(), nil, nil)
+	rec := reconciler.New(st, spdkplane.New(f.Client(), nil), nil, nil)
 	if dev != nil {
 		rec.SetMetaDevice(dev, "node-1", "test")
 	}
-	srv := New(st, f.Client(), nil, authMgr, rec, nil, WithMetaDevice(dev))
+	srv := New(st, spdkplane.New(f.Client(), nil), nil, authMgr, rec, nil, WithMetaDevice(dev))
 	srv.sbReader = func(d *store.Disk) (*hardware.RaidSuperblock, error) {
 		if d.PCIAddress == "" {
 			return f.SuperblockOf(d.DevicePath), nil

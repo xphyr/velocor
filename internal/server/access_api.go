@@ -45,7 +45,7 @@ func (s *Server) handleUpdateExport(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
-	if err := s.requireSPDK(); err != nil {
+	if err := s.requireDataPlane(); err != nil {
 		writeError(w, err)
 		return
 	}
@@ -53,7 +53,7 @@ func (s *Server) handleUpdateExport(w http.ResponseWriter, r *http.Request) {
 		writeError(w, fmt.Errorf("%w: node_ids can only be changed on a shared export", store.ErrInvalidArgument))
 		return
 	}
-	updated, err := dataplane.UpdateExport(r.Context(), s.spdk, s.store, id, vol, func(e *store.Export) error {
+	updated, err := dataplane.UpdateExport(r.Context(), s.dp, s.store, id, vol, func(e *store.Export) error {
 		if req.NodeIDs != nil {
 			e.NodeIDs = slices.Compact(slices.Sorted(slices.Values(*req.NodeIDs)))
 		}
@@ -108,11 +108,11 @@ func (s *Server) handleExportConnections(w http.ResponseWriter, r *http.Request)
 		writeError(w, err)
 		return
 	}
-	if err := s.requireSPDK(); err != nil {
+	if err := s.requireDataPlane(); err != nil {
 		writeError(w, err)
 		return
 	}
-	conns, err := dataplane.Connections(r.Context(), s.spdk, exp)
+	conns, err := dataplane.Connections(r.Context(), s.dp, exp)
 	if err != nil {
 		writeError(w, err)
 		return
@@ -200,7 +200,7 @@ func (s *Server) handleUpdateInitiatorGroup(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	if len(dependents) > 0 {
-		if err := s.requireSPDK(); err != nil {
+		if err := s.requireDataPlane(); err != nil {
 			writeError(w, err)
 			return
 		}
@@ -209,7 +209,7 @@ func (s *Server) handleUpdateInitiatorGroup(w http.ResponseWriter, r *http.Reque
 	for _, e := range dependents {
 		vol, err := s.store.GetVolume(e.VolumeID)
 		if err == nil {
-			err = dataplane.EnsureExport(r.Context(), s.spdk, s.store, e, vol)
+			err = dataplane.EnsureExport(r.Context(), s.dp, s.store, e, vol)
 		}
 		if err != nil {
 			failed = append(failed, fmt.Sprintf("%s: %v", e.Name, err))
@@ -252,33 +252,28 @@ func (s *Server) handleVolumeUsage(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
-	if err := s.requireSPDK(); err != nil {
+	if err := s.requireDataPlane(); err != nil {
 		writeError(w, err)
 		return
 	}
-	pool, err := s.store.GetPool(vol.PoolID)
+	if _, err := s.store.GetPool(vol.PoolID); err != nil {
+		writeError(w, err)
+		return
+	}
+	lvols, err := s.dp.Volumes(r.Context())
 	if err != nil {
 		writeError(w, err)
 		return
-	}
-	lvols, err := s.spdk.BdevLvolGetLvols(r.Context())
-	if err != nil {
-		writeError(w, err)
-		return
-	}
-	cluster := uint64(pool.ClusterSizeBytes)
-	if stores, err := s.spdk.BdevLvolGetLvstores(r.Context(), "", pool.LVSUUID); err == nil && len(stores) > 0 && stores[0].ClusterSize > 0 {
-		cluster = uint64(stores[0].ClusterSize)
 	}
 	for _, l := range lvols {
 		if l.UUID == vol.UUID {
 			writeJSON(w, http.StatusOK, map[string]any{
 				"size_bytes":      vol.SizeBytes,
-				"allocated_bytes": l.NumAllocatedClusters * cluster,
-				"thin_provision":  l.IsThinProvisioned,
+				"allocated_bytes": l.AllocatedBytes,
+				"thin_provision":  l.Thin,
 			})
 			return
 		}
 	}
-	writeError(w, fmt.Errorf("%w: lvol %s is not present in SPDK", store.ErrNotFound, vol.UUID))
+	writeError(w, fmt.Errorf("%w: lvol %s is not present in the data plane", store.ErrNotFound, vol.UUID))
 }

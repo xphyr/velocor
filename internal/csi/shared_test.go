@@ -10,6 +10,7 @@ import (
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/velocor/velocor/internal/auth"
+	"github.com/velocor/velocor/internal/dataplane/spdkplane"
 	"github.com/velocor/velocor/internal/server"
 	"github.com/velocor/velocor/internal/spdk/spdktest"
 	"github.com/velocor/velocor/internal/store"
@@ -36,7 +37,7 @@ func sharedHarness(t *testing.T) (*ControllerServer, *spdktest.Fake) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ts := httptest.NewServer(server.New(st, fake.Client(), nil, authMgr, nil, nil).Handler())
+	ts := httptest.NewServer(server.New(st, spdkplane.New(fake.Client(), nil), nil, authMgr, nil, nil).Handler())
 	t.Cleanup(ts.Close)
 	return NewControllerServer(NewHTTPClient(ts.URL, pat, true)), fake
 }

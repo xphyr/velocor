@@ -13,6 +13,7 @@ import (
 	"testing"
 
 	"github.com/velocor/velocor/internal/auth"
+	"github.com/velocor/velocor/internal/dataplane/spdkplane"
 	"github.com/velocor/velocor/internal/reconciler"
 	"github.com/velocor/velocor/internal/spdk/spdktest"
 	"github.com/velocor/velocor/internal/store"
@@ -41,9 +42,9 @@ func newHarness(t *testing.T) *harness {
 		t.Fatal(err)
 	}
 	clearMustChange(t, st)
-	rec := reconciler.New(st, f.Client(), nil, nil)
+	rec := reconciler.New(st, spdkplane.New(f.Client(), nil), nil, nil)
 	rec.SetSPDKInstance(func() string { return "" }) // not whatever spdk_tgt runs on this machine
-	srv := New(st, f.Client(), nil, authMgr, rec, nil)
+	srv := New(st, spdkplane.New(f.Client(), nil), nil, authMgr, rec, nil)
 	srv.os.reboot = func() { t.Log("reboot requested (fake)") } // never the real one
 	h := &harness{t: t, st: st, fake: f, srv: srv, rec: rec, ts: httptest.NewServer(srv.Handler())}
 	t.Cleanup(h.ts.Close)

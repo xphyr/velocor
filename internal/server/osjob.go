@@ -274,7 +274,7 @@ func (s *Server) connectedHosts(ctx context.Context) ([]string, error) {
 	}
 	var out []string
 	for _, e := range exps {
-		conns, err := dataplane.Connections(ctx, s.spdk, e)
+		conns, err := dataplane.Connections(ctx, s.dp, e)
 		if err != nil {
 			return nil, err
 		}
@@ -298,7 +298,7 @@ func (s *Server) handleRebootSystem(w http.ResponseWriter, r *http.Request) {
 		writeError(w, fmt.Errorf("%w: an OS upgrade is running; rebooting now would lose it", store.ErrInUse))
 		return
 	}
-	if !req.Force && s.spdk != nil {
+	if !req.Force && s.dp != nil {
 		ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 		hosts, err := s.connectedHosts(ctx)
 		cancel()

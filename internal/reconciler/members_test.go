@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/velocor/velocor/internal/dataplane"
+	"github.com/velocor/velocor/internal/dataplane/spdkplane"
 	"github.com/velocor/velocor/internal/store"
 )
 
@@ -16,7 +16,7 @@ func (e *env) spareDisk(id, pci string) *store.Disk {
 	if err := e.st.UpsertDisk(d); err != nil {
 		e.t.Fatal(err)
 	}
-	bdev, drv, err := dataplane.AttachDisk(e.ctx, e.fake.Client(), nil, d)
+	bdev, drv, err := spdkplane.AttachDisk(e.ctx, e.fake.Client(), nil, d)
 	if err != nil {
 		e.t.Fatal(err)
 	}

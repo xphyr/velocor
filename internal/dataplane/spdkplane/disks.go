@@ -1,13 +1,13 @@
-package dataplane
+package spdkplane
 
 import (
 	"context"
-	"crypto/sha1"
 	"fmt"
 	"log/slog"
 	"strings"
 	"sync"
 
+	"github.com/velocor/velocor/internal/dataplane"
 	"github.com/velocor/velocor/internal/hardware"
 	"github.com/velocor/velocor/internal/spdk"
 	"github.com/velocor/velocor/internal/store"
@@ -68,22 +68,6 @@ func ssdBackend() string {
 	return backend
 }
 
-// DiskBdevUUID returns the UUID given to a disk's io_uring/AIO bdev. It is derived from the
-// disk's stable hardware ID (a name-based, version-5-style UUID), so it is the same on every
-// restart, and recomputable without the metadata database. SPDK re-assembles a superblock RAID
-// only when each member's bdev UUID matches the superblock: a random UUID per restart would
-// leave every SSD pool offline after spdk_tgt restarts (found by the integration harness).
-// A member that came back under a new ID keeps its old UUID in BdevUUID (MatchMovedMembers).
-func DiskBdevUUID(d *store.Disk) string {
-	if d.BdevUUID != "" {
-		return d.BdevUUID
-	}
-	sum := sha1.Sum([]byte("velocor/disk-bdev/" + d.ID))
-	sum[6] = (sum[6] & 0x0f) | 0x50
-	sum[8] = (sum[8] & 0x3f) | 0x80
-	return fmt.Sprintf("%x-%x-%x-%x-%x", sum[0:4], sum[4:6], sum[6:8], sum[8:10], sum[10:16])
-}
-
 // UringBdevName returns the deterministic io_uring bdev name for a disk.
 func UringBdevName(d *store.Disk) string {
 	return "uring_" + d.ID
@@ -136,13 +120,13 @@ func AttachDisk(ctx context.Context, c *spdk.Client, hw *hardware.Manager, d *st
 			return "", "", fmt.Errorf("%w: disk %s has no device path", store.ErrInvalidArgument, d.ID)
 		}
 		if ssdBackend() == "aio" {
-			name, err := c.BdevAioCreate(ctx, UringBdevName(d), d.DevicePath, d.BlockSize, DiskBdevUUID(d))
+			name, err := c.BdevAioCreate(ctx, UringBdevName(d), d.DevicePath, d.BlockSize, dataplane.DiskBdevUUID(d))
 			if err != nil {
 				return "", "", fmt.Errorf("create aio bdev for %s: %w", d.DevicePath, err)
 			}
 			return name, store.DiskDriverStateAIOClaimed, nil
 		}
-		name, err := c.BdevUringCreate(ctx, UringBdevName(d), d.DevicePath, d.BlockSize, DiskBdevUUID(d))
+		name, err := c.BdevUringCreate(ctx, UringBdevName(d), d.DevicePath, d.BlockSize, dataplane.DiskBdevUUID(d))
 		if err != nil {
 			return "", "", fmt.Errorf("create io_uring bdev for %s: %w", d.DevicePath, err)
 		}
