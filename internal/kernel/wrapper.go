@@ -77,9 +77,10 @@ func (p *Plane) WrapperSuspended(ctx context.Context, volume string) (bool, erro
 
 // GroupMember is one volume of a group snapshot.
 type GroupMember struct {
-	Volume string // wrapper
-	VG, LV string // the thin volume to snapshot
-	Snap   string // the snapshot's LV name
+	Volume string   // wrapper
+	VG, LV string   // the thin volume to snapshot
+	Snap   string   // the snapshot's LV name
+	Tags   []string // LVM tags for the snapshot
 }
 
 // GroupSnapshot takes snapshots of several volumes at one instant: it suspends every member's
@@ -118,7 +119,7 @@ func (p *Plane) GroupSnapshot(ctx context.Context, members []GroupMember) error 
 		suspended = append(suspended, m.Volume)
 	}
 	for _, m := range members {
-		if err := p.Snapshot(ctx, m.VG, m.LV, m.Snap); err != nil {
+		if err := p.Snapshot(ctx, m.VG, m.LV, m.Snap, m.Tags...); err != nil {
 			return fail(fmt.Errorf("snapshot %s/%s: %w", m.VG, m.LV, err))
 		}
 		taken = append(taken, m)

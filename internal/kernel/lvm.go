@@ -111,15 +111,23 @@ func (p *Plane) DeactivatePool(ctx context.Context, vg string) error {
 	return err
 }
 
-// CreateVolume creates a volume: a thin LV in the pool, or a thick one beside it.
-func (p *Plane) CreateVolume(ctx context.Context, vg, thinPool, name string, sizeBytes uint64, thin bool) error {
+// CreateVolume creates a volume: a thin LV in the pool, or a thick one beside it, with LVM tags.
+func (p *Plane) CreateVolume(ctx context.Context, vg, thinPool, name string, sizeBytes uint64, thin bool, tags ...string) error {
 	size := fmt.Sprintf("%db", sizeBytes)
 	if thin {
-		_, err := p.lvm(ctx, "lvcreate", "--quiet", "--virtualsize", size, "--thinpool", vg+"/"+thinPool, "--name", name)
+		_, err := p.lvm(ctx, "lvcreate", append([]string{"--quiet", "--virtualsize", size, "--thinpool", vg + "/" + thinPool, "--name", name}, tagArgs(tags)...)...)
 		return err
 	}
-	_, err := p.lvm(ctx, "lvcreate", "--quiet", "--size", size, "--name", name, "--yes", "--wipesignatures", "n", "--zero", "n", vg)
+	_, err := p.lvm(ctx, "lvcreate", append(append([]string{"--quiet", "--size", size, "--name", name, "--yes", "--wipesignatures", "n", "--zero", "n"}, tagArgs(tags)...), vg)...)
 	return err
+}
+
+func tagArgs(tags []string) []string {
+	var out []string
+	for _, t := range tags {
+		out = append(out, "--addtag", t)
+	}
+	return out
 }
 
 // ResizeVolume grows a volume to sizeBytes.
@@ -130,9 +138,18 @@ func (p *Plane) ResizeVolume(ctx context.Context, vg, name string, sizeBytes uin
 
 // Snapshot takes a thin snapshot of a thin volume. LVM gives it the skip-activation flag, so it
 // has no device until ActivateLV with ignoreSkip.
-func (p *Plane) Snapshot(ctx context.Context, vg, origin, name string) error {
-	_, err := p.lvm(ctx, "lvcreate", "--quiet", "--snapshot", "--name", name, vg+"/"+origin)
+func (p *Plane) Snapshot(ctx context.Context, vg, origin, name string, tags ...string) error {
+	_, err := p.lvm(ctx, "lvcreate", append(append([]string{"--quiet", "--snapshot", "--name", name}, tagArgs(tags)...), vg+"/"+origin)...)
 	return err
+}
+
+// Clone creates a writable thin volume from a snapshot (a thin snapshot of it without the
+// skip-activation flag) and activates it.
+func (p *Plane) Clone(ctx context.Context, vg, snapshot, name string, tags ...string) error {
+	if _, err := p.lvm(ctx, "lvcreate", append(append([]string{"--quiet", "--snapshot", "--setactivationskip", "n", "--name", name}, tagArgs(tags)...), vg+"/"+snapshot)...); err != nil {
+		return err
+	}
+	return p.ActivateLV(ctx, vg, name, false)
 }
 
 // ActivateLV activates one LV (ignoreSkip for snapshots); DeactivateLV deactivates it.
@@ -169,13 +186,18 @@ type LV struct {
 	SkipActivation       bool
 	DMPath               string
 	SegType              string // thin, thin-pool, linear
+	Tags                 []string
 }
 
-// ListVolumes lists a volume group's LVs (LVM's hidden ones, such as the pool's data and metadata,
-// excluded).
+// ListVolumes lists a volume group's LVs, or every volume group's for vg "" (LVM's hidden ones,
+// such as the pool's data and metadata, excluded).
 func (p *Plane) ListVolumes(ctx context.Context, vg string) ([]LV, error) {
-	out, err := p.lvm(ctx, "lvs", "--reportformat", "json", "--units", "b", "--nosuffix",
-		"-o", "lv_name,vg_name,lv_uuid,lv_attr,lv_size,pool_lv,origin,thin_id,data_percent,metadata_percent,chunk_size,lv_active,lv_skip_activation,lv_dm_path,segtype", vg)
+	args := []string{"--reportformat", "json", "--units", "b", "--nosuffix",
+		"-o", "lv_name,vg_name,lv_uuid,lv_attr,lv_size,pool_lv,origin,thin_id,data_percent,metadata_percent,chunk_size,lv_active,lv_skip_activation,lv_dm_path,segtype,lv_tags"}
+	if vg != "" {
+		args = append(args, vg)
+	}
+	out, err := p.lvm(ctx, "lvs", args...)
 	if err != nil {
 		return nil, err
 	}
@@ -197,6 +219,9 @@ func parseLVs(out []byte) ([]LV, error) {
 			lv := LV{Name: m["lv_name"], VG: m["vg_name"], UUID: m["lv_uuid"], Attr: m["lv_attr"],
 				Pool: m["pool_lv"], Origin: m["origin"], Active: m["lv_active"] == "active",
 				SkipActivation: m["lv_skip_activation"] != "", DMPath: m["lv_dm_path"], SegType: m["segtype"]}
+			if t := m["lv_tags"]; t != "" {
+				lv.Tags = strings.Split(t, ",")
+			}
 			lv.Size, _ = strconv.ParseUint(m["lv_size"], 10, 64)
 			lv.ThinID, _ = strconv.Atoi(m["thin_id"])
 			lv.DataPercent, _ = strconv.ParseFloat(m["data_percent"], 64)
@@ -214,4 +239,44 @@ func (p *Plane) LVPath(vg, name string) string { return p.DevRoot + "/" + vg + "
 // dmName is device-mapper's name for an LV: "-" in either name is doubled.
 func dmName(vg, lv string) string {
 	return strings.ReplaceAll(vg, "-", "--") + "-" + strings.ReplaceAll(lv, "-", "--")
+}
+
+// VG is one volume group as LVM reports it.
+type VG struct {
+	Name, UUID string
+	Size, Free uint64
+	ExtentSize uint64
+	PV         string // the (single) physical volume's device
+}
+
+// ListVGs lists the volume groups on md arrays.
+func (p *Plane) ListVGs(ctx context.Context) ([]VG, error) {
+	out, err := p.lvm(ctx, "vgs", "--reportformat", "json", "--units", "b", "--nosuffix",
+		"-o", "vg_name,vg_uuid,vg_size,vg_free,vg_extent_size,pv_name")
+	if err != nil {
+		return nil, err
+	}
+	return parseVGs(out)
+}
+
+func parseVGs(out []byte) ([]VG, error) {
+	var rep struct {
+		Report []struct {
+			VG []map[string]string `json:"vg"`
+		} `json:"report"`
+	}
+	if err := json.Unmarshal(out, &rep); err != nil {
+		return nil, fmt.Errorf("vgs report: %w", err)
+	}
+	var vgs []VG
+	for _, r := range rep.Report {
+		for _, m := range r.VG {
+			vg := VG{Name: m["vg_name"], UUID: m["vg_uuid"], PV: m["pv_name"]}
+			vg.Size, _ = strconv.ParseUint(m["vg_size"], 10, 64)
+			vg.Free, _ = strconv.ParseUint(m["vg_free"], 10, 64)
+			vg.ExtentSize, _ = strconv.ParseUint(m["vg_extent_size"], 10, 64)
+			vgs = append(vgs, vg)
+		}
+	}
+	return vgs, nil
 }

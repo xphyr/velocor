@@ -26,8 +26,10 @@ func New(r Runner) *Plane {
 // ArraySpec describes an md array to create.
 type ArraySpec struct {
 	Name    string   // array name: DevRoot/md/<Name>
-	Level   string   // "raid1" or "raid10"
+	Level   string   // "raid0", "raid1" or "raid10"
 	Devices []string // member block devices
+	// ChunkKB is the chunk size of a striped level (raid0, raid10); 0 leaves mdadm's default.
+	ChunkKB uint32
 	// AssumeClean skips the initial resync. Only for tests: a production array resyncs so the
 	// members agree before data is written (md's write-intent bitmap keeps later resyncs short).
 	AssumeClean bool
@@ -42,15 +44,24 @@ func (p *Plane) ArrayPath(name string) string { return filepath.Join(p.DevRoot, 
 // the error to the reader and keeps the array running (TODO.md P0-7, checked by
 // TestLastCopyReadErrorKeepsThePool).
 func (p *Plane) CreateArray(ctx context.Context, s ArraySpec) (string, error) {
-	if s.Level != "raid1" && s.Level != "raid10" {
+	if s.Level != "raid0" && s.Level != "raid1" && s.Level != "raid10" {
 		return "", fmt.Errorf("unsupported level %q", s.Level)
 	}
-	if len(s.Devices) < 2 {
+	if len(s.Devices) < 2 && s.Level != "raid0" {
 		return "", fmt.Errorf("an array needs at least two devices, got %d", len(s.Devices))
 	}
 	args := []string{"--create", p.ArrayPath(s.Name), "--name=" + s.Name, "--homehost=any",
 		"--level=" + s.Level, "--raid-devices=" + strconv.Itoa(len(s.Devices)),
-		"--metadata=1.2", "--bitmap=internal", "--run", "--quiet"}
+		"--metadata=1.2", "--run", "--quiet"}
+	if s.Level != "raid0" { // raid0 has no redundancy to resync, so no bitmap
+		args = append(args, "--bitmap=internal")
+	}
+	if len(s.Devices) == 1 {
+		args = append(args, "--force") // mdadm wants it for a one-device raid0
+	}
+	if s.ChunkKB > 0 && s.Level != "raid1" {
+		args = append(args, "--chunk="+strconv.FormatUint(uint64(s.ChunkKB), 10))
+	}
 	if s.AssumeClean {
 		args = append(args, "--assume-clean")
 	}
@@ -111,6 +122,11 @@ func (p *Plane) StartScrub(name string, repair bool) error {
 
 func (p *Plane) StopScrub(name string) error { return p.writeMD(name, "sync_action", "idle") }
 
+// SetSyncMin makes the next sync (a scrub) start at sector: md resets it when the sync ends.
+func (p *Plane) SetSyncMin(name string, sector uint64) error {
+	return p.writeMD(name, "sync_min", strconv.FormatUint(sector, 10))
+}
+
 // SetSyncSpeedMax limits resync, rebuild and scrub to kbps KiB/s ("system" restores the default).
 func (p *Plane) SetSyncSpeedMax(name, kbps string) error {
 	return p.writeMD(name, "sync_speed_max", kbps)
@@ -118,17 +134,20 @@ func (p *Plane) SetSyncSpeedMax(name, kbps string) error {
 
 // ArrayStatus is an array's state from sysfs.
 type ArrayStatus struct {
-	Kernel      string // md127
-	UUID        string // as mdadm writes it: 8:8:8:8 hex
-	Level       string
-	RaidDisks   int
-	Degraded    int    // members missing or failed
-	ArrayState  string // clean, active, active-idle, ... ; "inactive" when not running
-	SyncAction  string // idle, resync, recover, check, repair, reshape, frozen
-	SyncDone    uint64 // sectors done of SyncTotal while SyncAction isn't idle
-	SyncTotal   uint64
-	MismatchCnt uint64 // sectors found different by the last check/repair
-	Members     []MemberStatus
+	Kernel     string // md127
+	UUID       string // as mdadm writes it: 8:8:8:8 hex
+	Level      string
+	RaidDisks  int
+	Degraded   int    // members missing or failed
+	ArrayState string // clean, active, active-idle, ... ; "inactive" when not running
+	SyncAction string // idle, resync, recover, check, repair, reshape, frozen
+	// LastSyncAction is the last sync action started; after a check or repair finishes,
+	// SyncAction is idle and this stays check or repair.
+	LastSyncAction string
+	SyncDone       uint64 // sectors done of SyncTotal while SyncAction isn't idle
+	SyncTotal      uint64
+	MismatchCnt    uint64 // sectors found different by the last check/repair
+	Members        []MemberStatus
 }
 
 // MemberStatus is one member device's state.
@@ -166,6 +185,8 @@ func (p *Plane) ArrayStatus(name string) (*ArrayStatus, error) {
 		Level:      rd("level"),
 		ArrayState: rd("array_state"),
 		SyncAction: rd("sync_action"),
+
+		LastSyncAction: rd("last_sync_action"),
 	}
 	st.RaidDisks, _ = strconv.Atoi(rd("raid_disks"))
 	st.Degraded, _ = strconv.Atoi(rd("degraded"))
@@ -220,4 +241,96 @@ func mdadmUUID(sysfs string) string {
 		return sysfs
 	}
 	return h[0:8] + ":" + h[8:16] + ":" + h[16:24] + ":" + h[24:32]
+}
+
+// ListArrays returns the names of the running arrays (DevRoot/md/<name>).
+func (p *Plane) ListArrays() []string {
+	es, _ := os.ReadDir(filepath.Join(p.DevRoot, "md"))
+	var out []string
+	for _, e := range es {
+		out = append(out, e.Name())
+	}
+	return out
+}
+
+// ExaminedArray is an array found in its members' metadata (mdadm --examine).
+type ExaminedArray struct {
+	Name    string // without mdadm's "homehost:" prefix
+	UUID    string // mdadm form
+	Level   string
+	Devices int      // the array's member count
+	Found   []string // members present, as device paths
+}
+
+// ExamineArrays reads every block device's md metadata and returns the arrays it describes,
+// running or not.
+func (p *Plane) ExamineArrays(ctx context.Context) ([]ExaminedArray, error) {
+	out, err := p.Run.Run(ctx, "mdadm", "--examine", "--scan", "--verbose", "--config=partitions")
+	if err != nil {
+		return nil, err
+	}
+	return parseExamineScan(string(out)), nil
+}
+
+// parseExamineScan parses "mdadm --examine --scan --verbose": an ARRAY line per array, its
+// members on the "devices=" line after it.
+func parseExamineScan(out string) []ExaminedArray {
+	var arrays []ExaminedArray
+	for _, line := range strings.Split(out, "\n") {
+		f := strings.Fields(line)
+		switch {
+		case len(f) >= 2 && f[0] == "ARRAY":
+			a := ExaminedArray{Name: filepath.Base(f[1])}
+			for _, kv := range f[2:] {
+				k, v, _ := strings.Cut(kv, "=")
+				switch k {
+				case "UUID":
+					a.UUID = v
+				case "level":
+					a.Level = v
+				case "num-devices":
+					a.Devices, _ = strconv.Atoi(v)
+				case "name":
+					_, a.Name, _ = strings.Cut(v, ":")
+					if a.Name == "" {
+						a.Name = v
+					}
+				}
+			}
+			arrays = append(arrays, a)
+		case len(f) == 1 && strings.HasPrefix(f[0], "devices=") && len(arrays) > 0:
+			for _, d := range strings.Split(strings.TrimPrefix(f[0], "devices="), ",") {
+				if d != "" {
+					arrays[len(arrays)-1].Found = append(arrays[len(arrays)-1].Found, d)
+				}
+			}
+		}
+	}
+	return arrays
+}
+
+// MemberRole returns a device's slot in its array from its md metadata, or -1 for a spare (or
+// a device md doesn't place).
+func (p *Plane) MemberRole(ctx context.Context, dev string) (int, error) {
+	out, err := p.Run.Run(ctx, "mdadm", "--examine", dev)
+	if err != nil {
+		return -1, err
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		k, v, ok := strings.Cut(line, ":")
+		if !ok || strings.TrimSpace(k) != "Device Role" {
+			continue
+		}
+		if n, err := strconv.Atoi(strings.TrimPrefix(strings.TrimSpace(v), "Active device ")); err == nil {
+			return n, nil
+		}
+		return -1, nil
+	}
+	return -1, fmt.Errorf("mdadm --examine %s: no device role", dev)
+}
+
+// ZeroSuperblock erases md metadata from a device that left its array.
+func (p *Plane) ZeroSuperblock(ctx context.Context, dev string) error {
+	_, err := p.Run.Run(ctx, "mdadm", "--zero-superblock", dev)
+	return err
 }
