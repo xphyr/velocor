@@ -107,6 +107,13 @@ listed until then so nothing is lost if the plan changes.
       `/run/velocor/scrubs.json` across velod restarts (cleared at boot, as md's is); the pool
       records the chunk size the data plane used (always 64 KiB on the kernel one);
     - the on-pool metadata copy on an LV: done (`meta.BlockDevice`).
+    - thin pool metadata (**done 2026-11-23**): its size and use are on the pool record
+      (`thin_metadata_bytes`, `thin_metadata_used_bytes`) and in the metrics
+      (`velocor_pool_thin_metadata_used_ratio`); the reconciler grows it from half full
+      (`Plane.GrowMetadata`: doubled within the volume group's free space, LVM's spare copy
+      included, up to 15.81 GiB); a pool that couldn't grow it is noted, and DEGRADED from
+      90% full; alerts at 80% (warning, 10 min) and 95% (critical). Fedora VM: grown 64 ->
+      116 MiB until no room, then reported;
     Then every row of the feature table (iSCSI via LIO, scrub on md, metadata copy
   on an LV, import, CBT via `thin_delta`, metrics, alerts, veloctl/UI wording, docs).
 - [ ] **K-3. Validation:** CSI matrix on both clusters, KubeVirt, the P0-7 scenario (an

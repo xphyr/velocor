@@ -137,8 +137,8 @@ func TestRenderRulesAppliesSettings(t *testing.T) {
 		}
 	}
 	rules, _ := Rules(settings)
-	if len(rules) != 28 {
-		t.Errorf("%d rules listed, want 28 (the watchdog isn't tunable)", len(rules))
+	if len(rules) != 30 {
+		t.Errorf("%d rules listed, want 30 (the watchdog isn't tunable)", len(rules))
 	}
 }
 

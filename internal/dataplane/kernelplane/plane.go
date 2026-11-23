@@ -53,6 +53,9 @@ const (
 type Plane struct {
 	k  *kernel.Plane
 	hw *hardware.Manager
+	// MetadataGrowAt is how full (percent) a thin pool's metadata gets before GrowMetadata
+	// doubles it.
+	MetadataGrowAt float64
 	// StateDir, if set, keeps the scrubs started (scrubs.json) across velod restarts; md itself
 	// keeps only its last action. A directory cleared at boot (/run/velocor), as md's is.
 	StateDir string
@@ -78,7 +81,7 @@ var _ dataplane.Plane = (*Plane)(nil)
 // New returns a kernel data plane. hw may be nil (tests); it rebinds NVMe drives left on a
 // userspace driver to the kernel's nvme driver.
 func New(k *kernel.Plane, hw *hardware.Manager) *Plane {
-	return &Plane{k: k, hw: hw, waiting: map[string]kernel.ExaminedArray{}, scrubs: map[string]*scrubRun{}}
+	return &Plane{k: k, hw: hw, MetadataGrowAt: 50, waiting: map[string]kernel.ExaminedArray{}, scrubs: map[string]*scrubRun{}}
 }
 
 // tagged keeps an error's text while also matching a dataplane error.

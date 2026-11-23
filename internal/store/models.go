@@ -487,15 +487,19 @@ type Pool struct {
 	AvailableBytes uint64      `json:"available_bytes"`
 	SpaceState     SpaceState  `json:"space_state,omitempty"`
 	// On-pool metadata copy (P0-3): the velocor-meta lvol and the last manifest written to it.
-	MetaLvolUUID   string       `json:"meta_lvol_uuid,omitempty"`
-	MetaGeneration uint64       `json:"meta_generation,omitempty"`
-	MetaHash       string       `json:"meta_hash,omitempty"`
-	MetaWrittenAt  time.Time    `json:"meta_written_at,omitempty"`
-	MetaError      string       `json:"meta_error,omitempty"`
-	FilterPolicy   FilterPolicy `json:"filter_policy"`
-	HealthStatus   HealthStatus `json:"health_status"`
-	StatusMessage  string       `json:"status_message,omitempty"`
-	CreatedAt      time.Time    `json:"created_at"`
+	// ThinMetadataBytes and ThinMetadataUsedBytes are the thin pool's own metadata (kernel data
+	// plane): finite, and worse to fill than the data. 0 where there is none (SPDK).
+	ThinMetadataBytes     uint64       `json:"thin_metadata_bytes,omitempty"`
+	ThinMetadataUsedBytes uint64       `json:"thin_metadata_used_bytes,omitempty"`
+	MetaLvolUUID          string       `json:"meta_lvol_uuid,omitempty"`
+	MetaGeneration        uint64       `json:"meta_generation,omitempty"`
+	MetaHash              string       `json:"meta_hash,omitempty"`
+	MetaWrittenAt         time.Time    `json:"meta_written_at,omitempty"`
+	MetaError             string       `json:"meta_error,omitempty"`
+	FilterPolicy          FilterPolicy `json:"filter_policy"`
+	HealthStatus          HealthStatus `json:"health_status"`
+	StatusMessage         string       `json:"status_message,omitempty"`
+	CreatedAt             time.Time    `json:"created_at"`
 }
 
 // Volume represents a logical volume (SPDK bdev_lvol) inside a Pool.

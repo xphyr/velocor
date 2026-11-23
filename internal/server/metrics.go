@@ -230,6 +230,10 @@ func poolMetrics(m *metricSet, pools []*store.Pool, vols []*store.Volume) {
 		m.gauge("velocor_pool_committed_bytes", hCommitted, float64(p.CommittedBytes), l...)
 		m.gauge("velocor_pool_available_bytes", hAvail, float64(p.AvailableBytes), l...)
 		m.gauge("velocor_pool_used_ratio", hUsed, store.UsedPercent(p)/100, l...)
+		if p.ThinMetadataBytes > 0 {
+			m.gauge("velocor_pool_thin_metadata_used_ratio", "How full the pool's thin metadata is (kernel data plane): when full, writes to new space fail.",
+				float64(p.ThinMetadataUsedBytes)/float64(p.ThinMetadataBytes), l...)
+		}
 		m.gauge("velocor_pool_space_state", hState, float64(spaceStateValue(p.SpaceState)), "pool", p.Name, "state", statusOrUnknown(p.SpaceState))
 		m.gauge("velocor_pool_health", hHealth, 1, "pool", p.Name, "status", statusOrUnknown(p.HealthStatus))
 		m.gauge("velocor_pool_durability", hDurable, 1, "pool", p.Name, "durability", statusOrUnknown(p.Durability))

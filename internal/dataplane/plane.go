@@ -88,6 +88,9 @@ type Plane interface {
 	ThinPools(ctx context.Context, name, uuid string) ([]ThinPool, error)
 	// CreateThinPool creates a thin pool named name on an array and returns its UUID.
 	CreateThinPool(ctx context.Context, array, name string, chunkBytes uint32) (string, error)
+	// GrowMetadata grows a thin pool's metadata when it is filling, as far as the room under it
+	// allows, and returns its new size (0: unchanged). An error says it needed to and couldn't.
+	GrowMetadata(ctx context.Context, uuid string) (uint64, error)
 	// DeleteThinPool deletes a thin pool and everything in it, by UUID or else by name.
 	DeleteThinPool(ctx context.Context, uuid, name string) error
 
@@ -253,6 +256,10 @@ type ThinPool struct {
 	ChunkBytes uint32 // allocation unit
 	TotalBytes uint64
 	FreeBytes  uint64
+	// MetadataBytes and MetadataUsedBytes are the thin pool's own metadata (the kernel's
+	// dm-thin), finite and worse to fill than the data: 0 where there is none to watch (SPDK).
+	MetadataBytes     uint64
+	MetadataUsedBytes uint64
 }
 
 // Volume is a volume or snapshot in a thin pool.

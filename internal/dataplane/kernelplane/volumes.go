@@ -84,6 +84,7 @@ func (p *Plane) ThinPools(ctx context.Context, name, uuid string) ([]dataplane.T
 		out = append(out, dataplane.ThinPool{
 			UUID: vg.UUID, Name: vg.Name, Array: p.arrayName(vg.PV), ChunkBytes: uint32(pool.ChunkSize),
 			TotalBytes: pool.Size, FreeBytes: pool.Size - min(used, pool.Size),
+			MetadataBytes: pool.MetadataSize, MetadataUsedBytes: uint64(float64(pool.MetadataSize) * pool.MetadataPercent / 100),
 		})
 	}
 	return out, nil
@@ -115,6 +116,43 @@ func (p *Plane) CreateThinPool(ctx context.Context, array, name string, _ uint32
 		return "", fmt.Errorf("thin pool %s not found after creating it", name)
 	}
 	return pools[0].UUID, nil
+}
+
+// GrowMetadata doubles a thin pool's metadata once it is MetadataGrowAt percent full, as far as
+// the volume group's free space allows (LVM keeps a spare copy as large, so the growth needs
+// twice its size free) and up to LVM's limit.
+func (p *Plane) GrowMetadata(ctx context.Context, uuid string) (uint64, error) {
+	vgs, err := p.k.ListVGs(ctx)
+	if err != nil {
+		return 0, err
+	}
+	i := slices.IndexFunc(vgs, func(vg kernel.VG) bool { return vg.UUID == uuid })
+	if i < 0 {
+		return 0, notFound("thin pool %s not found", uuid)
+	}
+	vg := vgs[i]
+	lvs, err := p.k.ListVolumes(ctx, vg.Name)
+	if err != nil {
+		return 0, err
+	}
+	j := slices.IndexFunc(lvs, func(lv kernel.LV) bool { return lv.SegType == "thin-pool" && lv.Name == thinLV })
+	if j < 0 || lvs[j].MetadataSize == 0 {
+		return 0, nil
+	}
+	pool := lvs[j]
+	if pool.MetadataPercent < p.MetadataGrowAt || pool.MetadataSize >= kernel.MaxMetadataSize {
+		return 0, nil
+	}
+	ext := max(vg.ExtentSize, 1)
+	add := min(pool.MetadataSize, kernel.MaxMetadataSize-pool.MetadataSize, vg.Free/2/ext*ext)
+	if add < ext {
+		return 0, fmt.Errorf("thin pool metadata is %.0f%% full and the volume group has no room to grow it (%d bytes free)", pool.MetadataPercent, vg.Free)
+	}
+	size := pool.MetadataSize + add
+	if err := p.k.GrowPoolMetadata(ctx, vg.Name, thinLV, size); err != nil {
+		return 0, err
+	}
+	return size, nil
 }
 
 // DeleteThinPool removes the volume group with everything in it (the wrappers first: an

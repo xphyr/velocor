@@ -39,8 +39,8 @@ func MetadataSize(dataBytes uint64) uint64 {
 	switch {
 	case m < 64*mib:
 		m = 64 * mib
-	case m > 16188*mib:
-		m = 16188 * mib
+	case m > MaxMetadataSize:
+		m = MaxMetadataSize
 	}
 	return m
 }
@@ -89,6 +89,16 @@ func (p *Plane) CreatePool(ctx context.Context, s PoolSpec) error {
 	_, err = p.lvm(ctx, "lvchange", "--quiet", "--errorwhenfull", "y", s.VG+"/"+s.Thin)
 	return err
 }
+
+// GrowPoolMetadata grows a thin pool's metadata to sizeBytes, online (LVM grows its spare copy
+// with it).
+func (p *Plane) GrowPoolMetadata(ctx context.Context, vg, thin string, sizeBytes uint64) error {
+	_, err := p.lvm(ctx, "lvextend", "--quiet", "--poolmetadatasize", fmt.Sprintf("%db", sizeBytes), vg+"/"+thin)
+	return err
+}
+
+// MaxMetadataSize is LVM's limit for a thin pool's metadata (15.81 GiB).
+const MaxMetadataSize = 16188 << 20
 
 // RemovePool removes the volume group (with every LV in it) and the PV label.
 func (p *Plane) RemovePool(ctx context.Context, vg, device string) error {
@@ -187,13 +197,14 @@ type LV struct {
 	DMPath               string
 	SegType              string // thin, thin-pool, linear
 	Tags                 []string
+	MetadataSize         uint64 // the thin pool's metadata
 }
 
 // ListVolumes lists a volume group's LVs, or every volume group's for vg "" (LVM's hidden ones,
 // such as the pool's data and metadata, excluded).
 func (p *Plane) ListVolumes(ctx context.Context, vg string) ([]LV, error) {
 	args := []string{"--reportformat", "json", "--units", "b", "--nosuffix",
-		"-o", "lv_name,vg_name,lv_uuid,lv_attr,lv_size,pool_lv,origin,thin_id,data_percent,metadata_percent,chunk_size,lv_active,lv_skip_activation,lv_dm_path,segtype,lv_tags"}
+		"-o", "lv_name,vg_name,lv_uuid,lv_attr,lv_size,pool_lv,origin,thin_id,data_percent,metadata_percent,chunk_size,lv_active,lv_skip_activation,lv_dm_path,segtype,lv_tags,lv_metadata_size"}
 	if vg != "" {
 		args = append(args, vg)
 	}
@@ -227,6 +238,7 @@ func parseLVs(out []byte) ([]LV, error) {
 			lv.DataPercent, _ = strconv.ParseFloat(m["data_percent"], 64)
 			lv.MetadataPercent, _ = strconv.ParseFloat(m["metadata_percent"], 64)
 			lv.ChunkSize, _ = strconv.ParseUint(m["chunk_size"], 10, 64)
+			lv.MetadataSize, _ = strconv.ParseUint(m["lv_metadata_size"], 10, 64)
 			lvs = append(lvs, lv)
 		}
 	}
