@@ -194,9 +194,11 @@ func writeAt(dev string, off int64, b []byte) error {
 	if err != nil {
 		return err
 	}
-	defer f.Close()
-	_, err = f.WriteAt(b, off)
-	return err
+	if _, err := f.WriteAt(b, off); err != nil {
+		_ = f.Close()
+		return err
+	}
+	return f.Close()
 }
 
 func readAt(dev string, off int64, b []byte) error {
@@ -204,7 +206,7 @@ func readAt(dev string, off int64, b []byte) error {
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	_, err = f.ReadAt(b, off)
 	return err
 }
@@ -533,13 +535,13 @@ func TestGroupSnapshotConsistent(t *testing.T) {
 			werr = err
 			return
 		}
-		defer fa.Close()
+		defer func() { _ = fa.Close() }()
 		fb, err := os.OpenFile(db, os.O_WRONLY|syscall.O_DIRECT, 0)
 		if err != nil {
 			werr = err
 			return
 		}
-		defer fb.Close()
+		defer func() { _ = fb.Close() }()
 		for n := uint64(1); !stop.Load(); n++ {
 			binary.LittleEndian.PutUint64(b, n)
 			if _, err := fa.WriteAt(b, 0); err != nil {

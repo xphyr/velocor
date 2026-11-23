@@ -20,14 +20,24 @@ GPL port of md/LVM into SPDK), the numbers and the plan are in
 phase 3. Items below marked **(K)** are resolved by the move and close at the cutover; they stay
 listed until then so nothing is lost if the plan changes.
 
-- [ ] **K-0. Design review** of the note. Decided 2026-11-20: QoS **dropped at the cutover**
+- [x] **K-0. Design review** of the note (merged, PR #32). Decided 2026-11-20: QoS **dropped at the cutover**
   (revisit later); thin pools use **64 KiB chunks with zeroing on**, measured in
   [docs/performance.md](docs/performance.md) (best after snapshots, finest CBT; zeroing stays on
   so new volumes can't read old data).
-- [ ] **K-1. Spike** behind the data-plane interface: md RAID1 + thin LV + nvmet, crash/restart,
-  a rebuild, a group snapshot through the dm-linear wrapper; the fake command layer for unit
-  tests; the privileged integration harness in CI.
-- [ ] **K-2. Parity:** every row of the feature table (iSCSI via LIO, scrub on md, metadata copy
+- [x] **K-1. Spike** (done 2026-11-23): `internal/kernel`, a standalone package not yet wired
+  into velod: md RAID, LVM thin (64 KiB, zeroing), a dm-linear wrapper per volume, group
+  snapshots through the wrappers, CBT from `thin_delta`/`thin_dump`, nvmet and LIO through
+  configfs, seams for optional LUKS/VDO/dm-crypt/dm-integrity layers. Unit tests on captured
+  tool output; seven root integration tests (`make test-kernel`, CI job `kernel-tests`) pass on
+  the lab VM, P0-7 included (EIO for that read only, array stays up, a rewrite heals it).
+  Findings folded into the design note (§5.2, §5.2.1, §5.3, §5.5, §5.6, §6): `--errorwhenfull`
+  needs `lvchange`; `N%VG` leaves no room for pool metadata; `pvcreate` starts an LVM devices
+  file, so every LVM call carries velod's own `--config`; iSCSI portals must stay on
+  SELinux-labelled ports (3260, 3205); md does not use the bad-block log on the last copy.
+- [ ] **K-2. Parity**, starting with a **data-plane interface** in velod: velod calls SPDK
+  directly in about 160 places and there is nothing to slot the kernel stack in behind, so K-2
+  introduces that interface (modelled on `internal/kernel`'s API), moves the SPDK code behind
+  it, then adds the kernel implementation. Then every row of the feature table (iSCSI via LIO, scrub on md, metadata copy
   on an LV, import, CBT via `thin_delta`, metrics, alerts, veloctl/UI wording, docs).
 - [ ] **K-3. Validation:** CSI matrix on both clusters, KubeVirt, the P0-7 scenario (an
   unreadable sector on the last copy keeps the pool up), the benchmark, soak.
