@@ -80,6 +80,13 @@
         "github-runners"
       ],
       "dependencyDashboardApproval": true
+    },
+    {
+      "description": "Major updates (Go modules, images, actions, sidecars) only on request from the Dependency Dashboard: they can change APIs or behaviour, and a Go major needs its import path changed, which a plain go.mod bump doesn't do (PR 23 only added v4 to go.mod and downgraded v3)",
+      "matchUpdateTypes": [
+        "major"
+      ],
+      "dependencyDashboardApproval": true
     }
   ],
   "customManagers": [
