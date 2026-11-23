@@ -516,8 +516,10 @@ const DURABILITY = {
 };
 const durabilityPill = (p) => DURABILITY[p.durability] && pill(DURABILITY[p.durability][0], DURABILITY[p.durability][1]);
 
-function poolTable(items, volumes, options = {}) {
+function poolTable(items, volumes, options = {}, deleted = []) {
   const count = (id) => volumes.filter((v) => v.pool_id === id).length;
+  // Deleted volumes keep their space until they're purged: shown, so a pool doesn't look empty.
+  const trash = (id) => deleted.filter((v) => v.pool_id === id).length;
   return table([
     { title: "Name", cell: (p) => el("strong", {}, link(p.name, "pool", p.id)), text: (p) => p.name },
     { title: "Health", cell: health, text: (p) => p.health_status },
@@ -525,18 +527,19 @@ function poolTable(items, volumes, options = {}) {
     { title: "Durability", cell: (p) => durabilityPill(p) || "", text: (p) => p.durability || "" },
     { title: "Space", cell: (p) => [spacePill(p), poolBar(p)], text: (p) => p.space_state || "" },
     { title: "Committed", num: true, cell: (p) => [humanSize(p.committed_bytes || 0), el("span", { class: "sub" }, `${humanSize(p.available_bytes || 0)} more accepted`)] },
-    { title: "Volumes", num: true, cell: (p) => link(String(count(p.id)), "volumes", p.id) },
+    { title: "Volumes", num: true, cell: (p) => [link(String(count(p.id)), "volumes", p.id), trash(p.id) > 0 && el("span", { class: "sub" }, `${trash(p.id)} deleted`)] },
   ], items, { empty: "No pools yet.", state: stateOf("pools"), ...options });
 }
 
 async function pools() {
-  const [items, volumes] = await Promise.all([list("/pools", "pools"), list("/volumes", "volumes")]);
+  const [items, volumes, deleted] = await Promise.all([list("/pools", "pools"), list("/volumes", "volumes"),
+    list("/deleted-volumes", "volumes").catch((err) => { if (err instanceof Unauthorized) throw err; return []; })]);
   return [
     el("h1", {}, "Pools"),
     el("div", { class: "toolbar" },
       action(can.admin, { class: "primary", id: "create-pool", onclick: createPoolDialog }, "Create pool"),
       action(can.admin, { id: "import-pool", onclick: importPoolDialog }, "Import pool")),
-    poolTable(items, volumes),
+    poolTable(items, volumes, {}, deleted),
   ];
 }
 
@@ -710,8 +713,9 @@ function startScrubDialog(p) {
 }
 
 async function pool(id) {
-  const [p, disksAll, volumes, scrubView] = await Promise.all([
+  const [p, disksAll, volumes, deletedVols, scrubView] = await Promise.all([
     api("/pools/" + encodeURIComponent(id)).then((r) => r.pool), list("/disks", "disks"), list("/volumes?pool_id=" + encodeURIComponent(id), "volumes"),
+    list("/deleted-volumes?pool_id=" + encodeURIComponent(id), "volumes").catch((err) => { if (err instanceof Unauthorized) throw err; return []; }),
     api("/pools/" + encodeURIComponent(id) + "/scrub").catch((err) => { if (err instanceof Unauthorized) throw err; return null; }),
   ]);
   const diskOf = (did) => disksAll.find((d) => d.id === did) || {};
@@ -770,6 +774,8 @@ async function pool(id) {
     ],
     el("h2", {}, "Volumes"),
     volumeTable(volumes, [p]),
+    deletedVols.length > 0 && el("p", { class: "muted" }, [`${deletedVols.length} deleted ${deletedVols.length === 1 ? "volume is" : "volumes are"} kept, with their space, until purged: `,
+      el("a", { href: hash("volumes", p.id) }, "see Deleted volumes"), "."]),
     el("h2", {}, "History"),
     graphPanel([{ name: "pool-space", title: "Space allocated" }, { name: "pool-iops", title: "IOPS" },
       { name: "pool-throughput", title: "Throughput" }, { name: "pool-latency", title: "Average latency" }], { pool: p.name }),
@@ -1980,9 +1986,10 @@ async function dashboard() {
     ...poolList.map((x) => ["Pool", "pool", x]), ...vols.map((x) => ["Volume", "volume", x]), ...exps.map((x) => ["Export", "export", x]),
   ].filter(([, , x]) => x.health_status && x.health_status !== "ONLINE");
   const badDisks = diskList.filter((d) => d.claimed && d.health_status && d.health_status !== "ONLINE");
-  const volByUUID = Object.fromEntries(vols.map((v) => [v.uuid, v]));
+  // SPDK names a volume's device by its UUID, the kernel data plane by its handle (vg/lv).
+  const volByDevice = Object.fromEntries(vols.flatMap((v) => [[v.uuid, v], v.handle && [v.handle, v]].filter(Boolean)));
   const rates = io && ioRates(io.stats || []);
-  const volRates = (rates || []).filter((r) => volByUUID[r.name]).map((r) => ({ ...r, vol: volByUUID[r.name] }));
+  const volRates = (rates || []).filter((r) => volByDevice[r.name]).map((r) => ({ ...r, vol: volByDevice[r.name] }));
   return [
     el("h1", {}, "Overview"),
     !spdk.connected && el("div", { class: "panel-notice bad" }, `The data plane isn't reachable (${spdk.endpoint || "unknown"}), so nothing is being served.`),
