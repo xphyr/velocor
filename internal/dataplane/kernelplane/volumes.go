@@ -169,11 +169,20 @@ func (p *Plane) Volumes(ctx context.Context) ([]dataplane.Volume, error) {
 	return out, nil
 }
 
-// CreateVolume creates the LV in the pool's volume group and its wrapper.
+// CreateVolume creates the LV in the pool's volume group (a thick one zeroed) and its wrapper.
 func (p *Plane) CreateVolume(ctx context.Context, pool, name string, sizeBytes uint64, thin bool) (string, error) {
 	u := newUUID()
 	if err := p.k.CreateVolume(ctx, pool, thinLV, name, sizeBytes, thin, tagUUID+u); err != nil {
 		return "", err
+	}
+	if !thin {
+		// A thick LV gets whatever its extents held: a deleted volume's data, or (seen on the lab
+		// VM) an earlier pool's metadata copy. Zero it, as SPDK's thick volumes read zeros; the
+		// thin pool zeroes new chunks itself.
+		if _, err := p.k.Run.Run(ctx, "blkdiscard", "--zeroout", p.k.LVPath(pool, name)); err != nil {
+			_ = p.k.RemoveVolume(context.WithoutCancel(ctx), pool, name)
+			return "", fmt.Errorf("zero the new volume: %w", err)
+		}
 	}
 	if name != metaLV {
 		if err := p.k.EnsureWrapper(ctx, name, p.k.LVPath(pool, name)); err != nil {
@@ -326,4 +335,14 @@ func extents(in []kernel.Extent) []dataplane.Extent {
 		out[i] = dataplane.Extent{OffsetBytes: e.Offset, SizeBytes: e.Length}
 	}
 	return out
+}
+
+// VolumePath is the device of a volume or snapshot (an LV, active): for velod's own direct I/O
+// on its metadata volume (meta.BlockDevice).
+func (p *Plane) VolumePath(ctx context.Context, volume string) (string, error) {
+	lv, err := p.resolve(ctx, volume)
+	if err != nil {
+		return "", err
+	}
+	return p.k.LVPath(lv.VG, lv.Name), nil
 }

@@ -94,11 +94,29 @@ func serial(exp *store.Export) string {
 	return s
 }
 
+// RemoveTarget removes the export's subsystem or target; nvmet listeners no subsystem uses any
+// more go with it.
 func (p *Plane) RemoveTarget(_ context.Context, exp *store.Export) error {
-	if dataplane.IsNVMe(exp.Protocol) {
-		return p.k.RemoveNVMeExport(exp.SubsystemNQN)
+	if !dataplane.IsNVMe(exp.Protocol) {
+		return p.k.RemoveISCSIExport(exp.TargetIQN, exp.VolumeID)
 	}
-	return p.k.RemoveISCSIExport(exp.TargetIQN, exp.VolumeID)
+	if err := p.k.RemoveNVMeExport(exp.SubsystemNQN); err != nil {
+		return err
+	}
+	used := map[int]bool{}
+	for _, nqn := range p.k.NVMeSubsystems() {
+		for _, pt := range p.k.NVMeSubsystemPorts(nqn) {
+			used[pt.ID] = true
+		}
+	}
+	for _, pt := range p.k.NVMePorts() {
+		if !used[pt.ID] {
+			if err := p.k.RemoveNVMePort(pt.ID); err != nil {
+				return fmt.Errorf("remove unused nvmet port %d: %w", pt.ID, err)
+			}
+		}
+	}
+	return nil
 }
 
 // Connections lists the connected hosts: NVMe host NQNs from nvmet's debugfs, else the peers of
@@ -115,14 +133,24 @@ func (p *Plane) Connections(ctx context.Context, exp *store.Export) ([]dataplane
 		// Without nvmet's debugfs (Fedora builds without CONFIG_NVME_TARGET_DEBUGFS), the
 		// network side: TCP connections to the export's listeners. Exports sharing a listener
 		// all show its connections, so this can over-report, never miss one.
+		// A host's controller has one TCP connection per queue: one entry per address, with
+		// its I/O queues (all but the admin queue).
+		count := map[string]int{}
+		var order []string
 		for _, pt := range p.k.NVMeSubsystemPorts(exp.SubsystemNQN) {
 			peers, err := p.tcpPeers(ctx, pt.Address, pt.Port)
 			if err != nil {
 				return nil, err
 			}
 			for _, a := range peers {
-				out = append(out, dataplane.Connection{Address: a})
+				if count[a] == 0 {
+					order = append(order, a)
+				}
+				count[a]++
 			}
+		}
+		for _, a := range order {
+			out = append(out, dataplane.Connection{Address: a, Queues: count[a] - 1})
 		}
 		return out, nil
 	}

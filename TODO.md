@@ -55,9 +55,22 @@ listed until then so nothing is lost if the plan changes.
     (tag `kernelintegration`) pass on the lab VM: volume lifecycle with snapshots, exact CBT, a
     group snapshot, a clone and a resize; NVMe/TCP and iSCSI exports with allowed and refused
     hosts and a portal without its address; member replace and rebuild; scrub; `Settle` after a
-    simulated reboot and an array waiting for a missing member, then started degraded. Open:
-    - wire it into velod (`--data-plane=kernel`), including disk claiming: `DiscoverDisks`
-      treats only vfio/uio NVMe drives as claimed, and kernel-attached disks stay on `nvme`;
+    simulated reboot and an array waiting for a missing member, then started degraded.
+    **velod wired (2026-11-23):** `velod --data-plane=kernel` (`VELOCOR_DATA_PLANE`; SPDK stays
+    the default) uses it, with the on-pool metadata copy on its LV (`meta.BlockDevice`, the same
+    out-of-process O_DIRECT I/O, no ublk) and spdk_tgt restart detection off. Thick volumes are
+    zeroed when created (a new pool's metadata LV read the previous pool's copy). A second velod
+    in kernel mode on the lab VM passed end to end through the API: claim, pool, volumes, an
+    NVMe/TCP export with the host connected and the volume's namespace UUID, exact
+    allocated/changed blocks, a group snapshot, a clone, a velod restart, a member replacement
+    with rebuild, a scrub to completion, and a teardown leaving nothing in the kernel. Open:
+    - the appliance: install mdadm, lvm2, device-mapper-persistent-data explicitly; md
+      auto-assembly off (`AUTO -all`) since Settle assembles; a way to choose the data plane
+      (the quadlet's `Exec` and the spdk unit); then a lab appliance on it;
+    - pool import and moved members (P1-14) still read SPDK RAID superblocks
+      (`hardware.ReadRaidSuperblock`): md's own metadata (`mdadm --examine`) replaces them;
+    - RAID10 is refused by the API's level check ("SPDK has no raid10"); md has it;
+    - claimed disks stay claimed across scans (the store keeps `Claimed`), checked;
     - iSCSI ACLs are by IQN only (**decided 2026-11-23**): LIO can't restrict an initiator by
       address, so a host's IP (which CSI registers) isn't enforced and an address-only ACL is
       refused; document it in the API and CSI docs;

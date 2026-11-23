@@ -16,8 +16,11 @@ import (
 
 	"github.com/velocor/velocor/internal/auth"
 	"github.com/velocor/velocor/internal/backup"
+	"github.com/velocor/velocor/internal/dataplane"
+	"github.com/velocor/velocor/internal/dataplane/kernelplane"
 	"github.com/velocor/velocor/internal/dataplane/spdkplane"
 	"github.com/velocor/velocor/internal/hardware"
+	"github.com/velocor/velocor/internal/kernel"
 	"github.com/velocor/velocor/internal/meta"
 	"github.com/velocor/velocor/internal/monitoring"
 	"github.com/velocor/velocor/internal/reconciler"
@@ -44,6 +47,7 @@ func main() {
 	var (
 		listenAddr        = flag.String("listen", envOrDefault("VELOCOR_LISTEN", ":8443"), "Address and port for the unified API/UI server")
 		dbPath            = flag.String("db", envOrDefault("VELOCOR_DB_PATH", "/var/lib/velocor/velocor.db"), "Path to persistent bbolt state database")
+		dataPlane         = flag.String("data-plane", envOrDefault("VELOCOR_DATA_PLANE", "spdk"), "The data plane: spdk (spdk_tgt) or kernel (md, LVM thin, nvmet and LIO; docs/design/kernel-dataplane.md)")
 		spdkSocket        = flag.String("spdk-socket", envOrDefault("VELOCOR_SPDK_SOCKET", spdk.DefaultSocketPath), "Path to spdk_tgt JSON-RPC 2.0 UNIX socket")
 		hugepagesMB       = flag.Uint64("hugepages-mb", 0, "Ensure at least N MiB of 2 MiB hugepages on startup (0 to skip)")
 		reconcileInterval = flag.Duration("reconcile-interval", 15*time.Second, "Background state reconciliation interval")
@@ -72,6 +76,10 @@ func main() {
 		"spdk_socket", *spdkSocket,
 	)
 
+	if *dataPlane != "spdk" && *dataPlane != "kernel" {
+		logger.Error("invalid --data-plane; use spdk or kernel", "value", *dataPlane)
+		os.Exit(1)
+	}
 	spdkplane.Logger = logger
 	switch *ssdBdev {
 	case "auto", "uring", "aio":
@@ -80,7 +88,7 @@ func main() {
 		logger.Error("invalid --ssd-bdev; use auto, uring or aio", "value", *ssdBdev)
 		os.Exit(1)
 	}
-	if *ssdBdev == "uring" {
+	if *ssdBdev == "uring" && *dataPlane == "spdk" {
 		if probe := hardware.ProbeIOURing(); !probe.Usable {
 			logger.Warn("--ssd-bdev=uring although io_uring may not work for spdk_tgt; a failed io_uring setup crashes it (use auto or aio)", "reason", probe.Reason)
 		}
@@ -110,7 +118,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	if *hugepagesMB > 0 && hwMgr != nil {
+	if *hugepagesMB > 0 && hwMgr != nil && *dataPlane == "spdk" {
 		if hp, err := hwMgr.EnsureHugepages(*hugepagesMB); err != nil {
 			logger.Warn("failed to allocate hugepages", "requested_mb", *hugepagesMB, "err", err)
 		} else {
@@ -140,9 +148,26 @@ func main() {
 		os.Exit(1)
 	}
 
-	spdkClient := spdk.NewClient(*spdkSocket)
-	dp := spdkplane.New(spdkClient, hwMgr)
+	var (
+		dp         dataplane.Plane
+		spdkClient *spdk.Client
+		kp         *kernelplane.Plane
+	)
+	if *dataPlane == "kernel" {
+		// In velod's container (host PID namespace), the storage tools run in the host's mount
+		// namespace, where their configuration and udev's /dev links are.
+		kp = kernelplane.New(kernel.New(kernel.Exec{HostNamespace: inContainer()}), hwMgr)
+		dp = kp
+	} else {
+		spdkClient = spdk.NewClient(*spdkSocket)
+		dp = spdkplane.New(spdkClient, hwMgr)
+	}
+	logger.Info("data plane", "kind", *dataPlane, "endpoint", dp.Endpoint())
 	rec := reconciler.New(st, dp, hwMgr, logger)
+	if kp != nil {
+		// No spdk_tgt whose restart (empty again) velod must restore after.
+		rec.SetSPDKInstance(func() string { return "" })
+	}
 	var metaDev meta.Device
 	if *metaCopies {
 		self, err := os.Executable()
@@ -155,7 +180,11 @@ func main() {
 			nodeID = cfg.NodeID
 		}
 		// One device for the reconciler (writes) and pool import (reads): it serializes them.
-		metaDev = &meta.UblkDevice{SPDK: spdkClient, Helper: self, StateDir: filepath.Dir(*spdkSocket), ID: metaUblkID, Logger: logger}
+		if kp != nil {
+			metaDev = &meta.BlockDevice{Path: kp.VolumePath, Helper: self}
+		} else {
+			metaDev = &meta.UblkDevice{SPDK: spdkClient, Helper: self, StateDir: filepath.Dir(*spdkSocket), ID: metaUblkID, Logger: logger}
+		}
 		rec.SetMetaDevice(metaDev, nodeID, version.Version)
 	}
 
@@ -278,4 +307,12 @@ func healthcheck(args []string) int {
 		return 1
 	}
 	return 0
+}
+
+// inContainer reports whether velod runs in a mount namespace other than PID 1's (its
+// container, which shares the host's PID namespace).
+func inContainer() bool {
+	self, err1 := os.Readlink("/proc/self/ns/mnt")
+	host, err2 := os.Readlink("/proc/1/ns/mnt")
+	return err1 == nil && err2 == nil && self != host
 }
