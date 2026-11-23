@@ -48,9 +48,7 @@ type Reconciler struct {
 
 	passMu sync.Mutex // serialises passes
 	meta   *metaSync  // on-pool metadata copies (nil: disabled)
-	// sbReader and discover replace reading RAID superblocks from disks and the hardware
-	// scan (tests).
-	sbReader func(*store.Disk) (*hardware.RaidSuperblock, error)
+	// discover replaces the hardware scan (tests).
 	discover func() ([]*store.Disk, error)
 
 	// cacheRefused: disks whose drive refused to turn its write cache off since velod started.
@@ -208,7 +206,7 @@ func (r *Reconciler) ReconcileOnce(ctx context.Context) (State, error) {
 	// Let SPDK finish examining every base bdev (RAID superblock assembly, lvstore load)
 	// before anything below concludes that on-disk metadata is missing.
 	examined := true
-	if err := r.dp.Settle(ctx); err != nil {
+	if err := r.dp.Settle(ctx, dataplane.ClaimedHandles(r.store)); err != nil {
 		examined = false
 		p.errs = append(p.errs, fmt.Sprintf("bdev_wait_for_examine: %v", err))
 	}

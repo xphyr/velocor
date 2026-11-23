@@ -211,7 +211,7 @@ func TestGroupSnapshotOrder(t *testing.T) {
 	if len(s.Steps) != 0 {
 		t.Fatalf("steps left: %v (calls %v)", s.Steps, s.Calls)
 	}
-	if !strings.HasSuffix(s.Calls[2], "--snapshot --name sa vg/a") || !strings.HasSuffix(s.Calls[3], "--snapshot --name sb vg/b") {
+	if !strings.HasSuffix(s.Calls[2], "--snapshot --permission r --name sa vg/a") || !strings.HasSuffix(s.Calls[3], "--snapshot --permission r --name sb vg/b") {
 		t.Errorf("snapshot calls %v", s.Calls[2:4])
 	}
 }
@@ -338,5 +338,28 @@ func TestParseVGsAndTags(t *testing.T) {
 	lvs, err := parseLVs([]byte(`{"report":[{"lv":[{"lv_name":"snap-1","vg_name":"v","lv_uuid":"u","lv_attr":"Vwi---tz-k","lv_size":"67108864","pool_lv":"thin","origin":"vol-1","thin_id":"2","segtype":"thin","lv_skip_activation":"skip activation","lv_tags":"velocor.uuid.1111,velocor.snapshot"}]}]}`))
 	if err != nil || len(lvs) != 1 || !slices.Equal(lvs[0].Tags, []string{"velocor.uuid.1111", "velocor.snapshot"}) || lvs[0].ThinID != 2 || !lvs[0].SkipActivation {
 		t.Fatalf("lvs %+v %v", lvs, err)
+	}
+}
+
+func TestParseExamine(t *testing.T) {
+	a, err := parseExamine(probeSection(t, "mdadm-examine-active"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := MemberInfo{ArrayUUID: "4009d12d:f41d8d3a:ac2d1e26:a4757ed6", Name: "raid_pool-mdex", Level: "raid1", RaidDevices: 2,
+		ArrayKiB: 203776, DeviceUUID: "abc0d854:f6cd4475:57c73c73:8b94c9ad", Events: 0, Role: 0, ArrayState: "AA"}
+	if *a != want {
+		t.Errorf("active member %+v, want %+v", *a, want)
+	}
+	r, err := parseExamine(probeSection(t, "mdadm-examine-removed"))
+	if err != nil || r.Role != 1 || r.ArrayUUID != want.ArrayUUID {
+		t.Errorf("removed member %+v %v", r, err)
+	}
+	if _, err := parseExamine("garbage"); err == nil {
+		t.Error("garbage parsed")
+	}
+	s := &Script{Steps: []Step{{Prefix: "mdadm --examine /dev/vda1", Err: &CommandError{Code: 1, Stderr: "mdadm: No md superblock detected on /dev/vda1.\n"}}}}
+	if m, err := New(s).ExamineMember(context.Background(), "/dev/vda1"); m != nil || err != nil {
+		t.Errorf("no metadata: %v %v", m, err)
 	}
 }

@@ -2,6 +2,7 @@ package kernel
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -333,4 +334,74 @@ func (p *Plane) MemberRole(ctx context.Context, dev string) (int, error) {
 func (p *Plane) ZeroSuperblock(ctx context.Context, dev string) error {
 	_, err := p.Run.Run(ctx, "mdadm", "--zero-superblock", dev)
 	return err
+}
+
+// MemberInfo is what one device's md metadata says (mdadm --examine).
+type MemberInfo struct {
+	ArrayUUID   string // mdadm form
+	Name        string // without the "homehost:" prefix
+	Level       string
+	RaidDevices int
+	ArrayKiB    uint64
+	DeviceUUID  string
+	// Events counts the array's metadata updates: a member that left the array keeps a lower
+	// count than the members still in it.
+	Events uint64
+	Role   int // slot; -1 for a spare
+	// ArrayState is this copy's view of the slots: "A" active, "." missing, "R" replacing.
+	ArrayState string
+}
+
+// ExamineMember reads a device's md metadata; nil (no error) when it has none.
+func (p *Plane) ExamineMember(ctx context.Context, dev string) (*MemberInfo, error) {
+	out, err := p.Run.Run(ctx, "mdadm", "--examine", dev)
+	var ce *CommandError
+	if errors.As(err, &ce) && strings.Contains(ce.Stderr, "No md superblock") {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return parseExamine(string(out))
+}
+
+func parseExamine(out string) (*MemberInfo, error) {
+	m := &MemberInfo{Role: -1}
+	for _, line := range strings.Split(out, "\n") {
+		k, v, ok := strings.Cut(line, " : ")
+		if !ok {
+			continue
+		}
+		v = strings.TrimSpace(v)
+		switch strings.TrimSpace(k) {
+		case "Array UUID":
+			m.ArrayUUID = v
+		case "Name":
+			m.Name = v
+			if _, n, ok := strings.Cut(v, ":"); ok {
+				m.Name = n
+			}
+			m.Name = strings.Fields(m.Name + " ")[0] // "name  (local to host x)"
+		case "Raid Level":
+			m.Level = v
+		case "Raid Devices":
+			m.RaidDevices, _ = strconv.Atoi(v)
+		case "Array Size":
+			m.ArrayKiB, _ = strconv.ParseUint(strings.Fields(v + " ")[0], 10, 64)
+		case "Device UUID":
+			m.DeviceUUID = v
+		case "Events":
+			m.Events, _ = strconv.ParseUint(v, 10, 64)
+		case "Device Role":
+			if n, err := strconv.Atoi(strings.TrimPrefix(v, "Active device ")); err == nil {
+				m.Role = n
+			}
+		case "Array State":
+			m.ArrayState = strings.Fields(v + " ")[0]
+		}
+	}
+	if m.ArrayUUID == "" {
+		return nil, fmt.Errorf("mdadm --examine: no array UUID in %q", strings.TrimSpace(out))
+	}
+	return m, nil
 }

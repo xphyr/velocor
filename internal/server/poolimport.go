@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/velocor/velocor/internal/dataplane"
-	"github.com/velocor/velocor/internal/hardware"
 	"github.com/velocor/velocor/internal/meta"
 	"github.com/velocor/velocor/internal/store"
 )
@@ -54,48 +53,19 @@ type ImportMember struct {
 	Stale bool `json:"stale,omitempty"`
 }
 
-type foundSB struct {
-	disk *store.Disk
-	sb   *hardware.RaidSuperblock
-}
-
-// readSuperblock reads a disk's RAID superblock through the kernel (nil: none).
-func (s *Server) readSuperblock(d *store.Disk) (*hardware.RaidSuperblock, error) {
-	if s.sbReader != nil {
-		return s.sbReader(d)
-	}
-	if d.DevicePath == "" {
-		return nil, nil // e.g. an NVMe drive bound to vfio-pci: no kernel view
-	}
-	return hardware.ReadRaidSuperblock(d.DevicePath)
-}
-
-// raidLevelName maps SPDK's enum raid_level to the store's names.
-func raidLevelName(level uint32) store.RaidLevel {
-	switch level {
-	case 0:
-		return store.RaidLevel0
-	case 1:
-		return store.RaidLevel1
-	case 95:
-		return store.RaidLevel5F
-	case 99:
-		return "CONCAT"
-	}
-	return store.RaidLevel(fmt.Sprintf("LEVEL-%d", level))
-}
-
-// importCandidates groups the unclaimed disks carrying a Velocor RAID superblock by array.
-func (s *Server) importCandidates() ([]ImportCandidate, map[string][]foundSB, error) {
+// importCandidates groups the unclaimed disks carrying a Velocor array's metadata by array
+// (Plane.ExamineDisks), with the arrays an earlier import attempt left claimed and assembled.
+func (s *Server) importCandidates() ([]ImportCandidate, map[string][]dataplane.DiskMember, error) {
 	disks, err := s.store.ListDisks()
 	if err != nil {
 		return nil, nil, err
 	}
+	ctx := context.Background()
 	// An import that failed after claiming its disks leaves them claimed with the array
 	// assembled (undoing that would degrade it): such arrays are candidates too.
-	assembled := map[string]*dataplane.Array{} // by member bdev name
+	assembled := map[string]*dataplane.Array{} // by member handle
 	if s.dp != nil {
-		if raids, err := s.dp.Arrays(context.Background()); err == nil {
+		if raids, err := s.dp.Arrays(ctx); err == nil {
 			for i := range raids {
 				for _, b := range raids[i].Members {
 					if b.Name != "" {
@@ -105,137 +75,104 @@ func (s *Server) importCandidates() ([]ImportCandidate, map[string][]foundSB, er
 			}
 		}
 	}
-	byRaid := map[string][]foundSB{}
+	arrays := map[string]*dataplane.DiskArray{}
+	var order []string
+	add := func(a dataplane.DiskArray) {
+		if !strings.HasPrefix(a.Name, "raid_pool-") {
+			return
+		}
+		cur := arrays[a.UUID]
+		if cur == nil {
+			order = append(order, a.UUID)
+			arrays[a.UUID] = &a
+			return
+		}
+		// The disks' own metadata describes the array better than a running array's view.
+		if a.Generation >= cur.Generation {
+			a.Members = append(a.Members, cur.Members...)
+			arrays[a.UUID] = &a
+		} else {
+			cur.Members = append(cur.Members, a.Members...)
+		}
+	}
+	var unclaimed []*store.Disk
 	for _, d := range disks {
 		if d.IsBootDevice || d.PoolID != "" {
 			continue
 		}
-		if d.Claimed {
-			if r := assembled[d.SPDKBdevName]; r != nil && strings.HasPrefix(r.Name, "raid_pool-") {
-				byRaid[r.UUID] = append(byRaid[r.UUID], foundSB{disk: d, sb: superblockOf(r)})
-			}
+		if !d.Claimed {
+			unclaimed = append(unclaimed, d)
 			continue
 		}
-		sb, err := s.readSuperblock(d)
-		if err != nil {
-			s.logger.Warn("cannot read the RAID superblock", "disk", d.ID, "err", err)
-			continue
-		}
-		if sb == nil || !strings.HasPrefix(sb.Name, "raid_pool-") {
-			continue
-		}
-		byRaid[sb.UUID] = append(byRaid[sb.UUID], foundSB{disk: d, sb: sb})
-	}
-	out := []ImportCandidate{}
-	for uuid, found := range byRaid {
-		// The newest superblock describes the array; members with an older one left it.
-		newest := found[0].sb
-		for _, f := range found {
-			if f.sb.SeqNumber > newest.SeqNumber {
-				newest = f.sb
-			}
-		}
-		c := ImportCandidate{
-			PoolID:    strings.TrimPrefix(newest.Name, "raid_"),
-			RaidName:  newest.Name,
-			RaidUUID:  uuid,
-			RaidLevel: string(raidLevelName(newest.Level)),
-			Members:   newest.NumMembers,
-			SeqNumber: newest.SeqNumber,
-			SizeBytes: newest.RaidBlocks * uint64(newest.BlockSize),
-		}
-		configured := map[string]int{}
-		for _, m := range newest.Members {
-			if m.State == hardware.RaidSBMemberConfigured {
-				configured[m.BdevUUID] = m.Slot
-			}
-		}
-		// Disks under new IDs (docs/review-history.md P1-14): their bdev UUID no longer matches a member, so
-		// match the members nobody claims to the current disks that match none.
-		var moved []dataplane.MovedDisk
-		var unmatched []string
-		matched := map[string]bool{}
-		for _, f := range found {
-			if f.disk.Type != store.DiskTypeSSD {
-				continue
-			}
-			if _, ok := configured[dataplane.DiskBdevUUID(f.disk)]; ok {
-				matched[dataplane.DiskBdevUUID(f.disk)] = true
-			} else if !f.disk.Claimed {
-				moved = append(moved, dataplane.MovedDisk{Disk: f.disk, SB: f.sb})
-			}
-		}
-		for u := range configured {
-			if !matched[u] {
-				unmatched = append(unmatched, u)
-			}
-		}
-		relinked, merr := dataplane.MatchMovedMembers(newest, unmatched, moved)
-		for i, f := range found {
-			if u, ok := relinked[f.disk.ID]; ok {
-				d := *f.disk
-				d.BdevUUID = u
-				found[i].disk = &d
-			}
-		}
-		for _, f := range found {
-			m := ImportMember{DiskID: f.disk.ID, Serial: f.disk.SerialNumber, Stale: f.sb.SeqNumber < newest.SeqNumber && !f.disk.Claimed}
-			if f.disk.Type == store.DiskTypeSSD {
-				if slot, ok := configured[dataplane.DiskBdevUUID(f.disk)]; ok {
-					m.Slot = &slot
-				} else {
-					m.Stale = true // not a configured member of the current array
+		if r := assembled[d.SPDKBdevName]; r != nil {
+			slot := slices.IndexFunc(r.Members, func(m dataplane.ArrayMember) bool { return m.Name == d.SPDKBdevName })
+			current := 0
+			for _, m := range r.Members {
+				if m.Configured {
+					current++
 				}
+			}
+			add(dataplane.DiskArray{UUID: r.UUID, Name: r.Name, Level: store.RaidLevel(strings.ToUpper(r.Level)), Slots: int(r.Slots),
+				Current: current, Members: []dataplane.DiskMember{{Disk: d, Slot: slot}}})
+		}
+	}
+	if s.dp != nil && len(unclaimed) > 0 {
+		examined, err := s.dp.ExamineDisks(ctx, unclaimed)
+		if err != nil {
+			return nil, nil, err
+		}
+		for _, a := range examined {
+			add(a)
+		}
+	}
+
+	out := []ImportCandidate{}
+	members := map[string][]dataplane.DiskMember{}
+	for _, uuid := range order {
+		a := arrays[uuid]
+		members[uuid] = a.Members
+		c := ImportCandidate{
+			PoolID:    strings.TrimPrefix(a.Name, "raid_"),
+			RaidName:  a.Name,
+			RaidUUID:  uuid,
+			RaidLevel: string(a.Level),
+			Members:   a.Slots,
+			SeqNumber: a.Generation,
+			SizeBytes: a.SizeBytes,
+		}
+		for _, m := range a.Members {
+			im := ImportMember{DiskID: m.Disk.ID, Serial: m.Disk.SerialNumber, Stale: m.Stale}
+			if m.Slot >= 0 {
+				slot := m.Slot
+				im.Slot = &slot
 			}
 			if !m.Stale {
 				c.Present++
 			}
-			c.Disks = append(c.Disks, m)
+			c.Disks = append(c.Disks, im)
 		}
 		slices.SortFunc(c.Disks, func(a, b ImportMember) int { return strings.Compare(a.DiskID, b.DiskID) })
-		c.Complete = c.Present >= len(configured)
+		c.Complete = c.Present >= a.Current
 		c.Importable = true
 		switch {
-		case c.RaidLevel != string(store.RaidLevel0) && c.RaidLevel != string(store.RaidLevel1):
+		case s.dp == nil || s.dp.CheckLevel(a.Level, a.Slots) != nil:
 			c.Importable, c.Reason = false, "unsupported RAID level "+c.RaidLevel
-		case !c.Complete && c.RaidLevel != string(store.RaidLevel1):
-			c.Importable, c.Reason = false, fmt.Sprintf("%d of %d members present; a %s array can't run without all of them", c.Present, len(configured), c.RaidLevel)
+		case !c.Complete && !redundant(a.Level):
+			c.Importable, c.Reason = false, fmt.Sprintf("%d of %d members present; a %s array can't run without all of them", c.Present, a.Current, c.RaidLevel)
 		case !c.Complete && c.Present == 0:
 			c.Importable, c.Reason = false, "no current member present"
 		case !c.Complete:
-			c.Reason = fmt.Sprintf("%d of %d members present: imports degraded (allow_degraded)", c.Present, len(configured))
+			c.Reason = fmt.Sprintf("%d of %d members present: imports degraded (allow_degraded)", c.Present, a.Current)
 		}
 		if _, err := s.store.GetPool(c.PoolID); err == nil {
 			c.Importable, c.Reason = false, "a pool with this ID already exists"
-		} else if merr != nil && c.Importable {
-			c.Reason = strings.TrimPrefix(c.Reason+"; ", "; ") + merr.Error()
+		} else if a.Unplaced != "" && c.Importable {
+			c.Reason = strings.TrimPrefix(c.Reason+"; ", "; ") + a.Unplaced
 		}
 		out = append(out, c)
 	}
 	slices.SortFunc(out, func(a, b ImportCandidate) int { return strings.Compare(a.PoolID, b.PoolID) })
-	return out, byRaid, nil
-}
-
-// superblockOf describes an assembled array the way its superblock would (seq 0: the kernel
-// read superblocks of other members take precedence).
-func superblockOf(r *dataplane.Array) *hardware.RaidSuperblock {
-	sb := &hardware.RaidSuperblock{UUID: r.UUID, Name: r.Name, NumMembers: int(r.Slots)}
-	switch strings.ToLower(r.Level) {
-	case "raid0":
-		sb.Level = 0
-	case "raid1":
-		sb.Level = 1
-	default:
-		sb.Level = 99
-	}
-	for i, b := range r.Members {
-		st := uint32(hardware.RaidSBMemberMissing)
-		if b.Configured {
-			st = hardware.RaidSBMemberConfigured
-		}
-		sb.Members = append(sb.Members, hardware.RaidSBMember{Slot: i, BdevUUID: b.UUID, State: st})
-	}
-	return sb
+	return out, members, nil
 }
 
 func (s *Server) handleListImportCandidates(w http.ResponseWriter, _ *http.Request) {
@@ -328,26 +265,30 @@ func (s *Server) importPool(ctx context.Context, poolID, rename string, allowDeg
 	//    and assembles the array from the superblocks.
 	var claimed []*store.Disk
 	for _, f := range found[cand.RaidUUID] {
-		if j := slices.IndexFunc(cand.Disks, func(m ImportMember) bool { return m.DiskID == f.disk.ID }); j < 0 || cand.Disks[j].Stale {
+		if f.Stale {
 			continue // a disk that left the array stays unclaimed
 		}
-		if f.disk.Claimed { // claimed by an earlier attempt
-			claimed = append(claimed, f.disk)
+		if f.Disk.Claimed { // claimed by an earlier attempt
+			claimed = append(claimed, f.Disk)
 			continue
 		}
-		if f.disk.BdevUUID != "" {
-			// A member under a new disk ID keeps its old bdev UUID, and must keep it after
-			// restarts: record it before SPDK sees the disk.
-			if _, merr := s.store.MutateDisk(f.disk.ID, func(cur *store.Disk) error {
-				cur.BdevUUID = f.disk.BdevUUID
+		disk := f.Disk
+		if f.Identity != "" {
+			// A member under a new disk ID keeps the identity its array knows it by, and must
+			// keep it after restarts: record it before the data plane sees the disk.
+			cp := *f.Disk
+			cp.BdevUUID = f.Identity
+			disk = &cp
+			if _, merr := s.store.MutateDisk(f.Disk.ID, func(cur *store.Disk) error {
+				cur.BdevUUID = f.Identity
 				return nil
 			}); merr != nil {
-				return nil, fmt.Errorf("record the bdev UUID of disk %s: %w", f.disk.ID, merr)
+				return nil, fmt.Errorf("record the bdev UUID of disk %s: %w", f.Disk.ID, merr)
 			}
 		}
-		d, cerr := s.attachAndClaim(ctx, f.disk, true)
+		d, cerr := s.attachAndClaim(ctx, disk, true)
 		if cerr != nil {
-			return nil, fmt.Errorf("claim disk %s: %w", f.disk.ID, cerr)
+			return nil, fmt.Errorf("claim disk %s: %w", f.Disk.ID, cerr)
 		}
 		claimed = append(claimed, d)
 	}
@@ -365,7 +306,7 @@ func (s *Server) importPool(ctx context.Context, poolID, rename string, allowDeg
 	lvsName := "lvs_" + poolID
 	var lvs *dataplane.ThinPool
 	for deadline := time.Now().Add(30 * time.Second); ; {
-		_ = s.dp.Settle(ctx)
+		_ = s.dp.Settle(ctx, dataplane.ClaimedHandles(s.store))
 		if stores, lerr := s.dp.ThinPools(ctx, lvsName, ""); lerr == nil && len(stores) > 0 {
 			lvs = &stores[0]
 			break
@@ -572,7 +513,7 @@ func (s *Server) recordLvols(vols []*store.Volume, snaps []*store.Snapshot) erro
 func (s *Server) waitForRaid(ctx context.Context, name string, allowDegraded bool) (*dataplane.Array, error) {
 	startedDegraded := false
 	for deadline := time.Now().Add(30 * time.Second); ; {
-		_ = s.dp.Settle(ctx)
+		_ = s.dp.Settle(ctx, dataplane.ClaimedHandles(s.store))
 		raids, err := s.dp.Arrays(ctx)
 		if err != nil {
 			return nil, err

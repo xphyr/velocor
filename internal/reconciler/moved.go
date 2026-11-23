@@ -7,16 +7,15 @@ import (
 	"strings"
 
 	"github.com/velocor/velocor/internal/dataplane"
-	"github.com/velocor/velocor/internal/hardware"
 	"github.com/velocor/velocor/internal/store"
 )
 
 // relinkMovedMembers finds pool members that came back under a new disk ID (docs/review-history.md P1-14)
-// and moves them to their new disk records, keeping the bdev UUID their RAID superblock knows
-// them by; reconcileDisks then attaches them and SPDK examine assembles the array. It looks
-// only at pools whose RAID isn't online and members whose disk the last scan didn't find, and
-// identifies the disks by the superblock on them (dataplane.MatchMovedMembers). It reports
-// whether it relinked anything.
+// and moves them to their new disk records, keeping the identity their array knows them by;
+// reconcileDisks then attaches them and the data plane assembles the array. It looks only at
+// pools whose array isn't online and members whose disk the last scan didn't find, and
+// identifies the disks by the array metadata on them (Plane.ExamineDisks). It reports whether
+// it relinked anything.
 func (r *Reconciler) relinkMovedMembers(ctx context.Context, p *pass, discovered []*store.Disk) bool {
 	if discovered == nil {
 		return false // no scan this pass: every disk would look gone
@@ -83,80 +82,68 @@ func (r *Reconciler) relinkMovedMembers(ctx context.Context, p *pass, discovered
 		return false
 	}
 
-	// Superblocks of the unclaimed SSDs, read once.
-	var unclaimed []dataplane.MovedDisk
+	// The array metadata on the unclaimed SSDs and on the members still in place (a member in
+	// place may hold a newer copy: then the found disks left the array earlier and must not
+	// come back as current members), read once.
+	var examine []*store.Disk
+	seen := map[string]bool{}
 	for _, d := range discovered {
 		cur := diskByID[d.ID]
 		if cur == nil || cur.Claimed || cur.PoolID != "" || cur.IsBootDevice || cur.Type != store.DiskTypeSSD {
 			continue
 		}
-		sb, err := r.readSuperblock(cur)
-		if err != nil {
-			r.logger.Warn("cannot read the RAID superblock", "disk", cur.ID, "err", err)
-			continue
+		examine, seen[cur.ID] = append(examine, cur), true
+	}
+	if len(examine) == 0 {
+		return false
+	}
+	for _, g := range todo {
+		for _, d := range g.staying {
+			if !seen[d.ID] {
+				examine, seen[d.ID] = append(examine, d), true
+			}
 		}
-		if sb != nil {
-			unclaimed = append(unclaimed, dataplane.MovedDisk{Disk: cur, SB: sb})
-		}
+	}
+	arrays, err := r.dp.ExamineDisks(ctx, examine)
+	if err != nil {
+		p.errs = append(p.errs, fmt.Sprintf("read array metadata: %v", err))
+		return false
 	}
 
 	relinked := false
 	for _, g := range todo {
-		var found []dataplane.MovedDisk
-		var newest *hardware.RaidSuperblock
-		for _, f := range unclaimed {
-			if f.SB.Name == g.pool.BaseBdevName && (newest == nil || f.SB.SeqNumber > newest.SeqNumber) {
-				newest = f.SB
-			}
-			if f.SB.Name == g.pool.BaseBdevName {
-				found = append(found, f)
-			}
-		}
-		if newest == nil {
+		i := slices.IndexFunc(arrays, func(a dataplane.DiskArray) bool { return a.Name == g.pool.BaseBdevName })
+		if i < 0 {
 			continue // nothing came back (yet): the pool stays UNAVAILABLE
 		}
-		// A member still in place may hold a newer superblock (the found disks left the
-		// array earlier): then they must not come back as current members.
-		for _, d := range g.staying {
-			if sb, err := r.readSuperblock(d); err == nil && sb != nil && sb.UUID == newest.UUID && sb.SeqNumber > newest.SeqNumber {
-				newest = sb
-			}
-		}
+		a := arrays[i]
 		res := "pool:" + g.pool.ID
-		want := map[string]*store.Disk{} // bdev UUID -> gone record
-		var uuids []string
-		for _, d := range g.members {
-			u := dataplane.DiskBdevUUID(d)
-			want[u] = d
-			uuids = append(uuids, u)
-		}
-		match, err := dataplane.MatchMovedMembers(newest, uuids, found)
-		if err != nil {
-			p.notePool(g.pool.ID, "disks came back under new IDs but can't be matched to their slots: "+err.Error())
+		if a.Unplaced != "" {
+			p.notePool(g.pool.ID, "disks came back under new IDs but can't be matched to their slots: "+a.Unplaced)
 			continue
 		}
-		for newID, u := range match {
-			old := want[u]
-			if _, err := r.store.RelinkPoolMember(g.pool.ID, old.ID, newID, u); err != nil {
-				p.errs = append(p.errs, fmt.Sprintf("%s: relink disk %s as %s: %v", res, old.ID, newID, err))
+		// A slot's gone disk is replaced by the unclaimed disk that now holds the slot.
+		goneBySlot := map[int]*store.Disk{}
+		for _, m := range store.PoolMembers(g.pool) {
+			if d := diskByID[m.DiskID]; d != nil && slices.Contains(g.members, d) {
+				goneBySlot[m.Slot] = d
+			}
+		}
+		for _, m := range a.Members {
+			old := goneBySlot[m.Slot]
+			if m.Stale || m.Slot < 0 || m.Disk.Claimed || old == nil {
 				continue
 			}
+			if _, err := r.store.RelinkPoolMember(g.pool.ID, old.ID, m.Disk.ID, m.Identity); err != nil {
+				p.errs = append(p.errs, fmt.Sprintf("%s: relink disk %s as %s: %v", res, old.ID, m.Disk.ID, err))
+				continue
+			}
+			delete(goneBySlot, m.Slot)
 			relinked = true
 			p.repaired++
 			r.logger.Warn("pool member came back under a new disk ID; relinked",
-				"pool", g.pool.Name, "old_disk", old.ID, "new_disk", newID, "bdev_uuid", u)
+				"pool", g.pool.Name, "old_disk", old.ID, "new_disk", m.Disk.ID, "slot", m.Slot)
 		}
 	}
 	return relinked
-}
-
-// readSuperblock reads a disk's RAID superblock through the kernel (nil: none).
-func (r *Reconciler) readSuperblock(d *store.Disk) (*hardware.RaidSuperblock, error) {
-	if r.sbReader != nil {
-		return r.sbReader(d)
-	}
-	if d.DevicePath == "" {
-		return nil, nil
-	}
-	return hardware.ReadRaidSuperblock(d.DevicePath)
 }

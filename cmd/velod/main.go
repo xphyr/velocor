@@ -166,6 +166,10 @@ func main() {
 		// In velod's container (host PID namespace), the storage tools run in the host's mount
 		// namespace, where their configuration and udev's /dev links are.
 		kp = kernelplane.New(kernel.New(kernel.Exec{HostNamespace: inContainer()}), hwMgr)
+		kp.StateDir = filepath.Dir(*spdkSocket) // /run/velocor: cleared at boot, as md's state is
+		if err := kp.LoadState(); err != nil {
+			logger.Warn("kernel data plane state not loaded", "err", err)
+		}
 		dp = kp
 	} else {
 		spdkClient = spdk.NewClient(*spdkSocket)

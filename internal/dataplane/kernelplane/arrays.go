@@ -2,7 +2,10 @@ package kernelplane
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"slices"
@@ -117,6 +120,7 @@ func (p *Plane) DeleteArray(ctx context.Context, name string) error {
 	w, waiting := p.waiting[name]
 	delete(p.waiting, name)
 	delete(p.scrubs, name)
+	p.saveScrubsLocked()
 	p.mu.Unlock()
 	var members []string
 	if st, err := p.k.ArrayStatus(name); err == nil {
@@ -244,7 +248,8 @@ func (p *Plane) StartScrub(_ context.Context, array string, repair bool, mbps ui
 		return err
 	}
 	p.mu.Lock()
-	p.scrubs[array] = &scrubRun{repair: repair, start: offsetBlocks}
+	p.scrubs[array] = &scrubRun{Repair: repair, Start: offsetBlocks}
+	p.saveScrubsLocked()
 	p.mu.Unlock()
 	return nil
 }
@@ -255,7 +260,8 @@ func (p *Plane) StopScrub(_ context.Context, array string) error {
 	}
 	p.mu.Lock()
 	if r := p.scrubs[array]; r != nil {
-		r.stopped = true
+		r.Stopped = true
+		p.saveScrubsLocked()
 	}
 	p.mu.Unlock()
 	if err := p.k.StopScrub(array); err != nil {
@@ -277,16 +283,16 @@ func (p *Plane) scrubOf(name string, st *kernel.ArrayStatus) *dataplane.Scrub {
 		sc.State, sc.Repair = dataplane.ScrubRunning, st.SyncAction == "repair"
 		sc.OffsetBlocks, sc.TotalBlocks = st.SyncDone, st.SyncTotal
 		if run != nil {
-			sc.StartOffsetBlocks = run.start
+			sc.StartOffsetBlocks = run.Start
 		}
 	case run != nil && (st.LastSyncAction == "check" || st.LastSyncAction == "repair"):
-		sc.Repair, sc.StartOffsetBlocks = run.repair, run.start
+		sc.Repair, sc.StartOffsetBlocks = run.Repair, run.Start
 		sc.TotalBlocks = p.sizeOf(st.Kernel) / 512
 		if st.Level == "raid1" {
 			sc.TotalBlocks = p.componentSectors(st.Kernel, sc.TotalBlocks)
 		}
 		sc.State, sc.OffsetBlocks = dataplane.ScrubCompleted, sc.TotalBlocks
-		if run.stopped {
+		if run.Stopped {
 			sc.State, sc.OffsetBlocks = dataplane.ScrubStopped, 0
 		}
 		_ = p.k.SetSyncSpeedMax(name, "system")
@@ -310,4 +316,55 @@ func (p *Plane) componentSectors(kname string, fallback uint64) uint64 {
 		return fallback
 	}
 	return kib * 2
+}
+
+// scrubOf needs the scrubs started before a velod restart: they are kept in StateDir.
+
+func (p *Plane) scrubsFile() string {
+	if p.StateDir == "" {
+		return ""
+	}
+	return filepath.Join(p.StateDir, "scrubs.json")
+}
+
+// LoadState reads the scrubs kept in StateDir (velod calls it once, after setting StateDir).
+func (p *Plane) LoadState() error {
+	f := p.scrubsFile()
+	if f == "" {
+		return nil
+	}
+	b, err := os.ReadFile(f)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	runs := map[string]*scrubRun{}
+	if err := json.Unmarshal(b, &runs); err != nil {
+		return fmt.Errorf("%s: %w", f, err)
+	}
+	p.mu.Lock()
+	p.scrubs = runs
+	p.mu.Unlock()
+	return nil
+}
+
+// saveScrubsLocked writes the scrubs (p.mu held); best effort: losing it only loses where a
+// scrub began.
+func (p *Plane) saveScrubsLocked() {
+	f := p.scrubsFile()
+	if f == "" {
+		return
+	}
+	b, err := json.Marshal(p.scrubs)
+	if err == nil {
+		tmp := f + ".tmp"
+		if err = os.WriteFile(tmp, b, 0o600); err == nil {
+			err = os.Rename(tmp, f)
+		}
+	}
+	if err != nil {
+		slog.Warn("cannot keep the scrub state", "file", f, "err", err)
+	}
 }

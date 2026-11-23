@@ -83,8 +83,9 @@ func (s *BoltStore) ReplacePoolMember(poolID string, slot int, newDiskID string)
 
 // RelinkPoolMember moves a pool member to the record of the same disk under a new ID (docs/review-history.md
 // P1-14): newDiskID takes oldDiskID's place in the pool's slots, keeps the bdev UUID the RAID
-// superblock knows the member by, and inherits the operator's settings for the disk. It is
-// claimed (the reconciler attaches it to SPDK). The old record, of a disk that is no longer
+// superblock knows the member by (SPDK; "" with md, which knows its members itself), and
+// inherits the operator's settings for the disk. It is claimed (the reconciler attaches it to
+// the data plane). The old record, of a disk that is no longer
 // there under that ID, is deleted.
 func (s *BoltStore) RelinkPoolMember(poolID, oldDiskID, newDiskID, bdevUUID string) (*Pool, error) {
 	var out Pool
@@ -101,8 +102,6 @@ func (s *BoltStore) RelinkPoolMember(poolID, oldDiskID, newDiskID, bdevUUID stri
 			return fmt.Errorf("disk %s: %w", newDiskID, err)
 		}
 		switch {
-		case bdevUUID == "":
-			return fmt.Errorf("%w: a bdev UUID is required", ErrInvalidArgument)
 		case old.PoolID != poolID:
 			return fmt.Errorf("%w: disk %s is not in pool %s", ErrInvalidArgument, oldDiskID, poolID)
 		case d.IsBootDevice:

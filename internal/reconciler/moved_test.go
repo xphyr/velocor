@@ -74,7 +74,9 @@ func (e *env) scanFinds(paths ...string) {
 		}
 		return out, nil
 	}
-	e.rec.sbReader = func(d *store.Disk) (*hardware.RaidSuperblock, error) { return e.fake.SuperblockOf(d.DevicePath), nil }
+	e.rec.dp.(*spdkplane.Plane).ReadSuperblock = func(d *store.Disk) (*hardware.RaidSuperblock, error) {
+		return e.fake.SuperblockOf(d.DevicePath), nil
+	}
 }
 
 func TestMirrorUnderNewDiskIDsComesBack(t *testing.T) {

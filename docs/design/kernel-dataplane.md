@@ -319,6 +319,11 @@ to what this note first assumed.)
   thin with the same `thin_delta` CBT) had shown CBT is exact at any size but over-reports in
   whole chunks, which 64 KiB keeps smallest. Metadata at 64 KiB is about 2 MB per GiB written,
   so velod sizes the metadata device from the pool, with headroom, and monitors it.
+- **iSCSI access is by IQN only (decided 2026-11-23).** LIO's ACLs name initiators; it has no
+  per-initiator address filter. SPDK enforced a host's IQN and its address together; the kernel
+  data plane enforces the IQN, doesn't enforce the address (which the CSI driver registers for
+  every host), and refuses an export whose ACL has addresses but no IQN rather than open it.
+  Address filtering, if wanted, would be host firewall rules per export.
 - **iSCSI portals must use SELinux-labelled iSCSI ports (3260, 3205).** An enforcing
   initiator's iscsid (`iscsid_t`, RHCOS nodes included) can't connect to any other port
   (EACCES). velod should refuse other ports for iSCSI portals, or at least warn.

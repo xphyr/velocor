@@ -76,26 +76,37 @@ listed until then so nothing is lost if the plan changes.
       to `nvme` (it took both drives from the P0-1 lab VM's running SPDK, 2026-11-23: nvmepool
       lost slot 0). Fixed: with the kernel data plane such a drive is claimed only by an
       operator;
-    - a member reported MISSING whose disk is back can't be put back: release refuses (not
-      detached) and replace refuses (still in the pool). Needs a re-add path (P0-1 follow-up);
-    - pool import and moved members (P1-14) still read SPDK RAID superblocks
-      (`hardware.ReadRaidSuperblock`): md's own metadata (`mdadm --examine`) replaces them;
-    - RAID10 is refused by the API's level check ("SPDK has no raid10"); md has it;
+    - a member whose own disk came back (MISSING, or left a running array) is put back with
+      `replace` naming that disk (**done 2026-11-23**): attached if needed, added back, the
+      array rebuilds onto it (md re-adds with its bitmap: only what changed). The array still
+      never takes a returning member back by itself. Lab appliance: sdb unplugged, pool
+      started degraded, data written, sdb re-plugged and put back: ONLINE, data intact;
+    - pool import and moved members (P1-14) on md (**done 2026-11-23**): `Plane.ExamineDisks`
+      groups disks by the array metadata on them (SPDK: the superblock and
+      `MatchMovedMembers`, moved from the server; md: each member's own `mdadm --examine`,
+      which names its slot, so nothing needs matching). `Settle` takes the claimed disks and
+      assembles only arrays on them, from them (an unclaimed copy, an import candidate or a
+      member that left, takes no part). Lab appliance: a fresh velod after a lost database
+      imported a pool from its metadata copy (volume, snapshot, data); a member re-plugged
+      under a new serial was relinked to its slot and the pool came back ONLINE;
+    - RAID10 (**done 2026-11-23**): the level check is the data plane's (`Plane.CheckLevel`):
+      the kernel builds md RAID10 (four disks or more), SPDK still refuses it;
     - claimed disks stay claimed across scans (the store keeps `Claimed`), checked;
     - iSCSI ACLs are by IQN only (**decided 2026-11-23**): LIO can't restrict an initiator by
       address, so a host's IP (which CSI registers) isn't enforced and an address-only ACL is
-      refused; document it in the API and CSI docs;
+      refused; documented (ARCHITECTURE.md, the design note);
     - NVMe connections (**decided 2026-11-23**): nvmet lists controllers only in debugfs, built
       into `nvmet.ko` with `CONFIG_NVME_TARGET_DEBUGFS`, which Fedora's kernel has off. Keep the
       fallback (the listeners' TCP peers via `ss`: never misses a host, over-reports when
       exports share a listener) and ask Fedora to enable the option; rebuild `nvmet.ko` in the
       OS image (signed with our own MOK-enrolled key) only if exact per-export connections
       become a requirement;
-    - snapshots are writable LVs (only velod's tag marks them); the group snapshot's quiesce
-      bound covers the snapshots too; per-disk I/O counters aren't reported; the scrub's start
-      and stopped/completed state live in memory (lost on a velod restart); the chunk size is
-      always 64 KiB whatever the pool asks for;
-    - the on-pool metadata copy needs an LV-backed `meta.Device` (no ublk).
+    - **done 2026-11-23:** snapshots are read-only LVs (clones writable); the group snapshot's
+      quiesce bound covers only the pause, not taking the snapshots; per-disk I/O counters are
+      reported (by handle); the scrub's start and stopped/completed state is kept in
+      `/run/velocor/scrubs.json` across velod restarts (cleared at boot, as md's is); the pool
+      records the chunk size the data plane used (always 64 KiB on the kernel one);
+    - the on-pool metadata copy on an LV: done (`meta.BlockDevice`).
     Then every row of the feature table (iSCSI via LIO, scrub on md, metadata copy
   on an LV, import, CBT via `thin_delta`, metrics, alerts, veloctl/UI wording, docs).
 - [ ] **K-3. Validation:** CSI matrix on both clusters, KubeVirt, the P0-7 scenario (an

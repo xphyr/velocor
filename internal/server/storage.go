@@ -215,28 +215,6 @@ func (s *Server) releaseDisk(w http.ResponseWriter, r *http.Request, id string) 
 
 // --- Pools ---
 
-func validRaidLevel(l store.RaidLevel, disks int) error {
-	if l == store.RaidLevel5F {
-		// SPDK's raid5f only accepts full-stripe writes, and the lvol blobstore issues smaller
-		// ones, so a volume store can't even be created on it (verified against SPDK v26.09).
-		return fmt.Errorf("%w: RAID5F is not supported: SPDK raid5f cannot hold a volume store", store.ErrInvalidArgument)
-	}
-	if l == store.RaidLevel10 {
-		// SPDK v26.09's bdev_raid has raid0, raid1, raid5f and concat: no raid10. It has to be
-		// built as raid0 over raid1 pairs (TODO.md L-4).
-		return fmt.Errorf("%w: RAID10 is not supported yet: SPDK has no raid10 level (use RAID1)", store.ErrInvalidArgument)
-	}
-	minDisks := map[store.RaidLevel]int{store.RaidLevel0: 1, store.RaidLevel1: 2}
-	n, ok := minDisks[l]
-	if !ok {
-		return fmt.Errorf("%w: unsupported raid_level %q", store.ErrInvalidArgument, l)
-	}
-	if disks < n {
-		return fmt.Errorf("%w: %s requires at least %d disks", store.ErrInvalidArgument, l, n)
-	}
-	return nil
-}
-
 func (s *Server) handleCreatePool(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Name             string             `json:"name"`
@@ -266,9 +244,9 @@ func (s *Server) handleCreatePool(w http.ResponseWriter, r *http.Request) {
 	}
 	for _, err := range []error{
 		validateDisplayName("pool", req.Name),
-		validRaidLevel(req.RaidLevel, len(req.DiskIDs)),
-		rejectFilters(req.FilterPolicy),
 		s.requireDataPlane(),
+		s.checkLevel(req.RaidLevel, len(req.DiskIDs)),
+		rejectFilters(req.FilterPolicy),
 	} {
 		if err != nil {
 			writeError(w, err)
@@ -348,6 +326,10 @@ func (s *Server) handleCreatePool(w http.ResponseWriter, r *http.Request) {
 		p.HealthStatus, p.StatusMessage = store.HealthStatusOnline, ""
 		if stores, err := s.dp.ThinPools(ctx, "", lvsUUID); err == nil && len(stores) > 0 {
 			p.TotalBytes, p.FreeBytes = stores[0].TotalBytes, stores[0].FreeBytes
+			if stores[0].ChunkBytes > 0 {
+				// What the data plane used: the kernel one's thin pools always take 64 KiB.
+				p.ClusterSizeBytes = stores[0].ChunkBytes
+			}
 			p.AllocatedBytes = p.TotalBytes - p.FreeBytes
 		}
 		p.SpaceState = store.SpaceStateOf(p)
@@ -1237,4 +1219,13 @@ func (s *Server) handleDeleteExport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{})
+}
+
+// checkLevel asks the data plane whether it can build the level (nil without one: the caller
+// refuses that first).
+func (s *Server) checkLevel(l store.RaidLevel, disks int) error {
+	if s.dp == nil {
+		return nil
+	}
+	return s.dp.CheckLevel(l, disks)
 }
