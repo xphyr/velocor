@@ -349,6 +349,16 @@ func (m *Manager) EnsureHugepages(minMB uint64) (*HugepageStatus, error) {
 	return status, nil
 }
 
+// ReleaseHugepages gives every free 2 MiB hugepage back to the kernel (the kernel data plane
+// uses none; the image reserves them for SPDK at boot).
+func (m *Manager) ReleaseHugepages() (*HugepageStatus, error) {
+	nrPath := filepath.Join(m.cfg.SysfsRoot, "kernel", "mm", "hugepages", "hugepages-2048kB", "nr_hugepages")
+	if err := os.WriteFile(nrPath, []byte("0\n"), 0644); err != nil {
+		return nil, fmt.Errorf("write 0 to %s: %w", nrPath, err)
+	}
+	return m.GetHugepageStatus()
+}
+
 // BindNVMeToUserspace unbinds an NVMe controller at pciAddr from the Linux kernel nvme driver
 // and binds it to vfio-pci (or uio_pci_generic), automatically enabling vfio noiommu mode
 // if running in a VM without an IOMMU. Refuses if the device is protected by the boot-disk guard.

@@ -192,3 +192,23 @@ func TestHardwareDiscoveryBootGuardAndVFIOBinding(t *testing.T) {
 		t.Fatalf("unexpected HugepageStatus: %+v", hpStatus)
 	}
 }
+
+func TestReleaseHugepages(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "kernel", "mm", "hugepages", "hugepages-2048kB")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for f, v := range map[string]string{"nr_hugepages": "512\n", "free_hugepages": "512\n"} {
+		if err := os.WriteFile(filepath.Join(dir, f), []byte(v), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	m := &Manager{cfg: Config{SysfsRoot: root}}
+	if _, err := m.ReleaseHugepages(); err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := os.ReadFile(filepath.Join(dir, "nr_hugepages")); string(b) != "0\n" {
+		t.Errorf("nr_hugepages = %q", b)
+	}
+}
