@@ -13,11 +13,11 @@ func TestStatusAfterDataPlaneRestart(t *testing.T) {
 	h := newHarness(t)
 	var inst atomic.Value
 	inst.Store("100:5000")
-	h.rec.SetSPDKInstance(func() string { return inst.Load().(string) })
+	h.rec.SetDataPlaneInstance(func() string { return inst.Load().(string) })
 	h.reconcile()
 	overall := func() (string, bool) {
 		st := h.expect(h.do("GET", "/api/v1/system/status", h.admin, nil))(http.StatusOK)
-		return st["overall_health"].(string), st["spdk"].(map[string]any)["restoring"].(bool)
+		return st["overall_health"].(string), st["data_plane"].(map[string]any)["restoring"].(bool)
 	}
 	if o, r := overall(); o != "ONLINE" || r {
 		t.Fatalf("after a pass on this spdk_tgt: %s restoring=%v, want ONLINE", o, r)

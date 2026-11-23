@@ -25,13 +25,13 @@ message Pool {
   repeated string disk_ids = 4;
   uint32 strip_size_kb = 5;
   // SPDK lvol_store cluster allocation unit (default 1 MiB).
-  uint32 cluster_size_bytes = 6;
+  uint32 chunk_size_bytes = 6;
   // Underlying RAID or single-disk SPDK bdev name.
-  string base_bdev_name = 7;
+  string array_name = 7;
   // Top-level bdev name consumed by lvol_store after applying optional filter bdevs.
-  string effective_bdev_name = 8;
-  string lvs_uuid = 9;
-  string lvs_name = 10;
+  string device = 8;
+  string thin_pool_uuid = 9;
+  string thin_pool_name = 10;
   uint64 total_bytes = 11;
   uint64 free_bytes = 12;
   uint64 allocated_bytes = 13;
@@ -45,7 +45,7 @@ message CreatePoolRequest {
   RaidLevel raid_level = 2;
   repeated string disk_ids = 3;
   uint32 strip_size_kb = 4;
-  uint32 cluster_size_bytes = 5;
+  uint32 chunk_size_bytes = 5;
   FilterPolicy filter_policy = 6;
 }
 

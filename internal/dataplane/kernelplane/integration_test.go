@@ -136,7 +136,7 @@ func (e *env) volume(name string, size uint64) (string, *store.Volume) {
 		e.t.Fatal(err)
 	}
 	return e.k.WrapperPath(name), &store.Volume{ID: name, UUID: u, PoolID: "pool-" + e.id, SizeBytes: size,
-		LvolBdevName: e.vg + "/" + name, EffectiveBdevName: e.vg + "/" + name}
+		Handle: e.vg + "/" + name, Device: e.vg + "/" + name}
 }
 
 func (e *env) arrayOf() dataplane.Array {
@@ -277,7 +277,7 @@ func TestVolumeLifecycle(t *testing.T) {
 		t.Fatal(err)
 	}
 	s2 := &store.Snapshot{ID: "snap-2", UUID: s2U, VolumeID: "vol-a", SizeBytes: size}
-	pool := &store.Pool{LVSName: e.vg}
+	pool := &store.Pool{ThinPoolName: e.vg}
 	alloc, err := e.p.AllocatedBlocks(e.ctx, pool, s1)
 	if err != nil {
 		t.Fatal(err)
@@ -481,7 +481,7 @@ func TestExports(t *testing.T) {
 	}
 
 	other, _ := e.volume("vol-y", size)
-	if err := e.p.ApplyExport(e.ctx, nvme, &store.Volume{ID: "vol-y", UUID: "", LvolBdevName: e.vg + "/vol-y"}, dataplane.ACL{HostNQNs: []string{hostNQN}}, portals[:1]); err == nil {
+	if err := e.p.ApplyExport(e.ctx, nvme, &store.Volume{ID: "vol-y", UUID: "", Handle: e.vg + "/vol-y"}, dataplane.ACL{HostNQNs: []string{hostNQN}}, portals[:1]); err == nil {
 		t.Errorf("an export was repointed to %s", other)
 	}
 

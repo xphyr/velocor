@@ -21,7 +21,7 @@ func TestGroupSnapshotWithoutDataPlane(t *testing.T) {
 	if err := st.UpsertDisk(&store.Disk{ID: "d1", Name: "d1", Type: store.DiskTypeSSD, SizeBytes: 1 << 40, Claimed: true}); err != nil {
 		t.Fatal(err)
 	}
-	if err := st.CreatePool(&store.Pool{ID: "pool-1", Name: "p1", RaidLevel: store.RaidLevel1, DiskIDs: []string{"d1"}, LVSName: "lvs_pool-1"}); err != nil {
+	if err := st.CreatePool(&store.Pool{ID: "pool-1", Name: "p1", RaidLevel: store.RaidLevel1, DiskIDs: []string{"d1"}, ThinPoolName: "lvs_pool-1"}); err != nil {
 		t.Fatal(err)
 	}
 	if err := st.CreateVolume(&store.Volume{ID: "vol-1", Name: "v1", PoolID: "pool-1", SizeBytes: 1 << 30}); err != nil {

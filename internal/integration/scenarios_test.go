@@ -61,7 +61,7 @@ func TestDataSurvivesCrashAndRestart(t *testing.T) {
 			a.tg.start()
 			// Until a pass has restored the new spdk_tgt, status must not say ONLINE (P2-11).
 			health := func() string { return a.must("GET", "/system/status", nil, "")["overall_health"].(string) }
-			visible := a.rec.SPDKInstance() != ""
+			visible := a.rec.DataPlaneInstance() != ""
 			if !visible {
 				t.Log("spdk_tgt's process isn't visible from here: restart detection can't be checked")
 			} else if h := health(); h != "RECONCILING" {
@@ -73,9 +73,9 @@ func TestDataSurvivesCrashAndRestart(t *testing.T) {
 			}
 			p, _ := a.st.GetPool(pool["id"].(string))
 			v, _ := a.st.GetVolume(vol["id"].(string))
-			if p.HealthStatus != store.HealthStatusOnline || v.HealthStatus != store.HealthStatusOnline || p.LVSUUID != pool["lvs_uuid"] {
+			if p.HealthStatus != store.HealthStatusOnline || v.HealthStatus != store.HealthStatusOnline || p.ThinPoolUUID != pool["thin_pool_uuid"] {
 				t.Fatalf("after %s restart: pool %s (%s) lvs %s, volume %s (%s); reconciler %+v",
-					how, p.HealthStatus, p.StatusMessage, p.LVSUUID, v.HealthStatus, v.StatusMessage, st)
+					how, p.HealthStatus, p.StatusMessage, p.ThinPoolUUID, v.HealthStatus, v.StatusMessage, st)
 			}
 			in.mustRead(0, data)
 			if len(st.Unmanaged) != 0 {
@@ -85,7 +85,7 @@ func TestDataSurvivesCrashAndRestart(t *testing.T) {
 	}
 
 	// Something created behind Velocor's back is reported, and left alone (P1-5).
-	stray, err := a.tg.client().BdevLvolCreate(context.Background(), pool["lvs_name"].(string), "stray", 4<<20, true, "")
+	stray, err := a.tg.client().BdevLvolCreate(context.Background(), pool["thin_pool_name"].(string), "stray", 4<<20, true, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -123,7 +123,7 @@ func TestExportACLEnforced(t *testing.T) {
 // Snapshots freeze data and clones see the snapshot's data, through real exports.
 func TestSnapshotsAndClones(t *testing.T) {
 	a, pool, vol, in := setup(t, "RAID0", 1)
-	cluster := int(pool["cluster_size_bytes"].(float64))
+	cluster := int(pool["chunk_size_bytes"].(float64))
 	clusterBlocks := cluster / blockSize
 	first := randomData(t, cluster)
 	if err := in.write(0, first); err != nil {
@@ -213,8 +213,8 @@ func TestWriteCacheAndFlushAdvertised(t *testing.T) {
 	a, pool, vol, _ := setup(t, "RAID1", 2)
 	disk, _ := a.st.GetDisk("diska")
 	for _, b := range []struct{ what, name string }{
-		{"base disk (aio)", disk.SPDKBdevName},
-		{"RAID", pool["base_bdev_name"].(string)},
+		{"base disk (aio)", disk.Handle},
+		{"RAID", pool["array_name"].(string)},
 		{"volume", vol["uuid"].(string)},
 	} {
 		raw := a.tg.rawBdev(b.name)
@@ -260,8 +260,8 @@ func TestDegradedRAID1(t *testing.T) {
 			t.Fatalf("the pool is reported ONLINE although its data can't be served")
 		}
 	}
-	if p.LVSUUID != pool["lvs_uuid"] {
-		t.Fatalf("the pool's volume store changed: %s -> %s", pool["lvs_uuid"], p.LVSUUID)
+	if p.ThinPoolUUID != pool["thin_pool_uuid"] {
+		t.Fatalf("the pool's volume store changed: %s -> %s", pool["thin_pool_uuid"], p.ThinPoolUUID)
 	}
 }
 
@@ -310,7 +310,7 @@ func TestRAID5FRefused(t *testing.T) {
 	var bdevs []string
 	for _, id := range []string{"diska", "diskb", "diskc"} {
 		d, _ := a.st.GetDisk(id)
-		bdevs = append(bdevs, d.SPDKBdevName)
+		bdevs = append(bdevs, d.Handle)
 	}
 	if err := tg.client().BdevRaidCreate(ctx, "r5", "raid5f", 64, bdevs, true); err != nil {
 		t.Fatal(err)

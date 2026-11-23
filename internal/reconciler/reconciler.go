@@ -24,10 +24,10 @@ type State struct {
 	LastError          string    `json:"last_error,omitempty"`
 	// Unmanaged lists what spdk_tgt holds that no store record accounts for (P1-5).
 	Unmanaged []UnmanagedObject `json:"unmanaged_objects,omitempty"`
-	// SPDKInstance is the spdk_tgt process the last completed pass reconciled
+	// DataPlaneInstance is the spdk_tgt process the last completed pass reconciled
 	// (hardware.SPDKInstance; "" when unknown). When the running one differs, the data plane
 	// was restarted after that pass and isn't restored yet (docs/review-history.md P2-11).
-	SPDKInstance string `json:"spdk_instance,omitempty"`
+	DataPlaneInstance string `json:"data_plane_instance,omitempty"`
 }
 
 // Reconciler continuously converges observed state in Linux sysfs and spdk_tgt
@@ -85,16 +85,16 @@ func New(st store.Store, dp dataplane.Plane, hwMgr *hardware.Manager, logger *sl
 	}
 }
 
-// SPDKInstance identifies the running spdk_tgt process ("" when unknown).
-func (r *Reconciler) SPDKInstance() string {
+// DataPlaneInstance identifies the running spdk_tgt process ("" when unknown).
+func (r *Reconciler) DataPlaneInstance() string {
 	if r.instance == nil {
 		return ""
 	}
 	return r.instance()
 }
 
-// SetSPDKInstance replaces how the running spdk_tgt is identified (tests).
-func (r *Reconciler) SetSPDKInstance(f func() string) {
+// SetDataPlaneInstance replaces how the running spdk_tgt is identified (tests).
+func (r *Reconciler) SetDataPlaneInstance(f func() string) {
 	r.passMu.Lock()
 	defer r.passMu.Unlock()
 	r.instance = f
@@ -103,10 +103,10 @@ func (r *Reconciler) SetSPDKInstance(f func() string) {
 // Restoring reports whether spdk_tgt was restarted since the last completed pass, so what
 // velod built in it (pools' RAIDs and volume stores, exports) isn't all back yet.
 func (r *Reconciler) Restoring() bool {
-	cur := r.SPDKInstance()
+	cur := r.DataPlaneInstance()
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return cur != "" && cur != r.state.SPDKInstance
+	return cur != "" && cur != r.state.DataPlaneInstance
 }
 
 // State returns a snapshot of the reconciler's current status.
@@ -141,7 +141,7 @@ func (r *Reconciler) Start(ctx context.Context, interval time.Duration) {
 			_, _ = r.ReconcileOnce(ctx)
 		case <-watch.C:
 			if r.Restoring() {
-				r.logger.Warn("spdk_tgt was restarted: restoring pools, volumes and exports now", "instance", r.SPDKInstance())
+				r.logger.Warn("spdk_tgt was restarted: restoring pools, volumes and exports now", "instance", r.DataPlaneInstance())
 				_, _ = r.ReconcileOnce(ctx)
 				ticker.Reset(interval)
 			}
@@ -186,7 +186,7 @@ func (r *Reconciler) ReconcileOnce(ctx context.Context) (State, error) {
 	p := &pass{}
 	// The spdk_tgt this pass reconciles, read before talking to it: a restart during the pass
 	// then shows as a different instance afterwards.
-	instance := r.SPDKInstance()
+	instance := r.DataPlaneInstance()
 	discovered := r.syncHardware(p)
 	r.enforceWriteCache(p)
 
@@ -223,7 +223,7 @@ func (r *Reconciler) ReconcileOnce(ctx context.Context) (State, error) {
 	lastErr := strings.Join(p.errs, "; ")
 	r.finishPass(p.repaired, p.degraded, lastErr)
 	r.mu.Lock()
-	r.state.SPDKInstance = instance
+	r.state.DataPlaneInstance = instance
 	r.mu.Unlock()
 	if p.unmanagedChecked {
 		r.mu.Lock()
@@ -353,7 +353,7 @@ func (r *Reconciler) reconcileDisks(ctx context.Context, p *pass) {
 		if !d.Claimed || d.IsBootDevice {
 			continue
 		}
-		bdevName, drv := d.SPDKBdevName, d.DriverState
+		bdevName, drv := d.Handle, d.DriverState
 		health := store.HealthStatusOnline
 		var smart *store.SmartHealth
 
@@ -377,7 +377,7 @@ func (r *Reconciler) reconcileDisks(ctx context.Context, p *pass) {
 
 		if health == store.HealthStatusOnline && d.Type == store.DiskTypeNVMe {
 			dd := *d
-			dd.SPDKBdevName = bdevName
+			dd.Handle = bdevName
 			if h, err := r.dp.NVMeHealth(ctx, &dd); err == nil {
 				smart = h
 				if smart.CriticalWarning {
@@ -391,8 +391,8 @@ func (r *Reconciler) reconcileDisks(ctx context.Context, p *pass) {
 			if !cur.Claimed {
 				return store.ErrSkipWrite // released concurrently
 			}
-			changed := cur.SPDKBdevName != bdevName || cur.DriverState != drv || cur.HealthStatus != health
-			cur.SPDKBdevName, cur.DriverState, cur.HealthStatus = bdevName, drv, health
+			changed := cur.Handle != bdevName || cur.DriverState != drv || cur.HealthStatus != health
+			cur.Handle, cur.DriverState, cur.HealthStatus = bdevName, drv, health
 			if smart != nil {
 				// SMART counters change constantly; only persist them alongside a real change
 				// or when the critical flag flips, to avoid a bbolt fsync per disk per pass.
@@ -445,7 +445,7 @@ func (r *Reconciler) reconcilePools(ctx context.Context, p *pass, examined bool)
 	}
 
 	for _, pool := range pools {
-		if pool.HealthStatus == store.HealthStatusReconciling && pool.LVSUUID == "" {
+		if pool.HealthStatus == store.HealthStatusReconciling && pool.ThinPoolUUID == "" {
 			continue // being created by the API right now; it owns the RAID/lvstore setup
 		}
 		res := "pool:" + pool.ID
@@ -461,7 +461,7 @@ func (r *Reconciler) reconcilePools(ctx context.Context, p *pass, examined bool)
 
 		// 1. RAID bdev (assembled by SPDK examine from its on-disk superblock): member states
 		// and RAID-level health.
-		ri := slices.IndexFunc(raids, func(rb dataplane.Array) bool { return rb.Name == pool.BaseBdevName })
+		ri := slices.IndexFunc(raids, func(rb dataplane.Array) bool { return rb.Name == pool.ArrayName })
 		raidOnline := false
 		members := store.PoolMembers(pool)
 		if ri >= 0 {
@@ -471,31 +471,31 @@ func (r *Reconciler) reconcilePools(ctx context.Context, p *pass, examined bool)
 				fail(v.health, reason)
 			}
 			if v.health != store.HealthStatusOnline && len(v.reasons) == 0 {
-				fail(v.health, "RAID "+pool.BaseBdevName+" is "+string(v.health))
+				fail(v.health, "RAID "+pool.ArrayName+" is "+string(v.health))
 			}
 		} else {
 			fail(store.HealthStatusUnavailable, fmt.Sprintf("RAID %s not assembled by SPDK examine (%d/%d member bdevs present)",
-				pool.BaseBdevName, r.presentMembers(pool, bdevs), len(pool.DiskIDs)))
+				pool.ArrayName, r.presentMembers(pool, bdevs), len(pool.DiskIDs)))
 		}
 
 		// 2. lvstore.
 		var lvs *dataplane.ThinPool
 		for i := range lvstores {
-			if lvstores[i].UUID == pool.LVSUUID {
+			if lvstores[i].UUID == pool.ThinPoolUUID {
 				lvs = &lvstores[i]
 			}
 		}
 		switch {
 		case lvs != nil || !raidOnline:
 			// Missing RAID already reported; never inspect lvstores on an incomplete array.
-		case pool.LVSUUID == "":
+		case pool.ThinPoolUUID == "":
 			fail(store.HealthStatusFaulted, "pool has no lvstore UUID; its creation never completed")
 		case !examined:
-			fail(store.HealthStatusDegraded, "waiting for SPDK examine to load lvstore "+pool.LVSName)
-		case slices.ContainsFunc(lvstores, func(l dataplane.ThinPool) bool { return l.Name == pool.LVSName }):
-			fail(store.HealthStatusFaulted, fmt.Sprintf("lvstore %s has a different UUID than recorded (%s); it may have been re-initialised", pool.LVSName, pool.LVSUUID))
+			fail(store.HealthStatusDegraded, "waiting for SPDK examine to load lvstore "+pool.ThinPoolName)
+		case slices.ContainsFunc(lvstores, func(l dataplane.ThinPool) bool { return l.Name == pool.ThinPoolName }):
+			fail(store.HealthStatusFaulted, fmt.Sprintf("lvstore %s has a different UUID than recorded (%s); it may have been re-initialised", pool.ThinPoolName, pool.ThinPoolUUID))
 		default:
-			fail(store.HealthStatusFaulted, fmt.Sprintf("lvstore %s (%s) not found on %s", pool.LVSName, pool.LVSUUID, pool.BaseBdevName))
+			fail(store.HealthStatusFaulted, fmt.Sprintf("lvstore %s (%s) not found on %s", pool.ThinPoolName, pool.ThinPoolUUID, pool.ArrayName))
 		}
 
 		var total, free, metaTotal, metaUsed uint64
@@ -602,11 +602,11 @@ func leftPool(d *store.Disk, pools []*store.Pool, raids []dataplane.Array) *stor
 			continue
 		}
 		if slices.Contains(p.DiskIDs, d.ID) {
-			ri := slices.IndexFunc(raids, func(rb dataplane.Array) bool { return rb.Name == p.BaseBdevName })
+			ri := slices.IndexFunc(raids, func(rb dataplane.Array) bool { return rb.Name == p.ArrayName })
 			rebuilding := slices.ContainsFunc(store.PoolMembers(p), func(m store.PoolMember) bool {
 				return m.DiskID == d.ID && m.State == store.MemberStateRebuilding
 			})
-			if ri < 0 || !strings.EqualFold(raids[ri].State, "online") || rebuilding || inRaid(raids, d.SPDKBdevName) {
+			if ri < 0 || !strings.EqualFold(raids[ri].State, "online") || rebuilding || inRaid(raids, d.Handle) {
 				return nil
 			}
 			return p // the running array lost it: it failed
@@ -625,11 +625,11 @@ func (r *Reconciler) memberBdevs(pool *store.Pool, bdevs map[string]dataplane.De
 	var members []string
 	for _, id := range pool.DiskIDs {
 		d, err := r.store.GetDisk(id)
-		if err != nil || d.SPDKBdevName == "" {
+		if err != nil || d.Handle == "" {
 			continue
 		}
-		if _, ok := bdevs[d.SPDKBdevName]; ok {
-			members = append(members, d.SPDKBdevName)
+		if _, ok := bdevs[d.Handle]; ok {
+			members = append(members, d.Handle)
 		}
 	}
 	return members, len(members) == len(pool.DiskIDs) && len(members) > 0
@@ -668,12 +668,12 @@ func (r *Reconciler) reconcileVolumes(ctx context.Context, p *pass, poolOnline m
 			p.degraded = append(p.degraded, res)
 		case !found:
 			health = store.HealthStatusFaulted
-			msg = fmt.Sprintf("lvol %s (%s) is missing from its lvstore; not re-creating it because that would present an empty disk", vol.LvolBdevName, vol.UUID)
+			msg = fmt.Sprintf("lvol %s (%s) is missing from its lvstore; not re-creating it because that would present an empty disk", vol.Handle, vol.UUID)
 			p.degrade(res, msg)
 		default:
-			if vol.EffectiveBdevName != vol.LvolBdevName {
-				if _, ok := bdevs[vol.EffectiveBdevName]; !ok {
-					health, msg = store.HealthStatusDegraded, fmt.Sprintf("filter bdev %s is not present", vol.EffectiveBdevName)
+			if vol.Device != vol.Handle {
+				if _, ok := bdevs[vol.Device]; !ok {
+					health, msg = store.HealthStatusDegraded, fmt.Sprintf("filter bdev %s is not present", vol.Device)
 					p.degrade(res, msg)
 				}
 			}
@@ -681,11 +681,11 @@ func (r *Reconciler) reconcileVolumes(ctx context.Context, p *pass, poolOnline m
 				online[vol.ID] = vol
 				q := vol.QosPolicy
 				have := info.QoS
-				if eff, ok := bdevs[vol.EffectiveBdevName]; ok {
+				if eff, ok := bdevs[vol.Device]; ok {
 					have = eff.QoS
 				}
 				if have != q {
-					if err := r.dp.SetQoS(ctx, vol.EffectiveBdevName, q); err != nil {
+					if err := r.dp.SetQoS(ctx, vol.Device, q); err != nil {
 						p.errs = append(p.errs, fmt.Sprintf("%s: apply QoS: %v", res, err))
 					} else {
 						p.repaired++

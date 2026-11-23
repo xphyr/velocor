@@ -151,7 +151,7 @@ func TestDiskBootGuardAndClaimLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ClaimDisk failed: %v", err)
 	}
-	if !claimed.Claimed || claimed.DriverState != DiskDriverStateVfioPCI || claimed.SPDKBdevName != "Nvme1n1" {
+	if !claimed.Claimed || claimed.DriverState != DiskDriverStateVfioPCI || claimed.Handle != "Nvme1n1" {
 		t.Fatalf("unexpected claimed disk state: %+v", claimed)
 	}
 
@@ -159,7 +159,7 @@ func TestDiskBootGuardAndClaimLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReleaseDisk failed: %v", err)
 	}
-	if released.Claimed || released.DriverState != DiskDriverStateKernel || released.SPDKBdevName != "" {
+	if released.Claimed || released.DriverState != DiskDriverStateKernel || released.Handle != "" {
 		t.Fatalf("unexpected released disk state: %+v", released)
 	}
 }
@@ -200,8 +200,8 @@ func TestPoolVolumeSnapshotAndExportReferentialIntegrity(t *testing.T) {
 	if err := st.CreatePool(pool); err != nil {
 		t.Fatalf("CreatePool failed: %v", err)
 	}
-	if pool.ClusterSizeBytes != DefaultClusterSizeBytes {
-		t.Fatalf("expected default ClusterSizeBytes=%d, got %d", DefaultClusterSizeBytes, pool.ClusterSizeBytes)
+	if pool.ChunkSizeBytes != DefaultChunkSizeBytes {
+		t.Fatalf("expected default ChunkSizeBytes=%d, got %d", DefaultChunkSizeBytes, pool.ChunkSizeBytes)
 	}
 
 	// Verify both disks now have PoolID="pool-1" and cannot be released while in the pool.

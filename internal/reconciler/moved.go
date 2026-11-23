@@ -48,7 +48,7 @@ func (r *Reconciler) relinkMovedMembers(ctx context.Context, p *pass, discovered
 	var todo []gone
 	var raids []dataplane.Array
 	for _, pool := range pools {
-		if pool.HealthStatus == store.HealthStatusReconciling && pool.LVSUUID == "" {
+		if pool.HealthStatus == store.HealthStatusReconciling && pool.ThinPoolUUID == "" {
 			continue // being created
 		}
 		var g gone
@@ -72,7 +72,7 @@ func (r *Reconciler) relinkMovedMembers(ctx context.Context, p *pass, discovered
 				return false
 			}
 		}
-		if i := slices.IndexFunc(raids, func(rb dataplane.Array) bool { return rb.Name == pool.BaseBdevName }); i >= 0 && strings.EqualFold(raids[i].State, "online") {
+		if i := slices.IndexFunc(raids, func(rb dataplane.Array) bool { return rb.Name == pool.ArrayName }); i >= 0 && strings.EqualFold(raids[i].State, "online") {
 			continue // running: a member that left it is a failure, handled elsewhere
 		}
 		g.pool = pool
@@ -112,7 +112,7 @@ func (r *Reconciler) relinkMovedMembers(ctx context.Context, p *pass, discovered
 
 	relinked := false
 	for _, g := range todo {
-		i := slices.IndexFunc(arrays, func(a dataplane.DiskArray) bool { return a.Name == g.pool.BaseBdevName })
+		i := slices.IndexFunc(arrays, func(a dataplane.DiskArray) bool { return a.Name == g.pool.ArrayName })
 		if i < 0 {
 			continue // nothing came back (yet): the pool stays UNAVAILABLE
 		}

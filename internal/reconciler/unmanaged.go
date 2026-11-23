@@ -95,15 +95,15 @@ func (r *Reconciler) scanUnmanaged(ctx context.Context, examined bool) ([]Unmana
 		Targets: map[string]bool{}, Skip: map[string]bool{meta.LvolName: true},
 	}
 	for _, pl := range pools {
-		known.ThinPools[pl.LVSUUID] = true
-		known.Devices[pl.BaseBdevName], known.Devices[pl.EffectiveBdevName] = true, true
+		known.ThinPools[pl.ThinPoolUUID] = true
+		known.Devices[pl.ArrayName], known.Devices[pl.Device] = true, true
 	}
 	for _, d := range disks {
-		known.Devices[d.SPDKBdevName] = true
+		known.Devices[d.Handle] = true
 	}
 	for _, v := range volumes {
 		known.Volumes[v.UUID] = true
-		known.Devices[v.EffectiveBdevName] = true
+		known.Devices[v.Device] = true
 	}
 	for _, s := range snaps {
 		known.Volumes[s.UUID] = true

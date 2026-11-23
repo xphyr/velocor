@@ -105,7 +105,7 @@ func (s *Server) scrubTick(ctx context.Context, now time.Time) error {
 
 	recs := map[string]*store.ScrubRecord{}
 	for _, p := range pools {
-		rec, err := s.syncScrub(ctx, p, raids[p.BaseBdevName], now)
+		rec, err := s.syncScrub(ctx, p, raids[p.ArrayName], now)
 		if err != nil {
 			s.logger.Warn("scrub: following pool failed", "pool", p.Name, "error", err)
 			continue
@@ -136,7 +136,7 @@ func (s *Server) scrubTick(ctx context.Context, now time.Time) error {
 	// Operator runs interrupted by a restart or a member change resume at once.
 	for _, p := range pools {
 		rec := recs[p.ID]
-		if rec != nil && rec.State == store.ScrubPaused && rec.Manual && scrubEligible(p, raids[p.BaseBdevName]) == "" {
+		if rec != nil && rec.State == store.ScrubPaused && rec.Manual && scrubEligible(p, raids[p.ArrayName]) == "" {
 			if err := s.startScrub(ctx, p, rec, true, true, rec.Repair, rec.MaxMBps, now); err != nil {
 				s.logger.Warn("scrub: resuming failed", "pool", p.Name, "error", err)
 			}
@@ -150,7 +150,7 @@ func (s *Server) scrubTick(ctx context.Context, now time.Time) error {
 	var pickDue time.Time
 	for _, p := range pools {
 		rec := recs[p.ID]
-		if scrubEligible(p, raids[p.BaseBdevName]) != "" || (rec != nil && rec.State == store.ScrubRunning) {
+		if scrubEligible(p, raids[p.ArrayName]) != "" || (rec != nil && rec.State == store.ScrubRunning) {
 			continue
 		}
 		due := scrubDue(p, rec, cfg)
@@ -318,7 +318,7 @@ func (s *Server) startScrub(ctx context.Context, p *store.Pool, rec *store.Scrub
 			offset = rec.OffsetBlocks
 		}
 	}
-	if err := s.dp.StartScrub(ctx, p.BaseBdevName, repair, maxMBps, offset); err != nil {
+	if err := s.dp.StartScrub(ctx, p.ArrayName, repair, maxMBps, offset); err != nil {
 		return err
 	}
 	_, err := s.store.MutateScrubRecord(p.ID, func(r *store.ScrubRecord) error {
@@ -346,7 +346,7 @@ func (s *Server) requestScrubStop(ctx context.Context, p *store.Pool, state stor
 	}); err != nil {
 		return err
 	}
-	return s.dp.StopScrub(ctx, p.BaseBdevName)
+	return s.dp.StopScrub(ctx, p.ArrayName)
 }
 
 // --- API ---
@@ -465,7 +465,7 @@ func (s *Server) handleGetPoolScrub(w http.ResponseWriter, r *http.Request) {
 	synced := false
 	if s.dp != nil {
 		if raids, err := s.raidsByName(r.Context()); err == nil {
-			rb = raids[p.BaseBdevName]
+			rb = raids[p.ArrayName]
 			// Bring the record up to date with SPDK, so progress is current.
 			s.scrubMu.Lock()
 			rec, err = s.syncScrub(r.Context(), p, rb, time.Now())
@@ -527,7 +527,7 @@ func (s *Server) handleStartPoolScrub(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	now := time.Now()
-	rec, err := s.syncScrub(r.Context(), p, raids[p.BaseBdevName], now)
+	rec, err := s.syncScrub(r.Context(), p, raids[p.ArrayName], now)
 	if err != nil {
 		writeError(w, err)
 		return
@@ -536,7 +536,7 @@ func (s *Server) handleStartPoolScrub(w http.ResponseWriter, r *http.Request) {
 		writeError(w, fmt.Errorf("%w: pool %s is already being scrubbed (%d%%)", store.ErrInUse, p.Name, scrubPercent(rec)))
 		return
 	}
-	if why := scrubEligible(p, raids[p.BaseBdevName]); why != "" {
+	if why := scrubEligible(p, raids[p.ArrayName]); why != "" {
 		writeError(w, fmt.Errorf("%w: can't scrub pool %s now: %s", store.ErrInUse, p.Name, why))
 		return
 	}
@@ -557,7 +557,7 @@ func (s *Server) handleStartPoolScrub(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	rec, _ = s.store.GetScrubRecord(p.ID)
-	writeJSON(w, http.StatusAccepted, s.poolScrubView(p, rec, raids[p.BaseBdevName], st.Scrub.Effective()))
+	writeJSON(w, http.StatusAccepted, s.poolScrubView(p, rec, raids[p.ArrayName], st.Scrub.Effective()))
 }
 
 func scrubPercent(r *store.ScrubRecord) int {

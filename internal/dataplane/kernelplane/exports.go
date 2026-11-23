@@ -22,7 +22,7 @@ func (p *Plane) ApplyExport(ctx context.Context, exp *store.Export, vol *store.V
 	}
 	lv, err := p.resolve(ctx, vol.UUID)
 	if err != nil {
-		if lv, err = p.resolve(ctx, vol.LvolBdevName); err != nil {
+		if lv, err = p.resolve(ctx, vol.Handle); err != nil {
 			return err
 		}
 	}

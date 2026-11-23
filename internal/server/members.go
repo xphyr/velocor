@@ -28,9 +28,9 @@ func (s *Server) poolRaid(ctx context.Context, pool *store.Pool) (*dataplane.Arr
 	if err != nil {
 		return nil, nil, fmt.Errorf("list raid bdevs: %w", err)
 	}
-	i := slices.IndexFunc(raids, func(rb dataplane.Array) bool { return rb.Name == pool.BaseBdevName })
+	i := slices.IndexFunc(raids, func(rb dataplane.Array) bool { return rb.Name == pool.ArrayName })
 	if i < 0 {
-		return nil, raids, fmt.Errorf("%w: RAID %s of pool %s is not assembled", store.ErrInvalidArgument, pool.BaseBdevName, pool.ID)
+		return nil, raids, fmt.Errorf("%w: RAID %s of pool %s is not assembled", store.ErrInvalidArgument, pool.ArrayName, pool.ID)
 	}
 	return &raids[i], raids, nil
 }
@@ -182,7 +182,7 @@ func (s *Server) handleReplacePoolDisk(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	if other := memberOf(raids, newDisk.SPDKBdevName); other != "" {
+	if other := memberOf(raids, newDisk.Handle); other != "" {
 		writeError(w, fmt.Errorf("%w: disk %s carries metadata of RAID %s and the data plane assembled it into that array; release it with a wipe first", store.ErrInUse, newDisk.ID, other))
 		return
 	}
@@ -199,7 +199,7 @@ func (s *Server) handleReplacePoolDisk(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
-	if err := s.dp.AddMember(ctx, rb.Name, newDisk.SPDKBdevName); err != nil {
+	if err := s.dp.AddMember(ctx, rb.Name, newDisk.Handle); err != nil {
 		s.undoReplace(pool.ID, prev, newDisk.ID)
 		writeError(w, fmt.Errorf("add disk %s to RAID %s: %w", newDisk.ID, rb.Name, err))
 		return
@@ -215,7 +215,7 @@ func (s *Server) handleReplacePoolDisk(w http.ResponseWriter, r *http.Request) {
 // data plane first if it isn't (the reconciler leaves a disk that left a running array alone).
 func (s *Server) putBack(w http.ResponseWriter, r *http.Request, pool *store.Pool, rb *dataplane.Array, raids []dataplane.Array, d *store.Disk) {
 	ctx := r.Context()
-	if other := memberOf(raids, d.SPDKBdevName); other != "" {
+	if other := memberOf(raids, d.Handle); other != "" {
 		writeError(w, fmt.Errorf("%w: disk %s is in RAID %s", store.ErrInUse, d.ID, other))
 		return
 	}
@@ -224,8 +224,8 @@ func (s *Server) putBack(w http.ResponseWriter, r *http.Request, pool *store.Poo
 		writeError(w, err)
 		return
 	}
-	present := d.SPDKBdevName != "" && slices.ContainsFunc(devs, func(x dataplane.Device) bool {
-		return x.Name == d.SPDKBdevName || slices.Contains(x.Aliases, d.SPDKBdevName)
+	present := d.Handle != "" && slices.ContainsFunc(devs, func(x dataplane.Device) bool {
+		return x.Name == d.Handle || slices.Contains(x.Aliases, d.Handle)
 	})
 	if !present {
 		h, drv, err := s.dp.AttachDisk(ctx, d)
@@ -234,7 +234,7 @@ func (s *Server) putBack(w http.ResponseWriter, r *http.Request, pool *store.Poo
 			return
 		}
 		if d, err = s.store.MutateDisk(d.ID, func(cur *store.Disk) error {
-			cur.SPDKBdevName, cur.DriverState = h, drv
+			cur.Handle, cur.DriverState = h, drv
 			return nil
 		}); err != nil {
 			writeError(w, err)
@@ -242,8 +242,8 @@ func (s *Server) putBack(w http.ResponseWriter, r *http.Request, pool *store.Poo
 		}
 	}
 	// SPDK's examine may already have put an attached member back into its slot.
-	if now, err := s.dp.Arrays(ctx); err != nil || memberOf(now, d.SPDKBdevName) != rb.Name {
-		if err := s.dp.AddMember(ctx, rb.Name, d.SPDKBdevName); err != nil {
+	if now, err := s.dp.Arrays(ctx); err != nil || memberOf(now, d.Handle) != rb.Name {
+		if err := s.dp.AddMember(ctx, rb.Name, d.Handle); err != nil {
 			writeError(w, fmt.Errorf("add disk %s back to RAID %s: %w", d.ID, rb.Name, err))
 			return
 		}
@@ -337,7 +337,7 @@ func (s *Server) handleReleasePoolDisk(w http.ResponseWriter, r *http.Request) {
 			writeError(w, err)
 			return
 		}
-		if rb := memberOf(raids, d.SPDKBdevName); rb != "" {
+		if rb := memberOf(raids, d.Handle); rb != "" {
 			writeError(w, fmt.Errorf("%w: disk %s is still a member of RAID %s", store.ErrInUse, diskID, rb))
 			return
 		}

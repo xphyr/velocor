@@ -327,13 +327,13 @@ const (
 	RoleReadOnly       Role = "READONLY"
 )
 
-// DefaultClusterSizeBytes is the default SPDK lvol_store cluster size (1 MiB).
+// DefaultChunkSizeBytes is the default SPDK lvol_store cluster size (1 MiB).
 //
 // SPDK reserves one metadata page (4 KiB) per cluster, and after an unclean stop recovery reads
 // all of them: with 64 KiB clusters a 500 GB pool carried ~30 GiB of metadata (6% of the pool)
 // and took 16 minutes to recover on velocor-1, long enough for hosts to give up. 1 MiB keeps
 // that to ~0.4% and about a minute, while thin allocation stays fine-grained.
-const DefaultClusterSizeBytes uint32 = 1 << 20
+const DefaultChunkSizeBytes uint32 = 1 << 20
 
 // FilterPolicy defines stackable SPDK filter bdev layers (crypto / compression).
 type FilterPolicy struct {
@@ -382,11 +382,11 @@ type Disk struct {
 	IsBootDevice     bool            `json:"is_boot_device"`
 	Claimed          bool            `json:"claimed"`
 	PoolID           string          `json:"pool_id,omitempty"`
-	SPDKBdevName     string          `json:"spdk_bdev_name,omitempty"`
-	// BdevUUID is the UUID of the disk's SPDK base bdev when it differs from the one derived
+	Handle           string          `json:"handle,omitempty"`
+	// MemberUUID is the UUID of the disk's SPDK base bdev when it differs from the one derived
 	// from the disk ID: a pool member that came back under a new ID keeps the UUID its RAID
 	// superblock knows it by (docs/review-history.md P1-14). Empty: derived from the ID.
-	BdevUUID     string       `json:"bdev_uuid,omitempty"`
+	MemberUUID   string       `json:"member_uuid,omitempty"`
 	HealthStatus HealthStatus `json:"health_status"`
 	Smart        SmartHealth  `json:"smart"`
 	// WriteCache is what the hardware reports (refreshed by every scan; the last known value is
@@ -470,16 +470,16 @@ type Pool struct {
 	Members []PoolMember `json:"members,omitempty"`
 	// DetachedDiskIDs are disks that left the RAID (failed, removed or replaced) but stay
 	// bound to the pool until an operator releases them, so they can't be reused by accident.
-	DetachedDiskIDs   []string `json:"detached_disk_ids,omitempty"`
-	StripSizeKB       uint32   `json:"strip_size_kb"`
-	ClusterSizeBytes  uint32   `json:"cluster_size_bytes"`
-	BaseBdevName      string   `json:"base_bdev_name"`
-	EffectiveBdevName string   `json:"effective_bdev_name"`
-	LVSUUID           string   `json:"lvs_uuid"`
-	LVSName           string   `json:"lvs_name"`
-	TotalBytes        uint64   `json:"total_bytes"`
-	FreeBytes         uint64   `json:"free_bytes"`
-	AllocatedBytes    uint64   `json:"allocated_bytes"`
+	DetachedDiskIDs []string `json:"detached_disk_ids,omitempty"`
+	StripSizeKB     uint32   `json:"strip_size_kb"`
+	ChunkSizeBytes  uint32   `json:"chunk_size_bytes"`
+	ArrayName       string   `json:"array_name"`
+	Device          string   `json:"device"`
+	ThinPoolUUID    string   `json:"thin_pool_uuid"`
+	ThinPoolName    string   `json:"thin_pool_name"`
+	TotalBytes      uint64   `json:"total_bytes"`
+	FreeBytes       uint64   `json:"free_bytes"`
+	AllocatedBytes  uint64   `json:"allocated_bytes"`
 	// Space accounting (P0-2), maintained by the reconciler: CommittedBytes is every volume's
 	// full size plus what snapshots hold; AvailableBytes is how much more the pool accepts.
 	SpacePolicy    SpacePolicy `json:"space_policy"`
@@ -491,7 +491,7 @@ type Pool struct {
 	// plane): finite, and worse to fill than the data. 0 where there is none (SPDK).
 	ThinMetadataBytes     uint64       `json:"thin_metadata_bytes,omitempty"`
 	ThinMetadataUsedBytes uint64       `json:"thin_metadata_used_bytes,omitempty"`
-	MetaLvolUUID          string       `json:"meta_lvol_uuid,omitempty"`
+	MetaVolumeUUID        string       `json:"meta_volume_uuid,omitempty"`
 	MetaGeneration        uint64       `json:"meta_generation,omitempty"`
 	MetaHash              string       `json:"meta_hash,omitempty"`
 	MetaWrittenAt         time.Time    `json:"meta_written_at,omitempty"`
@@ -504,24 +504,24 @@ type Pool struct {
 
 // Volume represents a logical volume (SPDK bdev_lvol) inside a Pool.
 type Volume struct {
-	ID                string            `json:"id"`
-	Name              string            `json:"name"`
-	PoolID            string            `json:"pool_id"`
-	UUID              string            `json:"uuid"`
-	LvolBdevName      string            `json:"lvol_bdev_name"`
-	EffectiveBdevName string            `json:"effective_bdev_name"`
-	SizeBytes         uint64            `json:"size_bytes"`
-	AllocatedBytes    uint64            `json:"allocated_bytes"`
-	ThinProvision     bool              `json:"thin_provision"`
-	ReadOnly          bool              `json:"read_only"`
-	ParentSnapshotID  string            `json:"parent_snapshot_id,omitempty"`
-	FilterPolicy      FilterPolicy      `json:"filter_policy"`
-	QosPolicy         QosPolicy         `json:"qos_policy"`
-	AttachmentState   AttachmentState   `json:"attachment_state"`
-	HealthStatus      HealthStatus      `json:"health_status"`
-	StatusMessage     string            `json:"status_message,omitempty"`
-	Labels            map[string]string `json:"labels,omitempty"`
-	CreatedAt         time.Time         `json:"created_at"`
+	ID               string            `json:"id"`
+	Name             string            `json:"name"`
+	PoolID           string            `json:"pool_id"`
+	UUID             string            `json:"uuid"`
+	Handle           string            `json:"handle"`
+	Device           string            `json:"device"`
+	SizeBytes        uint64            `json:"size_bytes"`
+	AllocatedBytes   uint64            `json:"allocated_bytes"`
+	ThinProvision    bool              `json:"thin_provision"`
+	ReadOnly         bool              `json:"read_only"`
+	ParentSnapshotID string            `json:"parent_snapshot_id,omitempty"`
+	FilterPolicy     FilterPolicy      `json:"filter_policy"`
+	QosPolicy        QosPolicy         `json:"qos_policy"`
+	AttachmentState  AttachmentState   `json:"attachment_state"`
+	HealthStatus     HealthStatus      `json:"health_status"`
+	StatusMessage    string            `json:"status_message,omitempty"`
+	Labels           map[string]string `json:"labels,omitempty"`
+	CreatedAt        time.Time         `json:"created_at"`
 	// DeletionProtection refuses deletion until an administrator turns it off.
 	DeletionProtection bool `json:"deletion_protection,omitempty"`
 	// DeletedAt is set while a deleted volume waits for its retention period to end: it is
@@ -545,7 +545,7 @@ type Snapshot struct {
 	VolumeID         string    `json:"volume_id"`
 	PoolID           string    `json:"pool_id"`
 	UUID             string    `json:"uuid"`
-	LvolBdevName     string    `json:"lvol_bdev_name"`
+	Handle           string    `json:"handle"`
 	SizeBytes        uint64    `json:"size_bytes"`
 	AllocatedBytes   uint64    `json:"allocated_bytes"`
 	ParentSnapshotID string    `json:"parent_snapshot_id,omitempty"`
@@ -609,7 +609,7 @@ type InitiatorGroup struct {
 	CreatedAt                 time.Time `json:"created_at"`
 }
 
-// Export maps a Volume's EffectiveBdevName to an NVMe-oF Subsystem/Namespace or iSCSI Target/LUN.
+// Export maps a Volume's Device to an NVMe-oF Subsystem/Namespace or iSCSI Target/LUN.
 type Export struct {
 	ID                string         `json:"id"`
 	Name              string         `json:"name"`

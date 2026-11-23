@@ -48,7 +48,7 @@ func (r *Reconciler) reconcileMeta(ctx context.Context, p *pass, poolOnline map[
 		return
 	}
 	for _, pool := range pools {
-		if !poolOnline[pool.ID] || pool.LVSUUID == "" {
+		if !poolOnline[pool.ID] || pool.ThinPoolUUID == "" {
 			continue
 		}
 		if err := r.syncPoolMeta(ctx, pool, lvols); err != nil {
@@ -69,13 +69,13 @@ func (r *Reconciler) reconcileMeta(ctx context.Context, p *pass, poolOnline map[
 func (r *Reconciler) syncPoolMeta(ctx context.Context, pool *store.Pool, lvols []dataplane.Volume) error {
 	uuid := ""
 	for _, l := range lvols {
-		if l.Pool == pool.LVSUUID && l.Name == meta.LvolName {
+		if l.Pool == pool.ThinPoolUUID && l.Name == meta.LvolName {
 			uuid = l.UUID
 		}
 	}
 	if uuid == "" {
 		// Thick, so a full pool can never fail a metadata write.
-		created, err := r.dp.CreateVolume(ctx, pool.LVSName, meta.LvolName, meta.LvolBytes, false)
+		created, err := r.dp.CreateVolume(ctx, pool.ThinPoolName, meta.LvolName, meta.LvolBytes, false)
 		if err != nil {
 			return fmt.Errorf("create the %s lvol: %w", meta.LvolName, err)
 		}
@@ -87,9 +87,9 @@ func (r *Reconciler) syncPoolMeta(ctx context.Context, pool *store.Pool, lvols [
 	if err != nil {
 		return fmt.Errorf("build the manifest: %w", err)
 	}
-	m.Pool.MetaLvolUUID = uuid
+	m.Pool.MetaVolumeUUID = uuid
 	digest := m.Digest()
-	if digest == pool.MetaHash && uuid == pool.MetaLvolUUID && pool.MetaError == "" && r.meta.synced[pool.ID] {
+	if digest == pool.MetaHash && uuid == pool.MetaVolumeUUID && pool.MetaError == "" && r.meta.synced[pool.ID] {
 		return nil
 	}
 
@@ -105,7 +105,7 @@ func (r *Reconciler) syncPoolMeta(ctx context.Context, pool *store.Pool, lvols [
 					"pool", pool.ID, "pool_generation", onPool.Generation, "db_generation", gen)
 				gen = onPool.Generation
 			}
-			if onPool.Generation == gen && onPool.Digest() == digest && uuid == pool.MetaLvolUUID {
+			if onPool.Generation == gen && onPool.Digest() == digest && uuid == pool.MetaVolumeUUID {
 				r.meta.synced[pool.ID] = true
 				return r.recordMeta(pool.ID, uuid, gen, digest, onPool.WrittenAt)
 			}
@@ -127,7 +127,7 @@ func (r *Reconciler) syncPoolMeta(ctx context.Context, pool *store.Pool, lvols [
 
 func (r *Reconciler) recordMeta(poolID, uuid string, gen uint64, digest string, at time.Time) error {
 	_, err := r.store.MutatePool(poolID, func(cur *store.Pool) error {
-		cur.MetaLvolUUID, cur.MetaGeneration, cur.MetaHash, cur.MetaWrittenAt, cur.MetaError = uuid, gen, digest, at, ""
+		cur.MetaVolumeUUID, cur.MetaGeneration, cur.MetaHash, cur.MetaWrittenAt, cur.MetaError = uuid, gen, digest, at, ""
 		return nil
 	})
 	return err

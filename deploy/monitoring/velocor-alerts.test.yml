@@ -26,7 +26,7 @@ tests:
           - exp_labels: {severity: critical, job: velocor, instance: "a:8443"}
             exp_annotations:
               summary: "SPDK (the data plane) on a:8443 doesn't answer"
-              description: "spdk_tgt doesn't answer velod: volumes are probably not being served."
+              description: "The data plane doesn't answer velod: volumes are probably not being served."
 
   # A degraded pool pages after 5 minutes, not before; ONLINE pools and other states don't.
   - interval: 1m

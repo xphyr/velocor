@@ -98,7 +98,7 @@ const MetaLvolBytes = 8 << 20
 func LimitBytes(p *Pool) uint64 {
 	e := p.SpacePolicy.Effective()
 	total := p.TotalBytes
-	if p.MetaLvolUUID != "" { // the thick metadata-copy lvol (P0-3) is not for volumes
+	if p.MetaVolumeUUID != "" { // the thick metadata-copy lvol (P0-3) is not for volumes
 		total -= min(total, MetaLvolBytes)
 	}
 	usable := float64(total) * (1 - *e.ReservePercent/100)

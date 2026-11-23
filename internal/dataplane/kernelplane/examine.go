@@ -22,7 +22,7 @@ func (p *Plane) ExamineDisks(ctx context.Context, disks []*store.Disk) ([]datapl
 	byUUID := map[string][]found{}
 	var order []string
 	for _, d := range disks {
-		dev := d.SPDKBdevName
+		dev := d.Handle
 		if dev == "" {
 			dev = d.DevicePath
 		}

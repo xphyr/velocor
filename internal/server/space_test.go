@@ -16,7 +16,7 @@ func spacePool(t *testing.T, h *harness) (string, string) {
 	t.Helper()
 	h.addDisk("d1", "0000:01:00.0")
 	id := h.pool("p1", "RAID0", "d1")
-	lvs := h.getPool(id)["lvs_name"].(string)
+	lvs := h.getPool(id)["thin_pool_name"].(string)
 	h.fake.SetLvstoreClusters(lvs, 1000)
 	return id, lvs
 }

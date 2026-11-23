@@ -86,7 +86,7 @@ func (p *Plane) DetachDisk(ctx context.Context, d *store.Disk) error {
 }
 
 func (p *Plane) NVMeHealth(ctx context.Context, d *store.Disk) (*store.SmartHealth, error) {
-	h, err := p.c.BdevNvmeGetControllerHealthInfo(ctx, NVMeControllerFromBdev(d.SPDKBdevName))
+	h, err := p.c.BdevNvmeGetControllerHealthInfo(ctx, NVMeControllerFromBdev(d.Handle))
 	if err != nil {
 		return nil, wrap(err)
 	}
@@ -105,11 +105,11 @@ func (p *Plane) NVMeHealth(ctx context.Context, d *store.Disk) (*store.SmartHeal
 }
 
 func (p *Plane) NVMeWriteCache(ctx context.Context, d *store.Disk) (store.WriteCacheState, error) {
-	return NVMeWriteCache(ctx, p.c, NVMeControllerFromBdev(d.SPDKBdevName))
+	return NVMeWriteCache(ctx, p.c, NVMeControllerFromBdev(d.Handle))
 }
 
 func (p *Plane) SetNVMeWriteCache(ctx context.Context, d *store.Disk, enabled bool) (store.WriteCacheState, error) {
-	return SetNVMeWriteCache(ctx, p.c, NVMeControllerFromBdev(d.SPDKBdevName), enabled)
+	return SetNVMeWriteCache(ctx, p.c, NVMeControllerFromBdev(d.Handle), enabled)
 }
 
 func (p *Plane) Devices(ctx context.Context) ([]dataplane.Device, error) {
@@ -346,7 +346,7 @@ func (p *Plane) ChangedBlocks(ctx context.Context, pool *store.Pool, base, targe
 func (p *Plane) blocks(ctx context.Context, pool *store.Pool, base, target *store.Snapshot) ([]dataplane.Extent, error) {
 	baseName := ""
 	if base != nil {
-		baseName = strings.TrimPrefix(base.LvolBdevName, pool.LVSName+"/")
+		baseName = strings.TrimPrefix(base.Handle, pool.ThinPoolName+"/")
 	}
 	layers := []string{target.UUID}
 	reachedBase := false
@@ -365,7 +365,7 @@ func (p *Plane) blocks(ctx context.Context, pool *store.Pool, base, target *stor
 		if len(layers) >= 4096 {
 			return nil, fmt.Errorf("snapshot chain of %s is longer than 4096 layers", target.ID)
 		}
-		cur = pool.LVSName + "/" + parent
+		cur = pool.ThinPoolName + "/" + parent
 		layers = append(layers, cur)
 	}
 	if base != nil && !reachedBase {

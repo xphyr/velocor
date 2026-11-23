@@ -24,7 +24,7 @@ groups:
         labels: {severity: critical}
         annotations:
           summary: "SPDK (the data plane) on {{ $labels.instance }} doesn't answer"
-          description: "spdk_tgt doesn't answer velod: volumes are probably not being served."
+          description: "The data plane doesn't answer velod: volumes are probably not being served."
 
       - alert: VelocorReconcilerStalled
         expr: time() - velocor_reconciler_last_run_timestamp_seconds > 600
@@ -43,7 +43,7 @@ groups:
           description: "Its passes have ended with an error for 15 minutes; the error is on the appliance's status page and in velod's log."
 
       - alert: VelocorUnmanagedSPDKObjects
-        expr: sum by (instance, kind) (velocor_spdk_unmanaged_objects) > 0
+        expr: sum by (instance, kind) (velocor_unmanaged_objects) > 0
         for: 15m
         labels: {severity: warning}
         annotations:

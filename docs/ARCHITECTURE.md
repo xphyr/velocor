@@ -23,9 +23,9 @@
 
 3. **Pool, Volume & Filter Bdev Hierarchy:**
    - **Disks** (`bdev_nvme` or `bdev_uring`) are grouped into a **Pool** (`bdev_raid` RAID 0/1 + SPDK `lvol_store`; RAID10 and parity RAID are not supported yet, see TODO L-3/L-4).
-   - Each Pool configures an `lvol_store` `cluster_size` (default `1 MiB`, rather than SPDK's 4 MiB; SPDK reserves a 4 KiB metadata page per cluster and reads all of them when recovering from an unclean stop, so smaller clusters cost capacity and recovery time) to keep thin-provisioning overhead low (the cluster is also the granularity any future changed-block tracking would report at).
+   - Each Pool configures a `chunk_size_bytes` (SPDK: the `lvol_store` cluster size, default `1 MiB`, rather than SPDK's 4 MiB; SPDK reserves a 4 KiB metadata page per cluster and reads all of them when recovering from an unclean stop, so smaller clusters cost capacity and recovery time) to keep thin-provisioning overhead low (the cluster is also the granularity any future changed-block tracking would report at).
    - **Volumes** (`bdev_lvol`) are thin- or thick-provisioned inside a Pool.
-   - Every Pool and Volume tracks both its `base_bdev_name` (or `lvol_bdev_name`) and its `effective_bdev_name` so stackable SPDK filter bdevs (`bdev_crypto` for AES-XTS encryption and `bdev_compress` for LZ4/Deflate compression) can wrap volumes or pools transparently without changing the Export layer.
+   - Every Pool and Volume tracks both its name in the data plane (`array_name`, or a volume's `handle`) and the `device` its users see, so stackable SPDK filter bdevs (`bdev_crypto` for AES-XTS encryption and `bdev_compress` for LZ4/Deflate compression) can wrap volumes or pools transparently without changing the Export layer.
    - Every Volume maintains an exclusive `attachment_state` (`UNATTACHED`, `BLOCK_EXPORT`, `FILESYSTEM`) so a volume can be exported over SAN protocols (NVMe-oF / iSCSI) now, or attached locally via SPDK `ublk` (`/dev/ublkbX`) for XFS + NFS/SMB in Phase 2 NAS, without ever allowing concurrent conflicting attachments.
 
 4. **Snapshots & Kubernetes CSI Readiness:**

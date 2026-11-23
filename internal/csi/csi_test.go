@@ -342,17 +342,17 @@ func TestVolumeGroupSnapshot(t *testing.T) {
 	fake := seedBackend(t, db, "pool-1")
 	pool, _ := db.GetPool("pool-1")
 	for _, vid := range []string{"vol-a", "vol-b"} {
-		uuid, err := fake.Client().BdevLvolCreate(context.Background(), pool.LVSName, vid, 1<<30, true, "")
+		uuid, err := fake.Client().BdevLvolCreate(context.Background(), pool.ThinPoolName, vid, 1<<30, true, "")
 		if err != nil {
 			t.Fatal(err)
 		}
 		if err := db.CreateVolume(&store.Volume{
-			ID:           vid,
-			Name:         vid,
-			PoolID:       "pool-1",
-			UUID:         uuid,
-			LvolBdevName: pool.LVSName + "/" + vid,
-			SizeBytes:    1 << 30,
+			ID:        vid,
+			Name:      vid,
+			PoolID:    "pool-1",
+			UUID:      uuid,
+			Handle:    pool.ThinPoolName + "/" + vid,
+			SizeBytes: 1 << 30,
 		}); err != nil {
 			t.Fatalf("CreateVolume %s: %v", vid, err)
 		}
@@ -527,14 +527,14 @@ func seedBackend(t *testing.T, st *store.BoltStore, poolID string) *spdktest.Fak
 	if err := st.CreatePool(pool); err != nil {
 		t.Fatal(err)
 	}
-	if err := c.BdevRaidCreate(ctx, pool.BaseBdevName, "raid0", 64, bdevs, true); err != nil {
+	if err := c.BdevRaidCreate(ctx, pool.ArrayName, "raid0", 64, bdevs, true); err != nil {
 		t.Fatal(err)
 	}
-	uuid, err := c.BdevLvolCreateLvstore(ctx, pool.EffectiveBdevName, pool.LVSName, 0, "")
+	uuid, err := c.BdevLvolCreateLvstore(ctx, pool.Device, pool.ThinPoolName, 0, "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.MutatePool(poolID, func(p *store.Pool) error { p.LVSUUID = uuid; return nil }); err != nil {
+	if _, err := st.MutatePool(poolID, func(p *store.Pool) error { p.ThinPoolUUID = uuid; return nil }); err != nil {
 		t.Fatal(err)
 	}
 	return fake
@@ -551,12 +551,12 @@ func TestDeleteVolumeProtectionAndRetention(t *testing.T) {
 	defer func() { _ = db.Close() }()
 	fake := seedBackend(t, db, "pool-1")
 	pool, _ := db.GetPool("pool-1")
-	uuid, err := fake.Client().BdevLvolCreate(context.Background(), pool.LVSName, "vol-p", 1<<30, true, "")
+	uuid, err := fake.Client().BdevLvolCreate(context.Background(), pool.ThinPoolName, "vol-p", 1<<30, true, "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := db.CreateVolume(&store.Volume{ID: "vol-p", Name: "vol-p", PoolID: "pool-1", UUID: uuid,
-		LvolBdevName: pool.LVSName + "/vol-p", SizeBytes: 1 << 30, DeletionProtection: true}); err != nil {
+		Handle: pool.ThinPoolName + "/vol-p", SizeBytes: 1 << 30, DeletionProtection: true}); err != nil {
 		t.Fatal(err)
 	}
 	authMgr, err := auth.NewManager(db, "test-pass-123")
@@ -584,7 +584,7 @@ func TestDeleteVolumeProtectionAndRetention(t *testing.T) {
 			t.Fatalf("DeleteVolume #%d: %v", i+1, err)
 		}
 	}
-	if v, err := db.GetVolume("vol-p"); err != nil || !v.Deleted() || !fake.LvolExists(pool.LVSName+"/vol-p") {
+	if v, err := db.GetVolume("vol-p"); err != nil || !v.Deleted() || !fake.LvolExists(pool.ThinPoolName+"/vol-p") {
 		t.Fatalf("volume should be kept as deleted: %+v %v", v, err)
 	}
 	if _, err := cs.ControllerGetVolume(ctx, &csi.ControllerGetVolumeRequest{VolumeId: "vol-p"}); status.Code(err) != codes.NotFound {

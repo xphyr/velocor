@@ -123,8 +123,8 @@ func (s *BoltStore) RelinkPoolMember(poolID, oldDiskID, newDiskID, bdevUUID stri
 		if i := slices.Index(out.DetachedDiskIDs, oldDiskID); i >= 0 {
 			out.DetachedDiskIDs[i] = newDiskID
 		}
-		d.Claimed, d.PoolID, d.BdevUUID = true, poolID, bdevUUID
-		d.DriverState, d.SPDKBdevName, d.HealthStatus = DiskDriverStateUnspecified, "", HealthStatusOnline
+		d.Claimed, d.PoolID, d.MemberUUID = true, poolID, bdevUUID
+		d.DriverState, d.Handle, d.HealthStatus = DiskDriverStateUnspecified, "", HealthStatusOnline
 		d.WriteCachePolicy, d.PowerLossProtected = old.WriteCachePolicy, old.PowerLossProtected
 		d.UpdatedAt = time.Now().UTC()
 		if err := putJSON(disksB, []byte(d.ID), &d); err != nil {

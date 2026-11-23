@@ -138,22 +138,22 @@ func AttachDisk(ctx context.Context, c *spdk.Client, hw *hardware.Manager, d *st
 
 // DetachDisk releases a disk's SPDK base bdev. A missing bdev is not an error.
 func DetachDisk(ctx context.Context, c *spdk.Client, d *store.Disk) error {
-	if d.SPDKBdevName == "" {
+	if d.Handle == "" {
 		return nil
 	}
 	var err error
 	switch d.Type {
 	case store.DiskTypeNVMe:
-		err = c.BdevNvmeDetachController(ctx, NVMeControllerFromBdev(d.SPDKBdevName))
+		err = c.BdevNvmeDetachController(ctx, NVMeControllerFromBdev(d.Handle))
 	case store.DiskTypeSSD:
 		if d.DriverState == store.DiskDriverStateAIOClaimed {
-			err = c.BdevAioDelete(ctx, d.SPDKBdevName)
+			err = c.BdevAioDelete(ctx, d.Handle)
 		} else {
-			err = c.BdevUringDelete(ctx, d.SPDKBdevName)
+			err = c.BdevUringDelete(ctx, d.Handle)
 		}
 	}
 	if err != nil && !spdk.IsNotFound(err) {
-		return fmt.Errorf("detach %s: %w", d.SPDKBdevName, err)
+		return fmt.Errorf("detach %s: %w", d.Handle, err)
 	}
 	return nil
 }

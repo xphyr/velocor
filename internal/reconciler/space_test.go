@@ -10,7 +10,7 @@ import (
 func TestSpaceAccountingAndStates(t *testing.T) {
 	e := newEnv(t)
 	pool, vol := e.provision(store.RaidLevel0, "0000:01:00.0")
-	e.fake.SetLvstoreClusters(pool.LVSName, 1000)
+	e.fake.SetLvstoreClusters(pool.ThinPoolName, 1000)
 	write := func(from, to uint64) {
 		for i := from; i < to; i++ {
 			e.fake.WriteCluster(vol.UUID, i)

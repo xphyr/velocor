@@ -32,7 +32,7 @@ func TestDeletedVolumeIsKeptAndRestorable(t *testing.T) {
 	h.addDisk("d1", "0000:01:00.0")
 	poolID := h.pool("p", "RAID0", "d1")
 	vol := h.volume(poolID, "data", 1<<30)
-	id, lvol := vol["id"].(string), vol["lvol_bdev_name"].(string)
+	id, lvol := vol["id"].(string), vol["handle"].(string)
 	h.fake.WriteCluster(lvol, 3)
 	csi := h.csiToken()
 
@@ -110,13 +110,13 @@ func TestDeletedVolumeIsPurgedWhenRetentionEnds(t *testing.T) {
 
 	h.expirePurge(gone["id"].(string))
 	h.reconcile()
-	if h.fake.LvolExists(gone["lvol_bdev_name"].(string)) {
+	if h.fake.LvolExists(gone["handle"].(string)) {
 		t.Fatal("expired volume's lvol not purged")
 	}
 	if _, err := h.st.GetVolume(gone["id"].(string)); err == nil {
 		t.Fatal("expired volume's record not purged")
 	}
-	if !h.fake.LvolExists(keep["lvol_bdev_name"].(string)) {
+	if !h.fake.LvolExists(keep["handle"].(string)) {
 		t.Fatal("volume purged before its retention ended")
 	}
 
@@ -126,7 +126,7 @@ func TestDeletedVolumeIsPurgedWhenRetentionEnds(t *testing.T) {
 	}
 	h.expect(h.do("POST", "/api/v1/deleted-volumes/"+keep["id"].(string)+"/restore", h.admin, nil))(http.StatusConflict)
 	h.expect(h.do("DELETE", "/api/v1/deleted-volumes/"+keep["id"].(string), h.admin, nil))(http.StatusOK)
-	if h.fake.LvolExists(keep["lvol_bdev_name"].(string)) {
+	if h.fake.LvolExists(keep["handle"].(string)) {
 		t.Fatal("purge left the lvol")
 	}
 	h.expect(h.do("DELETE", "/api/v1/pools/"+poolID, h.admin, nil))(http.StatusOK)
@@ -178,7 +178,7 @@ func TestVolumeRetentionSetting(t *testing.T) {
 	h.expect(h.do("PUT", "/api/v1/system/volume-retention", h.admin, map[string]any{"hours": 0}))(http.StatusOK)
 	vol = h.volume(poolID, "b", 1<<30)
 	h.expect(h.do("DELETE", "/api/v1/volumes/"+vol["id"].(string), h.admin, nil))(http.StatusOK)
-	if h.fake.LvolExists(vol["lvol_bdev_name"].(string)) {
+	if h.fake.LvolExists(vol["handle"].(string)) {
 		t.Fatal("retention 0 kept the lvol")
 	}
 	if _, err := h.st.GetVolume(vol["id"].(string)); err == nil {
@@ -197,7 +197,7 @@ func TestSnapshotDeleteWaitsForItsClones(t *testing.T) {
 	snapID := snap["id"].(string)
 	clone := h.expect(h.do("POST", "/api/v1/snapshots/"+snapID+":clone", h.admin, map[string]any{"clone_name": "restored"}))(http.StatusCreated)["volume"].(map[string]any)
 	cloneID := clone["id"].(string)
-	snapLvol := snap["lvol_bdev_name"].(string)
+	snapLvol := snap["handle"].(string)
 
 	// Live clone: the delete succeeds, the snapshot disappears, its lvol stays.
 	h.expect(h.do("DELETE", "/api/v1/snapshots/"+snapID, h.admin, nil))(http.StatusOK)

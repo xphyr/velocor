@@ -80,7 +80,7 @@ func TestMetricsForAlerting(t *testing.T) {
 		`velocor_volume_health{volume="v1",pool="p1",status="ONLINE"} 1`,
 		`velocor_disk_smart_critical_warning{disk="d1",type="NVME",pool="p1"} 0`,
 		`velocor_reconciler_last_run_failed 0`,
-		`velocor_spdk_unmanaged_objects{kind="LVOL"} 0`,
+		`velocor_unmanaged_objects{kind="LVOL"} 0`,
 	} {
 		if !strings.Contains(text, want+"\n") {
 			t.Errorf("metrics lack %s", want)

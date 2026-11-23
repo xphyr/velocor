@@ -248,7 +248,8 @@ func DecodeSlot(b []byte) (*Manifest, bool) {
 		return nil, false
 	}
 	var m Manifest
-	if err := json.Unmarshal(body, &m); err != nil || m.Generation != h.Generation {
+	// A copy written before the K-2 renames has the legacy keys (checked as written, above).
+	if err := json.Unmarshal(store.UpgradeJSON(bytes.Clone(body)), &m); err != nil || m.Generation != h.Generation {
 		return nil, false
 	}
 	return &m, true

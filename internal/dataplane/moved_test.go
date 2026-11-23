@@ -80,8 +80,8 @@ func TestMatchMovedMembers(t *testing.T) {
 func TestDiskBdevUUIDKeepsAMovedMembersUUID(t *testing.T) {
 	d := &store.Disk{ID: "ssd-new"}
 	derived := DiskBdevUUID(d)
-	d.BdevUUID = "11111111-2222-5333-8444-555555555555"
-	if got := DiskBdevUUID(d); got != d.BdevUUID || got == derived {
-		t.Fatalf("DiskBdevUUID = %s, want the kept %s", got, d.BdevUUID)
+	d.MemberUUID = "11111111-2222-5333-8444-555555555555"
+	if got := DiskBdevUUID(d); got != d.MemberUUID || got == derived {
+		t.Fatalf("DiskBdevUUID = %s, want the kept %s", got, d.MemberUUID)
 	}
 }

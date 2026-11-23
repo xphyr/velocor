@@ -21,7 +21,7 @@ func scrubPool(t *testing.T) (*harness, string, string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return h, id, p.BaseBdevName
+	return h, id, p.ArrayName
 }
 
 func (h *harness) tick(at time.Time) {

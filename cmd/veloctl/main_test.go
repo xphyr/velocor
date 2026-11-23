@@ -51,11 +51,11 @@ func newFixture(t *testing.T) *fixture {
 	_, _ = st.ClaimDisk("d1", store.DiskDriverStateVfioPCI, bdevs[0])
 	pool := &store.Pool{ID: "p1", Name: "p1", DiskIDs: []string{"d1"}, RaidLevel: store.RaidLevel0, HealthStatus: store.HealthStatusOnline}
 	_ = st.CreatePool(pool)
-	_ = c.BdevRaidCreate(ctx, pool.BaseBdevName, "raid0", 64, bdevs, true)
-	lvs, _ := c.BdevLvolCreateLvstore(ctx, pool.EffectiveBdevName, pool.LVSName, 0, "")
-	_, _ = st.MutatePool("p1", func(p *store.Pool) error { p.LVSUUID = lvs; return nil })
-	uuid, _ := c.BdevLvolCreate(ctx, pool.LVSName, "v1", 1<<30, true, "")
-	vol := &store.Volume{ID: "v1", Name: "v1", PoolID: "p1", UUID: uuid, LvolBdevName: pool.LVSName + "/v1", SizeBytes: 1 << 30}
+	_ = c.BdevRaidCreate(ctx, pool.ArrayName, "raid0", 64, bdevs, true)
+	lvs, _ := c.BdevLvolCreateLvstore(ctx, pool.Device, pool.ThinPoolName, 0, "")
+	_, _ = st.MutatePool("p1", func(p *store.Pool) error { p.ThinPoolUUID = lvs; return nil })
+	uuid, _ := c.BdevLvolCreate(ctx, pool.ThinPoolName, "v1", 1<<30, true, "")
+	vol := &store.Volume{ID: "v1", Name: "v1", PoolID: "p1", UUID: uuid, Handle: pool.ThinPoolName + "/v1", SizeBytes: 1 << 30}
 	_ = st.CreateVolume(vol)
 	_ = st.CreatePortal(&store.Portal{ID: "pt", Name: "pt", Protocol: store.ExportProtocolNVMeoFTCP, IPAddress: "10.0.0.1", Port: 4420})
 	ig := &store.InitiatorGroup{ID: "ig1", Name: "g", HostNQNs: []string{"nqn.2026-01.io.example:host-a"}}
@@ -212,7 +212,7 @@ func TestPoolReplaceStartDegradedReleaseAndRebuildCommands(t *testing.T) {
 	if err := f.run(t, "pool", "get", pool.ID); err != nil {
 		t.Fatal(err)
 	}
-	f.fake.SetRebuildProgress(pool.BaseBdevName, 100)
+	f.fake.SetRebuildProgress(pool.ArrayName, 100)
 	if err := f.run(t, "pool", "release-disk", pool.ID, "m2"); err != nil {
 		t.Fatal(err)
 	}

@@ -66,7 +66,7 @@ func OpenBoltStore(path string) (*BoltStore, error) {
 				return fmt.Errorf("create bucket %s: %w", string(b), err)
 			}
 		}
-		return nil
+		return upgradeKeys(tx)
 	})
 	if err != nil {
 		_ = db.Close()
@@ -421,7 +421,7 @@ func (s *BoltStore) upsertDisk(disk *Disk, syncBoot bool) error {
 				// inside the same transaction so a concurrent claim can never be lost.
 				cp.Claimed = true
 				cp.DriverState = existing.DriverState
-				cp.SPDKBdevName = existing.SPDKBdevName
+				cp.Handle = existing.Handle
 				cp.HealthStatus = existing.HealthStatus
 				cp.Smart = existing.Smart
 				if cp.IsBootDevice {
@@ -462,8 +462,8 @@ func (s *BoltStore) upsertDisk(disk *Disk, syncBoot bool) error {
 			// write-cache state survives while SPDK owns the device and the kernel can't see it.
 			cp.PowerLossProtected = existing.PowerLossProtected
 			cp.WriteCachePolicy = existing.WriteCachePolicy
-			if cp.BdevUUID == "" {
-				cp.BdevUUID = existing.BdevUUID
+			if cp.MemberUUID == "" {
+				cp.MemberUUID = existing.MemberUUID
 			}
 			cp.WriteCacheError = existing.WriteCacheError
 			if cp.WriteCache == WriteCacheUnknown {
@@ -527,7 +527,7 @@ func (s *BoltStore) ClaimDisk(id string, driverState DiskDriverState, spdkBdevNa
 			updated.DriverState = driverState
 		}
 		if spdkBdevName != "" {
-			updated.SPDKBdevName = spdkBdevName
+			updated.Handle = spdkBdevName
 		}
 		if updated.HealthStatus == "" || updated.HealthStatus == HealthStatusUnspecified {
 			updated.HealthStatus = HealthStatusOnline
@@ -554,8 +554,8 @@ func (s *BoltStore) ReleaseDisk(id string) (*Disk, error) {
 		}
 		updated.Claimed = false
 		updated.DriverState = DiskDriverStateKernel
-		updated.SPDKBdevName = ""
-		updated.BdevUUID = "" // a kept member UUID only matters while the disk is in its pool
+		updated.Handle = ""
+		updated.MemberUUID = "" // a kept member UUID only matters while the disk is in its pool
 		updated.UpdatedAt = time.Now().UTC()
 		return putJSON(b, []byte(id), &updated)
 	})
@@ -590,17 +590,17 @@ func (s *BoltStore) CreatePool(pool *Pool) error {
 	if len(cp.Members) == 0 {
 		SetPoolMembers(&cp, PoolMembers(&cp))
 	}
-	if cp.ClusterSizeBytes == 0 {
-		cp.ClusterSizeBytes = DefaultClusterSizeBytes
+	if cp.ChunkSizeBytes == 0 {
+		cp.ChunkSizeBytes = DefaultChunkSizeBytes
 	}
-	if cp.BaseBdevName == "" {
-		cp.BaseBdevName = fmt.Sprintf("raid_%s", cp.Name)
+	if cp.ArrayName == "" {
+		cp.ArrayName = fmt.Sprintf("raid_%s", cp.Name)
 	}
-	if cp.EffectiveBdevName == "" {
-		cp.EffectiveBdevName = cp.BaseBdevName
+	if cp.Device == "" {
+		cp.Device = cp.ArrayName
 	}
-	if cp.LVSName == "" {
-		cp.LVSName = fmt.Sprintf("lvs_%s", cp.Name)
+	if cp.ThinPoolName == "" {
+		cp.ThinPoolName = fmt.Sprintf("lvs_%s", cp.Name)
 	}
 	if cp.HealthStatus == "" || cp.HealthStatus == HealthStatusUnspecified {
 		cp.HealthStatus = HealthStatusOnline
@@ -853,11 +853,11 @@ func (s *BoltStore) CreateVolume(vol *Volume) error {
 			}
 		}
 
-		if cp.LvolBdevName == "" {
-			cp.LvolBdevName = fmt.Sprintf("%s/%s", pool.LVSName, cp.Name)
+		if cp.Handle == "" {
+			cp.Handle = fmt.Sprintf("%s/%s", pool.ThinPoolName, cp.Name)
 		}
-		if cp.EffectiveBdevName == "" {
-			cp.EffectiveBdevName = cp.LvolBdevName
+		if cp.Device == "" {
+			cp.Device = cp.Handle
 		}
 
 		volsB := tx.Bucket(bucketVolumes)
@@ -1051,8 +1051,8 @@ func (s *BoltStore) CreateSnapshot(snap *Snapshot) error {
 		if cp.SizeBytes == 0 {
 			cp.SizeBytes = vol.SizeBytes
 		}
-		if cp.LvolBdevName == "" {
-			cp.LvolBdevName = fmt.Sprintf("%s/%s", pool.LVSName, cp.Name)
+		if cp.Handle == "" {
+			cp.Handle = fmt.Sprintf("%s/%s", pool.ThinPoolName, cp.Name)
 		}
 
 		snapsB := tx.Bucket(bucketSnapshots)

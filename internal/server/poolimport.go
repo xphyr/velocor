@@ -104,8 +104,8 @@ func (s *Server) importCandidates() ([]ImportCandidate, map[string][]dataplane.D
 			unclaimed = append(unclaimed, d)
 			continue
 		}
-		if r := assembled[d.SPDKBdevName]; r != nil {
-			slot := slices.IndexFunc(r.Members, func(m dataplane.ArrayMember) bool { return m.Name == d.SPDKBdevName })
+		if r := assembled[d.Handle]; r != nil {
+			slot := slices.IndexFunc(r.Members, func(m dataplane.ArrayMember) bool { return m.Name == d.Handle })
 			current := 0
 			for _, m := range r.Members {
 				if m.Configured {
@@ -277,10 +277,10 @@ func (s *Server) importPool(ctx context.Context, poolID, rename string, allowDeg
 			// A member under a new disk ID keeps the identity its array knows it by, and must
 			// keep it after restarts: record it before the data plane sees the disk.
 			cp := *f.Disk
-			cp.BdevUUID = f.Identity
+			cp.MemberUUID = f.Identity
 			disk = &cp
 			if _, merr := s.store.MutateDisk(f.Disk.ID, func(cur *store.Disk) error {
-				cur.BdevUUID = f.Identity
+				cur.MemberUUID = f.Identity
 				return nil
 			}); merr != nil {
 				return nil, fmt.Errorf("record the bdev UUID of disk %s: %w", f.Disk.ID, merr)
@@ -372,7 +372,7 @@ func (s *Server) importPool(ctx context.Context, poolID, rename string, allowDeg
 	}
 	diskByBdev := map[string]string{}
 	for _, d := range claimed {
-		diskByBdev[d.SPDKBdevName] = d.ID
+		diskByBdev[d.Handle] = d.ID
 	}
 	pool.DiskIDs, pool.DetachedDiskIDs, pool.Members = nil, nil, nil
 	for _, b := range raid.Members {
@@ -380,15 +380,15 @@ func (s *Server) importPool(ctx context.Context, poolID, rename string, allowDeg
 			pool.DiskIDs = append(pool.DiskIDs, id)
 		}
 	}
-	pool.BaseBdevName, pool.EffectiveBdevName, pool.LVSName, pool.LVSUUID = cand.RaidName, cand.RaidName, lvsName, lvs.UUID
+	pool.ArrayName, pool.Device, pool.ThinPoolName, pool.ThinPoolUUID = cand.RaidName, cand.RaidName, lvsName, lvs.UUID
 	pool.RaidLevel = store.RaidLevel(strings.ToUpper(raid.Level))
 	pool.StripSizeKB = raid.StripKB
-	pool.ClusterSizeBytes = lvs.ChunkBytes
+	pool.ChunkSizeBytes = lvs.ChunkBytes
 	pool.TotalBytes, pool.FreeBytes = lvs.TotalBytes, lvs.FreeBytes
 	pool.AllocatedBytes = pool.TotalBytes - pool.FreeBytes
 	pool.CommittedBytes, pool.AvailableBytes, pool.SpaceState = 0, 0, ""
 	pool.HealthStatus, pool.StatusMessage = store.HealthStatusReconciling, "imported"
-	pool.MetaLvolUUID, pool.MetaGeneration, pool.MetaHash, pool.MetaError = metaUUID, plan.Generation, "", ""
+	pool.MetaVolumeUUID, pool.MetaGeneration, pool.MetaHash, pool.MetaError = metaUUID, plan.Generation, "", ""
 	pool.MetaWrittenAt = plan.WrittenAt
 
 	// 6. Check every record before writing any.
@@ -558,7 +558,7 @@ func (s *Server) importableLvols(plan *meta.Manifest, inLvs map[string]dataplane
 			continue
 		}
 		v.UUID = l.UUID
-		v.LvolBdevName, v.EffectiveBdevName = lvsName+"/"+v.ID, lvsName+"/"+v.ID
+		v.Handle, v.Device = lvsName+"/"+v.ID, lvsName+"/"+v.ID
 		v.AttachmentState, v.HealthStatus, v.StatusMessage = store.AttachmentStateUnattached, store.HealthStatusReconciling, ""
 		present[v.ID] = true
 		vols = append(vols, &v)
@@ -570,7 +570,7 @@ func (s *Server) importableLvols(plan *meta.Manifest, inLvs map[string]dataplane
 			res.Warnings = append(res.Warnings, fmt.Sprintf("snapshot %s (%s) not restored: its lvol or volume is missing", sn.ID, sn.Name))
 			continue
 		}
-		sn.UUID, sn.LvolBdevName = l.UUID, lvsName+"/"+sn.ID
+		sn.UUID, sn.Handle = l.UUID, lvsName+"/"+sn.ID
 		snaps = append(snaps, &sn)
 	}
 	return vols, snaps
