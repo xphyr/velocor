@@ -87,24 +87,12 @@ func (s *Server) rotateScrapeToken() (string, error) {
 	return secret, err
 }
 
-// reactorCPUs lists the CPUs SPDK's reactors poll on.
+// reactorCPUs lists the CPUs the data plane polls on.
 func (s *Server) reactorCPUs(ctx context.Context) ([]int, error) {
-	if s.spdk == nil {
-		return nil, fmt.Errorf("no SPDK client")
+	if s.dp == nil {
+		return nil, fmt.Errorf("no data plane")
 	}
-	var res struct {
-		Reactors []struct {
-			Lcore int `json:"lcore"`
-		} `json:"reactors"`
-	}
-	if err := s.spdk.Call(ctx, "framework_get_reactors", nil, &res); err != nil {
-		return nil, err
-	}
-	out := make([]int, len(res.Reactors))
-	for i, r := range res.Reactors {
-		out[i] = r.Lcore
-	}
-	return out, nil
+	return s.dp.PollingCPUs(ctx)
 }
 
 func (s *Server) handleGetMonitoring(w http.ResponseWriter, r *http.Request) {

@@ -68,8 +68,6 @@ func (e *AddressMissingError) Error() string {
 
 func (e *AddressMissingError) Unwrap() error { return store.ErrInvalidArgument }
 
-func errAddressMissing(p *store.Portal) error { return &AddressMissingError{Portal: p} }
-
 // missingPortals returns the portals err reports as missing their address, and whether
 // that is all err says.
 func missingPortals(err error) (ids []string, only bool) {

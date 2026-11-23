@@ -8,7 +8,6 @@ import (
 
 	"github.com/velocor/velocor/internal/dataplane"
 	"github.com/velocor/velocor/internal/hardware"
-	"github.com/velocor/velocor/internal/spdk"
 	"github.com/velocor/velocor/internal/store"
 )
 
@@ -48,7 +47,7 @@ func (r *Reconciler) relinkMovedMembers(ctx context.Context, p *pass, discovered
 		staying []*store.Disk // members still there
 	}
 	var todo []gone
-	var raids []spdk.RaidBdevInfo
+	var raids []dataplane.Array
 	for _, pool := range pools {
 		if pool.HealthStatus == store.HealthStatusReconciling && pool.LVSUUID == "" {
 			continue // being created
@@ -69,12 +68,12 @@ func (r *Reconciler) relinkMovedMembers(ctx context.Context, p *pass, discovered
 			continue
 		}
 		if raids == nil {
-			if raids, err = r.spdk.BdevRaidGetBdevs(ctx, "all"); err != nil {
+			if raids, err = r.dp.Arrays(ctx); err != nil {
 				p.errs = append(p.errs, fmt.Sprintf("list raid bdevs: %v", err))
 				return false
 			}
 		}
-		if i := slices.IndexFunc(raids, func(rb spdk.RaidBdevInfo) bool { return rb.Name == pool.BaseBdevName }); i >= 0 && strings.EqualFold(raids[i].State, "online") {
+		if i := slices.IndexFunc(raids, func(rb dataplane.Array) bool { return rb.Name == pool.BaseBdevName }); i >= 0 && strings.EqualFold(raids[i].State, "online") {
 			continue // running: a member that left it is a failure, handled elsewhere
 		}
 		g.pool = pool

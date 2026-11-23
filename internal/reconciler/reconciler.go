@@ -12,7 +12,6 @@ import (
 
 	"github.com/velocor/velocor/internal/dataplane"
 	"github.com/velocor/velocor/internal/hardware"
-	"github.com/velocor/velocor/internal/spdk"
 	"github.com/velocor/velocor/internal/store"
 )
 
@@ -43,7 +42,7 @@ type State struct {
 //     status fields it owns, via atomic Mutate* calls.
 type Reconciler struct {
 	store  store.Store
-	spdk   *spdk.Client
+	dp     dataplane.Plane
 	hw     *hardware.Manager
 	logger *slog.Logger
 
@@ -75,13 +74,13 @@ type Reconciler struct {
 }
 
 // New creates a new Reconciler instance.
-func New(st store.Store, spdkClient *spdk.Client, hwMgr *hardware.Manager, logger *slog.Logger) *Reconciler {
+func New(st store.Store, dp dataplane.Plane, hwMgr *hardware.Manager, logger *slog.Logger) *Reconciler {
 	if logger == nil {
 		logger = slog.Default()
 	}
 	return &Reconciler{
 		store:    st,
-		spdk:     spdkClient,
+		dp:       dp,
 		hw:       hwMgr,
 		logger:   logger,
 		instance: hardware.SPDKInstance,
@@ -193,7 +192,7 @@ func (r *Reconciler) ReconcileOnce(ctx context.Context) (State, error) {
 	discovered := r.syncHardware(p)
 	r.enforceWriteCache(p)
 
-	if _, err := r.spdk.GetVersion(ctx); err != nil {
+	if _, err := r.dp.Version(ctx); err != nil {
 		r.finishPass(0, []string{"spdk_tgt"}, fmt.Sprintf("spdk_tgt unreachable: %v", err))
 		return r.State(), err
 	}
@@ -209,7 +208,7 @@ func (r *Reconciler) ReconcileOnce(ctx context.Context) (State, error) {
 	// Let SPDK finish examining every base bdev (RAID superblock assembly, lvstore load)
 	// before anything below concludes that on-disk metadata is missing.
 	examined := true
-	if err := r.spdk.BdevWaitForExamine(ctx); err != nil {
+	if err := r.dp.Settle(ctx); err != nil {
 		examined = false
 		p.errs = append(p.errs, fmt.Sprintf("bdev_wait_for_examine: %v", err))
 	}
@@ -316,12 +315,12 @@ func (r *Reconciler) recordWriteCache(p *pass, id string, state store.WriteCache
 	}
 }
 
-func (r *Reconciler) bdevSet(ctx context.Context) (map[string]spdk.BdevInfo, error) {
-	bdevs, err := r.spdk.BdevGetBdevs(ctx, "")
+func (r *Reconciler) bdevSet(ctx context.Context) (map[string]dataplane.Device, error) {
+	bdevs, err := r.dp.Devices(ctx)
 	if err != nil {
 		return nil, err
 	}
-	m := make(map[string]spdk.BdevInfo, len(bdevs))
+	m := make(map[string]dataplane.Device, len(bdevs))
 	for _, b := range bdevs {
 		m[b.Name] = b
 		for _, a := range b.Aliases {
@@ -347,7 +346,7 @@ func (r *Reconciler) reconcileDisks(ctx context.Context, p *pass) {
 		p.errs = append(p.errs, fmt.Sprintf("list pools: %v", err))
 		return
 	}
-	raids, err := r.spdk.BdevRaidGetBdevs(ctx, "all")
+	raids, err := r.dp.Arrays(ctx)
 	if err != nil {
 		p.errs = append(p.errs, fmt.Sprintf("list raid bdevs: %v", err))
 		return
@@ -368,7 +367,7 @@ func (r *Reconciler) reconcileDisks(ctx context.Context, p *pass) {
 				p.degrade("disk:"+d.ID, fmt.Sprintf("left pool %s; release it, then replace with it to reuse it", pool.Name))
 				continue
 			}
-			name, st, err := dataplane.AttachDisk(ctx, r.spdk, r.hw, d)
+			name, st, err := r.dp.AttachDisk(ctx, d)
 			if err != nil {
 				health = store.HealthStatusDegraded
 				p.degrade("disk:"+d.ID, err.Error())
@@ -379,19 +378,10 @@ func (r *Reconciler) reconcileDisks(ctx context.Context, p *pass) {
 		}
 
 		if health == store.HealthStatusOnline && d.Type == store.DiskTypeNVMe {
-			if h, err := r.spdk.BdevNvmeGetControllerHealthInfo(ctx, dataplane.NVMeControllerFromBdev(bdevName)); err == nil {
-				smart = &store.SmartHealth{
-					TemperatureCelsius:             h.TemperatureCelsius,
-					AvailableSparePercent:          h.AvailableSpare,
-					AvailableSpareThresholdPercent: h.AvailableSpareThreshold,
-					PercentageUsed:                 h.PercentageUsed,
-					DataUnitsRead:                  h.DataUnitsRead,
-					DataUnitsWritten:               h.DataUnitsWritten,
-					MediaErrors:                    h.MediaErrors,
-					PowerOnHours:                   h.PowerOnHours,
-					UnsafeShutdowns:                h.UnsafeShutdowns,
-					CriticalWarning:                h.CriticalWarning != 0,
-				}
+			dd := *d
+			dd.SPDKBdevName = bdevName
+			if h, err := r.dp.NVMeHealth(ctx, &dd); err == nil {
+				smart = h
 				if smart.CriticalWarning {
 					health = store.HealthStatusDegraded
 					p.degrade("disk:"+d.ID, "NVMe SMART critical warning")
@@ -440,12 +430,12 @@ func (r *Reconciler) reconcilePools(ctx context.Context, p *pass, examined bool)
 		p.errs = append(p.errs, fmt.Sprintf("list bdevs: %v", err))
 		return online
 	}
-	raids, err := r.spdk.BdevRaidGetBdevs(ctx, "all")
+	raids, err := r.dp.Arrays(ctx)
 	if err != nil {
 		p.errs = append(p.errs, fmt.Sprintf("list raid bdevs: %v", err))
 		return online
 	}
-	lvstores, err := r.spdk.BdevLvolGetLvstores(ctx, "", "")
+	lvstores, err := r.dp.ThinPools(ctx, "", "")
 	if err != nil {
 		p.errs = append(p.errs, fmt.Sprintf("list lvstores: %v", err))
 		return online
@@ -473,7 +463,7 @@ func (r *Reconciler) reconcilePools(ctx context.Context, p *pass, examined bool)
 
 		// 1. RAID bdev (assembled by SPDK examine from its on-disk superblock): member states
 		// and RAID-level health.
-		ri := slices.IndexFunc(raids, func(rb spdk.RaidBdevInfo) bool { return rb.Name == pool.BaseBdevName })
+		ri := slices.IndexFunc(raids, func(rb dataplane.Array) bool { return rb.Name == pool.BaseBdevName })
 		raidOnline := false
 		members := store.PoolMembers(pool)
 		if ri >= 0 {
@@ -491,7 +481,7 @@ func (r *Reconciler) reconcilePools(ctx context.Context, p *pass, examined bool)
 		}
 
 		// 2. lvstore.
-		var lvs *spdk.LvolStoreInfo
+		var lvs *dataplane.ThinPool
 		for i := range lvstores {
 			if lvstores[i].UUID == pool.LVSUUID {
 				lvs = &lvstores[i]
@@ -504,7 +494,7 @@ func (r *Reconciler) reconcilePools(ctx context.Context, p *pass, examined bool)
 			fail(store.HealthStatusFaulted, "pool has no lvstore UUID; its creation never completed")
 		case !examined:
 			fail(store.HealthStatusDegraded, "waiting for SPDK examine to load lvstore "+pool.LVSName)
-		case slices.ContainsFunc(lvstores, func(l spdk.LvolStoreInfo) bool { return l.Name == pool.LVSName }):
+		case slices.ContainsFunc(lvstores, func(l dataplane.ThinPool) bool { return l.Name == pool.LVSName }):
 			fail(store.HealthStatusFaulted, fmt.Sprintf("lvstore %s has a different UUID than recorded (%s); it may have been re-initialised", pool.LVSName, pool.LVSUUID))
 		default:
 			fail(store.HealthStatusFaulted, fmt.Sprintf("lvstore %s (%s) not found on %s", pool.LVSName, pool.LVSUUID, pool.BaseBdevName))
@@ -512,11 +502,7 @@ func (r *Reconciler) reconcilePools(ctx context.Context, p *pass, examined bool)
 
 		var total, free uint64
 		if lvs != nil {
-			cs := uint64(lvs.ClusterSize)
-			if cs == 0 {
-				cs = uint64(pool.ClusterSizeBytes)
-			}
-			total, free = lvs.TotalDataClusters*cs, lvs.FreeClusters*cs
+			total, free = lvs.TotalBytes, lvs.FreeBytes
 			if raidOnline {
 				online[pool.ID] = true
 			}
@@ -575,7 +561,7 @@ func poolDurability(pool *store.Pool, disks []*store.Disk) store.Durability {
 // longer contains it (it failed since the last pass, before the pool was updated). A disk an
 // UNAVAILABLE pool waits for is still a member: it must be attached so the RAID can assemble.
 // So is a rebuild target, so an interrupted rebuild can restart.
-func leftPool(d *store.Disk, pools []*store.Pool, raids []spdk.RaidBdevInfo) *store.Pool {
+func leftPool(d *store.Disk, pools []*store.Pool, raids []dataplane.Array) *store.Pool {
 	if d.PoolID == "" {
 		return nil
 	}
@@ -584,7 +570,7 @@ func leftPool(d *store.Disk, pools []*store.Pool, raids []spdk.RaidBdevInfo) *st
 			continue
 		}
 		if slices.Contains(p.DiskIDs, d.ID) {
-			ri := slices.IndexFunc(raids, func(rb spdk.RaidBdevInfo) bool { return rb.Name == p.BaseBdevName })
+			ri := slices.IndexFunc(raids, func(rb dataplane.Array) bool { return rb.Name == p.BaseBdevName })
 			rebuilding := slices.ContainsFunc(store.PoolMembers(p), func(m store.PoolMember) bool {
 				return m.DiskID == d.ID && m.State == store.MemberStateRebuilding
 			})
@@ -603,7 +589,7 @@ func leftPool(d *store.Disk, pools []*store.Pool, raids []spdk.RaidBdevInfo) *st
 	return nil
 }
 
-func (r *Reconciler) memberBdevs(pool *store.Pool, bdevs map[string]spdk.BdevInfo) ([]string, bool) {
+func (r *Reconciler) memberBdevs(pool *store.Pool, bdevs map[string]dataplane.Device) ([]string, bool) {
 	var members []string
 	for _, id := range pool.DiskIDs {
 		d, err := r.store.GetDisk(id)
@@ -617,7 +603,7 @@ func (r *Reconciler) memberBdevs(pool *store.Pool, bdevs map[string]spdk.BdevInf
 	return members, len(members) == len(pool.DiskIDs) && len(members) > 0
 }
 
-func (r *Reconciler) presentMembers(pool *store.Pool, bdevs map[string]spdk.BdevInfo) int {
+func (r *Reconciler) presentMembers(pool *store.Pool, bdevs map[string]dataplane.Device) int {
 	m, _ := r.memberBdevs(pool, bdevs)
 	return len(m)
 }
@@ -662,13 +648,12 @@ func (r *Reconciler) reconcileVolumes(ctx context.Context, p *pass, poolOnline m
 			if health == store.HealthStatusOnline {
 				online[vol.ID] = vol
 				q := vol.QosPolicy
-				want := spdk.BdevRateLimits{RwIosPerSec: q.RwIosPerSec, RwMbytesPerSec: q.RwMbytesPerSec, RMbytesPerSec: q.RMbytesPerSec, WMbytesPerSec: q.WMbytesPerSec}
-				have := info.AssignedRateLimits
+				have := info.QoS
 				if eff, ok := bdevs[vol.EffectiveBdevName]; ok {
-					have = eff.AssignedRateLimits
+					have = eff.QoS
 				}
-				if have != want {
-					if err := r.spdk.BdevSetQoSLimit(ctx, vol.EffectiveBdevName, q.RwIosPerSec, q.RwMbytesPerSec, q.RMbytesPerSec, q.WMbytesPerSec); err != nil {
+				if have != q {
+					if err := r.dp.SetQoS(ctx, vol.EffectiveBdevName, q); err != nil {
 						p.errs = append(p.errs, fmt.Sprintf("%s: apply QoS: %v", res, err))
 					} else {
 						p.repaired++
@@ -701,14 +686,14 @@ func (r *Reconciler) reconcileExports(ctx context.Context, p *pass, volOnline ma
 		health, msg := store.HealthStatusOnline, ""
 		if exp.Disabled {
 			health, msg = store.HealthStatusOffline, "disabled: "+exp.DisabledReason
-			if err := dataplane.RemoveExport(ctx, r.spdk, exp); err != nil {
+			if err := dataplane.RemoveExport(ctx, r.dp, exp); err != nil {
 				msg += "; " + err.Error()
 			}
 			p.degrade(res, msg)
 		} else if vol, ok := volOnline[exp.VolumeID]; !ok {
 			health, msg = store.HealthStatusDegraded, "backing volume is not online"
 			p.degraded = append(p.degraded, res)
-		} else if err := dataplane.EnsureExport(ctx, r.spdk, r.store, exp, vol); err != nil {
+		} else if err := dataplane.EnsureExport(ctx, r.dp, r.store, exp, vol); err != nil {
 			health, msg = store.HealthStatusDegraded, err.Error()
 			p.degrade(res, msg)
 		}

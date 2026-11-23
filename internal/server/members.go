@@ -9,7 +9,6 @@ import (
 	"strings"
 
 	"github.com/velocor/velocor/internal/dataplane"
-	"github.com/velocor/velocor/internal/spdk"
 	"github.com/velocor/velocor/internal/store"
 )
 
@@ -23,22 +22,22 @@ func redundant(level store.RaidLevel) bool {
 	return strings.EqualFold(string(level), string(store.RaidLevel1))
 }
 
-// poolRaid returns SPDK's view of the pool's RAID bdev and of all RAID bdevs.
-func (s *Server) poolRaid(ctx context.Context, pool *store.Pool) (*spdk.RaidBdevInfo, []spdk.RaidBdevInfo, error) {
-	raids, err := s.spdk.BdevRaidGetBdevs(ctx, "all")
+// poolRaid returns the data plane's view of the pool's array and of all arrays.
+func (s *Server) poolRaid(ctx context.Context, pool *store.Pool) (*dataplane.Array, []dataplane.Array, error) {
+	raids, err := s.dp.Arrays(ctx)
 	if err != nil {
 		return nil, nil, fmt.Errorf("list raid bdevs: %w", err)
 	}
-	i := slices.IndexFunc(raids, func(rb spdk.RaidBdevInfo) bool { return rb.Name == pool.BaseBdevName })
+	i := slices.IndexFunc(raids, func(rb dataplane.Array) bool { return rb.Name == pool.BaseBdevName })
 	if i < 0 {
 		return nil, raids, fmt.Errorf("%w: RAID %s of pool %s is not assembled", store.ErrInvalidArgument, pool.BaseBdevName, pool.ID)
 	}
 	return &raids[i], raids, nil
 }
 
-func memberOf(raids []spdk.RaidBdevInfo, bdev string) string {
+func memberOf(raids []dataplane.Array, bdev string) string {
 	for _, rb := range raids {
-		for _, b := range rb.BaseBdevsList {
+		for _, b := range rb.Members {
 			if bdev != "" && b.Name == bdev {
 				return rb.Name
 			}
@@ -71,7 +70,7 @@ func (s *Server) handleReplacePoolDisk(w http.ResponseWriter, r *http.Request) {
 		writeError(w, fmt.Errorf("%w: body must be JSON with new_disk_id", store.ErrInvalidArgument))
 		return
 	}
-	if err := s.requireSPDK(); err != nil {
+	if err := s.requireDataPlane(); err != nil {
 		writeError(w, err)
 		return
 	}
@@ -95,14 +94,14 @@ func (s *Server) handleReplacePoolDisk(w http.ResponseWriter, r *http.Request) {
 		writeError(w, fmt.Errorf("%w: RAID %s is %s; a disk can only be replaced in a running pool (start it degraded first if it is waiting for a missing disk)",
 			store.ErrInvalidArgument, rb.Name, rb.State))
 		return
-	case rb.Process != nil:
-		writeError(w, fmt.Errorf("%w: RAID %s is already rebuilding %s (%d%%)", store.ErrInUse, rb.Name, rb.Process.Target, rb.Process.Progress.Percent))
+	case rb.Rebuild != nil:
+		writeError(w, fmt.Errorf("%w: RAID %s is already rebuilding %s (%d%%)", store.ErrInUse, rb.Name, rb.Rebuild.Target, rb.Rebuild.Percent))
 		return
 	}
 
 	members := store.PoolMembers(pool)
-	if len(members) != len(rb.BaseBdevsList) {
-		writeError(w, fmt.Errorf("%w: pool %s records %d slots but RAID %s has %d; wait for the reconciler", store.ErrInvalidArgument, pool.ID, len(members), rb.Name, len(rb.BaseBdevsList)))
+	if len(members) != len(rb.Members) {
+		writeError(w, fmt.Errorf("%w: pool %s records %d slots but RAID %s has %d; wait for the reconciler", store.ErrInvalidArgument, pool.ID, len(members), rb.Name, len(rb.Members)))
 		return
 	}
 	var slot int
@@ -113,19 +112,19 @@ func (s *Server) handleReplacePoolDisk(w http.ResponseWriter, r *http.Request) {
 			writeError(w, fmt.Errorf("%w: disk %s is not in a slot of pool %s", store.ErrNotFound, req.OldDiskID, pool.ID))
 			return
 		}
-		if b := rb.BaseBdevsList[slot]; b.Name != "" && b.IsConfigured {
+		if b := rb.Members[slot]; b.Name != "" && b.Configured {
 			if !req.AllowDegraded {
 				writeError(w, fmt.Errorf("%w: disk %s is working; replacing it removes the pool's redundancy until the rebuild completes (pass allow_degraded=true)", store.ErrInvalidArgument, req.OldDiskID))
 				return
 			}
-			if rb.NumBaseBdevsOperational < 2 {
+			if rb.Operational < 2 {
 				writeError(w, fmt.Errorf("%w: disk %s is the pool's only working member", store.ErrInvalidArgument, req.OldDiskID))
 				return
 			}
 			removeBdev = b.Name
 		}
 	} else {
-		slot = slices.IndexFunc(rb.BaseBdevsList, func(b spdk.RaidBaseBdev) bool { return b.Name == "" })
+		slot = slices.IndexFunc(rb.Members, func(b dataplane.ArrayMember) bool { return b.Name == "" })
 		if slot < 0 {
 			writeError(w, fmt.Errorf("%w: pool %s has no failed or missing disk; name old_disk_id to replace a working one", store.ErrInvalidArgument, pool.ID))
 			return
@@ -162,18 +161,18 @@ func (s *Server) handleReplacePoolDisk(w http.ResponseWriter, r *http.Request) {
 			writeError(w, err)
 			return
 		}
-		if raids, err = s.spdk.BdevRaidGetBdevs(ctx, "all"); err != nil {
+		if raids, err = s.dp.Arrays(ctx); err != nil {
 			writeError(w, err)
 			return
 		}
 	}
 	if other := memberOf(raids, newDisk.SPDKBdevName); other != "" {
-		writeError(w, fmt.Errorf("%w: disk %s carries metadata of RAID %s and SPDK assembled it into that array; release it with a wipe first", store.ErrInUse, newDisk.ID, other))
+		writeError(w, fmt.Errorf("%w: disk %s carries metadata of RAID %s and the data plane assembled it into that array; release it with a wipe first", store.ErrInUse, newDisk.ID, other))
 		return
 	}
 
 	if removeBdev != "" {
-		if err := s.spdk.BdevRaidRemoveBaseBdev(ctx, removeBdev); err != nil {
+		if err := s.dp.RemoveMember(ctx, removeBdev); err != nil {
 			writeError(w, fmt.Errorf("remove %s from RAID %s: %w", req.OldDiskID, rb.Name, err))
 			return
 		}
@@ -184,7 +183,7 @@ func (s *Server) handleReplacePoolDisk(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
-	if err := s.spdk.BdevRaidAddBaseBdev(ctx, rb.Name, newDisk.SPDKBdevName); err != nil {
+	if err := s.dp.AddMember(ctx, rb.Name, newDisk.SPDKBdevName); err != nil {
 		s.undoReplace(pool.ID, prev, newDisk.ID)
 		writeError(w, fmt.Errorf("add disk %s to RAID %s: %w", newDisk.ID, rb.Name, err))
 		return
@@ -220,7 +219,7 @@ func (s *Server) handleStartPoolDegraded(w http.ResponseWriter, r *http.Request)
 		Confirm string `json:"confirm"`
 	}
 	_ = json.NewDecoder(r.Body).Decode(&req)
-	if err := s.requireSPDK(); err != nil {
+	if err := s.requireDataPlane(); err != nil {
 		writeError(w, err)
 		return
 	}
@@ -243,7 +242,7 @@ func (s *Server) handleStartPoolDegraded(w http.ResponseWriter, r *http.Request)
 		writeError(w, fmt.Errorf("%w: RAID %s is %s, not waiting for a missing disk", store.ErrInvalidArgument, rb.Name, rb.State))
 		return
 	}
-	if err := s.spdk.BdevRaidStartDegraded(ctx, rb.Name); err != nil {
+	if err := s.dp.StartDegraded(ctx, rb.Name); err != nil {
 		writeError(w, fmt.Errorf("start RAID %s degraded: %w", rb.Name, err))
 		return
 	}
@@ -260,7 +259,7 @@ func (s *Server) handleStartPoolDegraded(w http.ResponseWriter, r *http.Request)
 //
 //	DELETE /api/v1/pools/{id}/disks/{disk_id}
 func (s *Server) handleReleasePoolDisk(w http.ResponseWriter, r *http.Request) {
-	if err := s.requireSPDK(); err != nil {
+	if err := s.requireDataPlane(); err != nil {
 		writeError(w, err)
 		return
 	}
@@ -272,7 +271,7 @@ func (s *Server) handleReleasePoolDisk(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if d.Claimed {
-		raids, err := s.spdk.BdevRaidGetBdevs(ctx, "all")
+		raids, err := s.dp.Arrays(ctx)
 		if err != nil {
 			writeError(w, err)
 			return
@@ -287,7 +286,7 @@ func (s *Server) handleReleasePoolDisk(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if d.Claimed {
-		if err := dataplane.DetachDisk(ctx, s.spdk, d); err != nil {
+		if err := s.dp.DetachDisk(ctx, d); err != nil {
 			writeError(w, err)
 			return
 		}
@@ -349,9 +348,9 @@ func (s *Server) handlePutRebuildSettings(w http.ResponseWriter, r *http.Request
 		writeError(w, err)
 		return
 	}
-	if s.spdk != nil {
-		if err := s.spdk.BdevRaidSetOptions(r.Context(), st.RebuildMaxMBps); err != nil {
-			writeError(w, fmt.Errorf("saved, but applying it to SPDK failed (the reconciler retries): %w", err))
+	if s.dp != nil {
+		if err := s.dp.SetRebuildLimit(r.Context(), st.RebuildMaxMBps); err != nil {
+			writeError(w, fmt.Errorf("saved, but applying it to the data plane failed (the reconciler retries): %w", err))
 			return
 		}
 	}

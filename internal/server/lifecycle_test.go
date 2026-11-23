@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/velocor/velocor/internal/auth"
+	"github.com/velocor/velocor/internal/dataplane/spdkplane"
 	"github.com/velocor/velocor/internal/reconciler"
 	"github.com/velocor/velocor/internal/spdk"
 	"github.com/velocor/velocor/internal/store"
@@ -29,8 +30,9 @@ func TestLifecycleEndpointsAndRBAC(t *testing.T) {
 		t.Fatalf("auth.NewManager failed: %v", err)
 	}
 	clearMustChange(t, st)
-	rec := reconciler.New(st, spdkClient, nil, nil)
-	srv := New(st, spdkClient, nil, authMgr, rec, nil)
+	dp := spdkplane.New(spdkClient, nil)
+	rec := reconciler.New(st, dp, nil, nil)
+	srv := New(st, dp, nil, authMgr, rec, nil)
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
 

@@ -34,12 +34,12 @@ func (s *Server) ready(ctx context.Context) bool {
 		s.logger.Warn("readiness: the database doesn't answer", "err", err)
 		return false
 	}
-	if s.spdk == nil {
+	if s.dp == nil {
 		return false
 	}
 	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
-	if _, err := s.spdk.GetVersion(ctx); err != nil {
+	if _, err := s.dp.Version(ctx); err != nil {
 		return false
 	}
 	return true

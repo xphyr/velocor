@@ -33,7 +33,7 @@ import (
 	"time"
 
 	"github.com/velocor/velocor/internal/auth"
-	"github.com/velocor/velocor/internal/dataplane"
+	"github.com/velocor/velocor/internal/dataplane/spdkplane"
 	"github.com/velocor/velocor/internal/reconciler"
 	"github.com/velocor/velocor/internal/server"
 	"github.com/velocor/velocor/internal/spdk"
@@ -181,7 +181,7 @@ func newAppliance(t *testing.T, tg *target) *appliance {
 	// The test containers run confined (SELinux container_t), where io_uring_setup fails and
 	// spdk_tgt would crash on the first io_uring bdev (docs/review-history.md P0-6). "auto" must see that and
 	// use AIO; if it didn't, every test here would lose its spdk_tgt.
-	dataplane.SSDBackend = "auto"
+	spdkplane.SSDBackend = "auto"
 	st, err := store.OpenBoltStore(filepath.Join(t.TempDir(), "velocor.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -195,9 +195,10 @@ func newAppliance(t *testing.T, tg *target) *appliance {
 	if err != nil {
 		t.Fatal(err)
 	}
-	rec := reconciler.New(st, tg.client(), nil, nil)
+	dp := spdkplane.New(tg.client(), nil)
+	rec := reconciler.New(st, dp, nil, nil)
 	rec.SetUnmanagedGrace(0) // report unaccounted SPDK objects at once, so tests can assert there are none
-	ts := httptest.NewServer(server.New(st, tg.client(), nil, authMgr, rec, nil).Handler())
+	ts := httptest.NewServer(server.New(st, dp, nil, authMgr, rec, nil).Handler())
 	t.Cleanup(ts.Close)
 	return &appliance{t: t, tg: tg, st: st, rec: rec, ts: ts, token: tok, port: freePort(t)}
 }

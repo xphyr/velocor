@@ -6,7 +6,7 @@ import (
 	"slices"
 	"strings"
 
-	"github.com/velocor/velocor/internal/spdk"
+	"github.com/velocor/velocor/internal/dataplane"
 	"github.com/velocor/velocor/internal/store"
 )
 
@@ -19,9 +19,9 @@ type raidView struct {
 }
 
 // inRaid reports whether bdev is a member of any RAID bdev.
-func inRaid(raids []spdk.RaidBdevInfo, bdev string) bool {
+func inRaid(raids []dataplane.Array, bdev string) bool {
 	for _, rb := range raids {
-		for _, b := range rb.BaseBdevsList {
+		for _, b := range rb.Members {
 			if b.Name == bdev {
 				return true
 			}
@@ -41,8 +41,8 @@ func diskLabel(id string) string {
 // SPDK is the source of truth for slot membership; the store supplies which disk a now-empty
 // slot held. An online array whose rebuild target dropped out (e.g. spdk_tgt restarted
 // mid-rebuild, which records nothing) gets the disk re-added, restarting the rebuild.
-func (r *Reconciler) viewRaid(ctx context.Context, pool *store.Pool, rb *spdk.RaidBdevInfo,
-	raids []spdk.RaidBdevInfo, disks []*store.Disk, bdevs map[string]spdk.BdevInfo) raidView {
+func (r *Reconciler) viewRaid(ctx context.Context, pool *store.Pool, rb *dataplane.Array,
+	raids []dataplane.Array, disks []*store.Disk, bdevs map[string]dataplane.Device) raidView {
 	prev := store.PoolMembers(pool)
 	diskByBdev := map[string]*store.Disk{}
 	diskByID := map[string]*store.Disk{}
@@ -56,21 +56,21 @@ func (r *Reconciler) viewRaid(ctx context.Context, pool *store.Pool, rb *spdk.Ra
 	state := strings.ToLower(rb.State)
 	v.online = state == "online"
 
-	for i, b := range rb.BaseBdevsList {
+	for i, b := range rb.Members {
 		m := store.PoolMember{Slot: i}
 		if i < len(prev) {
 			m.DiskID = prev[i].DiskID
 		}
 		switch {
-		case b.Name != "" && b.IsConfigured:
+		case b.Name != "" && b.Configured:
 			if d := diskByBdev[b.Name]; d != nil {
 				m.DiskID = d.ID
 			}
 			m.State = store.MemberStateActive
-			if rb.Process != nil && rb.Process.Target == b.Name {
-				m.State, m.RebuildPercent = store.MemberStateRebuilding, rb.Process.Progress.Percent
+			if rb.Rebuild != nil && rb.Rebuild.Target == b.Name {
+				m.State, m.RebuildPercent = store.MemberStateRebuilding, rb.Rebuild.Percent
 			}
-		case v.online && i < len(prev) && prev[i].State == store.MemberStateRebuilding && rb.Process == nil:
+		case v.online && i < len(prev) && prev[i].State == store.MemberStateRebuilding && rb.Rebuild == nil:
 			// The rebuild target isn't in the array any more and nothing is rebuilding: the
 			// rebuild was interrupted (restart) or its disk failed. Re-add it if it's here.
 			m.State = store.MemberStateFailed
@@ -78,7 +78,7 @@ func (r *Reconciler) viewRaid(ctx context.Context, pool *store.Pool, rb *spdk.Ra
 			if _, present := bdevs[bdevName(d)]; d == nil || !present || inRaid(raids, d.SPDKBdevName) {
 				break
 			}
-			if err := r.spdk.BdevRaidAddBaseBdev(ctx, rb.Name, d.SPDKBdevName); err != nil {
+			if err := r.dp.AddMember(ctx, rb.Name, d.SPDKBdevName); err != nil {
 				v.reasons = append(v.reasons, fmt.Sprintf("restarting the rebuild of %s failed: %v", diskLabel(d.ID), err))
 				break
 			}
@@ -114,7 +114,7 @@ func (r *Reconciler) viewRaid(ctx context.Context, pool *store.Pool, rb *spdk.Ra
 	case !v.online:
 		v.health = store.HealthStatusFaulted
 		v.reasons = append(v.reasons, fmt.Sprintf("RAID %s is %s (%d of %d members operational)",
-			rb.Name, rb.State, rb.NumBaseBdevsOperational, rb.NumBaseBdevs))
+			rb.Name, rb.State, rb.Operational, rb.Slots))
 	case len(rebuilding) > 0:
 		v.health = store.HealthStatusRebuilding
 		v.reasons = append(v.reasons, "rebuilding "+strings.Join(rebuilding, ", "))
@@ -146,7 +146,7 @@ func (r *Reconciler) applySettings(ctx context.Context, p *pass) {
 		p.errs = append(p.errs, fmt.Sprintf("read settings: %v", err))
 		return
 	}
-	cur, err := r.spdk.BdevRaidGetMaxBandwidth(ctx)
+	cur, err := r.dp.RebuildLimit(ctx)
 	if err != nil {
 		p.errs = append(p.errs, fmt.Sprintf("read rebuild speed limit: %v", err))
 		return
@@ -154,7 +154,7 @@ func (r *Reconciler) applySettings(ctx context.Context, p *pass) {
 	if cur == st.RebuildMaxMBps {
 		return
 	}
-	if err := r.spdk.BdevRaidSetOptions(ctx, st.RebuildMaxMBps); err != nil {
+	if err := r.dp.SetRebuildLimit(ctx, st.RebuildMaxMBps); err != nil {
 		p.errs = append(p.errs, fmt.Sprintf("apply rebuild speed limit: %v", err))
 		return
 	}

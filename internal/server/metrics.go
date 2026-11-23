@@ -348,13 +348,13 @@ func (s *Server) backupMetrics(m *metricSet) {
 // for rate() in Prometheus), and reports whether the data plane answers at all.
 func (s *Server) ioMetrics(ctx context.Context, m *metricSet, pools []*store.Pool, disks []*store.Disk, vols []*store.Volume) {
 	const hUp = "Whether spdk_tgt (the data plane) answers velod."
-	if s.spdk == nil {
+	if s.dp == nil {
 		m.gauge("velocor_dataplane_up", hUp, 0)
 		return
 	}
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	iostat, err := s.spdk.BdevGetIostat(ctx, "")
+	iostat, err := s.dp.IOStats(ctx, "")
 	if err != nil {
 		m.gauge("velocor_dataplane_up", hUp, 0)
 		return
@@ -390,7 +390,7 @@ func (s *Server) ioMetrics(ctx context.Context, m *metricSet, pools []*store.Poo
 		}
 	}
 	tick := float64(iostat.TickRate)
-	for _, b := range iostat.Bdevs {
+	for _, b := range iostat.Devices {
 		// Raw per-bdev counters, as before (any bdev, managed or not).
 		m.counter("velocor_bdev_read_ops_total", "Read operations on an SPDK bdev.", float64(b.NumReadOps), "bdev", b.Name)
 		m.counter("velocor_bdev_write_ops_total", "Write operations on an SPDK bdev.", float64(b.NumWriteOps), "bdev", b.Name)

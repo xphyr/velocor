@@ -3,7 +3,6 @@ package reconciler
 import (
 	"context"
 
-	"github.com/velocor/velocor/internal/dataplane"
 	"github.com/velocor/velocor/internal/store"
 )
 
@@ -21,8 +20,7 @@ func (r *Reconciler) nvmeWriteCache(ctx context.Context, p *pass) {
 		if d.Type != store.DiskTypeNVMe || !d.Claimed || d.IsBootDevice || d.SPDKBdevName == "" {
 			continue
 		}
-		ctrl := dataplane.NVMeControllerFromBdev(d.SPDKBdevName)
-		state, err := dataplane.NVMeWriteCache(ctx, r.spdk, ctrl)
+		state, err := r.dp.NVMeWriteCache(ctx, d)
 		if err != nil {
 			r.logger.Debug("cannot read the NVMe write cache", "disk", d.ID, "err", err)
 			continue // keep the last known state
@@ -34,7 +32,7 @@ func (r *Reconciler) nvmeWriteCache(ctx context.Context, p *pass) {
 		case d.WriteCacheError != "" && r.cacheRefused[d.ID]:
 			// refused since this start: reported, not retried
 		default:
-			state, err = dataplane.SetNVMeWriteCache(ctx, r.spdk, ctrl, false)
+			state, err = r.dp.SetNVMeWriteCache(ctx, d, false)
 			if err != nil {
 				msg = err.Error()
 				if r.cacheRefused == nil {

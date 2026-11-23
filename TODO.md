@@ -37,7 +37,20 @@ listed until then so nothing is lost if the plan changes.
 - [ ] **K-2. Parity**, starting with a **data-plane interface** in velod: velod calls SPDK
   directly in about 160 places and there is nothing to slot the kernel stack in behind, so K-2
   introduces that interface (modelled on `internal/kernel`'s API), moves the SPDK code behind
-  it, then adds the kernel implementation. Then every row of the feature table (iSCSI via LIO, scrub on md, metadata copy
+  it, then adds the kernel implementation.
+  - [x] **Interface** (2026-11-23): `dataplane.Plane` (disks, arrays, thin pools, volumes and
+    snapshots, group snapshots, allocated/changed blocks, exports, I/O stats, the unmanaged-object
+    inventory) with backend-neutral types and errors; the SPDK backend is
+    `internal/dataplane/spdkplane`. `server` and `reconciler` no longer import `internal/spdk`; no
+    behaviour change (unit tests unchanged apart from construction, SPDK integration suite).
+  - [ ] Still SPDK-shaped outside the interface: store/API field names (`spdk_bdev_name`,
+    `lvs_uuid`, `lvol_bdev_name`, `base_bdev_name`, `cluster_size_bytes`), the status JSON's
+    `spdk` object and `spdk_version`, `/system/iostats?bdev_name=`, metric names
+    (`velocor_bdev_*`, `velocor_spdk_unmanaged_objects`); restart detection
+    (`hardware.SPDKInstance`); moved-disk matching and pool import reading SPDK RAID superblocks
+    (`hardware.ReadRaidSuperblock`); the ublk metadata device (`meta.UblkDevice`, behind
+    `meta.Device` already: the kernel backend writes an LV directly).
+  - [ ] The kernel implementation of `dataplane.Plane` on `internal/kernel`. Then every row of the feature table (iSCSI via LIO, scrub on md, metadata copy
   on an LV, import, CBT via `thin_delta`, metrics, alerts, veloctl/UI wording, docs).
 - [ ] **K-3. Validation:** CSI matrix on both clusters, KubeVirt, the P0-7 scenario (an
   unreadable sector on the last copy keeps the pool up), the benchmark, soak.

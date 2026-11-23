@@ -12,6 +12,7 @@ import (
 
 	"github.com/velocor/velocor/internal/auth"
 	"github.com/velocor/velocor/internal/backup"
+	"github.com/velocor/velocor/internal/dataplane/spdkplane"
 	"github.com/velocor/velocor/internal/reconciler"
 	"github.com/velocor/velocor/internal/spdk/spdktest"
 	"github.com/velocor/velocor/internal/store"
@@ -33,7 +34,7 @@ func TestBackupDownloadAndRestore(t *testing.T) {
 	clearMustChange(t, st)
 	mgr := &backup.Manager{Dir: filepath.Join(dir, "backups"), DBPath: db, Source: st}
 	restarted := make(chan struct{}, 1)
-	srv := New(st, f.Client(), nil, authMgr, reconciler.New(st, f.Client(), nil, nil), nil,
+	srv := New(st, spdkplane.New(f.Client(), nil), nil, authMgr, reconciler.New(st, spdkplane.New(f.Client(), nil), nil, nil), nil,
 		WithBackups(mgr, func() { restarted <- struct{}{} }))
 	h := &harness{t: t, st: st, fake: f, ts: httptest.NewServer(srv.Handler())}
 	t.Cleanup(h.ts.Close)

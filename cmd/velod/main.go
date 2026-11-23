@@ -16,7 +16,7 @@ import (
 
 	"github.com/velocor/velocor/internal/auth"
 	"github.com/velocor/velocor/internal/backup"
-	"github.com/velocor/velocor/internal/dataplane"
+	"github.com/velocor/velocor/internal/dataplane/spdkplane"
 	"github.com/velocor/velocor/internal/hardware"
 	"github.com/velocor/velocor/internal/meta"
 	"github.com/velocor/velocor/internal/monitoring"
@@ -72,10 +72,10 @@ func main() {
 		"spdk_socket", *spdkSocket,
 	)
 
-	dataplane.Logger = logger
+	spdkplane.Logger = logger
 	switch *ssdBdev {
 	case "auto", "uring", "aio":
-		dataplane.SSDBackend = *ssdBdev
+		spdkplane.SSDBackend = *ssdBdev
 	default:
 		logger.Error("invalid --ssd-bdev; use auto, uring or aio", "value", *ssdBdev)
 		os.Exit(1)
@@ -141,7 +141,8 @@ func main() {
 	}
 
 	spdkClient := spdk.NewClient(*spdkSocket)
-	rec := reconciler.New(st, spdkClient, hwMgr, logger)
+	dp := spdkplane.New(spdkClient, hwMgr)
+	rec := reconciler.New(st, dp, hwMgr, logger)
 	var metaDev meta.Device
 	if *metaCopies {
 		self, err := os.Executable()
@@ -174,7 +175,7 @@ func main() {
 		}
 		mon = &monitoring.Manager{Dir: *monitoringDir, MetricsURL: scheme + "://" + monitoring.LocalTarget(*listenAddr) + "/metrics"}
 	}
-	srv := server.New(st, spdkClient, hwMgr, authMgr, rec, logger,
+	srv := server.New(st, dp, hwMgr, authMgr, rec, logger,
 		server.WithMonitoring(mon),
 		server.WithPublicMetrics(*metricsPublic),
 		server.WithInsecureHTTP(*insecureHTTP),

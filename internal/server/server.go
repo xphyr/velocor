@@ -31,7 +31,6 @@ import (
 	"github.com/velocor/velocor/internal/meta"
 	"github.com/velocor/velocor/internal/monitoring"
 	"github.com/velocor/velocor/internal/reconciler"
-	"github.com/velocor/velocor/internal/spdk"
 	"github.com/velocor/velocor/internal/store"
 	"github.com/velocor/velocor/internal/version"
 )
@@ -40,7 +39,7 @@ import (
 // and embedded Web UI over HTTP/HTTPS.
 type Server struct {
 	store      store.Store
-	spdk       *spdk.Client
+	dp         dataplane.Plane
 	hw         *hardware.Manager
 	auth       *auth.Manager
 	reconciler *reconciler.Reconciler
@@ -144,7 +143,7 @@ func WithPublicMetrics(public bool) Option {
 // New constructs a new control-plane Server and registers all routes.
 func New(
 	st store.Store,
-	spdkClient *spdk.Client,
+	dp dataplane.Plane,
 	hwMgr *hardware.Manager,
 	authMgr *auth.Manager,
 	rec *reconciler.Reconciler,
@@ -156,7 +155,7 @@ func New(
 	}
 	s := &Server{
 		store:      st,
-		spdk:       spdkClient,
+		dp:         dp,
 		hw:         hwMgr,
 		auth:       authMgr,
 		reconciler: rec,
@@ -698,7 +697,7 @@ func (s *Server) handleListSnapshots(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"snapshots": snaps})
 }
 
-func formatBlockExtents(extents []spdk.BlockExtent) []map[string]uint64 {
+func formatBlockExtents(extents []dataplane.Extent) []map[string]uint64 {
 	out := make([]map[string]uint64, 0, len(extents))
 	for _, e := range extents {
 		out = append(out, map[string]uint64{
@@ -967,9 +966,9 @@ func (s *Server) handleSystemStatus(w http.ResponseWriter, r *http.Request) {
 	spdkConnected := false
 	spdkVersion := ""
 	var socketPath string
-	if s.spdk != nil {
-		socketPath = s.spdk.SocketPath()
-		if ver, err := s.spdk.GetVersion(r.Context()); err == nil {
+	if s.dp != nil {
+		socketPath = s.dp.Endpoint()
+		if ver, err := s.dp.Version(r.Context()); err == nil {
 			spdkConnected = true
 			spdkVersion = ver
 		}
@@ -1034,18 +1033,18 @@ func (s *Server) handleTriggerReconcile(w http.ResponseWriter, r *http.Request) 
 
 func (s *Server) handleGetIoStats(w http.ResponseWriter, r *http.Request) {
 	bdevName := r.URL.Query().Get("bdev_name")
-	if s.spdk == nil {
+	if s.dp == nil {
 		writeJSON(w, http.StatusOK, map[string]any{"tick_rate": 0, "stats": []any{}})
 		return
 	}
-	res, err := s.spdk.BdevGetIostat(r.Context(), bdevName)
+	res, err := s.dp.IOStats(r.Context(), bdevName)
 	if err != nil {
 		writeError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"tick_rate": res.TickRate,
-		"stats":     res.Bdevs,
+		"stats":     res.Devices,
 	})
 }
 
@@ -1195,7 +1194,7 @@ func writeError(w http.ResponseWriter, err error) {
 		status = http.StatusInsufficientStorage
 	case errors.Is(err, errDataPlaneUnavailable):
 		status = http.StatusServiceUnavailable
-	case errors.Is(err, spdk.ErrCBTUnsupported):
+	case errors.Is(err, dataplane.ErrCBTUnsupported):
 		status = http.StatusNotImplemented
 	}
 	writeJSON(w, status, map[string]any{

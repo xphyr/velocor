@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/velocor/velocor/internal/dataplane"
 	"github.com/velocor/velocor/internal/meta"
-	"github.com/velocor/velocor/internal/spdk"
 	"github.com/velocor/velocor/internal/store"
 )
 
@@ -42,7 +42,7 @@ func (r *Reconciler) reconcileMeta(ctx context.Context, p *pass, poolOnline map[
 	if err != nil || len(pools) == 0 {
 		return
 	}
-	lvols, err := r.spdk.BdevLvolGetLvols(ctx)
+	lvols, err := r.dp.Volumes(ctx)
 	if err != nil {
 		p.errs = append(p.errs, fmt.Sprintf("list lvols: %v", err))
 		return
@@ -66,16 +66,16 @@ func (r *Reconciler) reconcileMeta(ctx context.Context, p *pass, poolOnline map[
 	}
 }
 
-func (r *Reconciler) syncPoolMeta(ctx context.Context, pool *store.Pool, lvols []spdk.LvolInfo) error {
+func (r *Reconciler) syncPoolMeta(ctx context.Context, pool *store.Pool, lvols []dataplane.Volume) error {
 	uuid := ""
 	for _, l := range lvols {
-		if l.LVS.UUID == pool.LVSUUID && l.Name == meta.LvolName {
+		if l.Pool == pool.LVSUUID && l.Name == meta.LvolName {
 			uuid = l.UUID
 		}
 	}
 	if uuid == "" {
 		// Thick, so a full pool can never fail a metadata write.
-		created, err := r.spdk.BdevLvolCreate(ctx, pool.LVSName, meta.LvolName, meta.LvolBytes, false, "")
+		created, err := r.dp.CreateVolume(ctx, pool.LVSName, meta.LvolName, meta.LvolBytes, false)
 		if err != nil {
 			return fmt.Errorf("create the %s lvol: %w", meta.LvolName, err)
 		}

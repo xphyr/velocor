@@ -8,31 +8,22 @@ import (
 )
 
 // reconcileSpace refreshes how much each volume and snapshot really holds, and each pool's
-// committed and available space and space state (TODO P0-2). Reads SPDK only; writes the
+// committed and available space and space state (TODO P0-2). Reads the data plane only; writes the
 // store only when a value changed.
 func (r *Reconciler) reconcileSpace(ctx context.Context, p *pass, poolOnline map[string]bool) {
 	pools, err := r.store.ListPools()
 	if err != nil || len(pools) == 0 {
 		return
 	}
-	lvols, err := r.spdk.BdevLvolGetLvols(ctx)
+	lvols, err := r.dp.Volumes(ctx)
 	if err != nil {
 		p.errs = append(p.errs, fmt.Sprintf("list lvols: %v", err))
 		return
 	}
-	lvstores, err := r.spdk.BdevLvolGetLvstores(ctx, "", "")
-	if err != nil {
-		p.errs = append(p.errs, fmt.Sprintf("list lvstores: %v", err))
-		return
-	}
-	clusterSize := map[string]uint64{}
-	for _, l := range lvstores {
-		clusterSize[l.UUID] = uint64(l.ClusterSize)
-	}
-	// Bytes each lvol holds, in its own volume store's cluster size.
+	// Bytes each volume and snapshot holds.
 	held := make(map[string]uint64, len(lvols))
 	for _, l := range lvols {
-		held[l.UUID] = l.NumAllocatedClusters * clusterSize[l.LVS.UUID]
+		held[l.UUID] = l.AllocatedBytes
 	}
 
 	for _, pool := range pools {

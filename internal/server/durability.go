@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/velocor/velocor/internal/dataplane"
 	"net/http"
 	"slices"
 	"strings"
@@ -79,10 +78,10 @@ func (s *Server) applyWriteCachePolicy(ctx context.Context, d *store.Disk) (stor
 		if !d.Claimed || d.SPDKBdevName == "" {
 			return d.WriteCache, nil
 		}
-		if err := s.requireSPDK(); err != nil {
+		if err := s.requireDataPlane(); err != nil {
 			return d.WriteCache, err
 		}
-		state, err := dataplane.SetNVMeWriteCache(ctx, s.spdk, dataplane.NVMeControllerFromBdev(d.SPDKBdevName), d.WriteCachePolicy != store.WriteCachePolicyDisabled)
+		state, err := s.dp.SetNVMeWriteCache(ctx, d, d.WriteCachePolicy != store.WriteCachePolicyDisabled)
 		if err != nil {
 			return state, fmt.Errorf("%w: %v", store.ErrInvalidArgument, err)
 		}

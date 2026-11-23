@@ -24,14 +24,13 @@ import (
 	"unicode"
 
 	"github.com/velocor/velocor/internal/dataplane"
-	"github.com/velocor/velocor/internal/spdk"
 	"github.com/velocor/velocor/internal/store"
 )
 
-var errDataPlaneUnavailable = errors.New("spdk data plane is not configured")
+var errDataPlaneUnavailable = errors.New("the data plane is not configured")
 
-func (s *Server) requireSPDK() error {
-	if s.spdk == nil {
+func (s *Server) requireDataPlane() error {
+	if s.dp == nil {
 		return errDataPlaneUnavailable
 	}
 	return nil
@@ -118,7 +117,7 @@ func (s *Server) claimDisk(w http.ResponseWriter, r *http.Request, id string) {
 		writeJSON(w, http.StatusOK, map[string]any{"disk": d})
 		return
 	}
-	if err := s.requireSPDK(); err != nil {
+	if err := s.requireDataPlane(); err != nil {
 		writeError(w, err)
 		return
 	}
@@ -144,18 +143,18 @@ func (s *Server) attachAndClaim(ctx context.Context, d *store.Disk, force bool) 
 			return nil, err
 		}
 	}
-	bdev, drv, err := dataplane.AttachDisk(ctx, s.spdk, s.hw, d)
+	bdev, drv, err := s.dp.AttachDisk(ctx, d)
 	if err != nil {
 		return nil, err
 	}
 	cacheState := store.WriteCacheUnknown
 	if d.WriteCachePolicy == store.WriteCachePolicyDisabled && d.Type == store.DiskTypeNVMe {
-		// The kernel no longer sees the drive: switch its cache off through SPDK before
-		// anything is written to it.
-		if cacheState, err = dataplane.SetNVMeWriteCache(ctx, s.spdk, dataplane.NVMeControllerFromBdev(bdev), false); err != nil {
-			attached := *d
-			attached.SPDKBdevName = bdev
-			_ = dataplane.DetachDisk(context.WithoutCancel(ctx), s.spdk, &attached)
+		// The kernel no longer sees the drive: switch its cache off through the data plane
+		// before anything is written to it.
+		attached := *d
+		attached.SPDKBdevName = bdev
+		if cacheState, err = s.dp.SetNVMeWriteCache(ctx, &attached, false); err != nil {
+			_ = s.dp.DetachDisk(context.WithoutCancel(ctx), &attached)
 			if s.hw != nil {
 				_ = s.hw.BindNVMeToKernel(d.PCIAddress)
 			}
@@ -169,7 +168,7 @@ func (s *Server) attachAndClaim(ctx context.Context, d *store.Disk, force bool) 
 	if err != nil {
 		attached := *d
 		attached.SPDKBdevName = bdev
-		_ = dataplane.DetachDisk(context.WithoutCancel(ctx), s.spdk, &attached)
+		_ = s.dp.DetachDisk(context.WithoutCancel(ctx), &attached)
 		if d.Type == store.DiskTypeNVMe && s.hw != nil {
 			_ = s.hw.BindNVMeToKernel(d.PCIAddress)
 		}
@@ -192,11 +191,11 @@ func (s *Server) releaseDisk(w http.ResponseWriter, r *http.Request, id string) 
 		writeJSON(w, http.StatusOK, map[string]any{"disk": d})
 		return
 	}
-	if err := s.requireSPDK(); err != nil {
+	if err := s.requireDataPlane(); err != nil {
 		writeError(w, err)
 		return
 	}
-	if err := dataplane.DetachDisk(r.Context(), s.spdk, d); err != nil {
+	if err := s.dp.DetachDisk(r.Context(), d); err != nil {
 		writeError(w, err)
 		return
 	}
@@ -269,7 +268,7 @@ func (s *Server) handleCreatePool(w http.ResponseWriter, r *http.Request) {
 		validateDisplayName("pool", req.Name),
 		validRaidLevel(req.RaidLevel, len(req.DiskIDs)),
 		rejectFilters(req.FilterPolicy),
-		s.requireSPDK(),
+		s.requireDataPlane(),
 	} {
 		if err != nil {
 			writeError(w, err)
@@ -324,22 +323,22 @@ func (s *Server) handleCreatePool(w http.ResponseWriter, r *http.Request) {
 			// The lvstore may exist even though creating it "failed" (e.g. a timeout while
 			// spdk_tgt went on and finished), and a RAID can't be deleted from under it: the
 			// delete would hang half-done. Remove the lvstore first.
-			if derr := s.spdk.BdevLvolDeleteLvstore(cleanup, "", pool.LVSName); derr != nil && !spdk.IsNotFound(derr) {
+			if derr := s.dp.DeleteThinPool(cleanup, "", pool.LVSName); derr != nil && !dataplane.IsNotFound(derr) {
 				err = fmt.Errorf("%w (rollback: delete lvstore %s: %v; RAID %s left in place)", err, pool.LVSName, derr, pool.BaseBdevName)
 				_ = s.store.DeletePool(pool.ID)
 				writeError(w, err)
 				return
 			}
-			_ = s.spdk.BdevRaidDelete(cleanup, pool.BaseBdevName, true)
+			_ = s.dp.DeleteArray(cleanup, pool.BaseBdevName)
 		}
 		_ = s.store.DeletePool(pool.ID)
 		writeError(w, err)
 	}
-	if err := s.spdk.BdevRaidCreate(ctx, pool.BaseBdevName, string(pool.RaidLevel), pool.StripSizeKB, baseBdevs, true); err != nil {
+	if err := s.dp.CreateArray(ctx, pool.BaseBdevName, pool.RaidLevel, pool.StripSizeKB, baseBdevs); err != nil {
 		fail(false, fmt.Errorf("create raid bdev: %w", err))
 		return
 	}
-	lvsUUID, err := s.spdk.BdevLvolCreateLvstore(ctx, pool.EffectiveBdevName, pool.LVSName, pool.ClusterSizeBytes, "")
+	lvsUUID, err := s.dp.CreateThinPool(ctx, pool.EffectiveBdevName, pool.LVSName, pool.ClusterSizeBytes)
 	if err != nil {
 		fail(true, fmt.Errorf("create lvstore: %w", err))
 		return
@@ -347,9 +346,8 @@ func (s *Server) handleCreatePool(w http.ResponseWriter, r *http.Request) {
 	updated, err := s.store.MutatePool(pool.ID, func(p *store.Pool) error {
 		p.LVSUUID = lvsUUID
 		p.HealthStatus, p.StatusMessage = store.HealthStatusOnline, ""
-		if stores, err := s.spdk.BdevLvolGetLvstores(ctx, "", lvsUUID); err == nil && len(stores) > 0 {
-			cs := uint64(stores[0].ClusterSize)
-			p.TotalBytes, p.FreeBytes = stores[0].TotalDataClusters*cs, stores[0].FreeClusters*cs
+		if stores, err := s.dp.ThinPools(ctx, "", lvsUUID); err == nil && len(stores) > 0 {
+			p.TotalBytes, p.FreeBytes = stores[0].TotalBytes, stores[0].FreeBytes
 			p.AllocatedBytes = p.TotalBytes - p.FreeBytes
 		}
 		p.SpaceState = store.SpaceStateOf(p)
@@ -374,7 +372,7 @@ func (s *Server) handleDeletePool(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
-	if err := s.requireSPDK(); err != nil {
+	if err := s.requireDataPlane(); err != nil {
 		writeError(w, err)
 		return
 	}
@@ -383,11 +381,11 @@ func (s *Server) handleDeletePool(w http.ResponseWriter, r *http.Request) {
 	if lvsUUID == "" {
 		lvsName = pool.LVSName
 	}
-	if err := s.spdk.BdevLvolDeleteLvstore(r.Context(), lvsUUID, lvsName); err != nil && !spdk.IsNotFound(err) {
+	if err := s.dp.DeleteThinPool(r.Context(), lvsUUID, lvsName); err != nil && !dataplane.IsNotFound(err) {
 		writeError(w, fmt.Errorf("delete lvstore: %w", err))
 		return
 	}
-	if err := s.spdk.BdevRaidDelete(r.Context(), pool.BaseBdevName, true); err != nil && !spdk.IsNotFound(err) {
+	if err := s.dp.DeleteArray(r.Context(), pool.BaseBdevName); err != nil && !dataplane.IsNotFound(err) {
 		writeError(w, fmt.Errorf("delete raid bdev: %w", err))
 		return
 	}
@@ -463,7 +461,7 @@ func (s *Server) handleCreateVolume(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
-	if err := s.requireSPDK(); err != nil {
+	if err := s.requireDataPlane(); err != nil {
 		writeError(w, err)
 		return
 	}
@@ -476,7 +474,7 @@ func (s *Server) handleCreateVolume(w http.ResponseWriter, r *http.Request) {
 	}
 	defer release()
 	alias := pool.LVSName + "/" + id
-	uuid, err := s.spdk.BdevLvolCreate(r.Context(), pool.LVSName, id, req.SizeBytes, req.ThinProvision, "")
+	uuid, err := s.dp.CreateVolume(r.Context(), pool.LVSName, id, req.SizeBytes, req.ThinProvision)
 	if err != nil {
 		writeError(w, fmt.Errorf("create lvol: %w", err))
 		return
@@ -504,12 +502,12 @@ func (s *Server) handleCreateVolume(w http.ResponseWriter, r *http.Request) {
 // deleting the lvol again if either step fails.
 func (s *Server) finishVolumeCreate(w http.ResponseWriter, r *http.Request, vol *store.Volume, status int) {
 	rollback := func(err error) {
-		_ = s.spdk.BdevLvolDelete(context.WithoutCancel(r.Context()), vol.UUID)
+		_ = s.dp.DeleteVolume(context.WithoutCancel(r.Context()), vol.UUID)
 		writeError(w, err)
 	}
 	if qosSet(vol.QosPolicy) {
 		q := vol.QosPolicy
-		if err := s.spdk.BdevSetQoSLimit(r.Context(), vol.EffectiveBdevName, q.RwIosPerSec, q.RwMbytesPerSec, q.RMbytesPerSec, q.WMbytesPerSec); err != nil {
+		if err := s.dp.SetQoS(r.Context(), vol.EffectiveBdevName, q); err != nil {
 			rollback(fmt.Errorf("apply QoS: %w", err))
 			return
 		}
@@ -551,7 +549,7 @@ func (s *Server) resizeVolume(w http.ResponseWriter, r *http.Request, id string)
 		writeJSON(w, http.StatusOK, map[string]any{"volume": vol})
 		return
 	}
-	if err := s.requireSPDK(); err != nil {
+	if err := s.requireDataPlane(); err != nil {
 		writeError(w, err)
 		return
 	}
@@ -561,7 +559,7 @@ func (s *Server) resizeVolume(w http.ResponseWriter, r *http.Request, id string)
 		return
 	}
 	defer release()
-	if err := s.spdk.BdevLvolResize(r.Context(), vol.UUID, req.NewSizeBytes); err != nil {
+	if err := s.dp.ResizeVolume(r.Context(), vol.UUID, req.NewSizeBytes); err != nil {
 		writeError(w, fmt.Errorf("resize lvol: %w", err))
 		return
 	}
@@ -590,12 +588,12 @@ func (s *Server) handleSetVolumeQoS(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
-	if err := s.requireSPDK(); err != nil {
+	if err := s.requireDataPlane(); err != nil {
 		writeError(w, err)
 		return
 	}
 	q := req.QosPolicy
-	if err := s.spdk.BdevSetQoSLimit(r.Context(), vol.EffectiveBdevName, q.RwIosPerSec, q.RwMbytesPerSec, q.RMbytesPerSec, q.WMbytesPerSec); err != nil {
+	if err := s.dp.SetQoS(r.Context(), vol.EffectiveBdevName, q); err != nil {
 		writeError(w, fmt.Errorf("apply QoS: %w", err))
 		return
 	}
@@ -642,7 +640,7 @@ func (s *Server) handleCreateSnapshot(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
-	if err := s.requireSPDK(); err != nil {
+	if err := s.requireDataPlane(); err != nil {
 		writeError(w, err)
 		return
 	}
@@ -653,7 +651,7 @@ func (s *Server) handleCreateSnapshot(w http.ResponseWriter, r *http.Request) {
 	}
 	defer release()
 	if err := s.store.CreateSnapshot(snap); err != nil {
-		_ = s.spdk.BdevLvolDelete(context.WithoutCancel(r.Context()), snap.UUID)
+		_ = s.dp.DeleteVolume(context.WithoutCancel(r.Context()), snap.UUID)
 		writeError(w, err)
 		return
 	}
@@ -676,7 +674,7 @@ func (s *Server) takeSnapshot(ctx context.Context, vol *store.Volume, pool *stor
 	if err != nil {
 		return nil, nil, err
 	}
-	uuid, err := s.spdk.BdevLvolSnapshot(ctx, vol.UUID, id)
+	uuid, err := s.dp.Snapshot(ctx, vol.UUID, id)
 	if err != nil {
 		release()
 		return nil, nil, fmt.Errorf("snapshot volume %s: %w", vol.ID, err)
@@ -743,7 +741,7 @@ func (s *Server) cloneSnapshot(w http.ResponseWriter, r *http.Request, snapID st
 		writeError(w, err)
 		return
 	}
-	if err := s.requireSPDK(); err != nil {
+	if err := s.requireDataPlane(); err != nil {
 		writeError(w, err)
 		return
 	}
@@ -756,7 +754,7 @@ func (s *Server) cloneSnapshot(w http.ResponseWriter, r *http.Request, snapID st
 	}
 	defer release()
 	alias := pool.LVSName + "/" + id
-	uuid, err := s.spdk.BdevLvolClone(r.Context(), snap.UUID, id)
+	uuid, err := s.dp.Clone(r.Context(), snap.UUID, id)
 	if err != nil {
 		writeError(w, fmt.Errorf("clone snapshot %s: %w", snap.ID, err))
 		return
@@ -799,13 +797,8 @@ func (s *Server) handleSnapshotGetOrBlocks(w http.ResponseWriter, r *http.Reques
 }
 
 // handleSnapshotBlocks answers blocks:allocated (every block of the snapshot that holds data)
-// and blocks:changed (the blocks written between base_snapshot_id and the snapshot) from SPDK's
-// per-layer cluster maps (bdev_lvol_get_fragmap, SPDK patch 0005). An lvol owns only the
-// clusters written while it was the newest layer of its chain, so the snapshot's allocated
-// blocks are the union over its whole chain (into a clone's origin), and the changes since
-// the base the union over the layers after the base, up to the snapshot. The chain is SPDK's
-// own (each lvol's base_snapshot), which is where the clusters are: it includes snapshots velod
-// keeps hidden for clones and reflects the merges SPDK does when a snapshot is deleted.
+// and blocks:changed (the blocks written between base_snapshot_id and the snapshot), from the
+// data plane's allocation maps (Plane.AllocatedBlocks / ChangedBlocks).
 func (s *Server) handleSnapshotBlocks(w http.ResponseWriter, r *http.Request, targetID string, changed bool) {
 	target, err := s.liveSnapshot(targetID)
 	if err != nil {
@@ -833,60 +826,25 @@ func (s *Server) handleSnapshotBlocks(w http.ResponseWriter, r *http.Request, ta
 		writeError(w, err)
 		return
 	}
-	if err := s.requireSPDK(); err != nil {
+	if err := s.requireDataPlane(); err != nil {
 		writeError(w, err)
 		return
 	}
-	ctx := r.Context()
-	baseName := ""
+	var extents []dataplane.Extent
 	if base != nil {
-		baseName = strings.TrimPrefix(base.LvolBdevName, pool.LVSName+"/")
+		extents, err = s.dp.ChangedBlocks(r.Context(), pool, base, target)
+	} else {
+		extents, err = s.dp.AllocatedBlocks(r.Context(), pool, target)
 	}
-	layers := []string{target.UUID}
-	reachedBase := false
-	for cur := target.UUID; ; {
-		parent, err := s.spdk.BdevLvolParent(ctx, cur)
-		if err != nil {
-			writeError(w, fmt.Errorf("snapshot chain of %s: %w", target.ID, err))
-			return
-		}
-		if parent == "" {
-			break
-		}
-		if base != nil && parent == baseName {
-			reachedBase = true
-			break
-		}
-		if len(layers) >= 4096 {
-			writeError(w, fmt.Errorf("snapshot chain of %s is longer than 4096 layers", target.ID))
-			return
-		}
-		cur = pool.LVSName + "/" + parent
-		layers = append(layers, cur)
-	}
-	if base != nil && !reachedBase {
-		writeError(w, fmt.Errorf("%w: snapshot %s is not older than %s in its chain", store.ErrInvalidArgument, base.ID, target.ID))
+	if err != nil {
+		writeError(w, err)
 		return
-	}
-	var extentSets [][]spdk.BlockExtent
-	for _, layer := range layers {
-		frag, err := s.spdk.BdevLvolGetFragmap(ctx, layer)
-		if err != nil {
-			writeError(w, err)
-			return
-		}
-		ext, err := spdk.DecodeFragmapExtents(frag, target.SizeBytes)
-		if err != nil {
-			writeError(w, fmt.Errorf("fragmap of %s: %w", layer, err))
-			return
-		}
-		extentSets = append(extentSets, ext)
 	}
 	resp := map[string]any{
 		"snapshot_id":        target.ID,
 		"volume_size_bytes":  target.SizeBytes,
 		"cluster_size_bytes": pool.ClusterSizeBytes,
-		"extents":            formatBlockExtents(spdk.MergeBlockExtents(extentSets...)),
+		"extents":            formatBlockExtents(extents),
 	}
 	if base != nil {
 		resp["base_snapshot_id"] = base.ID
@@ -916,10 +874,10 @@ func (s *Server) deleteSnapshot(ctx context.Context, snap *store.Snapshot) error
 	if err != nil || deferred {
 		return err
 	}
-	if err := s.requireSPDK(); err != nil {
+	if err := s.requireDataPlane(); err != nil {
 		return err
 	}
-	if err := s.spdk.BdevLvolDelete(ctx, snap.UUID); err != nil && !spdk.IsNotFound(err) {
+	if err := s.dp.DeleteVolume(ctx, snap.UUID); err != nil && !dataplane.IsNotFound(err) {
 		return fmt.Errorf("delete snapshot lvol: %w", err)
 	}
 	if err := s.store.DeleteSnapshot(snap.ID); err != nil {
@@ -936,17 +894,14 @@ func (s *Server) deleteSnapshot(ctx context.Context, snap *store.Snapshot) error
 // timeouts (30 s for Linux NVMe/TCP and iSCSI).
 const groupSnapshotQuiesceTimeout = 5 * time.Second
 
-// groupSnapshotError explains SPDK's group snapshot failures that callers can act on.
+// groupSnapshotError explains the group snapshot failures that callers can act on.
 func groupSnapshotError(err error) error {
-	var rpcErr *spdk.RPCError
-	if errors.As(err, &rpcErr) {
-		switch rpcErr.Code {
-		case -110: // ETIMEDOUT: no snapshot was taken
-			return fmt.Errorf("%w: I/O to the volumes didn't pause within %s (a disk may be slow); no snapshot was taken, try again: %v",
-				errDataPlaneUnavailable, groupSnapshotQuiesceTimeout, err)
-		case -32601: // method not found: an SPDK without patch 0003
-			return fmt.Errorf("%w: this data plane can't take group snapshots: %v", errDataPlaneUnavailable, err)
-		}
+	switch {
+	case errors.Is(err, dataplane.ErrQuiesceTimeout): // no snapshot was taken
+		return fmt.Errorf("%w: I/O to the volumes didn't pause within %s (a disk may be slow); no snapshot was taken, try again: %v",
+			errDataPlaneUnavailable, groupSnapshotQuiesceTimeout, err)
+	case errors.Is(err, dataplane.ErrUnsupported):
+		return fmt.Errorf("%w: this data plane can't take group snapshots: %v", errDataPlaneUnavailable, err)
 	}
 	return fmt.Errorf("group snapshot: %w", err)
 }
@@ -1012,12 +967,12 @@ func (s *Server) handleCreateVolumeGroupSnapshot(w http.ResponseWriter, r *http.
 		}
 		targets = append(targets, target{vol, pool})
 	}
-	if len(targets) > spdk.MaxSnapshotGroup {
-		writeError(w, fmt.Errorf("%w: a group snapshot can cover at most %d volumes", store.ErrInvalidArgument, spdk.MaxSnapshotGroup))
+	if err := s.requireDataPlane(); err != nil {
+		writeError(w, err)
 		return
 	}
-	if err := s.requireSPDK(); err != nil {
-		writeError(w, err)
+	if max := s.dp.MaxSnapshotGroup(); len(targets) > max {
+		writeError(w, fmt.Errorf("%w: a group snapshot can cover at most %d volumes", store.ErrInvalidArgument, max))
 		return
 	}
 
@@ -1032,7 +987,7 @@ func (s *Server) handleCreateVolumeGroupSnapshot(w http.ResponseWriter, r *http.
 		}
 	}()
 	snaps := make([]*store.Snapshot, 0, len(targets))
-	entries := make([]spdk.SnapshotGroupEntry, 0, len(targets))
+	entries := make([]dataplane.GroupEntry, 0, len(targets))
 	for _, t := range targets {
 		held, err := s.lvolHeldBytes(ctx, t.vol.UUID)
 		if err != nil {
@@ -1055,17 +1010,17 @@ func (s *Server) handleCreateVolumeGroupSnapshot(w http.ResponseWriter, r *http.
 			SizeBytes:      t.vol.SizeBytes,
 			AllocatedBytes: held,
 		})
-		entries = append(entries, spdk.SnapshotGroupEntry{LvolName: t.vol.UUID, SnapshotName: id})
+		entries = append(entries, dataplane.GroupEntry{Volume: t.vol.UUID, Snapshot: id})
 	}
 
-	// One SPDK call pauses I/O to every member (hosts' writes wait, nothing fails), snapshots
+	// The data plane pauses I/O to every member (hosts' writes wait, nothing fails), snapshots
 	// them all at that instant and resumes I/O, so the snapshots are consistent with each other
 	// whether or not hosts are writing (docs/review-history.md P1-15, SPDK patch 0003).
-	uuids, err := s.spdk.BdevLvolSnapshotGroup(ctx, entries, groupSnapshotQuiesceTimeout)
+	uuids, err := s.dp.SnapshotGroup(ctx, entries, groupSnapshotQuiesceTimeout)
 	if err != nil {
-		// SPDK stops at the first failed snapshot and may leave earlier ones; remove them.
+		// It may stop at the first failed snapshot and leave earlier ones; remove them.
 		for _, sn := range snaps {
-			_ = s.spdk.BdevLvolDelete(cleanup, sn.LvolBdevName)
+			_ = s.dp.DeleteVolume(cleanup, sn.LvolBdevName)
 		}
 		writeError(w, groupSnapshotError(err))
 		return
@@ -1076,7 +1031,7 @@ func (s *Server) handleCreateVolumeGroupSnapshot(w http.ResponseWriter, r *http.
 	rollback := func(err error) {
 		for _, sn := range snaps {
 			_ = s.store.DeleteSnapshot(sn.ID)
-			_ = s.spdk.BdevLvolDelete(cleanup, sn.UUID)
+			_ = s.dp.DeleteVolume(cleanup, sn.UUID)
 		}
 		writeError(w, err)
 	}
@@ -1163,7 +1118,7 @@ func (s *Server) handleCreateExport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// The export name is embedded in the default NQN / IQN.
-	if err := spdk.ValidateObjectName(req.Name); err != nil {
+	if err := dataplane.ValidateObjectName(req.Name); err != nil {
 		writeError(w, fmt.Errorf("%w: export %v", store.ErrInvalidArgument, err))
 		return
 	}
@@ -1243,7 +1198,7 @@ func (s *Server) handleCreateExport(w http.ResponseWriter, r *http.Request) {
 		writeError(w, fmt.Errorf("%w: %v", store.ErrInvalidArgument, err))
 		return
 	}
-	if err := s.requireSPDK(); err != nil {
+	if err := s.requireDataPlane(); err != nil {
 		writeError(w, err)
 		return
 	}
@@ -1252,9 +1207,9 @@ func (s *Server) handleCreateExport(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
-	if err := dataplane.EnsureExport(r.Context(), s.spdk, s.store, exp, vol); err != nil {
+	if err := dataplane.EnsureExport(r.Context(), s.dp, s.store, exp, vol); err != nil {
 		cleanup := context.WithoutCancel(r.Context())
-		_ = dataplane.RemoveExport(cleanup, s.spdk, exp)
+		_ = dataplane.RemoveExport(cleanup, s.dp, exp)
 		_ = s.store.DeleteExport(exp.ID)
 		writeError(w, err)
 		return
@@ -1269,11 +1224,11 @@ func (s *Server) handleDeleteExport(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
-	if err := s.requireSPDK(); err != nil {
+	if err := s.requireDataPlane(); err != nil {
 		writeError(w, err)
 		return
 	}
-	if err := dataplane.RemoveExport(r.Context(), s.spdk, exp); err != nil {
+	if err := dataplane.RemoveExport(r.Context(), s.dp, exp); err != nil {
 		writeError(w, err)
 		return
 	}

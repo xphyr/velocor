@@ -6,7 +6,7 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/velocor/velocor/internal/spdk"
+	"github.com/velocor/velocor/internal/dataplane"
 	"github.com/velocor/velocor/internal/store"
 )
 
@@ -88,10 +88,10 @@ func (s *Server) handleDeleteVolume(w http.ResponseWriter, r *http.Request) {
 
 // purgeVolume deletes a volume's lvol and record for good.
 func (s *Server) purgeVolume(ctx context.Context, vol *store.Volume) error {
-	if err := s.requireSPDK(); err != nil {
+	if err := s.requireDataPlane(); err != nil {
 		return err
 	}
-	if err := s.spdk.BdevLvolDelete(ctx, vol.UUID); err != nil && !spdk.IsNotFound(err) {
+	if err := s.dp.DeleteVolume(ctx, vol.UUID); err != nil && !dataplane.IsNotFound(err) {
 		return fmt.Errorf("delete lvol: %w", err)
 	}
 	if err := s.store.DeleteVolume(vol.ID); err != nil {
