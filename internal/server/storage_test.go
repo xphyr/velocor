@@ -43,7 +43,7 @@ func newHarness(t *testing.T) *harness {
 	}
 	clearMustChange(t, st)
 	rec := reconciler.New(st, spdkplane.New(f.Client(), nil), nil, nil)
-	rec.SetSPDKInstance(func() string { return "" }) // not whatever spdk_tgt runs on this machine
+	rec.SetDataPlaneInstance(func() string { return "" }) // not whatever spdk_tgt runs on this machine
 	srv := New(st, spdkplane.New(f.Client(), nil), nil, authMgr, rec, nil)
 	srv.os.reboot = func() { t.Log("reboot requested (fake)") } // never the real one
 	h := &harness{t: t, st: st, fake: f, srv: srv, rec: rec, ts: httptest.NewServer(srv.Handler())}
@@ -134,10 +134,10 @@ func TestStorageEndToEndAndCBT(t *testing.T) {
 	// 64 KiB clusters: the extents below are checked at that granularity.
 	h.expect(h.do("POST", "/api/v1/disks/nvme-data1:claim", h.admin, nil))(http.StatusOK)
 	poolID := field(h.expect(h.do("POST", "/api/v1/pools", h.admin, map[string]any{
-		"name": "pool0", "raid_level": "RAID0", "disk_ids": []string{"nvme-data1"}, "cluster_size_bytes": 65536,
+		"name": "pool0", "raid_level": "RAID0", "disk_ids": []string{"nvme-data1"}, "chunk_size_bytes": 65536,
 	}))(http.StatusCreated), "pool", "id").(string)
 	pool, _ := h.st.GetPool(poolID)
-	if pool.LVSUUID == "" || pool.HealthStatus != store.HealthStatusOnline {
+	if pool.ThinPoolUUID == "" || pool.HealthStatus != store.HealthStatusOnline {
 		t.Fatalf("pool not fully initialised: %+v", pool)
 	}
 
@@ -224,11 +224,11 @@ func TestSnapshotNamesDoNotCollideAcrossVolumes(t *testing.T) {
 
 	sa := h.expect(h.do("POST", "/api/v1/volumes/"+a["id"].(string)+"/snapshots", h.admin, map[string]any{"name": "daily"}))(http.StatusCreated)["snapshot"].(map[string]any)
 	sb := h.expect(h.do("POST", "/api/v1/volumes/"+b["id"].(string)+"/snapshots", h.admin, map[string]any{"name": "daily"}))(http.StatusCreated)["snapshot"].(map[string]any)
-	if sa["uuid"] == "" || sb["uuid"] == "" || sa["uuid"] == sb["uuid"] || sa["lvol_bdev_name"] == sb["lvol_bdev_name"] {
+	if sa["uuid"] == "" || sb["uuid"] == "" || sa["uuid"] == sb["uuid"] || sa["handle"] == sb["handle"] {
 		t.Fatalf("snapshots must map to distinct SPDK lvols: %v / %v", sa, sb)
 	}
 	h.expect(h.do("DELETE", "/api/v1/snapshots/"+sa["id"].(string), h.admin, nil))(http.StatusOK)
-	if !h.fake.LvolExists(sb["lvol_bdev_name"].(string)) || !h.fake.LvolExists(b["lvol_bdev_name"].(string)) {
+	if !h.fake.LvolExists(sb["handle"].(string)) || !h.fake.LvolExists(b["handle"].(string)) {
 		t.Fatalf("deleting one volume's snapshot destroyed another lvol")
 	}
 }
@@ -306,7 +306,7 @@ func TestSPDKFailuresAreNotPersisted(t *testing.T) {
 		t.Fatalf("volume record dropped although SPDK delete failed")
 	}
 	h.expect(h.do("DELETE", "/api/v1/deleted-volumes/"+volID, h.admin, nil))(http.StatusOK)
-	if h.fake.LvolExists(vol["lvol_bdev_name"].(string)) {
+	if h.fake.LvolExists(vol["handle"].(string)) {
 		t.Fatalf("lvol leaked")
 	}
 }
@@ -328,7 +328,7 @@ func TestSnapshotsOutliveSourceVolume(t *testing.T) {
 	vol := h.volume(poolID, "src", 1<<30)
 	snap := h.expect(h.do("POST", "/api/v1/volumes/"+vol["id"].(string)+"/snapshots", h.admin, map[string]any{"name": "s"}))(http.StatusCreated)["snapshot"].(map[string]any)
 	h.expect(h.do("DELETE", "/api/v1/volumes/"+vol["id"].(string), h.admin, nil))(http.StatusOK)
-	if !h.fake.LvolExists(snap["lvol_bdev_name"].(string)) {
+	if !h.fake.LvolExists(snap["handle"].(string)) {
 		t.Fatalf("snapshot lvol deleted with its source volume")
 	}
 	h.expect(h.do("POST", "/api/v1/snapshots/"+snap["id"].(string)+":clone", h.admin, map[string]any{"clone_name": "restored"}))(http.StatusCreated)
@@ -346,7 +346,7 @@ func TestGroupSnapshotWithCSIStyleName(t *testing.T) {
 		t.Fatalf("want 2 member snapshots, got %v", resp)
 	}
 	for _, s := range snaps {
-		if !h.fake.LvolExists(s.(map[string]any)["lvol_bdev_name"].(string)) {
+		if !h.fake.LvolExists(s.(map[string]any)["handle"].(string)) {
 			t.Fatalf("member snapshot missing in SPDK: %v", s)
 		}
 	}

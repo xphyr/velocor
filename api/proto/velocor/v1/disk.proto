@@ -52,7 +52,8 @@ message Disk {
   bool is_boot_device = 13;
   bool claimed = 14;
   string pool_id = 15;
-  string spdk_bdev_name = 16;
+  // The disk's handle in the data plane (SPDK bdev name, or the kernel's stable by-id/by-path link).
+  string handle = 16;
   HealthStatus health_status = 17;
   SmartHealth smart = 18;
   google.protobuf.Timestamp updated_at = 19;

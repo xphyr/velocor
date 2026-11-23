@@ -27,7 +27,7 @@ func TestReplaceFailedDiskRebuildAndRelease(t *testing.T) {
 	h.addDisk("d2", "0000:02:00.0")
 	h.addDisk("d3", "0000:03:00.0")
 	id := h.pool("p1", "RAID1", "d1", "d2")
-	raid := h.getPool(id)["base_bdev_name"].(string)
+	raid := h.getPool(id)["array_name"].(string)
 
 	h.fake.FailMedia("0000:02:00.0")
 	h.reconcile()
@@ -112,7 +112,7 @@ func TestReplaceRefusals(t *testing.T) {
 	}
 	d5, _ := h.st.GetDisk("d5")
 	d6, _ := h.st.GetDisk("d6")
-	if err := c.BdevRaidCreate(ctx, "stale", "raid1", 0, []string{d5.SPDKBdevName, d6.SPDKBdevName}, true); err != nil {
+	if err := c.BdevRaidCreate(ctx, "stale", "raid1", 0, []string{d5.Handle, d6.Handle}, true); err != nil {
 		t.Fatal(err)
 	}
 	if err := c.BdevRaidDelete(ctx, "stale", false); err != nil {

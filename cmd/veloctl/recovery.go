@@ -191,7 +191,7 @@ func runPoolImport(cfg *cliConfig, args []string) error {
 		p, _ := resp["pool"].(map[string]any)
 		from := "the copy on the pool"
 		if resp["source"] == "skeleton" {
-			from = "SPDK only (no readable copy on the pool)"
+			from = "the data plane only (no readable copy on the pool)"
 		} else if g := uint64FromAny(resp["generation"]); g > 0 {
 			from += fmt.Sprintf(" (generation %d, written %v)", g, resp["written_at"])
 		}

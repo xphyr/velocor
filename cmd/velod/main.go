@@ -179,7 +179,7 @@ func main() {
 	rec := reconciler.New(st, dp, hwMgr, logger)
 	if kp != nil {
 		// No spdk_tgt whose restart (empty again) velod must restore after.
-		rec.SetSPDKInstance(func() string { return "" })
+		rec.SetDataPlaneInstance(func() string { return "" })
 	}
 	var metaDev meta.Device
 	if *metaCopies {

@@ -59,7 +59,7 @@ func (r *Reconciler) findUnmanaged(ctx context.Context, p *pass, examined bool) 
 		o.FirstSeen = first.UTC()
 		report = append(report, o)
 		if !r.unmanagedLogged[key] {
-			r.logger.Warn("spdk_tgt holds an object Velocor doesn't manage; it is left alone",
+			r.logger.Warn("the data plane holds an object Velocor doesn't manage; it is left alone",
 				"kind", o.Kind, "name", o.Name, "uuid", o.UUID, "detail", o.Detail)
 		}
 	}
@@ -95,15 +95,15 @@ func (r *Reconciler) scanUnmanaged(ctx context.Context, examined bool) ([]Unmana
 		Targets: map[string]bool{}, Skip: map[string]bool{meta.LvolName: true},
 	}
 	for _, pl := range pools {
-		known.ThinPools[pl.LVSUUID] = true
-		known.Devices[pl.BaseBdevName], known.Devices[pl.EffectiveBdevName] = true, true
+		known.ThinPools[pl.ThinPoolUUID] = true
+		known.Devices[pl.ArrayName], known.Devices[pl.Device] = true, true
 	}
 	for _, d := range disks {
-		known.Devices[d.SPDKBdevName] = true
+		known.Devices[d.Handle] = true
 	}
 	for _, v := range volumes {
 		known.Volumes[v.UUID] = true
-		known.Devices[v.EffectiveBdevName] = true
+		known.Devices[v.Device] = true
 	}
 	for _, s := range snaps {
 		known.Volumes[s.UUID] = true

@@ -46,7 +46,7 @@ message InitiatorGroup {
   google.protobuf.Timestamp created_at = 8;
 }
 
-// Export maps a Volume's effective_bdev_name to an NVMe-oF Subsystem/Namespace or iSCSI Target/LUN.
+// Export maps a Volume's device to an NVMe-oF Subsystem/Namespace or iSCSI Target/LUN.
 message Export {
   string id = 1;
   string name = 2;

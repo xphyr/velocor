@@ -18,7 +18,7 @@ import (
 func TestImportSkeletonAfterLosingTheDatabase(t *testing.T) {
 	a, pool, vol, in := setup(t, "RAID1", 2)
 	poolID, volID := pool["id"].(string), vol["id"].(string)
-	cluster := int(pool["cluster_size_bytes"].(float64))
+	cluster := int(pool["chunk_size_bytes"].(float64))
 	first := randomData(t, cluster)
 	if err := in.write(0, first); err != nil {
 		t.Fatal(err)

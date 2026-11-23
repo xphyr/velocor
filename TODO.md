@@ -43,13 +43,15 @@ listed until then so nothing is lost if the plan changes.
     inventory) with backend-neutral types and errors; the SPDK backend is
     `internal/dataplane/spdkplane`. `server` and `reconciler` no longer import `internal/spdk`; no
     behaviour change (unit tests unchanged apart from construction, SPDK integration suite).
-  - [ ] Still SPDK-shaped outside the interface: store/API field names (`spdk_bdev_name`,
-    `lvs_uuid`, `lvol_bdev_name`, `base_bdev_name`, `cluster_size_bytes`), the status JSON's
-    `spdk` object and `spdk_version`, `/system/iostats?bdev_name=`, metric names
-    (`velocor_bdev_*`, `velocor_spdk_unmanaged_objects`); restart detection
-    (`hardware.SPDKInstance`); moved-disk matching and pool import reading SPDK RAID superblocks
-    (`hardware.ReadRaidSuperblock`); the ublk metadata device (`meta.UblkDevice`, behind
-    `meta.Device` already: the kernel backend writes an LV directly).
+  - [x] SPDK names outside the interface (**renamed outright 2026-11-23**, no users yet): store
+    and API fields `handle` (disks, volumes, snapshots), `member_uuid`, `array_name`, `device`,
+    `thin_pool_uuid`, `thin_pool_name`, `chunk_size_bytes`, `meta_volume_uuid`; the status
+    JSON's `data_plane` object (`endpoint`) and `data_plane_version`; the reconciler's
+    `data_plane_instance`; `/system/iostats?device=`; metrics `velocor_device_*{device}` and
+    `velocor_unmanaged_objects`; the proto API description. Databases and on-pool metadata
+    copies with the old keys are upgraded when read (`store.UpgradeJSON`; the P0-1 lab VM's
+    database checked). Restart detection, superblock reading and the ublk device now sit
+    behind the interface or apply to SPDK only.
   - [ ] The kernel implementation of `dataplane.Plane` on `internal/kernel`. **Started
     2026-11-23:** `internal/dataplane/kernelplane` implements every method; its integration tests
     (tag `kernelintegration`) pass on the lab VM: volume lifecycle with snapshots, exact CBT, a
@@ -115,7 +117,10 @@ listed until then so nothing is lost if the plan changes.
       90% full; alerts at 80% (warning, 10 min) and 95% (critical). Fedora VM: grown 64 ->
       116 MiB until no room, then reported;
     Then every row of the feature table (iSCSI via LIO, scrub on md, metadata copy
-  on an LV, import, CBT via `thin_delta`, metrics, alerts, veloctl/UI wording, docs).
+  on an LV, import, CBT via `thin_delta`, metrics, alerts, veloctl/UI wording, docs): all done
+  (wording: API errors, pool warnings, import results, `veloctl` and the web UI say volume, thin
+  pool, array and data plane, and SPDK only where something is SPDK's, 2026-11-23). K-2 is
+  complete; K-3 validates it.
 - [ ] **K-3. Validation:** CSI matrix on both clusters, KubeVirt, the P0-7 scenario (an
   unreadable sector on the last copy keeps the pool up), the benchmark, soak.
 - [ ] **K-4. Cutover:** remove SPDK (images, patches, client, fake, CI stage); rebuild the lab

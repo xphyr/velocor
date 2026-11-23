@@ -152,7 +152,7 @@ func (s *Server) attachAndClaim(ctx context.Context, d *store.Disk, force bool) 
 		// The kernel no longer sees the drive: switch its cache off through the data plane
 		// before anything is written to it.
 		attached := *d
-		attached.SPDKBdevName = bdev
+		attached.Handle = bdev
 		if cacheState, err = s.dp.SetNVMeWriteCache(ctx, &attached, false); err != nil {
 			_ = s.dp.DetachDisk(context.WithoutCancel(ctx), &attached)
 			if s.hw != nil {
@@ -167,7 +167,7 @@ func (s *Server) attachAndClaim(ctx context.Context, d *store.Disk, force bool) 
 	}
 	if err != nil {
 		attached := *d
-		attached.SPDKBdevName = bdev
+		attached.Handle = bdev
 		_ = s.dp.DetachDisk(context.WithoutCancel(ctx), &attached)
 		if d.Type == store.DiskTypeNVMe && s.hw != nil {
 			_ = s.hw.BindNVMeToKernel(d.PCIAddress)
@@ -206,7 +206,7 @@ func (s *Server) releaseDisk(w http.ResponseWriter, r *http.Request, id string) 
 	}
 	if d.Type == store.DiskTypeNVMe && s.hw != nil && d.PCIAddress != "" {
 		if err := s.hw.BindNVMeToKernel(d.PCIAddress); err != nil {
-			writeError(w, fmt.Errorf("disk released from SPDK but rebinding %s to the kernel nvme driver failed: %w", d.PCIAddress, err))
+			writeError(w, fmt.Errorf("disk released from the data plane but rebinding %s to the kernel nvme driver failed: %w", d.PCIAddress, err))
 			return
 		}
 	}
@@ -217,13 +217,13 @@ func (s *Server) releaseDisk(w http.ResponseWriter, r *http.Request, id string) 
 
 func (s *Server) handleCreatePool(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Name             string             `json:"name"`
-		RaidLevel        store.RaidLevel    `json:"raid_level"`
-		DiskIDs          []string           `json:"disk_ids"`
-		StripSizeKB      uint32             `json:"strip_size_kb"`
-		ClusterSizeBytes uint32             `json:"cluster_size_bytes"`
-		FilterPolicy     store.FilterPolicy `json:"filter_policy"`
-		SpacePolicy      store.SpacePolicy  `json:"space_policy"`
+		Name           string             `json:"name"`
+		RaidLevel      store.RaidLevel    `json:"raid_level"`
+		DiskIDs        []string           `json:"disk_ids"`
+		StripSizeKB    uint32             `json:"strip_size_kb"`
+		ChunkSizeBytes uint32             `json:"chunk_size_bytes"`
+		FilterPolicy   store.FilterPolicy `json:"filter_policy"`
+		SpacePolicy    store.SpacePolicy  `json:"space_policy"`
 	}
 	if err := decodeJSON(r, &req); err != nil {
 		writeError(w, err)
@@ -239,8 +239,8 @@ func (s *Server) handleCreatePool(w http.ResponseWriter, r *http.Request) {
 	if req.StripSizeKB == 0 {
 		req.StripSizeKB = 64
 	}
-	if req.ClusterSizeBytes == 0 {
-		req.ClusterSizeBytes = store.DefaultClusterSizeBytes
+	if req.ChunkSizeBytes == 0 {
+		req.ChunkSizeBytes = store.DefaultChunkSizeBytes
 	}
 	for _, err := range []error{
 		validateDisplayName("pool", req.Name),
@@ -262,29 +262,29 @@ func (s *Server) handleCreatePool(w http.ResponseWriter, r *http.Request) {
 			writeError(w, fmt.Errorf("disk %s: %w", diskID, err))
 			return
 		}
-		if !d.Claimed || d.SPDKBdevName == "" {
-			writeError(w, fmt.Errorf("%w: disk %s is not claimed by SPDK", store.ErrInvalidArgument, diskID))
+		if !d.Claimed || d.Handle == "" {
+			writeError(w, fmt.Errorf("%w: disk %s is not claimed", store.ErrInvalidArgument, diskID))
 			return
 		}
 		totalRaw += d.SizeBytes
-		baseBdevs = append(baseBdevs, d.SPDKBdevName)
+		baseBdevs = append(baseBdevs, d.Handle)
 	}
 
 	id := newResourceID("pool")
 	pool := &store.Pool{
-		ID:                id,
-		Name:              req.Name,
-		RaidLevel:         req.RaidLevel,
-		DiskIDs:           req.DiskIDs,
-		StripSizeKB:       req.StripSizeKB,
-		ClusterSizeBytes:  req.ClusterSizeBytes,
-		BaseBdevName:      "raid_" + id,
-		EffectiveBdevName: "raid_" + id,
-		LVSName:           "lvs_" + id,
-		TotalBytes:        totalRaw,
-		FreeBytes:         totalRaw,
-		FilterPolicy:      req.FilterPolicy,
-		SpacePolicy:       req.SpacePolicy,
+		ID:             id,
+		Name:           req.Name,
+		RaidLevel:      req.RaidLevel,
+		DiskIDs:        req.DiskIDs,
+		StripSizeKB:    req.StripSizeKB,
+		ChunkSizeBytes: req.ChunkSizeBytes,
+		ArrayName:      "raid_" + id,
+		Device:         "raid_" + id,
+		ThinPoolName:   "lvs_" + id,
+		TotalBytes:     totalRaw,
+		FreeBytes:      totalRaw,
+		FilterPolicy:   req.FilterPolicy,
+		SpacePolicy:    req.SpacePolicy,
 		// The reconciler leaves RECONCILING pools without an lvstore UUID alone.
 		HealthStatus:  store.HealthStatusReconciling,
 		StatusMessage: "creating",
@@ -301,34 +301,34 @@ func (s *Server) handleCreatePool(w http.ResponseWriter, r *http.Request) {
 			// The lvstore may exist even though creating it "failed" (e.g. a timeout while
 			// spdk_tgt went on and finished), and a RAID can't be deleted from under it: the
 			// delete would hang half-done. Remove the lvstore first.
-			if derr := s.dp.DeleteThinPool(cleanup, "", pool.LVSName); derr != nil && !dataplane.IsNotFound(derr) {
-				err = fmt.Errorf("%w (rollback: delete lvstore %s: %v; RAID %s left in place)", err, pool.LVSName, derr, pool.BaseBdevName)
+			if derr := s.dp.DeleteThinPool(cleanup, "", pool.ThinPoolName); derr != nil && !dataplane.IsNotFound(derr) {
+				err = fmt.Errorf("%w (rollback: delete thin pool %s: %v; array %s left in place)", err, pool.ThinPoolName, derr, pool.ArrayName)
 				_ = s.store.DeletePool(pool.ID)
 				writeError(w, err)
 				return
 			}
-			_ = s.dp.DeleteArray(cleanup, pool.BaseBdevName)
+			_ = s.dp.DeleteArray(cleanup, pool.ArrayName)
 		}
 		_ = s.store.DeletePool(pool.ID)
 		writeError(w, err)
 	}
-	if err := s.dp.CreateArray(ctx, pool.BaseBdevName, pool.RaidLevel, pool.StripSizeKB, baseBdevs); err != nil {
-		fail(false, fmt.Errorf("create raid bdev: %w", err))
+	if err := s.dp.CreateArray(ctx, pool.ArrayName, pool.RaidLevel, pool.StripSizeKB, baseBdevs); err != nil {
+		fail(false, fmt.Errorf("create the array: %w", err))
 		return
 	}
-	lvsUUID, err := s.dp.CreateThinPool(ctx, pool.EffectiveBdevName, pool.LVSName, pool.ClusterSizeBytes)
+	lvsUUID, err := s.dp.CreateThinPool(ctx, pool.Device, pool.ThinPoolName, pool.ChunkSizeBytes)
 	if err != nil {
-		fail(true, fmt.Errorf("create lvstore: %w", err))
+		fail(true, fmt.Errorf("create the thin pool: %w", err))
 		return
 	}
 	updated, err := s.store.MutatePool(pool.ID, func(p *store.Pool) error {
-		p.LVSUUID = lvsUUID
+		p.ThinPoolUUID = lvsUUID
 		p.HealthStatus, p.StatusMessage = store.HealthStatusOnline, ""
 		if stores, err := s.dp.ThinPools(ctx, "", lvsUUID); err == nil && len(stores) > 0 {
 			p.TotalBytes, p.FreeBytes = stores[0].TotalBytes, stores[0].FreeBytes
 			if stores[0].ChunkBytes > 0 {
 				// What the data plane used: the kernel one's thin pools always take 64 KiB.
-				p.ClusterSizeBytes = stores[0].ChunkBytes
+				p.ChunkSizeBytes = stores[0].ChunkBytes
 			}
 			p.AllocatedBytes = p.TotalBytes - p.FreeBytes
 		}
@@ -359,16 +359,16 @@ func (s *Server) handleDeletePool(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// SPDK treats uuid and lvs_name as mutually exclusive.
-	lvsUUID, lvsName := pool.LVSUUID, ""
+	lvsUUID, lvsName := pool.ThinPoolUUID, ""
 	if lvsUUID == "" {
-		lvsName = pool.LVSName
+		lvsName = pool.ThinPoolName
 	}
 	if err := s.dp.DeleteThinPool(r.Context(), lvsUUID, lvsName); err != nil && !dataplane.IsNotFound(err) {
-		writeError(w, fmt.Errorf("delete lvstore: %w", err))
+		writeError(w, fmt.Errorf("delete the thin pool: %w", err))
 		return
 	}
-	if err := s.dp.DeleteArray(r.Context(), pool.BaseBdevName); err != nil && !dataplane.IsNotFound(err) {
-		writeError(w, fmt.Errorf("delete raid bdev: %w", err))
+	if err := s.dp.DeleteArray(r.Context(), pool.ArrayName); err != nil && !dataplane.IsNotFound(err) {
+		writeError(w, fmt.Errorf("delete the array: %w", err))
 		return
 	}
 	if err := s.store.DeletePool(id); err != nil {
@@ -382,7 +382,7 @@ func (s *Server) handleDeletePool(w http.ResponseWriter, r *http.Request) {
 
 func poolUsable(pool *store.Pool) error {
 	switch {
-	case pool.LVSUUID == "",
+	case pool.ThinPoolUUID == "",
 		pool.HealthStatus == store.HealthStatusFaulted,
 		pool.HealthStatus == store.HealthStatusReconciling,
 		pool.HealthStatus == store.HealthStatusUnavailable: // RAID waiting for a missing disk
@@ -455,10 +455,10 @@ func (s *Server) handleCreateVolume(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer release()
-	alias := pool.LVSName + "/" + id
-	uuid, err := s.dp.CreateVolume(r.Context(), pool.LVSName, id, req.SizeBytes, req.ThinProvision)
+	alias := pool.ThinPoolName + "/" + id
+	uuid, err := s.dp.CreateVolume(r.Context(), pool.ThinPoolName, id, req.SizeBytes, req.ThinProvision)
 	if err != nil {
-		writeError(w, fmt.Errorf("create lvol: %w", err))
+		writeError(w, fmt.Errorf("create the volume: %w", err))
 		return
 	}
 	vol := &store.Volume{
@@ -466,8 +466,8 @@ func (s *Server) handleCreateVolume(w http.ResponseWriter, r *http.Request) {
 		Name:               req.Name,
 		PoolID:             req.PoolID,
 		UUID:               uuid,
-		LvolBdevName:       alias,
-		EffectiveBdevName:  alias,
+		Handle:             alias,
+		Device:             alias,
 		SizeBytes:          req.SizeBytes,
 		ThinProvision:      req.ThinProvision,
 		FilterPolicy:       req.FilterPolicy,
@@ -489,7 +489,7 @@ func (s *Server) finishVolumeCreate(w http.ResponseWriter, r *http.Request, vol 
 	}
 	if qosSet(vol.QosPolicy) {
 		q := vol.QosPolicy
-		if err := s.dp.SetQoS(r.Context(), vol.EffectiveBdevName, q); err != nil {
+		if err := s.dp.SetQoS(r.Context(), vol.Device, q); err != nil {
 			rollback(fmt.Errorf("apply QoS: %w", err))
 			return
 		}
@@ -542,7 +542,7 @@ func (s *Server) resizeVolume(w http.ResponseWriter, r *http.Request, id string)
 	}
 	defer release()
 	if err := s.dp.ResizeVolume(r.Context(), vol.UUID, req.NewSizeBytes); err != nil {
-		writeError(w, fmt.Errorf("resize lvol: %w", err))
+		writeError(w, fmt.Errorf("resize the volume: %w", err))
 		return
 	}
 	updated, err := s.store.MutateVolume(id, func(v *store.Volume) error {
@@ -575,7 +575,7 @@ func (s *Server) handleSetVolumeQoS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	q := req.QosPolicy
-	if err := s.dp.SetQoS(r.Context(), vol.EffectiveBdevName, q); err != nil {
+	if err := s.dp.SetQoS(r.Context(), vol.Device, q); err != nil {
 		writeError(w, fmt.Errorf("apply QoS: %w", err))
 		return
 	}
@@ -667,7 +667,7 @@ func (s *Server) takeSnapshot(ctx context.Context, vol *store.Volume, pool *stor
 		VolumeID:       vol.ID,
 		PoolID:         pool.ID,
 		UUID:           uuid,
-		LvolBdevName:   pool.LVSName + "/" + id,
+		Handle:         pool.ThinPoolName + "/" + id,
 		SizeBytes:      vol.SizeBytes,
 		AllocatedBytes: held,
 	}, release, nil
@@ -735,27 +735,27 @@ func (s *Server) cloneSnapshot(w http.ResponseWriter, r *http.Request, snapID st
 		return
 	}
 	defer release()
-	alias := pool.LVSName + "/" + id
+	alias := pool.ThinPoolName + "/" + id
 	uuid, err := s.dp.Clone(r.Context(), snap.UUID, id)
 	if err != nil {
 		writeError(w, fmt.Errorf("clone snapshot %s: %w", snap.ID, err))
 		return
 	}
 	clone := &store.Volume{
-		ID:                id,
-		Name:              req.CloneName,
-		PoolID:            pool.ID,
-		UUID:              uuid,
-		LvolBdevName:      alias,
-		EffectiveBdevName: alias,
-		SizeBytes:         snap.SizeBytes,
-		ThinProvision:     true,
-		ParentSnapshotID:  snap.ID,
-		FilterPolicy:      req.FilterPolicy,
-		QosPolicy:         req.QosPolicy,
-		AttachmentState:   store.AttachmentStateUnattached,
-		HealthStatus:      store.HealthStatusOnline,
-		Labels:            req.Labels,
+		ID:               id,
+		Name:             req.CloneName,
+		PoolID:           pool.ID,
+		UUID:             uuid,
+		Handle:           alias,
+		Device:           alias,
+		SizeBytes:        snap.SizeBytes,
+		ThinProvision:    true,
+		ParentSnapshotID: snap.ID,
+		FilterPolicy:     req.FilterPolicy,
+		QosPolicy:        req.QosPolicy,
+		AttachmentState:  store.AttachmentStateUnattached,
+		HealthStatus:     store.HealthStatusOnline,
+		Labels:           req.Labels,
 	}
 	s.finishVolumeCreate(w, r, clone, http.StatusCreated)
 }
@@ -823,10 +823,10 @@ func (s *Server) handleSnapshotBlocks(w http.ResponseWriter, r *http.Request, ta
 		return
 	}
 	resp := map[string]any{
-		"snapshot_id":        target.ID,
-		"volume_size_bytes":  target.SizeBytes,
-		"cluster_size_bytes": pool.ClusterSizeBytes,
-		"extents":            formatBlockExtents(extents),
+		"snapshot_id":       target.ID,
+		"volume_size_bytes": target.SizeBytes,
+		"chunk_size_bytes":  pool.ChunkSizeBytes,
+		"extents":           formatBlockExtents(extents),
 	}
 	if base != nil {
 		resp["base_snapshot_id"] = base.ID
@@ -860,7 +860,7 @@ func (s *Server) deleteSnapshot(ctx context.Context, snap *store.Snapshot) error
 		return err
 	}
 	if err := s.dp.DeleteVolume(ctx, snap.UUID); err != nil && !dataplane.IsNotFound(err) {
-		return fmt.Errorf("delete snapshot lvol: %w", err)
+		return fmt.Errorf("delete the snapshot: %w", err)
 	}
 	if err := s.store.DeleteSnapshot(snap.ID); err != nil {
 		return err
@@ -988,7 +988,7 @@ func (s *Server) handleCreateVolumeGroupSnapshot(w http.ResponseWriter, r *http.
 			Name:           req.Name + "-" + t.vol.ID,
 			VolumeID:       t.vol.ID,
 			PoolID:         t.pool.ID,
-			LvolBdevName:   t.pool.LVSName + "/" + id,
+			Handle:         t.pool.ThinPoolName + "/" + id,
 			SizeBytes:      t.vol.SizeBytes,
 			AllocatedBytes: held,
 		})
@@ -1002,7 +1002,7 @@ func (s *Server) handleCreateVolumeGroupSnapshot(w http.ResponseWriter, r *http.
 	if err != nil {
 		// It may stop at the first failed snapshot and leave earlier ones; remove them.
 		for _, sn := range snaps {
-			_ = s.dp.DeleteVolume(cleanup, sn.LvolBdevName)
+			_ = s.dp.DeleteVolume(cleanup, sn.Handle)
 		}
 		writeError(w, groupSnapshotError(err))
 		return

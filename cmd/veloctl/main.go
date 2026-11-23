@@ -496,12 +496,12 @@ func runSystem(cfg *cliConfig, args []string) error {
 			return printJSON(resp)
 		}
 		node, _ := resp["node"].(map[string]any)
-		spdkSt, _ := resp["spdk"].(map[string]any)
+		spdkSt, _ := resp["data_plane"].(map[string]any)
 		recSt, _ := resp["reconciler"].(map[string]any)
 		fmt.Printf("Overall Health:     %v\n", resp["overall_health"])
 		fmt.Printf("Node ID / Hostname: %v (%v)\n", node["node_id"], node["hostname"])
 		fmt.Printf("Velocor Version:    %v (commit %v)\n", node["version"], node["commit"])
-		fmt.Printf("SPDK Connected:     %v (version %v, socket %v)\n", spdkSt["connected"], node["spdk_version"], spdkSt["socket_path"])
+		fmt.Printf("Data plane:         connected %v (%v, %v)\n", spdkSt["connected"], node["data_plane_version"], spdkSt["endpoint"])
 		fmt.Printf("Hugepages (MiB):    %v total / %v free\n", spdkSt["hugepages_total_mb"], spdkSt["hugepages_free_mb"])
 		fmt.Printf("Drift Repaired:     %v\n", recSt["drift_repaired_count"])
 		if degraded, _ := recSt["degraded_resources"].([]any); len(degraded) > 0 {
@@ -511,7 +511,7 @@ func runSystem(cfg *cliConfig, args []string) error {
 			fmt.Printf("WARNING: %v\n", w)
 		}
 		if objs := sliceOfMaps(recSt["unmanaged_objects"]); len(objs) > 0 {
-			fmt.Println("\nIn spdk_tgt, not managed by Velocor (left alone):")
+			fmt.Println("\nIn the data plane, not managed by Velocor (left alone):")
 			tw := newTabWriter()
 			fmt.Fprintln(tw, "KIND\tNAME\tUUID\tDETAILS\tSINCE")
 			for _, o := range objs {
@@ -810,18 +810,18 @@ func runPool(cfg *cliConfig, args []string) error {
 		name := fs.String("name", "", "Pool name")
 		raid := fs.String("raid", "RAID0", "RAID level: RAID0 | RAID1 (RAID10 is not supported yet)")
 		disksCSV := fs.String("disks", "", "Comma-separated disk IDs")
-		clusterSz := fs.Uint("cluster-size", 1<<20, "SPDK lvol_store cluster size in bytes (default 1 MiB; smaller clusters mean much more metadata and slower recovery)")
+		clusterSz := fs.Uint("chunk-size", 1<<20, "Thin allocation unit in bytes (SPDK: the lvstore cluster, default 1 MiB; the kernel data plane always uses 64 KiB)")
 		policy := spacePolicyFlags(fs)
 		_ = fs.Parse(args[1:])
 		if *name == "" || *disksCSV == "" {
 			return fmt.Errorf("--name and --disks are required")
 		}
 		resp, err := cfg.request("POST", "/api/v1/pools", map[string]any{
-			"name":               *name,
-			"raid_level":         strings.ToUpper(*raid),
-			"disk_ids":           strings.Split(*disksCSV, ","),
-			"cluster_size_bytes": *clusterSz,
-			"space_policy":       policy(),
+			"name":             *name,
+			"raid_level":       strings.ToUpper(*raid),
+			"disk_ids":         strings.Split(*disksCSV, ","),
+			"chunk_size_bytes": *clusterSz,
+			"space_policy":     policy(),
 		})
 		if err != nil {
 			return err
@@ -841,7 +841,7 @@ func runPool(cfg *cliConfig, args []string) error {
 		}
 		p, _ := resp["pool"].(map[string]any)
 		fmt.Printf("Pool:    %v (%v)\n", p["name"], p["id"])
-		fmt.Printf("RAID:    %v on %v\n", p["raid_level"], p["base_bdev_name"])
+		fmt.Printf("RAID:    %v on %v\n", p["raid_level"], p["array_name"])
 		fmt.Printf("Health:  %v %v\n", p["health_status"], strOrEmpty(p["status_message"]))
 		fmt.Printf("Size:    %s total, %s free\n", humanBytes(uint64FromAny(p["total_bytes"])), humanBytes(uint64FromAny(p["free_bytes"])))
 		sp, _ := p["space_policy"].(map[string]any)
@@ -1027,7 +1027,7 @@ func runVolume(cfg *cliConfig, args []string) error {
 		for _, v := range sliceOfMaps(resp["volumes"]) {
 			fmt.Fprintf(tw, "%v\t%v\t%v\t%s\t%s\t%v\t%v\t%v\t%v\n",
 				v["id"], v["name"], v["pool_id"], humanBytes(uint64FromAny(v["size_bytes"])), humanBytes(uint64FromAny(v["allocated_bytes"])),
-				v["thin_provision"], v["attachment_state"], v["effective_bdev_name"], v["health_status"])
+				v["thin_provision"], v["attachment_state"], v["device"], v["health_status"])
 		}
 		return tw.Flush()
 
@@ -2131,6 +2131,6 @@ func printBlocks(cfg *cliConfig, resp map[string]any, what string) error {
 		return err
 	}
 	fmt.Printf("%d ranges, %d bytes %s, of a %d-byte volume (%d-byte clusters)\n", len(ext), total, what,
-		uint64FromAny(resp["volume_size_bytes"]), uint64FromAny(resp["cluster_size_bytes"]))
+		uint64FromAny(resp["volume_size_bytes"]), uint64FromAny(resp["chunk_size_bytes"]))
 	return nil
 }

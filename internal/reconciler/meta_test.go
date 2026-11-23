@@ -18,12 +18,12 @@ func TestMetaCopyWrittenOnChangeOnly(t *testing.T) {
 
 	e.reconcile()
 	p := e.pool()
-	if p.MetaLvolUUID == "" || p.MetaGeneration != 1 || p.MetaHash == "" || p.MetaError != "" {
-		t.Fatalf("after the first pass: lvol %q gen %d hash %q err %q", p.MetaLvolUUID, p.MetaGeneration, p.MetaHash, p.MetaError)
+	if p.MetaVolumeUUID == "" || p.MetaGeneration != 1 || p.MetaHash == "" || p.MetaError != "" {
+		t.Fatalf("after the first pass: lvol %q gen %d hash %q err %q", p.MetaVolumeUUID, p.MetaGeneration, p.MetaHash, p.MetaError)
 	}
 	read := func() *meta.Manifest {
 		t.Helper()
-		slots, _ := dev.ReadSlots(e.ctx, p.MetaLvolUUID)
+		slots, _ := dev.ReadSlots(e.ctx, p.MetaVolumeUUID)
 		m, err := meta.Newest(slots...)
 		if err != nil {
 			t.Fatal(err)
@@ -55,7 +55,7 @@ func TestMetaCopyWrittenOnChangeOnly(t *testing.T) {
 		t.Fatal(err)
 	}
 	e.reconcile()
-	dev.Corrupt(p.MetaLvolUUID, meta.SlotFor(3))
+	dev.Corrupt(p.MetaVolumeUUID, meta.SlotFor(3))
 	if m := read(); m.Generation != 2 {
 		t.Fatalf("after a torn generation 3: read generation %d, want 2", m.Generation)
 	}
@@ -91,7 +91,7 @@ func TestMetaGenerationNeverGoesBackwards(t *testing.T) {
 	m, _ := meta.Build(e.st, p.ID, "node-1", "test")
 	m.Generation = 7
 	img, _ := meta.EncodeSlot(m)
-	if err := dev.WriteSlot(e.ctx, p.MetaLvolUUID, meta.SlotFor(7), img); err != nil {
+	if err := dev.WriteSlot(e.ctx, p.MetaVolumeUUID, meta.SlotFor(7), img); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := e.st.MutatePool(p.ID, func(c *store.Pool) error { c.Name = "restored"; return nil }); err != nil {

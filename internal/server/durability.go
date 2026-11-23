@@ -75,7 +75,7 @@ func (s *Server) handleUpdateDisk(w http.ResponseWriter, r *http.Request) {
 // recorded, and applied when it is claimed.
 func (s *Server) applyWriteCachePolicy(ctx context.Context, d *store.Disk) (store.WriteCacheState, error) {
 	if d.Type == store.DiskTypeNVMe {
-		if !d.Claimed || d.SPDKBdevName == "" {
+		if !d.Claimed || d.Handle == "" {
 			return d.WriteCache, nil
 		}
 		if err := s.requireDataPlane(); err != nil {

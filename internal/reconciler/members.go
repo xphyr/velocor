@@ -48,8 +48,8 @@ func (r *Reconciler) viewRaid(ctx context.Context, pool *store.Pool, rb *datapla
 	diskByID := map[string]*store.Disk{}
 	for _, d := range disks {
 		diskByID[d.ID] = d
-		if d.SPDKBdevName != "" {
-			diskByBdev[d.SPDKBdevName] = d
+		if d.Handle != "" {
+			diskByBdev[d.Handle] = d
 		}
 	}
 	v := raidView{health: store.HealthStatusOnline}
@@ -75,10 +75,10 @@ func (r *Reconciler) viewRaid(ctx context.Context, pool *store.Pool, rb *datapla
 			// rebuild was interrupted (restart) or its disk failed. Re-add it if it's here.
 			m.State = store.MemberStateFailed
 			d := diskByID[m.DiskID]
-			if _, present := bdevs[bdevName(d)]; d == nil || !present || inRaid(raids, d.SPDKBdevName) {
+			if _, present := bdevs[bdevName(d)]; d == nil || !present || inRaid(raids, d.Handle) {
 				break
 			}
-			if err := r.dp.AddMember(ctx, rb.Name, d.SPDKBdevName); err != nil {
+			if err := r.dp.AddMember(ctx, rb.Name, d.Handle); err != nil {
 				v.reasons = append(v.reasons, fmt.Sprintf("restarting the rebuild of %s failed: %v", diskLabel(d.ID), err))
 				break
 			}
@@ -133,7 +133,7 @@ func bdevName(d *store.Disk) string {
 	if d == nil {
 		return ""
 	}
-	return d.SPDKBdevName
+	return d.Handle
 }
 
 func membersEqual(a, b []store.PoolMember) bool { return slices.Equal(a, b) }

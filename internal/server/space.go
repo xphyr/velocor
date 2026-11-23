@@ -94,10 +94,10 @@ func (s *Server) reserveSpace(ctx context.Context, poolID string, delta uint64,
 // refreshFree updates the pool copy with the thin pool's current size and free space from the
 // data plane (the stored values are as old as the last reconciler pass). Best effort.
 func (s *Server) refreshFree(ctx context.Context, pool *store.Pool) {
-	if s.dp == nil || pool.LVSUUID == "" {
+	if s.dp == nil || pool.ThinPoolUUID == "" {
 		return
 	}
-	stores, err := s.dp.ThinPools(ctx, "", pool.LVSUUID)
+	stores, err := s.dp.ThinPools(ctx, "", pool.ThinPoolUUID)
 	if err != nil || len(stores) != 1 {
 		return
 	}
@@ -148,7 +148,7 @@ func (s *Server) lvolHeldBytes(ctx context.Context, uuid string) (uint64, error)
 			return l.AllocatedBytes, nil
 		}
 	}
-	return 0, fmt.Errorf("%w: lvol %s", store.ErrNotFound, uuid)
+	return 0, fmt.Errorf("%w: volume %s", store.ErrNotFound, uuid)
 }
 
 // handleUpdatePool changes a pool's space policy: PATCH /api/v1/pools/{id} {space_policy}; only

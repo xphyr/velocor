@@ -50,7 +50,7 @@ alerts reach anyone (after velod has been up for 15 minutes).
 
 ## Health endpoints
 
-`GET /healthz` (velod is serving) and `GET /readyz` (velod's database and spdk_tgt answer) need
+`GET /healthz` (velod is serving) and `GET /readyz` (velod's database and the data plane answer) need
 no token and answer only `ok` (200) or `not ready` (503), for load balancers, uptime checks and
 container health. The velod quadlet runs `velod healthcheck` every 30 seconds and restarts a
 velod that stops answering.
@@ -93,7 +93,7 @@ selector plus an `Endpoints` and a `ServiceMonitor`) with `job: velocor`, the to
 | Alert | Severity | Fires when |
 |---|---|---|
 | `VelocorDown` | critical | The appliance's `/metrics` can't be scraped for 2 minutes |
-| `VelocorDataPlaneDown` | critical | spdk_tgt doesn't answer velod for 2 minutes |
+| `VelocorDataPlaneDown` | critical | The data plane doesn't answer velod for 2 minutes |
 | `VelocorPoolFaulted` | critical | A pool is FAULTED, OFFLINE or UNAVAILABLE (not served) |
 | `VelocorPoolDegraded` | critical | A pool has lost redundancy for 5 minutes |
 | `VelocorPoolSpaceCritical` | critical | A pool is at CRITICAL: new volumes and growth are refused |
@@ -137,13 +137,13 @@ ends and a new one starts.
 |---|---|---|
 | `velocor_up` | | velod answers (always 1 when scraped) |
 | `velocor_build_info` | `version` | velod's version |
-| `velocor_dataplane_up` | | spdk_tgt answers velod |
+| `velocor_dataplane_up` | | The data plane answers velod |
 | `velocor_status_warnings` | | Warnings on the status page |
 | `velocor_reconciler_last_run_timestamp_seconds` | | Last completed reconciler pass |
 | `velocor_reconciler_last_run_failed` | | The last pass ended with an error |
 | `velocor_reconciler_degraded_resources` | | Resources reported as degraded |
 | `velocor_reconciler_drift_repaired_total` | | Resources repaired so far |
-| `velocor_spdk_unmanaged_objects` | `kind` | Objects in SPDK no record accounts for |
+| `velocor_unmanaged_objects` | `kind` | Objects in the data plane no record accounts for |
 | `velocor_backup_last_timestamp_seconds` | `kind` | Newest database backup of a kind |
 | `velocor_pool_health` | `pool`, `status` | Pool health |
 | `velocor_pool_members` | `pool`, `state` | RAID members by state (ACTIVE, REBUILDING, FAILED, MISSING) |
@@ -173,4 +173,4 @@ ends and a new one starts.
 | `velocor_{pool,volume,disk}_{read,write}_ops_total` | `pool` / `volume`, `pool` / `disk`, `pool` | Completed I/Os |
 | `velocor_{pool,volume,disk}_{read,written,unmapped}_bytes_total` | as above | Bytes read, written, unmapped |
 | `velocor_{pool,volume,disk}_{read,write}_seconds_total` | as above | Time spent on I/O; `rate(..._read_seconds_total) / rate(..._read_ops_total)` is the average read latency |
-| `velocor_bdev_{read,write}_ops_total` | `bdev` | Raw per-bdev counters for every SPDK bdev |
+| `velocor_device_{read,write}_ops_total` | `device` | Raw per-device counters for every data plane device |

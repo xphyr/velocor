@@ -35,7 +35,7 @@ func (a *appliance) failDisk(id string) {
 	if d.DriverState == store.DiskDriverStateAIOClaimed {
 		del = a.tg.client().BdevAioDelete
 	}
-	if err := del(context.Background(), d.SPDKBdevName); err != nil {
+	if err := del(context.Background(), d.Handle); err != nil {
 		a.t.Fatalf("hot-remove %s (%s): %v", id, d.DriverState, err)
 	}
 }

@@ -17,7 +17,7 @@ func (r *Reconciler) nvmeWriteCache(ctx context.Context, p *pass) {
 		return // reported by the other steps of the pass
 	}
 	for _, d := range disks {
-		if d.Type != store.DiskTypeNVMe || !d.Claimed || d.IsBootDevice || d.SPDKBdevName == "" {
+		if d.Type != store.DiskTypeNVMe || !d.Claimed || d.IsBootDevice || d.Handle == "" {
 			continue
 		}
 		state, err := r.dp.NVMeWriteCache(ctx, d)

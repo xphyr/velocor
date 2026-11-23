@@ -31,10 +31,10 @@ message Volume {
   string name = 2;
   string pool_id = 3;
   string uuid = 4;
-  // Raw SPDK lvol bdev alias (e.g., "<lvs_name>/<vol_name>").
-  string lvol_bdev_name = 5;
-  // Top-level bdev name exposed to exports after optional crypto/compress filter wrapping.
-  string effective_bdev_name = 6;
+  // The volume's name in the data plane ("<thin pool>/<volume id>").
+  string handle = 5;
+  // The device the exports serve (the volume itself, or a filter over it).
+  string device = 6;
   uint64 size_bytes = 7;
   uint64 allocated_bytes = 8;
   bool thin_provision = 9;
@@ -55,7 +55,7 @@ message Snapshot {
   string volume_id = 3;
   string pool_id = 4;
   string uuid = 5;
-  string lvol_bdev_name = 6;
+  string handle = 6;
   uint64 size_bytes = 7;
   uint64 allocated_bytes = 8;
   string parent_snapshot_id = 9;
@@ -177,7 +177,7 @@ message GetSnapshotAllocatedBlocksRequest {
 message GetSnapshotAllocatedBlocksResponse {
   string snapshot_id = 1;
   uint64 volume_size_bytes = 2;
-  uint32 cluster_size_bytes = 3;
+  uint32 chunk_size_bytes = 3;
   repeated BlockExtent extents = 4;
   uint64 next_offset_bytes = 5;
 }
@@ -193,7 +193,7 @@ message GetSnapshotChangedBlocksResponse {
   string base_snapshot_id = 1;
   string target_snapshot_id = 2;
   uint64 volume_size_bytes = 3;
-  uint32 cluster_size_bytes = 4;
+  uint32 chunk_size_bytes = 4;
   repeated BlockExtent extents = 5;
   uint64 next_offset_bytes = 6;
 }

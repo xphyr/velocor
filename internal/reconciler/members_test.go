@@ -68,17 +68,17 @@ func TestRebuildProgressAndCompletion(t *testing.T) {
 	if _, err := e.st.ReplacePoolMember(pool.ID, 1, spare.ID); err != nil {
 		t.Fatal(err)
 	}
-	if err := e.fake.Client().BdevRaidAddBaseBdev(e.ctx, pool.BaseBdevName, spare.SPDKBdevName); err != nil {
+	if err := e.fake.Client().BdevRaidAddBaseBdev(e.ctx, pool.ArrayName, spare.Handle); err != nil {
 		t.Fatal(err)
 	}
-	e.fake.SetRebuildProgress(pool.BaseBdevName, 37)
+	e.fake.SetRebuildProgress(pool.ArrayName, 37)
 	e.reconcile()
 	p := e.pool()
 	if p.HealthStatus != store.HealthStatusRebuilding || p.Members[1].RebuildPercent != 37 || p.Members[1].DiskID != "disk-c" {
 		t.Fatalf("during rebuild: %s %q %+v", p.HealthStatus, p.StatusMessage, p.Members)
 	}
 
-	e.fake.SetRebuildProgress(pool.BaseBdevName, 100)
+	e.fake.SetRebuildProgress(pool.ArrayName, 100)
 	e.reconcile()
 	p = e.pool()
 	if p.HealthStatus != store.HealthStatusOnline || p.Members[1].State != store.MemberStateActive {
@@ -98,10 +98,10 @@ func TestInterruptedRebuildIsRestarted(t *testing.T) {
 	if _, err := e.st.ReplacePoolMember(pool.ID, 1, spare.ID); err != nil {
 		t.Fatal(err)
 	}
-	if err := e.fake.Client().BdevRaidAddBaseBdev(e.ctx, pool.BaseBdevName, spare.SPDKBdevName); err != nil {
+	if err := e.fake.Client().BdevRaidAddBaseBdev(e.ctx, pool.ArrayName, spare.Handle); err != nil {
 		t.Fatal(err)
 	}
-	e.fake.SetRebuildProgress(pool.BaseBdevName, 60)
+	e.fake.SetRebuildProgress(pool.ArrayName, 60)
 	e.reconcile()
 
 	// spdk_tgt restarts mid-rebuild: the array comes back degraded without the target.
@@ -119,7 +119,7 @@ func TestInterruptedRebuildIsRestarted(t *testing.T) {
 	if n := e.fake.CallCount("bdev_raid_add_base_bdev"); n != 2 {
 		t.Fatalf("bdev_raid_add_base_bdev called %d times, want 2 (replace + restart)", n)
 	}
-	e.fake.SetRebuildProgress(pool.BaseBdevName, 100)
+	e.fake.SetRebuildProgress(pool.ArrayName, 100)
 	e.reconcile()
 	if p = e.pool(); p.HealthStatus != store.HealthStatusOnline {
 		t.Fatalf("after the restarted rebuild: %s %q", p.HealthStatus, p.StatusMessage)

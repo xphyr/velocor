@@ -57,21 +57,21 @@ func (e *env) provision(level store.RaidLevel, pcis ...string) (*store.Pool, *st
 	if err := e.st.CreatePool(pool); err != nil {
 		e.t.Fatal(err)
 	}
-	if err := c.BdevRaidCreate(e.ctx, pool.BaseBdevName, string(level), 64, bdevs, true); err != nil {
+	if err := c.BdevRaidCreate(e.ctx, pool.ArrayName, string(level), 64, bdevs, true); err != nil {
 		e.t.Fatal(err)
 	}
-	lvsUUID, err := c.BdevLvolCreateLvstore(e.ctx, pool.EffectiveBdevName, pool.LVSName, 0, "")
+	lvsUUID, err := c.BdevLvolCreateLvstore(e.ctx, pool.Device, pool.ThinPoolName, 0, "")
 	if err != nil {
 		e.t.Fatal(err)
 	}
-	if _, err := e.st.MutatePool(pool.ID, func(p *store.Pool) error { p.LVSUUID = lvsUUID; return nil }); err != nil {
+	if _, err := e.st.MutatePool(pool.ID, func(p *store.Pool) error { p.ThinPoolUUID = lvsUUID; return nil }); err != nil {
 		e.t.Fatal(err)
 	}
 	vol := &store.Volume{ID: "vol-1", Name: "vol-1", PoolID: pool.ID, SizeBytes: 1 << 30, QosPolicy: store.QosPolicy{RwIosPerSec: 5000}}
 	if err := e.st.CreateVolume(vol); err != nil {
 		e.t.Fatal(err)
 	}
-	uuid, err := c.BdevLvolCreate(e.ctx, pool.LVSName, vol.Name, vol.SizeBytes, false, "")
+	uuid, err := c.BdevLvolCreate(e.ctx, pool.ThinPoolName, vol.Name, vol.SizeBytes, false, "")
 	if err != nil {
 		e.t.Fatal(err)
 	}
@@ -97,13 +97,13 @@ func TestRestartWithLazyExamineNeverWipesLvstore(t *testing.T) {
 	e.fake.Restart()
 	st := e.reconcile()
 
-	if gen := e.fake.LvstoreGeneration(pool.LVSName); gen != 1 {
+	if gen := e.fake.LvstoreGeneration(pool.ThinPoolName); gen != 1 {
 		t.Fatalf("lvstore was re-initialised (generation %d): pool data destroyed", gen)
 	}
 	if e.fake.CallCount("bdev_lvol_create_lvstore") != 1 || e.fake.CallCount("bdev_raid_create") != 1 {
 		t.Fatalf("reconciler created storage instead of letting examine assemble it: %v", e.fake.Calls())
 	}
-	if !e.fake.LvolExists(vol.LvolBdevName) {
+	if !e.fake.LvolExists(vol.Handle) {
 		t.Fatalf("volume lvol lost")
 	}
 	p, _ := e.st.GetPool(pool.ID)
@@ -120,7 +120,7 @@ func TestMissingLvstoreIsFaultedNotReinitialised(t *testing.T) {
 	e := newEnv(t)
 	pool, _ := e.provision(store.RaidLevel0, "0000:01:00.0")
 	// Simulate the lvstore being unreadable: pretend the recorded UUID belongs to something else.
-	if _, err := e.st.MutatePool(pool.ID, func(p *store.Pool) error { p.LVSUUID = "deadbeef"; return nil }); err != nil {
+	if _, err := e.st.MutatePool(pool.ID, func(p *store.Pool) error { p.ThinPoolUUID = "deadbeef"; return nil }); err != nil {
 		t.Fatal(err)
 	}
 	e.fake.Restart()
@@ -277,14 +277,14 @@ func TestSSDPoolReassemblesAfterRestart(t *testing.T) {
 	if err := e.st.CreatePool(pool); err != nil {
 		t.Fatal(err)
 	}
-	if err := c.BdevRaidCreate(e.ctx, pool.BaseBdevName, "raid1", 0, bdevs, true); err != nil {
+	if err := c.BdevRaidCreate(e.ctx, pool.ArrayName, "raid1", 0, bdevs, true); err != nil {
 		t.Fatal(err)
 	}
-	uuid, err := c.BdevLvolCreateLvstore(e.ctx, pool.EffectiveBdevName, pool.LVSName, 0, "")
+	uuid, err := c.BdevLvolCreateLvstore(e.ctx, pool.Device, pool.ThinPoolName, 0, "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := e.st.MutatePool(pool.ID, func(p *store.Pool) error { p.LVSUUID = uuid; return nil }); err != nil {
+	if _, err := e.st.MutatePool(pool.ID, func(p *store.Pool) error { p.ThinPoolUUID = uuid; return nil }); err != nil {
 		t.Fatal(err)
 	}
 

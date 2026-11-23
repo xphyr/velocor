@@ -5,8 +5,8 @@
 //
 // Handles, as velod stores them:
 //   - a disk: a stable /dev/disk/by-path (NVMe) or by-id link to it (diskHandle);
-//   - an array: its md name (DevRoot/md/<name>), Pool.BaseBdevName;
-//   - a thin pool: its volume group, named Pool.LVSName, with the VG's UUID;
+//   - an array: its md name (DevRoot/md/<name>), Pool.ArrayName;
+//   - a thin pool: its volume group, named Pool.ThinPoolName, with the VG's UUID;
 //   - a volume or snapshot: the LV named by its velod ID in that VG, alias "vg/id", and a UUID
 //     velod can use as the NVMe namespace UUID, kept in an LVM tag (LVM's own UUIDs aren't
 //     RFC 4122);
@@ -40,7 +40,7 @@ const (
 	tagUUID = "velocor.uuid."
 	// tagSnapshot marks an LV as a snapshot (read-only to velod; clones don't carry it).
 	tagSnapshot = "velocor.snapshot"
-	// arrayPrefix is how velod names arrays (Pool.BaseBdevName): Settle assembles only these.
+	// arrayPrefix is how velod names arrays (Pool.ArrayName): Settle assembles only these.
 	arrayPrefix = "raid_"
 	// dataPercent of an array's volume group goes to the thin pool's data; the rest holds the
 	// pool's metadata (and LVM's spare copy), thick volumes and the on-pool metadata copy.
@@ -299,7 +299,7 @@ func (p *Plane) DetachDisk(context.Context, *store.Disk) error { return nil }
 
 // nvmeController is the controller device (/dev/nvme0) of an NVMe disk's namespace.
 func (p *Plane) nvmeController(d *store.Disk) (string, error) {
-	kname := kernelName(d.SPDKBdevName)
+	kname := kernelName(d.Handle)
 	if kname == "" {
 		kname = kernelName(d.DevicePath)
 	}

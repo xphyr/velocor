@@ -35,10 +35,10 @@ func (e *env) ssdPool(level store.RaidLevel, paths ...string) *store.Pool {
 	if err := e.st.CreatePool(pool); err != nil {
 		e.t.Fatal(err)
 	}
-	if err := c.BdevRaidCreate(e.ctx, pool.BaseBdevName, strings.ToLower(string(level)), 64, bdevs, true); err != nil {
+	if err := c.BdevRaidCreate(e.ctx, pool.ArrayName, strings.ToLower(string(level)), 64, bdevs, true); err != nil {
 		e.t.Fatal(err)
 	}
-	lvs, err := c.BdevLvolCreateLvstore(e.ctx, pool.EffectiveBdevName, pool.LVSName, 0, "")
+	lvs, err := c.BdevLvolCreateLvstore(e.ctx, pool.Device, pool.ThinPoolName, 0, "")
 	if err != nil {
 		e.t.Fatal(err)
 	}
@@ -46,14 +46,14 @@ func (e *env) ssdPool(level store.RaidLevel, paths ...string) *store.Pool {
 	if err := e.st.CreateVolume(vol); err != nil {
 		e.t.Fatal(err)
 	}
-	uuid, err := c.BdevLvolCreate(e.ctx, pool.LVSName, vol.Name, vol.SizeBytes, false, "")
+	uuid, err := c.BdevLvolCreate(e.ctx, pool.ThinPoolName, vol.Name, vol.SizeBytes, false, "")
 	if err != nil {
 		e.t.Fatal(err)
 	}
 	if _, err := e.st.MutateVolume(vol.ID, func(v *store.Volume) error { v.UUID = uuid; return nil }); err != nil {
 		e.t.Fatal(err)
 	}
-	if _, err := e.st.MutatePool(pool.ID, func(p *store.Pool) error { p.LVSUUID = lvs; return nil }); err != nil {
+	if _, err := e.st.MutatePool(pool.ID, func(p *store.Pool) error { p.ThinPoolUUID = lvs; return nil }); err != nil {
 		e.t.Fatal(err)
 	}
 	e.reconcile()
@@ -112,7 +112,7 @@ func TestMirrorUnderNewDiskIDsComesBack(t *testing.T) {
 		if !d.Claimed || d.PoolID != pool.ID || d.WriteCachePolicy != store.WriteCachePolicyDisabled {
 			t.Fatalf("new disk %s: %+v", id, d)
 		}
-		got[d.BdevUUID] = true
+		got[d.MemberUUID] = true
 	}
 	for id, u := range old {
 		if !got[u] {

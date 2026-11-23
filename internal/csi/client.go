@@ -47,10 +47,10 @@ type BlockExtent struct {
 
 // BlockMetadataResult is velod's answer to blocks:allocated / blocks:changed (CBT).
 type BlockMetadataResult struct {
-	SnapshotID       string        `json:"snapshot_id"`
-	VolumeSizeBytes  uint64        `json:"volume_size_bytes"`
-	ClusterSizeBytes uint64        `json:"cluster_size_bytes"`
-	Extents          []BlockExtent `json:"extents"`
+	SnapshotID      string        `json:"snapshot_id"`
+	VolumeSizeBytes uint64        `json:"volume_size_bytes"`
+	ChunkSizeBytes  uint64        `json:"chunk_size_bytes"`
+	Extents         []BlockExtent `json:"extents"`
 }
 
 // VolumeGroupSnapshotResult represents a VolumeGroupSnapshot and its member Snapshots.

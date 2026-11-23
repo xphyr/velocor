@@ -16,8 +16,8 @@ import (
 // (docs/design/kernel-dataplane.md, TODO K-2).
 //
 // Objects are named by the handles velod keeps in its store records: an array by
-// Pool.BaseBdevName, a thin pool by Pool.LVSUUID / Pool.LVSName, a volume or snapshot by its
-// UUID (or its "pool/name" alias), a disk by Disk.SPDKBdevName. The handles are opaque to
+// Pool.ArrayName, a thin pool by Pool.ThinPoolUUID / Pool.ThinPoolName, a volume or snapshot by its
+// UUID (or its "pool/name" alias), a disk by Disk.Handle. The handles are opaque to
 // velod; each backend chooses and interprets them. (The store field names still say SPDK; they
 // are renamed when the kernel backend lands.)
 //
@@ -38,7 +38,7 @@ type Plane interface {
 	PollingCPUs(ctx context.Context) ([]int, error)
 
 	// AttachDisk hands a claimed disk to the data plane and returns its handle (stored as
-	// Disk.SPDKBdevName) and the driver state it is now in.
+	// Disk.Handle) and the driver state it is now in.
 	AttachDisk(ctx context.Context, d *store.Disk) (string, store.DiskDriverState, error)
 	// DetachDisk gives the disk back to the host. A disk that isn't attached is not an error.
 	DetachDisk(ctx context.Context, d *store.Disk) error
@@ -164,7 +164,7 @@ type DiskMember struct {
 	Stale bool
 	// Identity is how the array knows this disk when that differs from the disk's own: a
 	// member that came back under a new disk ID keeps the SPDK bdev UUID it was created with
-	// (Disk.BdevUUID). "" when no such thing is needed (md knows its members itself).
+	// (Disk.MemberUUID). "" when no such thing is needed (md knows its members itself).
 	Identity string
 }
 
@@ -351,8 +351,8 @@ func ClaimedHandles(st store.Store) []string {
 	}
 	var out []string
 	for _, d := range disks {
-		if d.Claimed && d.SPDKBdevName != "" {
-			out = append(out, d.SPDKBdevName)
+		if d.Claimed && d.Handle != "" {
+			out = append(out, d.Handle)
 		}
 	}
 	return out

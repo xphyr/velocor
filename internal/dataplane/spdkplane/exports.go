@@ -17,11 +17,11 @@ import (
 const anyACL = "ANY"
 
 func bdevMatches(actual string, vol *store.Volume) bool {
-	if actual == vol.EffectiveBdevName {
+	if actual == vol.Device {
 		return true
 	}
 	// SPDK reports lvol bdevs by their UUID name rather than the lvs/name alias.
-	return vol.UUID != "" && actual == vol.UUID && vol.EffectiveBdevName == vol.LvolBdevName
+	return vol.UUID != "" && actual == vol.UUID && vol.Device == vol.Handle
 }
 
 func ensureNVMe(ctx context.Context, c *spdk.Client, exp *store.Export, vol *store.Volume, acl dataplane.ACL, portals []*store.Portal) error {
@@ -86,12 +86,12 @@ func ensureNVMe(ctx context.Context, c *spdk.Client, exp *store.Export, vol *sto
 	if i := slices.IndexFunc(sub.Namespaces, func(n spdk.NvmfNamespace) bool { return n.Nsid == nsid }); i >= 0 {
 		if !bdevMatches(sub.Namespaces[i].BdevName, vol) {
 			return fmt.Errorf("nvmf subsystem %s nsid %d is backed by %s, expected %s; refusing to repoint a live namespace",
-				exp.SubsystemNQN, nsid, sub.Namespaces[i].BdevName, vol.EffectiveBdevName)
+				exp.SubsystemNQN, nsid, sub.Namespaces[i].BdevName, vol.Device)
 		}
 	} else {
 		// The namespace UUID is pinned to the lvol UUID so hosts can verify the device identity.
-		if _, err := c.NvmfSubsystemAddNs(ctx, exp.SubsystemNQN, vol.EffectiveBdevName, nsid, vol.UUID); err != nil {
-			return fmt.Errorf("add namespace %s to %s: %w", vol.EffectiveBdevName, exp.SubsystemNQN, err)
+		if _, err := c.NvmfSubsystemAddNs(ctx, exp.SubsystemNQN, vol.Device, nsid, vol.UUID); err != nil {
+			return fmt.Errorf("add namespace %s to %s: %w", vol.Device, exp.SubsystemNQN, err)
 		}
 	}
 
@@ -233,7 +233,7 @@ func ensureIscsi(ctx context.Context, c *spdk.Client, exp *store.Export, vol *st
 	i := slices.IndexFunc(nodes, func(n spdk.IscsiTargetNode) bool { return n.Name == exp.TargetIQN })
 	if i < 0 {
 		if err := c.IscsiCreateTargetNode(ctx, exp.TargetIQN, exp.Name,
-			[]spdk.IscsiLun{{BdevName: vol.EffectiveBdevName, LunID: int(exp.LUNID)}},
+			[]spdk.IscsiLun{{BdevName: vol.Device, LunID: int(exp.LUNID)}},
 			maps, 64, true, false, false, 0); err != nil {
 			return fmt.Errorf("create iscsi target %s: %w", exp.TargetIQN, err)
 		}
@@ -241,7 +241,7 @@ func ensureIscsi(ctx context.Context, c *spdk.Client, exp *store.Export, vol *st
 	}
 	node := nodes[i]
 	if !slices.ContainsFunc(node.Luns, func(l spdk.IscsiLun) bool { return l.LunID == int(exp.LUNID) && bdevMatches(l.BdevName, vol) }) {
-		return fmt.Errorf("iscsi target %s LUN %d is not backed by %s; refusing to repoint a live target", exp.TargetIQN, exp.LUNID, vol.EffectiveBdevName)
+		return fmt.Errorf("iscsi target %s LUN %d is not backed by %s; refusing to repoint a live target", exp.TargetIQN, exp.LUNID, vol.Device)
 	}
 	var addMaps, rmMaps []spdk.IscsiPgIgMap
 	for _, m := range maps {

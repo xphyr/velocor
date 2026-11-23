@@ -113,13 +113,13 @@ func (s *Server) warnings() []string {
 	out = append(out, s.durabilityWarnings()...)
 	if s.reconciler != nil {
 		if sum := reconciler.UnmanagedSummary(s.reconciler.State().Unmanaged); sum != "" {
-			out = append(out, "spdk_tgt holds objects that Velocor doesn't manage ("+sum+"), listed on the System page. "+
+			out = append(out, "the data plane holds objects that Velocor doesn't manage ("+sum+"), listed on the System page. "+
 				"They are left alone: they may be leftovers of a failed operation, or the only copy of data after the database was lost. "+
 				"Import the pool or restore a database backup if they are yours; remove them by hand only once you know what they are.")
 		}
 	}
 	if s.hw != nil && s.hw.UnsafeNoIOMMUAllowed() {
-		out = append(out, "Unsafe no-IOMMU mode is allowed: SPDK can DMA anywhere in host memory. Use this only in lab VMs.")
+		out = append(out, "Unsafe no-IOMMU mode is allowed: SPDK (its vfio NVMe driver) can DMA anywhere in host memory. Use this only in lab VMs.")
 	}
 	if w := s.monitoringWarning(); w != "" {
 		out = append(out, w)
@@ -962,14 +962,14 @@ func (s *Server) handleSystemStatus(w http.ResponseWriter, r *http.Request) {
 		nodeID = cfg.NodeID
 	}
 
-	spdkConnected := false
-	spdkVersion := ""
+	dpConnected := false
+	dpVersion := ""
 	var socketPath string
 	if s.dp != nil {
 		socketPath = s.dp.Endpoint()
 		if ver, err := s.dp.Version(r.Context()); err == nil {
-			spdkConnected = true
-			spdkVersion = ver
+			dpConnected = true
+			dpVersion = ver
 		}
 	}
 
@@ -985,12 +985,12 @@ func (s *Server) handleSystemStatus(w http.ResponseWriter, r *http.Request) {
 	restoring := false
 	if s.reconciler != nil {
 		recState = s.reconciler.State()
-		restoring = spdkConnected && s.reconciler.Restoring()
+		restoring = dpConnected && s.reconciler.Restoring()
 	}
 
 	overall := store.HealthStatusOnline
 	switch {
-	case !spdkConnected || len(recState.DegradedResources) > 0:
+	case !dpConnected || len(recState.DegradedResources) > 0:
 		overall = store.HealthStatusDegraded
 	case restoring:
 		// spdk_tgt answers, but it was (re)started after the last completed pass: pools,
@@ -1001,18 +1001,18 @@ func (s *Server) handleSystemStatus(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"overall_health": overall,
 		"node": map[string]any{
-			"node_id":        nodeID,
-			"hostname":       hostname,
-			"version":        version.Version,
-			"commit":         version.Commit,
-			"build_time":     version.BuildTime,
-			"spdk_version":   spdkVersion,
-			"uptime_seconds": uint64(time.Since(s.startedAt).Seconds()),
+			"node_id":            nodeID,
+			"hostname":           hostname,
+			"version":            version.Version,
+			"commit":             version.Commit,
+			"build_time":         version.BuildTime,
+			"data_plane_version": dpVersion,
+			"uptime_seconds":     uint64(time.Since(s.startedAt).Seconds()),
 		},
-		"spdk": map[string]any{
-			"connected":          spdkConnected,
+		"data_plane": map[string]any{
+			"connected":          dpConnected,
 			"restoring":          restoring,
-			"socket_path":        socketPath,
+			"endpoint":           socketPath,
 			"hugepages_total_mb": hpTotalMB,
 			"hugepages_free_mb":  hpFreeMB,
 		},
@@ -1031,7 +1031,7 @@ func (s *Server) handleTriggerReconcile(w http.ResponseWriter, r *http.Request) 
 }
 
 func (s *Server) handleGetIoStats(w http.ResponseWriter, r *http.Request) {
-	bdevName := r.URL.Query().Get("bdev_name")
+	bdevName := r.URL.Query().Get("device")
 	if s.dp == nil {
 		writeJSON(w, http.StatusOK, map[string]any{"tick_rate": 0, "stats": []any{}})
 		return
