@@ -250,6 +250,9 @@ func (p *Plane) CreateThinPool(ctx context.Context, array, name string, chunkByt
 	return p.c.BdevLvolCreateLvstore(ctx, array, name, chunkBytes, "")
 }
 
+// GrowMetadata: an lvstore keeps its metadata in its own clusters; nothing to grow.
+func (p *Plane) GrowMetadata(context.Context, string) (uint64, error) { return 0, nil }
+
 func (p *Plane) DeleteThinPool(ctx context.Context, uuid, name string) error {
 	return wrap(p.c.BdevLvolDeleteLvstore(ctx, uuid, name))
 }

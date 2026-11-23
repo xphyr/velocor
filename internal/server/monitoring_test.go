@@ -251,7 +251,7 @@ func TestAlertingSettingsKeepSecrets(t *testing.T) {
 			found = r["setting"].(map[string]any)["threshold"] == float64(65) && r["tunable"].(map[string]any)["default"] == float64(70)
 		}
 	}
-	if !found || len(rules) != 28 {
+	if !found || len(rules) != 30 {
 		t.Fatalf("rules: %d, VelocorDiskHot setting shown: %v", len(rules), found)
 	}
 	h.expect(h.do("GET", "/api/v1/monitoring/settings", h.csiToken(), nil))(http.StatusForbidden)

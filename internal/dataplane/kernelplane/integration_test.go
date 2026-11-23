@@ -764,3 +764,42 @@ func TestRAID10(t *testing.T) {
 	})
 	verify(t, dev, 0, 64*mib, 9)
 }
+
+// Thin metadata grows once it passes the threshold, doubling while the volume group has room;
+// once there is none, growing fails and says so.
+func TestThinMetadataGrows(t *testing.T) {
+	e := newEnv(t)
+	e.pool()
+	before, err := e.p.ThinPools(e.ctx, e.vg, "")
+	if err != nil || len(before) != 1 || before[0].MetadataBytes == 0 || before[0].MetadataUsedBytes == 0 {
+		t.Fatalf("thin pool %+v %v", before, err)
+	}
+	e.p.MetadataGrowAt = 101 // never full enough
+	if n, err := e.p.GrowMetadata(e.ctx, e.poolU); n != 0 || err != nil {
+		t.Fatalf("grew below the threshold: %d %v", n, err)
+	}
+	e.p.MetadataGrowAt = 0.001
+	size := before[0].MetadataBytes
+	var growErr error
+	for range 10 {
+		n, err := e.p.GrowMetadata(e.ctx, e.poolU)
+		if err != nil {
+			growErr = err
+			break
+		}
+		if n <= size || n > 2*size {
+			t.Fatalf("grew from %d to %d", size, n)
+		}
+		size = n
+	}
+	after, _ := e.p.ThinPools(e.ctx, e.vg, "")
+	if after[0].MetadataBytes != size || size == before[0].MetadataBytes {
+		t.Errorf("metadata %d -> %d (thin pool says %d)", before[0].MetadataBytes, size, after[0].MetadataBytes)
+	}
+	if growErr == nil || !strings.Contains(growErr.Error(), "no room") {
+		t.Errorf("growing with no room left: %v", growErr)
+	}
+	t.Logf("metadata grown %d -> %d bytes, then: %v", before[0].MetadataBytes, size, growErr)
+	dev, _ := e.volume("vol-m", 16*mib) // the pool still works
+	fill(t, dev, 0, 16*mib, 11)
+}

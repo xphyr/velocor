@@ -308,8 +308,10 @@ to what this note first assumed.)
   view becomes "connected hosts" from the network side (`ss` on the port) for NVMe/TCP, exact
   for iSCSI (LIO lists sessions). Accepted, noted in the API docs.
 - **Thin pool metadata is finite** (16 GiB maximum) and a full metadata device is worse than a
-  full data pool. velod sizes it generously, monitors it (`thin pool status`), alerts, and grows
-  it while the pool has room; `lvm.conf` autoextend is a backstop.
+  full data pool. velod sizes it generously (four times the measured need), records and exports
+  its use, grows it from half full while the volume group has room (doubling, with LVM's spare
+  copy), marks the pool DEGRADED from 90% and alerts from 80% (done in K-2). No `lvm.conf`
+  autoextend: it needs dmeventd, and velod's own growth covers it.
 - **Chunk size and zeroing: 64 KiB, zeroing on** (measured 2026-11-20,
   [performance.md](../performance.md) "LVM thin chunk size and zeroing"). Steady writes are the
   same at 64, 128 and 256 KiB; writes after a snapshot are best at 64 KiB (5.5k IOPS against

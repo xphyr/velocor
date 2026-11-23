@@ -88,6 +88,36 @@ tests:
               summary: "Pool f is FULL: writes to new space fail"
               description: "Hosts get write errors on thin volumes. Free space immediately (purge deleted volumes, delete snapshots)."
 
+  # Thin metadata: 85% warns after 10 minutes, 97% pages at once, 60% (being grown) stays quiet.
+  - interval: 1m
+    input_series:
+      - series: 'velocor_pool_thin_metadata_used_ratio{instance="a",pool="m85"}'
+        values: '0.85x20'
+      - series: 'velocor_pool_thin_metadata_used_ratio{instance="a",pool="m97"}'
+        values: '0.97x20'
+      - series: 'velocor_pool_thin_metadata_used_ratio{instance="a",pool="m60"}'
+        values: '0.6x20'
+    alert_rule_test:
+      - {eval_time: 5m, alertname: VelocorPoolThinMetadataFilling, exp_alerts: []}
+      - eval_time: 15m
+        alertname: VelocorPoolThinMetadataFilling
+        exp_alerts:
+          - exp_labels: {severity: warning, instance: a, pool: m85}
+            exp_annotations:
+              summary: "Pool m85's thin metadata is 85% full"
+              description: "velod grows it from half full while the pool's disks have room; it couldn't. When full, writes to new space fail: delete snapshots and volumes."
+          - exp_labels: {severity: warning, instance: a, pool: m97}
+            exp_annotations:
+              summary: "Pool m97's thin metadata is 97% full"
+              description: "velod grows it from half full while the pool's disks have room; it couldn't. When full, writes to new space fail: delete snapshots and volumes."
+      - eval_time: 1m
+        alertname: VelocorPoolThinMetadataFull
+        exp_alerts:
+          - exp_labels: {severity: critical, instance: a, pool: m97}
+            exp_annotations:
+              summary: "Pool m97's thin metadata is nearly full (97%)"
+              description: "Writes to new space are about to fail on hosts. Delete snapshots and volumes now."
+
   # A pool growing 2% an hour from 60% fills within a day; a flat one doesn't.
   - interval: 1m
     input_series:

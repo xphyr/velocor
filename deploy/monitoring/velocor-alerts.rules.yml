@@ -167,6 +167,21 @@ groups:
           summary: "Pool {{ $labels.pool }} is FULL: writes to new space fail"
           description: "Hosts get write errors on thin volumes. Free space immediately (purge deleted volumes, delete snapshots)."
 
+      - alert: VelocorPoolThinMetadataFilling
+        expr: velocor_pool_thin_metadata_used_ratio > 0.8
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "Pool {{ $labels.pool }}'s thin metadata is {{ $value | humanizePercentage }} full"
+          description: "velod grows it from half full while the pool's disks have room; it couldn't. When full, writes to new space fail: delete snapshots and volumes."
+
+      - alert: VelocorPoolThinMetadataFull
+        expr: velocor_pool_thin_metadata_used_ratio > 0.95
+        labels: {severity: critical}
+        annotations:
+          summary: "Pool {{ $labels.pool }}'s thin metadata is nearly full ({{ $value | humanizePercentage }})"
+          description: "Writes to new space are about to fail on hosts. Delete snapshots and volumes now."
+
       - alert: VelocorPoolFillsWithin24h
         expr: velocor_pool_used_ratio > 0.5 and predict_linear(velocor_pool_used_ratio[6h], 24 * 3600) > 0.95
         for: 1h

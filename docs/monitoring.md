@@ -111,6 +111,8 @@ selector plus an `Endpoints` and a `ServiceMonitor`) with `job: velocor`, the to
 | `VelocorScrubOverdue` | warning | A pool hasn't completed a scheduled scrub for twice the interval |
 | `VelocorPoolSpaceWarning` | warning | A pool is at WARNING for 10 minutes |
 | `VelocorPoolFillsWithin24h` | warning | A pool over 50% used will be full within a day at the rate of the last 6 hours |
+| `VelocorPoolThinMetadataFilling` | warning | A pool's thin metadata (kernel data plane) is over 80% full for 10 minutes: velod grows it from half full and couldn't |
+| `VelocorPoolThinMetadataFull` | critical | A pool's thin metadata is over 95% full: writes to new space are about to fail |
 | `VelocorDiskMediaErrors` | warning | A disk reported new media errors in the last hour |
 | `VelocorDiskWornOut` | warning | An NVMe drive is 90% through its rated endurance |
 | `VelocorDiskHot` | warning | A disk is above 70 °C for 15 minutes |
@@ -149,6 +151,7 @@ ends and a new one starts.
 | `velocor_pool_durability` | `pool`, `durability` | DURABLE, AT_RISK or UNKNOWN |
 | `velocor_pool_space_state` | `pool`, `state` | 0 OK, 1 WARNING, 2 CRITICAL, 3 FULL |
 | `velocor_pool_used_ratio` | `pool` | Allocated fraction of the volume store |
+| `velocor_pool_thin_metadata_used_ratio` | `pool` | How full the thin pool's metadata is (kernel data plane only) |
 | `velocor_pool_total_bytes`, `velocor_pool_free_bytes` | `pool`, `raid` | Capacity and free space |
 | `velocor_pool_committed_bytes`, `velocor_pool_available_bytes` | `pool` | Space promised, and how much more the space policy accepts |
 | `velocor_pool_metadata_copy_failed` | `pool` | The on-pool metadata copy failed on the last write |

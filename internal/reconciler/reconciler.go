@@ -498,11 +498,17 @@ func (r *Reconciler) reconcilePools(ctx context.Context, p *pass, examined bool)
 			fail(store.HealthStatusFaulted, fmt.Sprintf("lvstore %s (%s) not found on %s", pool.LVSName, pool.LVSUUID, pool.BaseBdevName))
 		}
 
-		var total, free uint64
+		var total, free, metaTotal, metaUsed uint64
 		if lvs != nil {
 			total, free = lvs.TotalBytes, lvs.FreeBytes
+			metaTotal, metaUsed = lvs.MetadataBytes, lvs.MetadataUsedBytes
 			if raidOnline {
 				online[pool.ID] = true
+				metaTotal = r.growThinMetadata(ctx, p, pool, lvs, fail)
+			}
+			if metaTotal > 0 && metaUsed*100 >= metaTotal*thinMetadataDegradedPercent {
+				fail(store.HealthStatusDegraded, fmt.Sprintf("thin pool metadata is %d%% full; when full, writes to new space fail: free space (delete snapshots and volumes)",
+					metaUsed*100/metaTotal))
 			}
 		}
 		reasons = append(reasons, p.notes[pool.ID]...)
@@ -514,6 +520,10 @@ func (r *Reconciler) reconcilePools(ctx context.Context, p *pass, examined bool)
 			if !membersEqual(store.PoolMembers(cur), members) || len(cur.Members) == 0 {
 				changed = true
 				store.SetPoolMembers(cur, members)
+			}
+			if lvs != nil && (cur.ThinMetadataBytes != metaTotal || cur.ThinMetadataUsedBytes != metaUsed) {
+				changed = true
+				cur.ThinMetadataBytes, cur.ThinMetadataUsedBytes = metaTotal, metaUsed
 			}
 			if lvs != nil && (cur.TotalBytes != total || cur.FreeBytes != free) {
 				changed = true
@@ -534,6 +544,30 @@ func (r *Reconciler) reconcilePools(ctx context.Context, p *pass, examined bool)
 		}
 	}
 	return online
+}
+
+// thinMetadataDegradedPercent: a pool whose thin metadata is this full is DEGRADED (growing it
+// starts at half full, so this means growing couldn't keep up).
+const thinMetadataDegradedPercent = 90
+
+// growThinMetadata grows the thin pool's metadata when it is filling (Plane.GrowMetadata) and
+// returns its size afterwards; a pool that needed it and couldn't is reported.
+func (r *Reconciler) growThinMetadata(ctx context.Context, p *pass, pool *store.Pool, lvs *dataplane.ThinPool, fail func(store.HealthStatus, string)) uint64 {
+	if lvs.MetadataBytes == 0 {
+		return 0
+	}
+	grown, err := r.dp.GrowMetadata(ctx, lvs.UUID)
+	switch {
+	case err != nil && lvs.MetadataUsedBytes*100 >= lvs.MetadataBytes*80:
+		fail(store.HealthStatusDegraded, "growing the thin pool metadata failed: "+err.Error())
+	case err != nil:
+		p.notePool(pool.ID, "growing the thin pool metadata failed: "+err.Error())
+	case grown > 0:
+		p.repaired++
+		r.logger.Warn("thin pool metadata grown", "pool", pool.Name, "from", lvs.MetadataBytes, "to", grown)
+		return grown
+	}
+	return lvs.MetadataBytes
 }
 
 // poolDurability is the weakest durability of the pool's member disks.
