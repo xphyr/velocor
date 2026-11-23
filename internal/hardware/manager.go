@@ -41,6 +41,12 @@ type Config struct {
 	// to uio_pci_generic) when the host has no IOMMU. Without an IOMMU, SPDK can DMA anywhere
 	// in host memory, so this is only appropriate for VMs/labs and must be opted into.
 	AllowUnsafeNoIOMMU bool
+	// KernelDataPlane: drives stay on their kernel drivers, so an NVMe drive on a userspace
+	// driver (vfio-pci, uio) is not taken as claimed by discovery (with SPDK it is: only SPDK
+	// binds drives there). Such a drive is left alone until an operator claims it; otherwise
+	// the kernel data plane would take it from whatever holds it (found on the lab VM, where it
+	// took two drives from a running spdk_tgt).
+	KernelDataPlane bool
 }
 
 // HugepageStatus reports 2 MiB hugepage allocation on the node.
@@ -169,10 +175,10 @@ func (m *Manager) DiscoverDisks() ([]*store.Disk, error) {
 			switch driverName {
 			case "vfio-pci":
 				driverState = store.DiskDriverStateVfioPCI
-				claimed = true
+				claimed = !m.cfg.KernelDataPlane
 			case "uio_pci_generic", "igb_uio":
 				driverState = store.DiskDriverStateUioPCIGeneric
-				claimed = true
+				claimed = !m.cfg.KernelDataPlane
 			}
 
 			numaNode := int32(readSysfsInt(filepath.Join(devDir, "numa_node"), 0))

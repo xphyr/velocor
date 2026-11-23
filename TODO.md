@@ -64,9 +64,20 @@ listed until then so nothing is lost if the plan changes.
     NVMe/TCP export with the host connected and the volume's namespace UUID, exact
     allocated/changed blocks, a group snapshot, a clone, a velod restart, a member replacement
     with rebuild, a scrub to completion, and a teardown leaving nothing in the kernel. Open:
-    - the appliance: install mdadm, lvm2, device-mapper-persistent-data explicitly; md
-      auto-assembly off (`AUTO -all`) since Settle assembles; a way to choose the data plane
-      (the quadlet's `Exec` and the spdk unit); then a lab appliance on it;
+    - the appliance (**done 2026-11-23**, `dev-86511f2`): storage tools installed; md
+      auto-assembly off (`AUTO -all`, `rd.md=0`) and host LVM limited to md arrays with no
+      auto-activation; `/etc/velocor/velod.env` (`VELOCOR_DATA_PLANE=kernel`) selects the data
+      plane and `velocor-spdk` skips itself; velod frees SPDK's hugepages. A fresh appliance
+      (the K-2 lab VM) runs it. Found there: velod's `nsenter` must enter the host's IPC
+      namespace too (LVM/dmsetup wait for udev on SysV semaphores; `lvcreate` hung). Found
+      on the P0-1 lab VM: an upgrade through the API (`bootc switch`, bootc 1.17) didn't add
+      the new `rd.md=0` karg (a fresh install has it; `AUTO -all` still covers udev);
+    - discovery took vfio-bound NVMe drives as claimed, so the kernel data plane rebound them
+      to `nvme` (it took both drives from the P0-1 lab VM's running SPDK, 2026-11-23: nvmepool
+      lost slot 0). Fixed: with the kernel data plane such a drive is claimed only by an
+      operator;
+    - a member reported MISSING whose disk is back can't be put back: release refuses (not
+      detached) and replace refuses (still in the pool). Needs a re-add path (P0-1 follow-up);
     - pool import and moved members (P1-14) still read SPDK RAID superblocks
       (`hardware.ReadRaidSuperblock`): md's own metadata (`mdadm --examine`) replaces them;
     - RAID10 is refused by the API's level check ("SPDK has no raid10"); md has it;

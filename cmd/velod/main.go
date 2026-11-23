@@ -111,6 +111,7 @@ func main() {
 
 	hwMgr, err := hardware.NewManager(hardware.Config{
 		AllowUnsafeNoIOMMU: os.Getenv("VELOCOR_ALLOW_UNSAFE_NOIOMMU") == "true",
+		KernelDataPlane:    *dataPlane == "kernel",
 	})
 	if err != nil {
 		// Without the hardware manager there is no boot-disk guard; fail closed.
