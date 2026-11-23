@@ -34,7 +34,7 @@ each needed another one:
 | No consistent group snapshot of volumes in use (P1-15) | patch 0003 | no primitive; see §5.3 |
 | No scrub; no resync after an unclean stop (P2-2) | patch 0004, then a rate-limit fix | md `check`/`repair`, write-intent bitmap |
 | No changed-block tracking (L-2) | patch 0005 | `thin_delta` |
-| **One unreadable sector on the last good copy takes a mirror pool offline (P0-7)**, found 2026-11-20 with emulated disk errors; the auto-restarted rebuild then repeats it | would need patch 0006 | md fails that read (EIO) and keeps the array up; bad-block log |
+| **One unreadable sector on the last good copy takes a mirror pool offline (P0-7)**, found 2026-11-20 with emulated disk errors; the auto-restarted rebuild then repeats it | would need patch 0006 | md fails that read (EIO) and keeps the array up; rewriting the block heals it (verified in the K-1 spike) |
 | FLUSH never reaches the drives (P0-4), so hosts are told writes are durable while drives cache them | per-disk cache-off policy, PLP declaration; real fix deferred (L-1) | flush passes through dm and md |
 | A full thin pool gives hosts EIO (L-6) | open | dm-thin `error_if_no_space`; nvmet maps ENOSPC to Capacity Exceeded |
 | No RAID10 (L-4), no parity RAID (L-3: `raid5f` is full-stripe only and can't hold a volume store) | refused | md raid10, raid5/6 with PPL or journal |
@@ -161,7 +161,7 @@ velod ── mdadm / lvm2 / dmsetup / configfs ──^
 
 - **Drives** stay on their kernel drivers. No vfio, no hugepages. Write-cache control (P0-4)
   stays as information and policy; see §5.1 for why it relaxes.
-- **Pool = one md array** (metadata 1.2, write-intent bitmap, bad-block log) carrying one LVM
+- **Pool = one md array** (metadata 1.2, write-intent bitmap) carrying one LVM
   volume group with one thin pool and any thick LVs. RAID1 and RAID10 at first; RAID5/6 with
   PPL (or a journal device) is now a configuration choice rather than a project (L-3).
 - **Volume = an LV**, thin by default, wrapped in a trivial dm-linear device that velod owns
@@ -203,10 +203,10 @@ velod ── mdadm / lvm2 / dmsetup / configfs ──^
 | Export connections list | nvmet has no per-controller listing in configfs | §6 |
 | Flush / write cache (P0-4, L-1) | passes through; nvmet advertises VWC when the device has a cache | L-1 closes |
 | Discard | passes through dm-thin (reclaims) to md to drives | `issue_discards` in lvm.conf |
-| Full pool | `error_if_no_space=1` on the thin pool → ENOSPC → NVMe Capacity Exceeded | L-6 closes; thin **metadata** full is a new failure mode (§6) |
+| Full pool | `error_if_no_space=1` on the thin pool (`lvchange --errorwhenfull y`; `lvcreate` refuses the flag for a thin pool) → ENOSPC → NVMe Capacity Exceeded | L-6 closes; thin **metadata** full is a new failure mode (§6) |
 | Grow (L-7) | replace members with larger disks → `mdadm --grow --size max` → `pvresize` → `lvextend` the thin pool; or `mdadm --grow --raid-devices` on RAID10 | |
 | RAID10 (L-4), parity (L-3) | md levels 10, 5, 6 (`--consistency-policy=ppl` or a journal) | a configuration choice |
-| Bad sector on the last copy (P0-7) | md returns EIO for that I/O, records it in the bad-block log, keeps the array | the acceptance test for the new stack |
+| Bad sector on the last copy (P0-7) | md returns EIO for that I/O and keeps the array; rewriting the block heals it | the acceptance test for the new stack; passes in the spike (`TestLastCopyReadErrorKeepsThePool`) |
 | Unclean shutdown | write-intent bitmap resync | SPDK had none |
 | Encryption / compression (policies refused today) | dm-crypt per volume (in the wrapper slot), dm-vdo or none | later |
 | Metrics | `/sys/block/*/stat`, `/proc/mdstat`, thin pool `status` (used/metadata), nvmet/LIO configfs | same exporter shape |
@@ -226,7 +226,22 @@ list.
 md identifies members by UUID in the superblock, so disks that move between controllers or
 change kernel names assemble without help (P1-14 becomes mostly unnecessary; velod still has to
 map the new disk IDs onto its records). The LVM devices file is turned off in favour of a
-filter on `/dev/md*`, because velod decides which disks are Velocor's.
+filter on `/dev/md*`, because velod decides which disks are Velocor's. This has to be done per
+call, not left to the host's `lvm.conf`: `pvcreate` quietly starts a devices file
+(`/etc/lvm/devices/system.devices`) when none exists, after which LVM ignores every device not
+listed in it. velod therefore passes its own `--config` on every LVM command (no devices file,
+md-only filter).
+
+The md arrays are created on kernel 7.x with metadata that warns it won't assemble on kernels
+6.18 or older (configurable logical block size). That only matters if pool disks are moved to an
+older system; the appliance image never goes back.
+
+### 5.2.1 Sizing the thin pool
+
+`lvcreate --extents 100%VG` (or any `N%VG`) for the thin pool leaves no room for its metadata LV
+and the spare metadata copy LVM keeps for repair, and on a small VG trips an lvm2 assertion.
+velod computes the data size itself from `vgs` (VG size and extent size), minus the metadata and
+spare, and passes explicit sizes.
 
 ### 5.3 Consistent group snapshots
 
@@ -239,6 +254,10 @@ left suspended by a velod crash is resumed by the reconciler at start, which is 
 mitigation the SPDK design had. The SPDK integration scenario (`TestGroupSnapshots`: a group
 taken under dependent writes is one point in time) becomes the acceptance test.
 
+Spike result: this works as designed. LVM's md-only filter means `lvcreate -s` never opens the
+suspended wrapper, so there is no deadlock; 8 of 8 group snapshots taken under ~37k dependent
+write pairs were consistent, at about 200 ms per group (`TestGroupSnapshotConsistent`).
+
 ### 5.4 Changed-block tracking
 
 `dmsetup message <pool> 0 reserve_metadata_snap`, then `thin_delta --snap1 <id> --snap2 <id>`
@@ -246,6 +265,33 @@ taken under dependent writes is one point in time) becomes the acceptance test.
 then `release_metadata_snap`. Thin device IDs come from `lvs -o thin_id`. One metadata snapshot
 at a time, serialized by velod. Output granularity is the pool's chunk size. The CSI
 SnapshotMetadata layer above velod's `blocks:allocated` / `blocks:changed` stays as it is.
+
+### 5.5 Optional layers
+
+The volume stack, bottom to top, is md array, [pool feature], PV/VG, thin pool, LV, [volume
+layers], dm-linear wrapper, export. The wrapper is always on top, so group snapshots and the
+targets don't depend on what sits underneath. `internal/kernel/stack.go` has two seams, both
+off unless configured and none implemented yet:
+
+- **PoolFeature**, pool-wide: LUKS between md and the PV, or VDO deduplication and compression
+  of the thin pool's data (`lvcreate --type thin-pool --pooldatavdo y`).
+- **VolumeLayer**, per volume between the LV and the wrapper: dm-crypt with a per-volume key, or
+  dm-integrity checksums.
+
+The OS image already has `dm-vdo`, `dm-crypt`, `dm-integrity` and `cryptsetup`; VDO also needs
+`vdoformat` from Fedora's `vdo` package.
+
+### 5.6 Spike results (K-1)
+
+`internal/kernel` implements the stack as a standalone package (not wired into velod), with unit
+tests on output captured from the real tools and seven root integration tests
+(`internal/kernel/integration_test.go`) that pass on the lab VM: exports over NVMe/TCP and
+iSCSI with allowed and refused hosts, restore after a simulated reboot, rebuild onto a
+replacement, consistent group snapshots (§5.3), exact CBT from `thin_delta`, ENOSPC within about
+0.3 s on a full pool, and P0-7. On P0-7, md does not fail the last in-sync member of a RAID1:
+the unreadable sector fails only that read with EIO, the array stays active, and writing the
+block again heals it. (It does not record the sector in the bad-block log in that case, contrary
+to what this note first assumed.)
 
 ## 6. What we give up or must decide
 
@@ -273,6 +319,9 @@ SnapshotMetadata layer above velod's `blocks:allocated` / `blocks:changed` stays
   thin with the same `thin_delta` CBT) had shown CBT is exact at any size but over-reports in
   whole chunks, which 64 KiB keeps smallest. Metadata at 64 KiB is about 2 MB per GiB written,
   so velod sizes the metadata device from the pool, with headroom, and monitors it.
+- **iSCSI portals must use SELinux-labelled iSCSI ports (3260, 3205).** An enforcing
+  initiator's iscsid (`iscsid_t`, RHCOS nodes included) can't connect to any other port
+  (EACCES). velod should refuse other ports for iSCSI portals, or at least warn.
 - **Two license regimes avoided:** all kernel pieces are used, not linked; velod stays
   Apache-2.0.
 
@@ -283,11 +332,12 @@ SnapshotMetadata layer above velod's `blocks:allocated` / `blocks:changed` stays
   model (members, rebuilds, scrubs, snapshots, failures). This is the largest single piece of
   the rewrite and the one that keeps velod's test suite meaningful.
 - **Integration tests:** today's run rootless with file-backed disks; md and dm need
-  `CAP_SYS_ADMIN` and block devices. They move to loop devices in a privileged container on the
-  CI runner (sudo is available). The scenarios stay the same list: crash/restart, rebuild,
-  missing at boot, scrub repair, group snapshot under writes, capacity to FULL, pool import,
-  and the P0-7 case (an unreadable sector on the last copy) with `dm-flakey` or `dm-dust`
-  standing in for QEMU's `blkdebug`.
+  `CAP_SYS_ADMIN` and block devices. The harness is a Go test binary (build tag
+  `kernelintegration`) run as root against loop devices on sparse files, on the CI runner or
+  the lab VM (`make test-kernel`); no privileged container is needed. The scenarios stay the
+  same list: crash/restart, rebuild, missing at boot, scrub repair, group snapshot under
+  writes, capacity to FULL, pool import, and the P0-7 case (an unreadable sector on the last
+  copy) with `dm-dust` standing in for QEMU's `blkdebug`.
 - **Lab:** the `blkdebug` recipe in [testing.md](../testing.md) and the CSI matrix on both
   clusters (x86 and Arm) unchanged; the three-way benchmark method for before/after numbers.
 
@@ -296,9 +346,9 @@ SnapshotMetadata layer above velod's `blocks:allocated` / `blocks:changed` stays
 Phases, each ending in a merge; the SPDK stack keeps running in the lab until phase 3.
 
 0. **Design review** (this note); QoS dropped and chunk size 64 KiB with zeroing on (both decided 2026-11-20).
-1. **Spike behind the data-plane interface:** md RAID1 + thin LV + nvmet export, enough for
+1. **Spike** (a standalone package; the data-plane interface in velod comes first in phase 2, since velod calls SPDK directly today): md RAID1 + thin LV + nvmet export, enough for
    `TestDataSurvivesCrashAndRestart`, a rebuild and a group snapshot; the fake command layer
-   for unit tests; the privileged integration harness in CI. Exposes the real risks (§5.3,
+   for unit tests; the root integration harness in CI. Done as K-1 (§5.6). Exposes the real risks (§5.3,
    §5.4, §7) with code, not prose.
 2. **Parity:** everything in §5 including iSCSI through LIO, scrub scheduling on md, metadata
    copy on an LV, pool import, CBT, metrics and alerts; `veloctl` and UI wording; docs.

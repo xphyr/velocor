@@ -10,6 +10,7 @@
 #   make push                        push spdk/velod/csi, then build and push the OS image
 #   make test-integration            Go integration tests against a real spdk_tgt (rootless podman)
 #   make spdk-unit-tests             SPDK unit tests for the libraries our SPDK patches touch
+#   make test-kernel                 kernel data plane tests on real md/LVM/nvmet/LIO (runs sudo)
 #   make qcow2 QCOW2_KEYS=a.pub      bootable disk from the pushed OS image (needs KVM, no root)
 #
 # Registry credentials come from podman's usual auth file, or REGISTRY_AUTH_FILE.
@@ -82,7 +83,7 @@ endef
 GO_BUILD_ARGS := --build-arg VERSION=$(VERSION) --build-arg COMMIT=$(COMMIT) --build-arg BUILD_TIME=$(BUILD_TIME)
 DIGEST_DIR := $(BINARY_DIR)/digests
 
-.PHONY: build build-velod build-veloctl build-csi test test-integration lint shellcheck check-pins check-alerts \
+.PHONY: build build-velod build-veloctl build-csi test test-integration test-kernel lint shellcheck check-pins check-alerts \
 	proto proto-lint clean images image-spdk image-spdk-test spdk-unit-tests image-velod image-csi image-os \
 	push push-spdk push-velod push-csi push-os check-push qcow2
 
@@ -100,6 +101,16 @@ test:
 # Real spdk_tgt in rootless podman (no root, hugepages or NVMe needed).
 test-integration: image-spdk-test
 	VELOCOR_IT_IMAGE=$(SPDK_TEST_IMAGE) go test -tags integration -count=1 -v -timeout 30m ./internal/integration/
+
+# The kernel data plane's integration tests (TODO.md K-1) against real md, LVM, device-mapper,
+# nvmet and LIO, on loop devices: they need root, the kernel modules and the storage tools, so
+# they run on the lab VM or CI's runner, never inside a container. KERNEL_TEST_RUN filters them.
+KERNEL_TEST_BIN ?= bin/kernel.test
+KERNEL_TEST_RUN ?= .
+test-kernel:
+	@mkdir -p $(dir $(KERNEL_TEST_BIN))
+	CGO_ENABLED=0 go test -c -tags kernelintegration -o $(KERNEL_TEST_BIN) ./internal/kernel/
+	cd internal/kernel && sudo $(abspath $(KERNEL_TEST_BIN)) -test.v -test.count=1 -test.timeout 30m -test.run '$(KERNEL_TEST_RUN)'
 
 # Without local installs, run the linters from their images, e.g.
 #   GOLANGCI_LINT="podman run --rm -v $$PWD:/repo:z -w /repo docker.io/golangci/golangci-lint:v2.15.0 golangci-lint"

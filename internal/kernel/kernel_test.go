@@ -1,0 +1,312 @@
+package kernel
+
+import (
+	"context"
+	"errors"
+	"os"
+	"path/filepath"
+	"slices"
+	"strings"
+	"testing"
+)
+
+// probeSection returns one "##### name" section of testdata/probe.txt: real output of mdadm, LVM,
+// sysfs and the thin tools, captured on the lab VM (Fedora 45, kernel 7.3, lvm2 2.03.43,
+// mdadm 4.6, thin-provisioning-tools 1.3.4).
+func probeSection(t *testing.T, name string) string {
+	t.Helper()
+	b, err := os.ReadFile("testdata/probe.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, rest, ok := strings.Cut(string(b), "##### "+name+"\n")
+	if !ok {
+		t.Fatalf("no section %q", name)
+	}
+	if i := strings.Index(rest, "##### "); i >= 0 {
+		rest = rest[:i]
+	}
+	return rest
+}
+
+func TestParseLVs(t *testing.T) {
+	lvs, err := parseLVs([]byte(probeSection(t, "lvs-json")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	byName := map[string]LV{}
+	for _, lv := range lvs {
+		byName[lv.Name] = lv
+	}
+	pool, vol, s1 := byName["tpool"], byName["vol"], byName["s1"]
+	if pool.SegType != "thin-pool" || pool.ChunkSize != 65536 || !pool.Active || pool.MetadataPercent != 10.28 {
+		t.Errorf("pool %+v", pool)
+	}
+	if vol.ThinID != 1 || vol.Size != 268435456 || vol.Pool != "tpool" || !vol.Active || vol.SkipActivation {
+		t.Errorf("volume %+v", vol)
+	}
+	if s1.ThinID != 2 || s1.Origin != "vol" || s1.Active || !s1.SkipActivation || s1.DMPath != "/dev/mapper/k1vg-s1" {
+		t.Errorf("snapshot %+v", s1)
+	}
+}
+
+// The captured delta: snapshot 1 had 4 chunks written; then 4 KiB at 400 KiB (chunk 6) and
+// 128 KiB at 640 KiB (chunks 10-11). Both forms of thin_delta's output must give the same.
+func TestParseThinDelta(t *testing.T) {
+	want := []Extent{{6 << 16, 1 << 16}, {10 << 16, 2 << 16}}
+	for _, sec := range []string{"thin_delta", "thin_delta-verbose"} {
+		got, err := parseThinDelta([]byte(probeSection(t, sec)), 256<<20)
+		if err != nil {
+			t.Fatalf("%s: %v", sec, err)
+		}
+		if !slices.Equal(got, want) {
+			t.Errorf("%s: %v, want %v", sec, got, want)
+		}
+	}
+	// Cut at the volume's size, and every kind of change counted.
+	x := `<superblock data_block_size="128"><diff left="1" right="2"><left_only begin="0" length="1"/>` +
+		`<different begin="1" length="2"/><same begin="3" length="1"/><right_only begin="4" length="10"/></diff></superblock>`
+	got, err := parseThinDelta([]byte(x), 5<<16+100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(got, []Extent{{0, 3 << 16}, {4 << 16, 1<<16 + 100}}) {
+		t.Errorf("merged/cut %v", got)
+	}
+	if _, err := parseThinDelta([]byte(`<superblock data_block_size="128"><diff><odd begin="0" length="1"/></diff></superblock>`), 0); err == nil {
+		t.Error("an unknown entry must be an error, not silently skipped")
+	}
+}
+
+func TestParseThinDump(t *testing.T) {
+	got, err := parseThinDump([]byte(probeSection(t, "thin_dump-s1")), 256<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(got, []Extent{{0, 4 << 16}}) {
+		t.Errorf("allocated %v", got)
+	}
+	x := `<superblock data_block_size="128"><device dev_id="1"><single_mapping origin_block="7" data_block="1" time="0"/>` +
+		`<range_mapping origin_begin="0" data_begin="2" length="2" time="0"/><single_mapping origin_block="2" data_block="9" time="0"/></device></superblock>`
+	got, err = parseThinDump([]byte(x), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(got, []Extent{{0, 3 << 16}, {7 << 16, 1 << 16}}) {
+		t.Errorf("single and range mappings %v", got)
+	}
+}
+
+// fakeArray writes an md array's sysfs files and /dev/md/<name> link under a temp root.
+func fakeArray(t *testing.T, files map[string]string, members map[string][3]string) *Plane {
+	t.Helper()
+	root := t.TempDir()
+	p := &Plane{SysRoot: filepath.Join(root, "sys"), DevRoot: filepath.Join(root, "dev")}
+	md := filepath.Join(p.SysRoot, "block", "md127", "md")
+	for f, v := range files {
+		mustWrite(t, filepath.Join(md, f), v+"\n")
+	}
+	for dev, v := range members {
+		mustWrite(t, filepath.Join(md, "dev-"+dev, "state"), v[0]+"\n")
+		mustWrite(t, filepath.Join(md, "dev-"+dev, "slot"), v[1]+"\n")
+		mustWrite(t, filepath.Join(md, "dev-"+dev, "bad_blocks"), v[2])
+	}
+	if err := os.MkdirAll(filepath.Join(p.DevRoot, "md"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(p.DevRoot, "md127"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("../md127", filepath.Join(p.DevRoot, "md", "pool1")); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+func mustWrite(t *testing.T, path, s string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(s), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// The states seen while the probe rebuilt a mirror onto a new member.
+func TestArrayStatusDuringRecovery(t *testing.T) {
+	p := fakeArray(t, map[string]string{
+		"uuid": "2249bf85-011f-2b38-e0c6-74cc21efb06e", "level": "raid1", "raid_disks": "2", "degraded": "1",
+		"array_state": "clean", "sync_action": "recover", "sync_completed": "261888 / 4188160", "mismatch_cnt": "0",
+	}, map[string][3]string{
+		"loop0": {"in_sync", "0", "8192 8\n"},
+		"loop2": {"spare", "1", ""},
+	})
+	st, err := p.ArrayStatus("pool1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Kernel != "md127" || st.UUID != "2249bf85:011f2b38:e0c674cc:21efb06e" || st.Degraded != 1 ||
+		st.SyncAction != "recover" || st.SyncDone != 261888 || st.SyncTotal != 4188160 {
+		t.Fatalf("status %+v", st)
+	}
+	m := map[string]MemberStatus{}
+	for _, x := range st.Members {
+		m[x.Device] = x
+	}
+	if !m["loop0"].Has("in_sync") || m["loop0"].BadBlocks != 1 || m["loop0"].Slot != 0 {
+		t.Errorf("good member %+v", m["loop0"])
+	}
+	if !m["loop2"].Has("spare") || m["loop2"].Slot != 1 {
+		t.Errorf("rebuilding member %+v", m["loop2"])
+	}
+}
+
+func TestArrayStatusFailedMember(t *testing.T) {
+	p := fakeArray(t, map[string]string{"uuid": "x", "degraded": "1", "sync_action": "idle", "sync_completed": "none"},
+		map[string][3]string{"loop1": {"faulty,blocked", "none", ""}})
+	st, err := p.ArrayStatus("pool1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f := st.Members[0]; !f.Has("faulty") || !f.Has("blocked") || f.Slot != -1 || st.SyncTotal != 0 {
+		t.Errorf("failed member %+v, status %+v", f, st)
+	}
+	if _, err := p.ArrayStatus("nope"); err == nil {
+		t.Error("a missing array must be an error")
+	}
+}
+
+func TestSmallHelpers(t *testing.T) {
+	if got := dmName("vg-a", "vol-1"); got != "vg--a-vol--1" {
+		t.Errorf("dmName %q", got)
+	}
+	if !sameDevNum("253:4", "fd:4") || sameDevNum("253:4", "fd:5") || sameDevNum("8:0", "bogus") {
+		t.Error("sameDevNum")
+	}
+	const gib = 1 << 30
+	for _, c := range []struct{ data, want uint64 }{{1 * gib, 64 << 20}, {100 * gib, 800 << 20}, {10000 * gib, 16188 << 20}} {
+		if got := MetadataSize(c.data); got != c.want {
+			t.Errorf("MetadataSize(%d GiB) = %d MiB, want %d", c.data/gib, got>>20, c.want>>20)
+		}
+	}
+}
+
+// A group snapshot suspends every wrapper before taking any snapshot and resumes them all after.
+func TestGroupSnapshotOrder(t *testing.T) {
+	s := &Script{Steps: []Step{
+		{Prefix: "dmsetup suspend --nolockfs velocor-a"},
+		{Prefix: "dmsetup suspend --nolockfs velocor-b"},
+		{Prefix: "lvm lvcreate --config"},
+		{Prefix: "lvm lvcreate --config"},
+		{Prefix: "dmsetup resume velocor-a"},
+		{Prefix: "dmsetup resume velocor-b"},
+	}}
+	p := &Plane{Run: s}
+	err := p.GroupSnapshot(context.Background(), []GroupMember{
+		{Volume: "a", VG: "vg", LV: "a", Snap: "sa"}, {Volume: "b", VG: "vg", LV: "b", Snap: "sb"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(s.Steps) != 0 {
+		t.Fatalf("steps left: %v (calls %v)", s.Steps, s.Calls)
+	}
+	if !strings.HasSuffix(s.Calls[2], "--snapshot --name sa vg/a") || !strings.HasSuffix(s.Calls[3], "--snapshot --name sb vg/b") {
+		t.Errorf("snapshot calls %v", s.Calls[2:4])
+	}
+}
+
+// A failed snapshot leaves nothing behind: the snapshots taken are removed and every wrapper is
+// resumed, even one the failure came after.
+func TestGroupSnapshotFailureCleansUp(t *testing.T) {
+	boom := errors.New("boom")
+	s := &Script{Steps: []Step{
+		{Prefix: "dmsetup suspend --nolockfs velocor-a"},
+		{Prefix: "dmsetup suspend --nolockfs velocor-b"},
+		{Prefix: "lvm lvcreate"},
+		{Prefix: "lvm lvcreate", Err: boom},
+		{Prefix: "dmsetup resume velocor-a"},
+		{Prefix: "dmsetup resume velocor-b"},
+		{Prefix: "lvm lvremove"},
+	}}
+	p := &Plane{Run: s}
+	err := p.GroupSnapshot(context.Background(), []GroupMember{
+		{Volume: "a", VG: "vg", LV: "a", Snap: "sa"}, {Volume: "b", VG: "vg", LV: "b", Snap: "sb"}})
+	if !errors.Is(err, boom) || !strings.Contains(err.Error(), "snapshot vg/b") {
+		t.Fatalf("error %v", err)
+	}
+	if len(s.Steps) != 0 {
+		t.Fatalf("cleanup incomplete, steps left %v (calls %v)", s.Steps, s.Calls)
+	}
+	if !strings.HasSuffix(s.Calls[6], "vg/sa") {
+		t.Errorf("removed %q, want the snapshot taken (vg/sa)", s.Calls[6])
+	}
+
+	// A failed suspend: only what was suspended is resumed, nothing is snapshotted.
+	s = &Script{Steps: []Step{
+		{Prefix: "dmsetup suspend --nolockfs velocor-a"},
+		{Prefix: "dmsetup suspend --nolockfs velocor-b", Err: boom},
+		{Prefix: "dmsetup resume velocor-a"},
+	}}
+	p.Run = s
+	if err := p.GroupSnapshot(context.Background(), []GroupMember{{Volume: "a"}, {Volume: "b"}}); !errors.Is(err, boom) || len(s.Steps) != 0 {
+		t.Fatalf("suspend failure: %v, steps left %v", err, s.Steps)
+	}
+}
+
+// Resuming happens even after the context ran out.
+func TestGroupSnapshotResumesAfterCancel(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	r := runnerFunc(func(c context.Context, name string, args ...string) ([]byte, error) {
+		line := name + " " + strings.Join(args, " ")
+		if strings.HasPrefix(line, "lvm lvcreate") {
+			cancel()
+			return nil, context.Canceled
+		}
+		if strings.HasPrefix(line, "dmsetup resume") && c.Err() != nil {
+			return nil, errors.New("resume ran with a cancelled context")
+		}
+		return nil, nil
+	})
+	p := &Plane{Run: r}
+	err := p.GroupSnapshot(ctx, []GroupMember{{Volume: "a", VG: "vg", LV: "a", Snap: "sa"}})
+	if !errors.Is(err, context.Canceled) || strings.Contains(err.Error(), "cancelled context") {
+		t.Fatalf("error %v", err)
+	}
+}
+
+type runnerFunc func(ctx context.Context, name string, args ...string) ([]byte, error)
+
+func (f runnerFunc) Run(ctx context.Context, name string, args ...string) ([]byte, error) {
+	return f(ctx, name, args...)
+}
+
+// Every LVM command carries velod's own device filter, so the host's devices file can't decide.
+func TestLVMConfigOnEveryCall(t *testing.T) {
+	var calls []string
+	p := &Plane{Run: runnerFunc(func(_ context.Context, name string, args ...string) ([]byte, error) {
+		calls = append(calls, name+" "+strings.Join(args, " "))
+		if name == "lvm" && len(args) > 0 && args[0] == "vgs" {
+			return []byte("  10737418240 4194304\n"), nil // a 10 GiB VG, 4 MiB extents
+		}
+		return []byte(`{"report":[{"lv":[]}]}`), nil
+	}), DevRoot: "/dev"}
+	ctx := context.Background()
+	_ = p.CreatePool(ctx, PoolSpec{VG: "vg", Device: "/dev/md/p", Thin: "thin", DataPercent: 90})
+	_ = p.CreateVolume(ctx, "vg", "thin", "v", 1<<30, true)
+	_, _ = p.ListVolumes(ctx, "vg")
+	for _, c := range calls {
+		if strings.HasPrefix(c, "lvm ") && !strings.Contains(c, "use_devicesfile = 0") {
+			t.Errorf("no velod config: %s", c)
+		}
+	}
+	pool := calls[len(calls)-4]
+	if c := calls[len(calls)-3]; !strings.Contains(c, "lvchange") || !strings.Contains(c, "--errorwhenfull y vg/thin") {
+		t.Errorf("full pool not set to fail writes at once: %s", c)
+	}
+	for _, want := range []string{"--type thin-pool", "--chunksize 65536b", "--zero y", "--size 9512681472b", "--poolmetadatasize 75497472b"} { // 90%: 9 GiB, less two 72 MiB metadata copies
+		if !strings.Contains(pool, want) {
+			t.Errorf("thin pool command lacks %q: %s", want, pool)
+		}
+	}
+}

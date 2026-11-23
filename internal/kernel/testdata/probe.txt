@@ -1,0 +1,152 @@
+##### mdadm-detail-export
+MD_LEVEL=raid1
+MD_DEVICES=2
+MD_METADATA=1.2
+MD_UUID=2249bf85:011f2b38:e0c674cc:21efb06e
+MD_DEVNAME=k1probe
+MD_RESHAPE_ACTIVE=False
+MD_NAME=fedora:k1probe
+MD_DEVICE_dev_loop0_ROLE=0
+MD_DEVICE_dev_loop0_DEV=/dev/loop0
+MD_DEVICE_dev_loop1_ROLE=1
+MD_DEVICE_dev_loop1_DEV=/dev/loop1
+##### mdadm-examine-export-member
+MD_LEVEL=raid1
+MD_DEVICES=2
+MD_NAME=fedora:k1probe
+MD_ARRAY_SIZE=2144.34MB
+MD_UUID=2249bf85:011f2b38:e0c674cc:21efb06e
+MD_UPDATE_TIME=1795211123
+MD_DEV_UUID=7893ea3b:e0330278:475747fb:1af95b72
+MD_EVENTS=0
+##### md-sysfs
+array_state=clean
+level=raid1
+raid_disks=2
+degraded=0
+sync_action=idle
+sync_completed=none
+sync_speed_max=200000 (system)
+mismatch_cnt=0
+uuid=2249bf85-011f-2b38-e0c6-74cc21efb06e
+metadata_version=1.2
+dev-loop0 state=in_sync slot=0 bad_blocks=[]
+dev-loop1 state=in_sync slot=1 bad_blocks=[]
+##### mdstat
+Personalities : [raid1] 
+md127 : active raid1 loop1[1] loop0[0]
+      2094080 blocks super 1.2 [2/2] [UU]
+      bitmap: 1/1 pages [4KB], 65536KB chunk
+
+unused devices: <none>
+  Physical volume "/dev/md127" successfully created.
+  Creating devices file /etc/lvm/devices/system.devices
+  Volume group "k1vg" successfully created
+  Thin pool volume with chunk size 64.00 KiB can address at most <15.88 TiB of data.
+  Logical volume "tpool" created.
+  Logical volume "vol" created.
+  Logical volume "s1" created.
+  Logical volume "s2" created.
+##### lvs-json
+  {
+      "report": [
+          {
+              "lv": [
+                  {"lv_name":"s1", "vg_name":"k1vg", "lv_uuid":"aU3iC3-pYRH-YNLC-F2Bs-zyh6-sA2u-bdsG1b", "lv_attr":"Vwi---tz-k", "lv_size":"268435456", "pool_lv":"tpool", "origin":"vol", "thin_id":"2", "data_percent":"", "metadata_percent":"", "chunk_size":"0", "zero":"zero", "lv_active":"", "lv_skip_activation":"skip activation", "lv_dm_path":"/dev/mapper/k1vg-s1", "segtype":"thin"},
+                  {"lv_name":"s2", "vg_name":"k1vg", "lv_uuid":"ciMYSY-cQ50-SSRZ-xVzV-atvi-PuSu-8xfd4o", "lv_attr":"Vwi---tz-k", "lv_size":"268435456", "pool_lv":"tpool", "origin":"vol", "thin_id":"3", "data_percent":"", "metadata_percent":"", "chunk_size":"0", "zero":"zero", "lv_active":"", "lv_skip_activation":"skip activation", "lv_dm_path":"/dev/mapper/k1vg-s2", "segtype":"thin"},
+                  {"lv_name":"tpool", "vg_name":"k1vg", "lv_uuid":"Xtfd3q-peXM-JLvz-AMtw-xkQu-ShZL-KIFZ6p", "lv_attr":"twi-aotz--", "lv_size":"1073741824", "pool_lv":"", "origin":"", "thin_id":"", "data_percent":"0.04", "metadata_percent":"10.28", "chunk_size":"65536", "zero":"zero", "lv_active":"active", "lv_skip_activation":"", "lv_dm_path":"/dev/mapper/k1vg-tpool", "segtype":"thin-pool"},
+                  {"lv_name":"vol", "vg_name":"k1vg", "lv_uuid":"nLUHbQ-U7pd-Uz2P-IfMV-mWNQ-cdVK-B0fPsb", "lv_attr":"Vwi-a-tz--", "lv_size":"268435456", "pool_lv":"tpool", "origin":"", "thin_id":"1", "data_percent":"0.17", "metadata_percent":"", "chunk_size":"0", "zero":"zero", "lv_active":"active", "lv_skip_activation":"", "lv_dm_path":"/dev/mapper/k1vg-vol", "segtype":"thin"}
+              ]
+          }
+      ]
+      ,
+      "log": [
+      ]
+  }
+##### vgs-json
+  {
+      "report": [
+          {
+              "vg": [
+                  {"vg_name":"k1vg", "vg_uuid":"WULaax-TSed-16EQ-wWMh-jJHN-PAaK-gNvxvO", "vg_size":"2143289344", "vg_free":"1035993088", "pv_count":"1", "lv_count":"4"}
+              ]
+          }
+      ]
+      ,
+      "log": [
+      ]
+  }
+##### pvs-json
+  {
+      "report": [
+          {
+              "pv": [
+              ]
+          }
+      ]
+      ,
+      "log": [
+          {"log_seq_num":"1", "log_type":"error", "log_context":"processing", "log_object_type":"pv", "log_object_name":"", "log_object_id":"", "log_object_group":"", "log_object_group_id":"", "log_message":"Cannot use k1vg: device not found", "log_errno":"-1", "log_ret_code":"0"}
+      ]
+  }
+##### dmsetup-status-pool
+0 2097152 thin-pool 3 421/4096 7/16384 - rw discard_passdown queue_if_no_space - 1024 
+##### dmsetup-table-vol
+0 524288 thin 252:2 1
+##### thin-ids s1=2 s2=3
+##### thin_delta
+<superblock uuid="" time="2" transaction="3" data_block_size="128" nr_data_blocks="0">
+  <diff left="2" right="3">
+    <same begin="0" length="4"/>
+    <right_only begin="6" length="1"/>
+    <right_only begin="10" length="2"/>
+  </diff>
+</superblock>##### thin_delta-verbose
+<superblock uuid="" time="2" transaction="3" data_block_size="128" nr_data_blocks="0">
+  <diff left="2" right="3">
+    <same>
+      <range begin="0" data_begin="0" length="4"/>
+    </same>
+    <right_only>
+      <range begin="6" data_begin="4" length="1"/>
+      <range begin="10" data_begin="5" length="2"/>
+    </right_only>
+  </diff>
+</superblock>##### thin_dump-s1
+<superblock uuid="" time="2" transaction="3" version="2" data_block_size="128" nr_data_blocks="0">
+  <device dev_id="2" mapped_blocks="4" transaction="1" creation_time="1" snap_time="1">
+    <range_mapping origin_begin="0" data_begin="0" length="4" time="0"/>
+  </device>
+</superblock>##### dmsetup-create-wrapper
+Name:              velocor-k1probe
+State:             ACTIVE
+Read Ahead:        256
+Tables present:    LIVE
+Open count:        0
+Event number:      0
+Major, minor:      252, 5
+Number of targets: 1
+
+##### dmsetup-info-suspended
+velocor-k1probe:Suspended
+##### mdadm-fail-detail
+MD_DEVICES=2
+MD_DEVICE_dev_loop0_ROLE=0
+MD_DEVICE_dev_loop0_DEV=/dev/loop0
+MD_DEVICE_dev_loop1_ROLE=1
+MD_DEVICE_dev_loop1_DEV=/dev/loop1
+dev-loop0 state=in_sync
+dev-loop1 state=faulty,blocked
+##### md-recovering
+degraded=1
+sync_action=recover
+sync_completed=261888 / 4188160
+dev-loop0 state=in_sync slot=0
+dev-loop2 state=spare slot=1
+md127 : active raid1 loop2[2] loop0[0]
+      2094080 blocks super 1.2 [2/1] [U_]
+      [=>...................]  recovery =  9.6% (201984/2094080) finish=0.1min speed=201984K/sec
+      bitmap: 1/1 pages [4KB], 65536KB chunk
+##### teardown
+mdadm: stopped /dev/md/k1probe
+done
