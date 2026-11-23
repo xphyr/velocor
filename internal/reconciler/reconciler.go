@@ -141,7 +141,7 @@ func (r *Reconciler) Start(ctx context.Context, interval time.Duration) {
 			_, _ = r.ReconcileOnce(ctx)
 		case <-watch.C:
 			if r.Restoring() {
-				r.logger.Warn("spdk_tgt was restarted: restoring pools, volumes and exports now", "instance", r.DataPlaneInstance())
+				r.logger.Warn("the data plane was restarted: restoring pools, volumes and exports now", "instance", r.DataPlaneInstance())
 				_, _ = r.ReconcileOnce(ctx)
 				ticker.Reset(interval)
 			}
@@ -191,7 +191,7 @@ func (r *Reconciler) ReconcileOnce(ctx context.Context) (State, error) {
 	r.enforceWriteCache(p)
 
 	if _, err := r.dp.Version(ctx); err != nil {
-		r.finishPass(0, []string{"spdk_tgt"}, fmt.Sprintf("spdk_tgt unreachable: %v", err))
+		r.finishPass(0, []string{"data-plane"}, fmt.Sprintf("the data plane is unreachable: %v", err))
 		return r.State(), err
 	}
 
@@ -474,7 +474,7 @@ func (r *Reconciler) reconcilePools(ctx context.Context, p *pass, examined bool)
 				fail(v.health, "RAID "+pool.ArrayName+" is "+string(v.health))
 			}
 		} else {
-			fail(store.HealthStatusUnavailable, fmt.Sprintf("RAID %s not assembled by SPDK examine (%d/%d member bdevs present)",
+			fail(store.HealthStatusUnavailable, fmt.Sprintf("array %s isn't assembled (%d/%d member disks present)",
 				pool.ArrayName, r.presentMembers(pool, bdevs), len(pool.DiskIDs)))
 		}
 
@@ -489,13 +489,13 @@ func (r *Reconciler) reconcilePools(ctx context.Context, p *pass, examined bool)
 		case lvs != nil || !raidOnline:
 			// Missing RAID already reported; never inspect lvstores on an incomplete array.
 		case pool.ThinPoolUUID == "":
-			fail(store.HealthStatusFaulted, "pool has no lvstore UUID; its creation never completed")
+			fail(store.HealthStatusFaulted, "pool has no thin pool UUID; its creation never completed")
 		case !examined:
-			fail(store.HealthStatusDegraded, "waiting for SPDK examine to load lvstore "+pool.ThinPoolName)
+			fail(store.HealthStatusDegraded, "waiting for the data plane to load thin pool "+pool.ThinPoolName)
 		case slices.ContainsFunc(lvstores, func(l dataplane.ThinPool) bool { return l.Name == pool.ThinPoolName }):
-			fail(store.HealthStatusFaulted, fmt.Sprintf("lvstore %s has a different UUID than recorded (%s); it may have been re-initialised", pool.ThinPoolName, pool.ThinPoolUUID))
+			fail(store.HealthStatusFaulted, fmt.Sprintf("thin pool %s has a different UUID than recorded (%s); it may have been re-initialised", pool.ThinPoolName, pool.ThinPoolUUID))
 		default:
-			fail(store.HealthStatusFaulted, fmt.Sprintf("lvstore %s (%s) not found on %s", pool.ThinPoolName, pool.ThinPoolUUID, pool.ArrayName))
+			fail(store.HealthStatusFaulted, fmt.Sprintf("thin pool %s (%s) not found on %s", pool.ThinPoolName, pool.ThinPoolUUID, pool.ArrayName))
 		}
 
 		var total, free, metaTotal, metaUsed uint64
@@ -668,12 +668,12 @@ func (r *Reconciler) reconcileVolumes(ctx context.Context, p *pass, poolOnline m
 			p.degraded = append(p.degraded, res)
 		case !found:
 			health = store.HealthStatusFaulted
-			msg = fmt.Sprintf("lvol %s (%s) is missing from its lvstore; not re-creating it because that would present an empty disk", vol.Handle, vol.UUID)
+			msg = fmt.Sprintf("volume %s (%s) is missing from its thin pool; not re-creating it because that would present an empty disk", vol.Handle, vol.UUID)
 			p.degrade(res, msg)
 		default:
 			if vol.Device != vol.Handle {
 				if _, ok := bdevs[vol.Device]; !ok {
-					health, msg = store.HealthStatusDegraded, fmt.Sprintf("filter bdev %s is not present", vol.Device)
+					health, msg = store.HealthStatusDegraded, fmt.Sprintf("filter device %s is not present", vol.Device)
 					p.degrade(res, msg)
 				}
 			}

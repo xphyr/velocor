@@ -113,13 +113,13 @@ func (s *Server) warnings() []string {
 	out = append(out, s.durabilityWarnings()...)
 	if s.reconciler != nil {
 		if sum := reconciler.UnmanagedSummary(s.reconciler.State().Unmanaged); sum != "" {
-			out = append(out, "spdk_tgt holds objects that Velocor doesn't manage ("+sum+"), listed on the System page. "+
+			out = append(out, "the data plane holds objects that Velocor doesn't manage ("+sum+"), listed on the System page. "+
 				"They are left alone: they may be leftovers of a failed operation, or the only copy of data after the database was lost. "+
 				"Import the pool or restore a database backup if they are yours; remove them by hand only once you know what they are.")
 		}
 	}
 	if s.hw != nil && s.hw.UnsafeNoIOMMUAllowed() {
-		out = append(out, "Unsafe no-IOMMU mode is allowed: SPDK can DMA anywhere in host memory. Use this only in lab VMs.")
+		out = append(out, "Unsafe no-IOMMU mode is allowed: SPDK (its vfio NVMe driver) can DMA anywhere in host memory. Use this only in lab VMs.")
 	}
 	if w := s.monitoringWarning(); w != "" {
 		out = append(out, w)

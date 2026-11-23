@@ -283,7 +283,7 @@ func (s *Server) importPool(ctx context.Context, poolID, rename string, allowDeg
 				cur.MemberUUID = f.Identity
 				return nil
 			}); merr != nil {
-				return nil, fmt.Errorf("record the bdev UUID of disk %s: %w", f.Disk.ID, merr)
+				return nil, fmt.Errorf("record the member UUID of disk %s: %w", f.Disk.ID, merr)
 			}
 		}
 		d, cerr := s.attachAndClaim(ctx, disk, true)
@@ -336,19 +336,19 @@ func (s *Server) importPool(ctx context.Context, poolID, rename string, allowDeg
 	if l, ok := inLvs[meta.LvolName]; ok {
 		metaUUID = l.UUID
 		if s.metaDev == nil {
-			res.Warnings = append(res.Warnings, "on-pool metadata copies are disabled on this appliance; rebuilt the pool from SPDK")
+			res.Warnings = append(res.Warnings, "on-pool metadata copies are disabled on this appliance; rebuilt the pool from the data plane")
 		} else {
 			slots, rerr := s.metaDev.ReadSlots(ctx, l.UUID)
 			if rerr == nil {
 				plan, rerr = meta.Newest(slots...)
 			}
 			if rerr != nil {
-				res.Warnings = append(res.Warnings, fmt.Sprintf("the metadata copy is unreadable (%v); rebuilt the pool from SPDK", rerr))
+				res.Warnings = append(res.Warnings, fmt.Sprintf("the metadata copy is unreadable (%v); rebuilt the pool from the data plane", rerr))
 				plan = nil
 			}
 		}
 	} else {
-		res.Warnings = append(res.Warnings, "the pool has no metadata copy; rebuilt it from SPDK")
+		res.Warnings = append(res.Warnings, "the pool has no metadata copy; rebuilt it from the data plane")
 	}
 	if plan != nil {
 		res.Source, res.Generation, res.WrittenAt = "manifest", plan.Generation, plan.WrittenAt
@@ -554,7 +554,7 @@ func (s *Server) importableLvols(plan *meta.Manifest, inLvs map[string]dataplane
 		l, ok := inLvs[v.ID]
 		if !ok || l.Snapshot {
 			res.MissingVolumeIDs = append(res.MissingVolumeIDs, v.ID)
-			res.Warnings = append(res.Warnings, fmt.Sprintf("volume %s (%s) has no lvol in the pool; not restored", v.ID, v.Name))
+			res.Warnings = append(res.Warnings, fmt.Sprintf("volume %s (%s) isn't in the pool's data plane; not restored", v.ID, v.Name))
 			continue
 		}
 		v.UUID = l.UUID
@@ -567,7 +567,7 @@ func (s *Server) importableLvols(plan *meta.Manifest, inLvs map[string]dataplane
 	for _, sn := range plan.Snapshots {
 		l, ok := inLvs[sn.ID]
 		if !ok || !present[sn.VolumeID] {
-			res.Warnings = append(res.Warnings, fmt.Sprintf("snapshot %s (%s) not restored: its lvol or volume is missing", sn.ID, sn.Name))
+			res.Warnings = append(res.Warnings, fmt.Sprintf("snapshot %s (%s) not restored: it or its volume is missing from the data plane", sn.ID, sn.Name))
 			continue
 		}
 		sn.UUID, sn.Handle = l.UUID, lvsName+"/"+sn.ID
@@ -774,7 +774,7 @@ func (s *Server) importSkeleton(ctx context.Context, poolID string, inLvs map[st
 			snapOwner[name] = owner(name)
 		}
 	}
-	res.Warnings = append(res.Warnings, "recovered from SPDK only: names, labels, QoS, exports and access control are not restored; volumes and snapshots are named by their IDs")
+	res.Warnings = append(res.Warnings, "recovered from the data plane only: names, labels, QoS, exports and access control are not restored; volumes and snapshots are named by their IDs")
 	for _, name := range names {
 		n := nodes[name]
 		if n.l.Snapshot {

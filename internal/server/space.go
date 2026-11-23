@@ -148,7 +148,7 @@ func (s *Server) lvolHeldBytes(ctx context.Context, uuid string) (uint64, error)
 			return l.AllocatedBytes, nil
 		}
 	}
-	return 0, fmt.Errorf("%w: lvol %s", store.ErrNotFound, uuid)
+	return 0, fmt.Errorf("%w: volume %s", store.ErrNotFound, uuid)
 }
 
 // handleUpdatePool changes a pool's space policy: PATCH /api/v1/pools/{id} {space_policy}; only

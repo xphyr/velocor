@@ -511,7 +511,7 @@ func runSystem(cfg *cliConfig, args []string) error {
 			fmt.Printf("WARNING: %v\n", w)
 		}
 		if objs := sliceOfMaps(recSt["unmanaged_objects"]); len(objs) > 0 {
-			fmt.Println("\nIn spdk_tgt, not managed by Velocor (left alone):")
+			fmt.Println("\nIn the data plane, not managed by Velocor (left alone):")
 			tw := newTabWriter()
 			fmt.Fprintln(tw, "KIND\tNAME\tUUID\tDETAILS\tSINCE")
 			for _, o := range objs {

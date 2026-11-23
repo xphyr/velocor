@@ -373,8 +373,8 @@ function claimDialog(d) {
   openDialog({
     title: `Claim ${d.name || d.id}`,
     intro: d.type === "NVME"
-      ? "The drive is taken from the Linux nvme driver and handed to SPDK, which polls it directly. The host can no longer see it."
-      : "SPDK opens the disk through io_uring. Nothing else on the host should use it afterwards.",
+      ? "The drive is handed to the data plane. With SPDK it is taken from the Linux nvme driver and polled directly, and the host can no longer see it; with the kernel data plane it stays on the nvme driver."
+      : "The data plane takes the disk (SPDK opens it through io_uring). Nothing else on the host should use it afterwards.",
     submit: "Claim",
     action: async () => {
       try {
@@ -390,7 +390,7 @@ function claimDialog(d) {
       confirmDialog({
         title: `Destroy the data on ${d.name || d.id}?`,
         warning: el("div", { class: "panel-notice bad" }, r.needsForce),
-        intro: "Claiming it anyway gives the whole disk to SPDK, and everything on it is lost.",
+        intro: "Claiming it anyway gives the whole disk to the data plane, and everything on it is lost.",
         submit: "Claim and destroy data",
         confirmText: d.name || d.id,
         action: () => send("POST", `/disks/${encodeURIComponent(d.id)}:claim?force=true`),
@@ -403,7 +403,7 @@ function claimDialog(d) {
 function releaseDialog(d) {
   openDialog({
     title: `Release ${d.name || d.id}`,
-    intro: "SPDK lets go of it and it's handed back to the Linux kernel.",
+    intro: "The data plane lets go of it and the Linux kernel has it to itself again.",
     submit: "Release",
     action: () => send("POST", `/disks/${encodeURIComponent(d.id)}:release`),
     done: () => { notify(`Released ${d.name || d.id}.`); rerender(); },
@@ -482,7 +482,7 @@ async function createPoolDialog() {
   const free = (await list("/disks", "disks")).filter((d) => d.claimed && !d.pool_id && !d.is_boot_device);
   openDialog({
     title: "Create a pool",
-    intro: "This builds an SPDK RAID across the disks, with its layout recorded on them so it reassembles after a restart, and a logical volume store on top.",
+    intro: "This builds a RAID array across the disks (SPDK RAID, or md with the kernel data plane), with its layout recorded on them so it reassembles after a restart, and a thin pool on top.",
     submit: "Create",
     fields: [
       { name: "name", label: "Name", required: true },
@@ -569,7 +569,7 @@ async function importPoolDialog() {
 function importResult(r) {
   const from = r.source === "manifest"
     ? `from the copy on the pool (generation ${r.generation}, written ${humanTime(r.written_at)})`
-    : "from SPDK only: the pool had no readable copy of its configuration";
+    : "from the data plane only: the pool had no readable copy of its configuration";
   openDialog({
     title: `Imported ${r.pool.name}`,
     intro: `Recovered ${from}: ${r.volumes} volumes, ${r.snapshots} snapshots; ${r.exports_enabled} exports served, ${r.exports_disabled} restored disabled.`,
@@ -1010,7 +1010,7 @@ async function volume(id) {
       !exps.length && v.deletion_protection && can.provision && el("span", { class: "muted" }, "It can't be deleted while it's protected.")),
     el("dl", { class: "facts" },
       fact("Health", health(v)),
-      fact("Space", usage ? [bar(usage.allocated_bytes, usage.size_bytes), el("span", { class: "sub" }, "Includes what it shares with its snapshots.")] : el("span", { class: "muted" }, "SPDK can't say at the moment.")),
+      fact("Space", usage ? [bar(usage.allocated_bytes, usage.size_bytes), el("span", { class: "sub" }, "Includes what it shares with its snapshots.")] : el("span", { class: "muted" }, "The data plane can't say at the moment.")),
       fact("Pool", p ? link(p.name, "pool", p.id) : mono(v.pool_id)),
       fact("Provisioning", v.thin_provision ? "Thin" : "Thick"),
       fact("Exported", exps.length ? exps.map((e) => el("div", {}, link(e.name, "export", e.id), ` (${protoName(e.protocol)})`)) : pill("Not exported", "quiet")),
@@ -1220,7 +1220,7 @@ async function accessDialog(e) {
   const groups = await list("/initiator-groups", "initiator_groups");
   openDialog({
     title: `Who can connect to ${e.name}`,
-    intro: "Hosts that lose access are cut off at once. It's applied to SPDK before it's saved, so if it can't be applied nothing changes.",
+    intro: "Hosts that lose access are cut off at once. It's applied to the data plane before it's saved, so if it can't be applied nothing changes.",
     submit: "Save",
     danger: true,
     fields: accessFields(groups, e),
@@ -1447,7 +1447,7 @@ async function addPortalDialog() {
   const ips = [...new Set((net.interfaces || []).flatMap((i) => (i.addresses || []).map((a) => a.split("/")[0])))];
   openDialog({
     title: "Add a portal",
-    intro: "An address and port that hosts connect to. SPDK starts listening when an export uses it.",
+    intro: "An address and port that hosts connect to. The data plane starts listening when an export uses it.",
     submit: "Add",
     fields: [
       { name: "name", label: "Name", required: true },
@@ -1762,7 +1762,7 @@ function monitoringDialog(enabled) {
     title: enabled ? "Turn off monitoring" : "Turn on monitoring",
     intro: enabled
       ? "Prometheus and Alertmanager stop, and no alerts are evaluated until monitoring is turned on again. Their history stays on disk."
-      : `Starts Prometheus and Alertmanager on the appliance, listening only on localhost. They use some memory and CPU, kept off SPDK's cores, and up to 2 GB of the boot disk for history.`,
+      : `Starts Prometheus and Alertmanager on the appliance, listening only on localhost. They use some memory and CPU, kept off the cores the data plane polls on (SPDK), and up to 2 GB of the boot disk for history.`,
     submit: enabled ? "Turn off" : "Turn on",
     danger: enabled,
     fields: [],

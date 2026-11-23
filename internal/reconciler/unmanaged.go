@@ -59,7 +59,7 @@ func (r *Reconciler) findUnmanaged(ctx context.Context, p *pass, examined bool) 
 		o.FirstSeen = first.UTC()
 		report = append(report, o)
 		if !r.unmanagedLogged[key] {
-			r.logger.Warn("spdk_tgt holds an object Velocor doesn't manage; it is left alone",
+			r.logger.Warn("the data plane holds an object Velocor doesn't manage; it is left alone",
 				"kind", o.Kind, "name", o.Name, "uuid", o.UUID, "detail", o.Detail)
 		}
 	}

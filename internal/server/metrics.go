@@ -143,7 +143,7 @@ func (s *Server) collectMetrics(ctx context.Context) *metricSet {
 	m := newMetricSet()
 	m.gauge("velocor_up", "Whether the Velocor control plane (velod) is up.", 1)
 	m.gauge("velocor_build_info", "velod's version, as a label.", 1, "version", version.Version)
-	m.gauge("velocor_status_warnings", "Warnings shown on the status page (insecure HTTP, bootstrap password file, unmanaged SPDK objects, ...).",
+	m.gauge("velocor_status_warnings", "Warnings shown on the status page (insecure HTTP, bootstrap password file, unmanaged data plane objects, ...).",
 		float64(len(s.warnings())))
 
 	s.reconcilerMetrics(m)

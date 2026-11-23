@@ -275,5 +275,5 @@ func (s *Server) handleVolumeUsage(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	writeError(w, fmt.Errorf("%w: lvol %s is not present in the data plane", store.ErrNotFound, vol.UUID))
+	writeError(w, fmt.Errorf("%w: volume %s is not present in the data plane", store.ErrNotFound, vol.UUID))
 }

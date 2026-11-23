@@ -77,10 +77,10 @@ func (r *Reconciler) syncPoolMeta(ctx context.Context, pool *store.Pool, lvols [
 		// Thick, so a full pool can never fail a metadata write.
 		created, err := r.dp.CreateVolume(ctx, pool.ThinPoolName, meta.LvolName, meta.LvolBytes, false)
 		if err != nil {
-			return fmt.Errorf("create the %s lvol: %w", meta.LvolName, err)
+			return fmt.Errorf("create the %s volume: %w", meta.LvolName, err)
 		}
 		uuid = created
-		r.logger.Info("created the metadata lvol", "pool", pool.ID, "lvol", uuid)
+		r.logger.Info("created the metadata volume", "pool", pool.ID, "volume", uuid)
 	}
 
 	m, err := meta.Build(r.store, pool.ID, r.meta.nodeID, r.meta.version)
@@ -97,7 +97,7 @@ func (r *Reconciler) syncPoolMeta(ctx context.Context, pool *store.Pool, lvols [
 	if !r.meta.synced[pool.ID] {
 		slots, err := r.meta.dev.ReadSlots(ctx, uuid)
 		if err != nil {
-			return fmt.Errorf("read the metadata lvol: %w", err)
+			return fmt.Errorf("read the metadata volume: %w", err)
 		}
 		if onPool, err := meta.Newest(slots...); err == nil {
 			if onPool.Generation > gen {

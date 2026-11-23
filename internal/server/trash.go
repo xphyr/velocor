@@ -92,7 +92,7 @@ func (s *Server) purgeVolume(ctx context.Context, vol *store.Volume) error {
 		return err
 	}
 	if err := s.dp.DeleteVolume(ctx, vol.UUID); err != nil && !dataplane.IsNotFound(err) {
-		return fmt.Errorf("delete lvol: %w", err)
+		return fmt.Errorf("delete the volume: %w", err)
 	}
 	if err := s.store.DeleteVolume(vol.ID); err != nil {
 		return err

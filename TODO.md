@@ -117,7 +117,10 @@ listed until then so nothing is lost if the plan changes.
       90% full; alerts at 80% (warning, 10 min) and 95% (critical). Fedora VM: grown 64 ->
       116 MiB until no room, then reported;
     Then every row of the feature table (iSCSI via LIO, scrub on md, metadata copy
-  on an LV, import, CBT via `thin_delta`, metrics, alerts, veloctl/UI wording, docs).
+  on an LV, import, CBT via `thin_delta`, metrics, alerts, veloctl/UI wording, docs): all done
+  (wording: API errors, pool warnings, import results, `veloctl` and the web UI say volume, thin
+  pool, array and data plane, and SPDK only where something is SPDK's, 2026-11-23). K-2 is
+  complete; K-3 validates it.
 - [ ] **K-3. Validation:** CSI matrix on both clusters, KubeVirt, the P0-7 scenario (an
   unreadable sector on the last copy keeps the pool up), the benchmark, soak.
 - [ ] **K-4. Cutover:** remove SPDK (images, patches, client, fake, CI stage); rebuild the lab

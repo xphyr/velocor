@@ -206,7 +206,7 @@ func (s *Server) releaseDisk(w http.ResponseWriter, r *http.Request, id string) 
 	}
 	if d.Type == store.DiskTypeNVMe && s.hw != nil && d.PCIAddress != "" {
 		if err := s.hw.BindNVMeToKernel(d.PCIAddress); err != nil {
-			writeError(w, fmt.Errorf("disk released from SPDK but rebinding %s to the kernel nvme driver failed: %w", d.PCIAddress, err))
+			writeError(w, fmt.Errorf("disk released from the data plane but rebinding %s to the kernel nvme driver failed: %w", d.PCIAddress, err))
 			return
 		}
 	}
@@ -263,7 +263,7 @@ func (s *Server) handleCreatePool(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if !d.Claimed || d.Handle == "" {
-			writeError(w, fmt.Errorf("%w: disk %s is not claimed by SPDK", store.ErrInvalidArgument, diskID))
+			writeError(w, fmt.Errorf("%w: disk %s is not claimed", store.ErrInvalidArgument, diskID))
 			return
 		}
 		totalRaw += d.SizeBytes
@@ -302,7 +302,7 @@ func (s *Server) handleCreatePool(w http.ResponseWriter, r *http.Request) {
 			// spdk_tgt went on and finished), and a RAID can't be deleted from under it: the
 			// delete would hang half-done. Remove the lvstore first.
 			if derr := s.dp.DeleteThinPool(cleanup, "", pool.ThinPoolName); derr != nil && !dataplane.IsNotFound(derr) {
-				err = fmt.Errorf("%w (rollback: delete lvstore %s: %v; RAID %s left in place)", err, pool.ThinPoolName, derr, pool.ArrayName)
+				err = fmt.Errorf("%w (rollback: delete thin pool %s: %v; array %s left in place)", err, pool.ThinPoolName, derr, pool.ArrayName)
 				_ = s.store.DeletePool(pool.ID)
 				writeError(w, err)
 				return
@@ -313,12 +313,12 @@ func (s *Server) handleCreatePool(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 	}
 	if err := s.dp.CreateArray(ctx, pool.ArrayName, pool.RaidLevel, pool.StripSizeKB, baseBdevs); err != nil {
-		fail(false, fmt.Errorf("create raid bdev: %w", err))
+		fail(false, fmt.Errorf("create the array: %w", err))
 		return
 	}
 	lvsUUID, err := s.dp.CreateThinPool(ctx, pool.Device, pool.ThinPoolName, pool.ChunkSizeBytes)
 	if err != nil {
-		fail(true, fmt.Errorf("create lvstore: %w", err))
+		fail(true, fmt.Errorf("create the thin pool: %w", err))
 		return
 	}
 	updated, err := s.store.MutatePool(pool.ID, func(p *store.Pool) error {
@@ -364,11 +364,11 @@ func (s *Server) handleDeletePool(w http.ResponseWriter, r *http.Request) {
 		lvsName = pool.ThinPoolName
 	}
 	if err := s.dp.DeleteThinPool(r.Context(), lvsUUID, lvsName); err != nil && !dataplane.IsNotFound(err) {
-		writeError(w, fmt.Errorf("delete lvstore: %w", err))
+		writeError(w, fmt.Errorf("delete the thin pool: %w", err))
 		return
 	}
 	if err := s.dp.DeleteArray(r.Context(), pool.ArrayName); err != nil && !dataplane.IsNotFound(err) {
-		writeError(w, fmt.Errorf("delete raid bdev: %w", err))
+		writeError(w, fmt.Errorf("delete the array: %w", err))
 		return
 	}
 	if err := s.store.DeletePool(id); err != nil {
@@ -458,7 +458,7 @@ func (s *Server) handleCreateVolume(w http.ResponseWriter, r *http.Request) {
 	alias := pool.ThinPoolName + "/" + id
 	uuid, err := s.dp.CreateVolume(r.Context(), pool.ThinPoolName, id, req.SizeBytes, req.ThinProvision)
 	if err != nil {
-		writeError(w, fmt.Errorf("create lvol: %w", err))
+		writeError(w, fmt.Errorf("create the volume: %w", err))
 		return
 	}
 	vol := &store.Volume{
@@ -542,7 +542,7 @@ func (s *Server) resizeVolume(w http.ResponseWriter, r *http.Request, id string)
 	}
 	defer release()
 	if err := s.dp.ResizeVolume(r.Context(), vol.UUID, req.NewSizeBytes); err != nil {
-		writeError(w, fmt.Errorf("resize lvol: %w", err))
+		writeError(w, fmt.Errorf("resize the volume: %w", err))
 		return
 	}
 	updated, err := s.store.MutateVolume(id, func(v *store.Volume) error {
@@ -860,7 +860,7 @@ func (s *Server) deleteSnapshot(ctx context.Context, snap *store.Snapshot) error
 		return err
 	}
 	if err := s.dp.DeleteVolume(ctx, snap.UUID); err != nil && !dataplane.IsNotFound(err) {
-		return fmt.Errorf("delete snapshot lvol: %w", err)
+		return fmt.Errorf("delete the snapshot: %w", err)
 	}
 	if err := s.store.DeleteSnapshot(snap.ID); err != nil {
 		return err
