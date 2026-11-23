@@ -50,7 +50,29 @@ listed until then so nothing is lost if the plan changes.
     (`hardware.SPDKInstance`); moved-disk matching and pool import reading SPDK RAID superblocks
     (`hardware.ReadRaidSuperblock`); the ublk metadata device (`meta.UblkDevice`, behind
     `meta.Device` already: the kernel backend writes an LV directly).
-  - [ ] The kernel implementation of `dataplane.Plane` on `internal/kernel`. Then every row of the feature table (iSCSI via LIO, scrub on md, metadata copy
+  - [ ] The kernel implementation of `dataplane.Plane` on `internal/kernel`. **Started
+    2026-11-23:** `internal/dataplane/kernelplane` implements every method; its integration tests
+    (tag `kernelintegration`) pass on the lab VM: volume lifecycle with snapshots, exact CBT, a
+    group snapshot, a clone and a resize; NVMe/TCP and iSCSI exports with allowed and refused
+    hosts and a portal without its address; member replace and rebuild; scrub; `Settle` after a
+    simulated reboot and an array waiting for a missing member, then started degraded. Open:
+    - wire it into velod (`--data-plane=kernel`), including disk claiming: `DiscoverDisks`
+      treats only vfio/uio NVMe drives as claimed, and kernel-attached disks stay on `nvme`;
+    - iSCSI ACLs are by IQN only (**decided 2026-11-23**): LIO can't restrict an initiator by
+      address, so a host's IP (which CSI registers) isn't enforced and an address-only ACL is
+      refused; document it in the API and CSI docs;
+    - NVMe connections (**decided 2026-11-23**): nvmet lists controllers only in debugfs, built
+      into `nvmet.ko` with `CONFIG_NVME_TARGET_DEBUGFS`, which Fedora's kernel has off. Keep the
+      fallback (the listeners' TCP peers via `ss`: never misses a host, over-reports when
+      exports share a listener) and ask Fedora to enable the option; rebuild `nvmet.ko` in the
+      OS image (signed with our own MOK-enrolled key) only if exact per-export connections
+      become a requirement;
+    - snapshots are writable LVs (only velod's tag marks them); the group snapshot's quiesce
+      bound covers the snapshots too; per-disk I/O counters aren't reported; the scrub's start
+      and stopped/completed state live in memory (lost on a velod restart); the chunk size is
+      always 64 KiB whatever the pool asks for;
+    - the on-pool metadata copy needs an LV-backed `meta.Device` (no ublk).
+    Then every row of the feature table (iSCSI via LIO, scrub on md, metadata copy
   on an LV, import, CBT via `thin_delta`, metrics, alerts, veloctl/UI wording, docs).
 - [ ] **K-3. Validation:** CSI matrix on both clusters, KubeVirt, the P0-7 scenario (an
   unreadable sector on the last copy keeps the pool up), the benchmark, soak.

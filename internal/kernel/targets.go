@@ -111,7 +111,9 @@ type NVMeExport struct {
 	UUID   string
 	Device string // the volume's wrapper
 	Hosts  []string
-	Ports  []int
+	// AllowAnyHost lets every host connect (Hosts is then ignored).
+	AllowAnyHost bool
+	Ports        []int
 }
 
 // EnsureNVMeExport creates or updates an export: only the listed hosts may connect, on the
@@ -121,7 +123,15 @@ func (p *Plane) EnsureNVMeExport(e NVMeExport) error {
 	if err := mkdir(sub); err != nil {
 		return err
 	}
-	if err := writeAttr(filepath.Join(sub, "attr_allow_any_host"), "0"); err != nil {
+	anyHost := "0"
+	if e.AllowAnyHost {
+		anyHost = "1"
+	}
+	hosts := e.Hosts
+	if e.AllowAnyHost {
+		hosts = nil
+	}
+	if err := writeAttr(filepath.Join(sub, "attr_allow_any_host"), anyHost); err != nil {
 		return err
 	}
 	if e.Serial != "" {
@@ -133,7 +143,7 @@ func (p *Plane) EnsureNVMeExport(e NVMeExport) error {
 		return err
 	}
 	// Hosts: global objects, linked into the subsystem's allowed list.
-	for _, h := range e.Hosts {
+	for _, h := range hosts {
 		if err := mkdir(p.configfs("nvmet", "hosts", h)); err != nil {
 			return err
 		}
@@ -142,7 +152,7 @@ func (p *Plane) EnsureNVMeExport(e NVMeExport) error {
 		}
 	}
 	for _, h := range dirNames(filepath.Join(sub, "allowed_hosts")) {
-		if !slices.Contains(e.Hosts, h) {
+		if !slices.Contains(hosts, h) {
 			if err := os.Remove(filepath.Join(sub, "allowed_hosts", h)); err != nil {
 				return err
 			}
@@ -240,6 +250,8 @@ type ISCSIExport struct {
 	Device     string // the volume's wrapper
 	Portals    []string
 	Initiators []string // initiator IQNs allowed to log in
+	// AnyInitiator lets every initiator log in (Initiators is then ignored).
+	AnyInitiator bool
 }
 
 func (p *Plane) lio(parts ...string) string {
@@ -287,7 +299,12 @@ func (p *Plane) EnsureISCSIExport(e ISCSIExport) error {
 	if err := mkdir(tpg); err != nil {
 		return err
 	}
-	for _, kv := range [][2]string{{"authentication", "0"}, {"generate_node_acls", "0"}, {"demo_mode_write_protect", "1"}} {
+	gen, wp := "0", "1"
+	initiators := e.Initiators
+	if e.AnyInitiator {
+		gen, wp, initiators = "1", "0", nil
+	}
+	for _, kv := range [][2]string{{"authentication", "0"}, {"generate_node_acls", gen}, {"demo_mode_write_protect", wp}} {
 		if err := writeAttr(filepath.Join(tpg, "attrib", kv[0]), kv[1]); err != nil {
 			return err
 		}
@@ -311,7 +328,7 @@ func (p *Plane) EnsureISCSIExport(e ISCSIExport) error {
 	if err := symlink(bs, filepath.Join(lun, e.Backstore)); err != nil {
 		return err
 	}
-	for _, ini := range e.Initiators {
+	for _, ini := range initiators {
 		acl := filepath.Join(tpg, "acls", ini)
 		if err := mkdir(acl); err != nil {
 			return err
@@ -324,7 +341,7 @@ func (p *Plane) EnsureISCSIExport(e ISCSIExport) error {
 		}
 	}
 	for _, ini := range dirNames(filepath.Join(tpg, "acls")) {
-		if !slices.Contains(e.Initiators, ini) {
+		if !slices.Contains(initiators, ini) {
 			if err := removeACL(filepath.Join(tpg, "acls", ini)); err != nil {
 				return err
 			}
@@ -390,4 +407,100 @@ func (p *Plane) RemoveISCSIExport(iqn, backstore string) error {
 		return os.Remove(p.lio("core", "iblock_0", backstore))
 	}
 	return nil
+}
+
+// ---- inventory -----------------------------------------------------------------------------
+
+// NVMePorts lists the nvmet listeners.
+func (p *Plane) NVMePorts() []NVMePort {
+	var out []NVMePort
+	for _, id := range dirNames(p.configfs("nvmet", "ports")) {
+		n, err := strconv.Atoi(id)
+		if err != nil {
+			continue
+		}
+		dir := p.configfs("nvmet", "ports", id)
+		port, _ := strconv.Atoi(readAttr(filepath.Join(dir, "addr_trsvcid")))
+		out = append(out, NVMePort{ID: n, Address: readAttr(filepath.Join(dir, "addr_traddr")), Port: port})
+	}
+	return out
+}
+
+// NVMeSubsystems lists the nvmet subsystems' NQNs.
+func (p *Plane) NVMeSubsystems() []string { return dirNames(p.configfs("nvmet", "subsystems")) }
+
+// NVMeSubsystemDevice is the device behind a subsystem's namespace 1.
+func (p *Plane) NVMeSubsystemDevice(nqn string) string {
+	return readAttr(p.configfs("nvmet", "subsystems", nqn, "namespaces", "1", "device_path"))
+}
+
+// RevalidateNVMe makes nvmet re-read the size of a subsystem's namespace (after a resize), so
+// connected hosts see it.
+func (p *Plane) RevalidateNVMe(nqn string) error {
+	f := p.configfs("nvmet", "subsystems", nqn, "namespaces", "1", "revalidate_size")
+	if _, err := os.Stat(f); err != nil {
+		return nil // no namespace, or a kernel without the attribute
+	}
+	return os.WriteFile(f, []byte("1"), 0o644)
+}
+
+// NVMeSubsystemPorts lists the listeners a subsystem is linked to.
+func (p *Plane) NVMeSubsystemPorts(nqn string) []NVMePort {
+	var out []NVMePort
+	for _, pt := range p.NVMePorts() {
+		if _, err := os.Lstat(p.configfs("nvmet", "ports", strconv.Itoa(pt.ID), "subsystems", nqn)); err == nil {
+			out = append(out, pt)
+		}
+	}
+	return out
+}
+
+// ISCSITargets lists the LIO iSCSI targets' IQNs.
+func (p *Plane) ISCSITargets() []string {
+	var out []string
+	for _, n := range dirNames(p.lio("iscsi")) {
+		if strings.HasPrefix(n, "iqn.") || strings.HasPrefix(n, "eui.") || strings.HasPrefix(n, "naa.") {
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
+// NVMeHosts lists the host NQNs connected to a subsystem, from nvmet's debugfs (kernel 6.10+);
+// nil when debugfs isn't there.
+func (p *Plane) NVMeHosts(nqn string) []string {
+	dir := filepath.Join(p.SysRoot, "kernel", "debug", "nvmet", nqn)
+	var out []string
+	for _, c := range dirNames(dir) {
+		if !strings.HasPrefix(c, "ctrl") {
+			continue
+		}
+		if h := readAttr(filepath.Join(dir, c, "hostnqn")); h != "" {
+			out = append(out, h)
+		}
+	}
+	return out
+}
+
+// ISCSISessions lists the initiators logged in to a target, with their addresses where LIO
+// reports them.
+func (p *Plane) ISCSISessions(iqn string) (initiators, addresses []string) {
+	acls := p.lio("iscsi", iqn, "tpgt_1", "acls")
+	for _, ini := range dirNames(acls) {
+		info := readAttr(filepath.Join(acls, ini, "info"))
+		if !strings.Contains(info, "LOGGED_IN") {
+			continue
+		}
+		addr := ""
+		for _, line := range strings.Split(info, "\n") {
+			if _, rest, ok := strings.Cut(line, "Address "); ok {
+				if f := strings.Fields(rest); len(f) > 0 {
+					addr = f[0]
+				}
+				break
+			}
+		}
+		initiators, addresses = append(initiators, ini), append(addresses, addr)
+	}
+	return initiators, addresses
 }

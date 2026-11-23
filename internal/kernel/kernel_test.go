@@ -310,3 +310,33 @@ func TestLVMConfigOnEveryCall(t *testing.T) {
 		}
 	}
 }
+
+func TestParseExamineScan(t *testing.T) {
+	// mdadm 4.6, captured on the lab VM.
+	out := "ARRAY /dev/md/raid_pool-k2probe  level=raid1 metadata=1.2 num-devices=2 UUID=18b475c2:edd58647:45bb9801:365ca52d\n" +
+		"   devices=/dev/loop1,/dev/loop0\n" +
+		"ARRAY /dev/md/other  level=raid1 metadata=1.2 num-devices=2 UUID=1314364f:36a60865:1e5f4e62:1e0af79f name=any:raid_pool-x\n" +
+		"   devices=/dev/loop2\n"
+	a := parseExamineScan(out)
+	if len(a) != 2 {
+		t.Fatalf("arrays %+v", a)
+	}
+	if a[0].Name != "raid_pool-k2probe" || a[0].UUID != "18b475c2:edd58647:45bb9801:365ca52d" || a[0].Level != "raid1" ||
+		a[0].Devices != 2 || !slices.Equal(a[0].Found, []string{"/dev/loop1", "/dev/loop0"}) {
+		t.Errorf("first %+v", a[0])
+	}
+	if a[1].Name != "raid_pool-x" || len(a[1].Found) != 1 {
+		t.Errorf("second %+v", a[1])
+	}
+}
+
+func TestParseVGsAndTags(t *testing.T) {
+	vgs, err := parseVGs([]byte(`{"report":[{"vg":[{"vg_name":"lvs_pool-k2probe","vg_uuid":"PpWRHu-d9k3-IyXe-nLaa-Wb3D-vdR9-9qS1Ne","vg_size":"310378496","vg_free":"197132288","vg_extent_size":"4194304","pv_name":"/dev/md127"}]}],"log":[]}`))
+	if err != nil || len(vgs) != 1 || vgs[0] != (VG{Name: "lvs_pool-k2probe", UUID: "PpWRHu-d9k3-IyXe-nLaa-Wb3D-vdR9-9qS1Ne", Size: 310378496, Free: 197132288, ExtentSize: 4194304, PV: "/dev/md127"}) {
+		t.Fatalf("vgs %+v %v", vgs, err)
+	}
+	lvs, err := parseLVs([]byte(`{"report":[{"lv":[{"lv_name":"snap-1","vg_name":"v","lv_uuid":"u","lv_attr":"Vwi---tz-k","lv_size":"67108864","pool_lv":"thin","origin":"vol-1","thin_id":"2","segtype":"thin","lv_skip_activation":"skip activation","lv_tags":"velocor.uuid.1111,velocor.snapshot"}]}]}`))
+	if err != nil || len(lvs) != 1 || !slices.Equal(lvs[0].Tags, []string{"velocor.uuid.1111", "velocor.snapshot"}) || lvs[0].ThinID != 2 || !lvs[0].SkipActivation {
+		t.Fatalf("lvs %+v %v", lvs, err)
+	}
+}
