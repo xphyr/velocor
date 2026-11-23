@@ -148,18 +148,17 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
-  # SPDK's unit tests for the libraries our carried SPDK patches touch (deploy/containers/
-  # spdk-patches): a separate SPDK compile with unit tests enabled. Images aren't published
-  # unless they pass.
-  # The kernel data plane (TODO.md K-1): md, LVM thin, device-mapper, nvmet and LIO on loop
-  # devices, as root. Needs the runner's kernel modules (nvmet, target_core, dm-dust live in
-  # linux-modules-extra) and the storage tools. Not yet a gate for the images.
+  # The kernel data plane's integration tests (TODO.md K-1/K-2) against real md, LVM thin,
+  # device-mapper, nvmet and LIO on loop devices, as root, in a Fedora VM under the runner's
+  # KVM (hack/kernel-tests-vm.sh): the runner's own Azure kernel has no installable extra
+  # modules (dm-dust, nvmet, LIO), and the VM matches the appliance's kernel family and tools.
+  # Not yet a gate for the images.
   kernel-tests:
     name: Kernel data plane tests
     needs: changes
     if: needs.changes.outputs.go == 'true'
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 40
     permissions:
       contents: read
     steps:
@@ -169,15 +168,21 @@ jobs:
       - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
           go-version-file: go.mod
-      - name: Install the storage tools and kernel modules
+      - name: KVM and QEMU
         run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules && sudo udevadm trigger --name-match=kvm
           sudo apt-get update -q
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -qy --no-install-recommends \
-            mdadm lvm2 thin-provisioning-tools nvme-cli open-iscsi "linux-modules-extra-$(uname -r)"
-          sudo modprobe -a raid1 dm_thin_pool dm_dust nvmet nvmet-tcp nvme-tcp \
-            target_core_mod target_core_iblock iscsi_target_mod iscsi_tcp
-      - run: make test-kernel
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -qy --no-install-recommends qemu-system-x86 qemu-utils genisoimage
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/velocor-kernel-tests
+          key: fedora-cloud-${{ hashFiles('hack/kernel-tests-vm.sh') }}
+      - run: make test-kernel-vm
 
+  # SPDK's unit tests for the libraries our carried SPDK patches touch (deploy/containers/
+  # spdk-patches): a separate SPDK compile with unit tests enabled. Images aren't published
+  # unless they pass.
   spdk-unit-tests:
     name: SPDK patch unit tests
     needs: changes
