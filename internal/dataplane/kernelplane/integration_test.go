@@ -514,10 +514,9 @@ func TestReplaceAndScrub(t *testing.T) {
 	e.pool()
 	dev, _ := e.volume("vol-r", 64*mib)
 	fill(t, dev, 0, 64*mib, 5)
-	waitFor(t, "the initial resync", 120*time.Second, func() bool {
-		st, err := e.k.ArrayStatus(e.array)
-		return err == nil && st.SyncAction == "idle"
-	})
+	if st, err := e.k.ArrayStatus(e.array); err == nil {
+		t.Logf("removing a member during %q (md lets go of it late while it resyncs)", st.SyncAction)
+	}
 
 	if err := e.p.RemoveMember(e.ctx, e.disks[1]); err != nil {
 		t.Fatal(err)

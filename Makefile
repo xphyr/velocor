@@ -11,6 +11,7 @@
 #   make test-integration            Go integration tests against a real spdk_tgt (rootless podman)
 #   make spdk-unit-tests             SPDK unit tests for the libraries our SPDK patches touch
 #   make test-kernel                 kernel data plane tests on real md/LVM/nvmet/LIO (runs sudo)
+#   make test-kernel-vm              the same in a throwaway Fedora VM under KVM (no root; CI)
 #   make qcow2 QCOW2_KEYS=a.pub      bootable disk from the pushed OS image (needs KVM, no root)
 #
 # Registry credentials come from podman's usual auth file, or REGISTRY_AUTH_FILE.
@@ -83,7 +84,7 @@ endef
 GO_BUILD_ARGS := --build-arg VERSION=$(VERSION) --build-arg COMMIT=$(COMMIT) --build-arg BUILD_TIME=$(BUILD_TIME)
 DIGEST_DIR := $(BINARY_DIR)/digests
 
-.PHONY: build build-velod build-veloctl build-csi test test-integration test-kernel lint shellcheck check-pins check-alerts \
+.PHONY: build build-velod build-veloctl build-csi test test-integration test-kernel test-kernel-vm lint shellcheck check-pins check-alerts \
 	proto proto-lint clean images image-spdk image-spdk-test spdk-unit-tests image-velod image-csi image-os \
 	push push-spdk push-velod push-csi push-os check-push qcow2
 
@@ -110,7 +111,13 @@ KERNEL_TEST_RUN ?= .
 test-kernel:
 	@mkdir -p $(dir $(KERNEL_TEST_BIN))
 	CGO_ENABLED=0 go test -c -tags kernelintegration -o $(KERNEL_TEST_BIN) ./internal/kernel/
+	CGO_ENABLED=0 go test -c -tags kernelintegration -o $(KERNEL_TEST_BIN)plane ./internal/dataplane/kernelplane/
 	cd internal/kernel && sudo $(abspath $(KERNEL_TEST_BIN)) -test.v -test.count=1 -test.timeout 30m -test.run '$(KERNEL_TEST_RUN)'
+	sudo $(abspath $(KERNEL_TEST_BIN))plane -test.v -test.count=1 -test.timeout 30m -test.run '$(KERNEL_TEST_RUN)'
+
+# The same tests in a throwaway Fedora Cloud VM under KVM: no root needed (CI runs this).
+test-kernel-vm:
+	hack/kernel-tests-vm.sh '$(KERNEL_TEST_RUN)'
 
 # Without local installs, run the linters from their images, e.g.
 #   GOLANGCI_LINT="podman run --rm -v $$PWD:/repo:z -w /repo docker.io/golangci/golangci-lint:v2.15.0 golangci-lint"

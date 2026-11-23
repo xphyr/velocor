@@ -8,6 +8,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/velocor/velocor/internal/dataplane"
 	"github.com/velocor/velocor/internal/kernel"
@@ -167,7 +168,15 @@ func (p *Plane) RemoveMember(ctx context.Context, member string) error {
 					return err
 				}
 			}
-			return p.k.RemoveMember(ctx, name, dev)
+			// md lets go of a failed member asynchronously (longer while it resyncs): until
+			// then the remove fails with EBUSY.
+			var err error
+			for deadline := time.Now().Add(15 * time.Second); ; {
+				if err = p.k.RemoveMember(ctx, name, dev); err == nil || time.Now().After(deadline) || ctx.Err() != nil {
+					return err
+				}
+				time.Sleep(250 * time.Millisecond)
+			}
 		}
 	}
 	return notFound("%s is not in an array", member)

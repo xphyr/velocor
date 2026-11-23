@@ -111,6 +111,7 @@ func main() {
 
 	hwMgr, err := hardware.NewManager(hardware.Config{
 		AllowUnsafeNoIOMMU: os.Getenv("VELOCOR_ALLOW_UNSAFE_NOIOMMU") == "true",
+		KernelDataPlane:    *dataPlane == "kernel",
 	})
 	if err != nil {
 		// Without the hardware manager there is no boot-disk guard; fail closed.
@@ -118,6 +119,14 @@ func main() {
 		os.Exit(1)
 	}
 
+	if *dataPlane == "kernel" && hwMgr != nil {
+		// The image reserves hugepages at boot for spdk_tgt, which doesn't run with this data plane.
+		if hp, err := hwMgr.ReleaseHugepages(); err != nil {
+			logger.Warn("failed to release hugepages", "err", err)
+		} else {
+			logger.Info("hugepages released (not needed by the kernel data plane)", "total_mb", hp.TotalMB)
+		}
+	}
 	if *hugepagesMB > 0 && hwMgr != nil && *dataPlane == "spdk" {
 		if hp, err := hwMgr.EnsureHugepages(*hugepagesMB); err != nil {
 			logger.Warn("failed to allocate hugepages", "requested_mb", *hugepagesMB, "err", err)

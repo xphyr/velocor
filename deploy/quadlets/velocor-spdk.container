@@ -25,6 +25,9 @@ Ulimit=nofile=1048576:1048576
 Exec=-r /run/velocor/spdk.sock -m 0x1 -s 1024 --json /etc/velocor/spdk.json
 
 [Service]
+# Not with the kernel data plane (/etc/velocor/velod.env, read by velocor-velod): the unit is
+# skipped, not failed.
+ExecCondition=/bin/sh -c '! grep -qsx "VELOCOR_DATA_PLANE=kernel" /etc/velocor/velod.env'
 TimeoutStopSec=150
 ExecStartPre=/usr/bin/mkdir -p /run/velocor
 ExecStartPre=/usr/bin/rm -f /run/velocor/spdk.sock

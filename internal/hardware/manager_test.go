@@ -192,3 +192,49 @@ func TestHardwareDiscoveryBootGuardAndVFIOBinding(t *testing.T) {
 		t.Fatalf("unexpected HugepageStatus: %+v", hpStatus)
 	}
 }
+
+func TestReleaseHugepages(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "kernel", "mm", "hugepages", "hugepages-2048kB")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for f, v := range map[string]string{"nr_hugepages": "512\n", "free_hugepages": "512\n"} {
+		if err := os.WriteFile(filepath.Join(dir, f), []byte(v), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	m := &Manager{cfg: Config{SysfsRoot: root}}
+	if _, err := m.ReleaseHugepages(); err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := os.ReadFile(filepath.Join(dir, "nr_hugepages")); string(b) != "0\n" {
+		t.Errorf("nr_hugepages = %q", b)
+	}
+}
+
+// A drive on vfio-pci was put there by SPDK: claimed with the SPDK data plane, but not with
+// the kernel one, which would otherwise take it from whatever holds it.
+func TestDiscoveryVFIODriveClaimedOnlyWithSPDK(t *testing.T) {
+	root := t.TempDir()
+	sysfs := filepath.Join(root, "sys")
+	dev := filepath.Join(sysfs, "bus", "pci", "devices", "0000:01:00.0")
+	mustWriteFile(t, filepath.Join(dev, "class"), "0x010802\n")
+	mustWriteFile(t, filepath.Join(dev, "numa_node"), "0\n")
+	drv := filepath.Join(sysfs, "bus", "pci", "drivers", "vfio-pci")
+	mustWriteFile(t, filepath.Join(drv, "bind"), "")
+	if err := os.Symlink(drv, filepath.Join(dev, "driver")); err != nil {
+		t.Fatal(err)
+	}
+	mustWriteFile(t, filepath.Join(root, "proc", "self", "mountinfo"), "")
+	for _, kernel := range []bool{false, true} {
+		m := &Manager{cfg: Config{SysfsRoot: sysfs, ProcRoot: filepath.Join(root, "proc"), DevRoot: filepath.Join(root, "dev"), KernelDataPlane: kernel}}
+		disks, err := m.DiscoverDisks()
+		if err != nil || len(disks) != 1 {
+			t.Fatalf("kernel=%v: %+v %v", kernel, disks, err)
+		}
+		if d := disks[0]; d.DriverState != store.DiskDriverStateVfioPCI || d.Claimed == kernel {
+			t.Errorf("kernel data plane %v: driver %s, claimed %v", kernel, d.DriverState, d.Claimed)
+		}
+	}
+}

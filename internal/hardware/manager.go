@@ -41,6 +41,12 @@ type Config struct {
 	// to uio_pci_generic) when the host has no IOMMU. Without an IOMMU, SPDK can DMA anywhere
 	// in host memory, so this is only appropriate for VMs/labs and must be opted into.
 	AllowUnsafeNoIOMMU bool
+	// KernelDataPlane: drives stay on their kernel drivers, so an NVMe drive on a userspace
+	// driver (vfio-pci, uio) is not taken as claimed by discovery (with SPDK it is: only SPDK
+	// binds drives there). Such a drive is left alone until an operator claims it; otherwise
+	// the kernel data plane would take it from whatever holds it (found on the lab VM, where it
+	// took two drives from a running spdk_tgt).
+	KernelDataPlane bool
 }
 
 // HugepageStatus reports 2 MiB hugepage allocation on the node.
@@ -169,10 +175,10 @@ func (m *Manager) DiscoverDisks() ([]*store.Disk, error) {
 			switch driverName {
 			case "vfio-pci":
 				driverState = store.DiskDriverStateVfioPCI
-				claimed = true
+				claimed = !m.cfg.KernelDataPlane
 			case "uio_pci_generic", "igb_uio":
 				driverState = store.DiskDriverStateUioPCIGeneric
-				claimed = true
+				claimed = !m.cfg.KernelDataPlane
 			}
 
 			numaNode := int32(readSysfsInt(filepath.Join(devDir, "numa_node"), 0))
@@ -347,6 +353,16 @@ func (m *Manager) EnsureHugepages(minMB uint64) (*HugepageStatus, error) {
 			requiredPages, minMB, status.TotalPages, status.TotalMB)
 	}
 	return status, nil
+}
+
+// ReleaseHugepages gives every free 2 MiB hugepage back to the kernel (the kernel data plane
+// uses none; the image reserves them for SPDK at boot).
+func (m *Manager) ReleaseHugepages() (*HugepageStatus, error) {
+	nrPath := filepath.Join(m.cfg.SysfsRoot, "kernel", "mm", "hugepages", "hugepages-2048kB", "nr_hugepages")
+	if err := os.WriteFile(nrPath, []byte("0\n"), 0644); err != nil {
+		return nil, fmt.Errorf("write 0 to %s: %w", nrPath, err)
+	}
+	return m.GetHugepageStatus()
 }
 
 // BindNVMeToUserspace unbinds an NVMe controller at pciAddr from the Linux kernel nvme driver

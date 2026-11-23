@@ -42,8 +42,8 @@ func (e *CommandError) Error() string {
 
 func (e *CommandError) Unwrap() error { return e.Err }
 
-// Exec runs commands on this host. With HostNamespace set, it runs them in PID 1's mount
-// namespace through nsenter, for a velod in a container that shares the host's PID namespace:
+// Exec runs commands on this host. With HostNamespace set, it runs them in PID 1's mount and
+// IPC namespaces through nsenter, for a velod in a container that shares the host's PID namespace:
 // the storage tools, their configuration and /dev are the host's.
 type Exec struct {
 	HostNamespace bool
@@ -52,7 +52,10 @@ type Exec struct {
 // Run implements Runner.
 func (x Exec) Run(ctx context.Context, name string, args ...string) ([]byte, error) {
 	if x.HostNamespace {
-		args = append([]string{"-t", "1", "-m", "--", name}, args...)
+		// The IPC namespace too: LVM and dmsetup wait for udev through SysV semaphores, which
+		// udev on the host completes in the host's IPC namespace (in velod's own, they wait
+		// forever: found on the lab appliance, lvcreate hung creating a thin pool).
+		args = append([]string{"-t", "1", "-m", "-i", "--", name}, args...)
 		name = "nsenter"
 	}
 	cmd := exec.CommandContext(ctx, name, args...)
