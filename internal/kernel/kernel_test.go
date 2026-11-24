@@ -1,6 +1,7 @@
 package kernel
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"os"
@@ -8,6 +9,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 )
 
 // probeSection returns one "##### name" section of testdata/probe.txt: real output of mdadm, LVM,
@@ -55,7 +57,7 @@ func TestParseLVs(t *testing.T) {
 func TestParseThinDelta(t *testing.T) {
 	want := []Extent{{6 << 16, 1 << 16}, {10 << 16, 2 << 16}}
 	for _, sec := range []string{"thin_delta", "thin_delta-verbose"} {
-		got, err := parseThinDelta([]byte(probeSection(t, sec)), 256<<20)
+		got, err := parseThinDelta(strings.NewReader(probeSection(t, sec)), 256<<20)
 		if err != nil {
 			t.Fatalf("%s: %v", sec, err)
 		}
@@ -66,20 +68,20 @@ func TestParseThinDelta(t *testing.T) {
 	// Cut at the volume's size, and every kind of change counted.
 	x := `<superblock data_block_size="128"><diff left="1" right="2"><left_only begin="0" length="1"/>` +
 		`<different begin="1" length="2"/><same begin="3" length="1"/><right_only begin="4" length="10"/></diff></superblock>`
-	got, err := parseThinDelta([]byte(x), 5<<16+100)
+	got, err := parseThinDelta(bytes.NewReader([]byte(x)), 5<<16+100)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !slices.Equal(got, []Extent{{0, 3 << 16}, {4 << 16, 1<<16 + 100}}) {
 		t.Errorf("merged/cut %v", got)
 	}
-	if _, err := parseThinDelta([]byte(`<superblock data_block_size="128"><diff><odd begin="0" length="1"/></diff></superblock>`), 0); err == nil {
+	if _, err := parseThinDelta(bytes.NewReader([]byte(`<superblock data_block_size="128"><diff><odd begin="0" length="1"/></diff></superblock>`)), 0); err == nil {
 		t.Error("an unknown entry must be an error, not silently skipped")
 	}
 }
 
 func TestParseThinDump(t *testing.T) {
-	got, err := parseThinDump([]byte(probeSection(t, "thin_dump-s1")), 256<<20)
+	got, err := parseThinDump(strings.NewReader(probeSection(t, "thin_dump-s1")), 256<<20)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -88,7 +90,7 @@ func TestParseThinDump(t *testing.T) {
 	}
 	x := `<superblock data_block_size="128"><device dev_id="1"><single_mapping origin_block="7" data_block="1" time="0"/>` +
 		`<range_mapping origin_begin="0" data_begin="2" length="2" time="0"/><single_mapping origin_block="2" data_block="9" time="0"/></device></superblock>`
-	got, err = parseThinDump([]byte(x), 0)
+	got, err = parseThinDump(bytes.NewReader([]byte(x)), 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -165,8 +167,8 @@ func TestArrayStatusDuringRecovery(t *testing.T) {
 func TestParseBadBlocks(t *testing.T) {
 	// Device sectors; the data starts at 2048. Duplicates (both logs) once; a range in the
 	// metadata area dropped, one straddling it cut.
-	got := parseBadBlocks("4196352 8\n100 8\n2040 16\n4196352 8\n\nbad line\n5000 0\n", 2048)
-	want := []SectorRange{{4194304, 8}, {0, 8}}
+	got := parseBadBlocks("4196352 8\n100 8\n2040 16\n4196352 8\n\nbad line\n5000 0\n4196356 8\n", 2048)
+	want := []SectorRange{{0, 8}, {4194304, 12}} // the logs' overlap once, too
 	if !slices.Equal(got, want) {
 		t.Fatalf("got %v, want %v", got, want)
 	}
@@ -205,12 +207,10 @@ func TestSmallHelpers(t *testing.T) {
 // A group snapshot suspends every wrapper before taking any snapshot and resumes them all after.
 func TestGroupSnapshotOrder(t *testing.T) {
 	s := &Script{Steps: []Step{
-		{Prefix: "dmsetup suspend --nolockfs velocor-a"},
-		{Prefix: "dmsetup suspend --nolockfs velocor-b"},
+		{Prefix: "dmsetup suspend --nolockfs velocor-a velocor-b"},
 		{Prefix: "lvm lvcreate --config"},
 		{Prefix: "lvm lvcreate --config"},
-		{Prefix: "dmsetup resume velocor-a"},
-		{Prefix: "dmsetup resume velocor-b"},
+		{Prefix: "dmsetup resume velocor-a velocor-b"},
 	}}
 	p := &Plane{Run: s}
 	err := p.GroupSnapshot(context.Background(), []GroupMember{
@@ -221,8 +221,8 @@ func TestGroupSnapshotOrder(t *testing.T) {
 	if len(s.Steps) != 0 {
 		t.Fatalf("steps left: %v (calls %v)", s.Steps, s.Calls)
 	}
-	if !strings.HasSuffix(s.Calls[2], "--snapshot --permission r --name sa vg/a") || !strings.HasSuffix(s.Calls[3], "--snapshot --permission r --name sb vg/b") {
-		t.Errorf("snapshot calls %v", s.Calls[2:4])
+	if !strings.HasSuffix(s.Calls[1], "--snapshot --permission r --name sa vg/a") || !strings.HasSuffix(s.Calls[2], "--snapshot --permission r --name sb vg/b") {
+		t.Errorf("snapshot calls %v", s.Calls[1:3])
 	}
 }
 
@@ -231,10 +231,10 @@ func TestGroupSnapshotOrder(t *testing.T) {
 func TestGroupSnapshotFailureCleansUp(t *testing.T) {
 	boom := errors.New("boom")
 	s := &Script{Steps: []Step{
-		{Prefix: "dmsetup suspend --nolockfs velocor-a"},
-		{Prefix: "dmsetup suspend --nolockfs velocor-b"},
+		{Prefix: "dmsetup suspend --nolockfs velocor-a velocor-b"},
 		{Prefix: "lvm lvcreate"},
 		{Prefix: "lvm lvcreate", Err: boom},
+		{Prefix: "dmsetup resume velocor-a velocor-b", Err: boom}, // then one by one
 		{Prefix: "dmsetup resume velocor-a"},
 		{Prefix: "dmsetup resume velocor-b"},
 		{Prefix: "lvm lvremove"},
@@ -252,11 +252,11 @@ func TestGroupSnapshotFailureCleansUp(t *testing.T) {
 		t.Errorf("removed %q, want the snapshot taken (vg/sa)", s.Calls[6])
 	}
 
-	// A failed suspend: only what was suspended is resumed, nothing is snapshotted.
+	// A failed suspend: all are resumed (it may have suspended any of them), nothing is
+	// snapshotted.
 	s = &Script{Steps: []Step{
-		{Prefix: "dmsetup suspend --nolockfs velocor-a"},
-		{Prefix: "dmsetup suspend --nolockfs velocor-b", Err: boom},
-		{Prefix: "dmsetup resume velocor-a"},
+		{Prefix: "dmsetup suspend --nolockfs velocor-a velocor-b", Err: boom},
+		{Prefix: "dmsetup resume velocor-a velocor-b"},
 	}}
 	p.Run = s
 	if err := p.GroupSnapshot(context.Background(), []GroupMember{{Volume: "a"}, {Volume: "b"}}); !errors.Is(err, boom) || len(s.Steps) != 0 {
@@ -327,9 +327,13 @@ func TestParseExamineScan(t *testing.T) {
 		"   devices=/dev/loop1,/dev/loop0\n" +
 		"ARRAY /dev/md/other  level=raid1 metadata=1.2 num-devices=2 UUID=1314364f:36a60865:1e5f4e62:1e0af79f name=any:raid_pool-x\n" +
 		"   devices=/dev/loop2\n"
-	a := parseExamineScan(out)
-	if len(a) != 2 {
+	a := parseExamineScan(out + "ARRAY /dev/md/spared  level=raid1 metadata=1.2 num-devices=2 UUID=2314364f:36a60865:1e5f4e62:1e0af79f\n" +
+		"   spares=1   devices=/dev/sda,/dev/sdb,/dev/sdc\n")
+	if len(a) != 3 {
 		t.Fatalf("arrays %+v", a)
+	}
+	if !slices.Equal(a[2].Found, []string{"/dev/sda", "/dev/sdb", "/dev/sdc"}) {
+		t.Errorf("an array with a spare: %+v", a[2])
 	}
 	if a[0].Name != "raid_pool-k2probe" || a[0].UUID != "18b475c2:edd58647:45bb9801:365ca52d" || a[0].Level != "raid1" ||
 		a[0].Devices != 2 || !slices.Equal(a[0].Found, []string{"/dev/loop1", "/dev/loop0"}) {
@@ -368,8 +372,178 @@ func TestParseExamine(t *testing.T) {
 	if _, err := parseExamine("garbage"); err == nil {
 		t.Error("garbage parsed")
 	}
+	// A foreign disk's odd metadata: empty values, not a crash.
+	if m, err := parseExamine("Array UUID : 1:2:3:4\nName : host:\nArray Size :  \nArray State :  \nDevice Role : \n"); err != nil || m.Name != "" || m.ArrayKiB != 0 {
+		t.Errorf("empty values: %+v %v", m, err)
+	}
 	s := &Script{Steps: []Step{{Prefix: "mdadm --examine /dev/vda1", Err: &CommandError{Code: 1, Stderr: "mdadm: No md superblock detected on /dev/vda1.\n"}}}}
 	if m, err := New(s).ExamineMember(context.Background(), "/dev/vda1"); m != nil || err != nil {
 		t.Errorf("no metadata: %v %v", m, err)
+	}
+}
+
+func TestSuspendedWrappers(t *testing.T) {
+	s := &Script{Steps: []Step{{Prefix: "dmsetup info", Out: "velocor-vol-a Suspended\nvelocor-vol-b Active\nvg0-thin Suspended\n"}}}
+	got, err := (&Plane{Run: s}).SuspendedWrappers(context.Background())
+	if err != nil || len(got) != 1 || got[0] != "vol-a" {
+		t.Fatalf("suspended wrappers %v %v", got, err)
+	}
+}
+
+// Names become configfs directories: one that isn't a single path component is refused before
+// anything is created, and removing one does nothing.
+func TestTargetNamesStayInConfigfs(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "kernel", "config", "nvmet", "subsystems"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	victim := filepath.Join(root, "kernel", "config", "victim")
+	if err := os.MkdirAll(victim, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	p := &Plane{SysRoot: root}
+	const up = "nqn.2024-01.x:../../../victim"
+	for name, err := range map[string]error{
+		"subsystem":  p.EnsureNVMeExport(NVMeExport{NQN: up}),
+		"host":       p.EnsureNVMeExport(NVMeExport{NQN: "nqn.2024-01.x:a", Hosts: []string{"../../victim/h"}}),
+		"target":     p.EnsureISCSIExport(ISCSIExport{IQN: "iqn.2024-01.x:../../../victim", Backstore: "v"}),
+		"backstore":  p.EnsureISCSIExport(ISCSIExport{IQN: "iqn.2024-01.x:a", Backstore: "../v"}),
+		"initiator":  p.EnsureISCSIExport(ISCSIExport{IQN: "iqn.2024-01.x:a", Backstore: "v", Initiators: []string{".."}}),
+		"portal":     p.EnsureISCSIExport(ISCSIExport{IQN: "iqn.2024-01.x:a", Backstore: "v", Portals: []string{"../x:3260"}}),
+		"empty name": p.EnsureNVMeExport(NVMeExport{}),
+	} {
+		if err == nil || !strings.Contains(err.Error(), "invalid name") {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+	if err := errors.Join(p.RemoveNVMeExport("nqn.2024-01.x:a/../../../victim"), p.RemoveNVMeExport("../../victim"), p.RemoveISCSIExport("../../victim", "../victim")); err != nil {
+		t.Error(err)
+	}
+	if es, err := os.ReadDir(victim); err != nil || len(es) != 0 {
+		t.Errorf("outside directory: %v %v", es, err)
+	}
+	if es := dirNames(filepath.Join(root, "kernel", "config", "nvmet", "subsystems")); len(es) != 0 {
+		t.Errorf("created %v", es)
+	}
+}
+
+// A metadata snapshot a crashed velod left reserved is released and reserved again; one that
+// can't be had is reported; the snapshot is released even if reading it panics.
+func TestMetadataSnapRecovery(t *testing.T) {
+	busy := &CommandError{Code: 1, Stderr: "device-mapper: message ioctl failed: Invalid argument"}
+	run := func(steps ...Step) (*Script, error) {
+		s := &Script{Steps: steps}
+		return s, (&Plane{Run: s}).withMetadataSnap(context.Background(), "vg", "thin", func(string) error { return nil })
+	}
+	const msg = "dmsetup message vg-thin-tpool 0 "
+	if s, err := run(Step{Prefix: msg + "reserve", Err: busy}, Step{Prefix: msg + "release"}, Step{Prefix: msg + "reserve"}, Step{Prefix: msg + "release"}); err != nil || len(s.Steps) != 0 {
+		t.Errorf("left over: %v, steps left %v", err, s.Steps)
+	}
+	if s, err := run(Step{Prefix: msg + "reserve", Err: busy}, Step{Prefix: msg + "release", Err: errors.New("none held")}); !errors.Is(err, busy) || len(s.Steps) != 0 {
+		t.Errorf("not left over: %v, steps left %v", err, s.Steps)
+	}
+	s := &Script{Steps: []Step{{Prefix: msg + "reserve"}, {Prefix: msg + "release"}}}
+	func() {
+		defer func() { _ = recover() }()
+		_ = (&Plane{Run: s}).withMetadataSnap(context.Background(), "vg", "thin", func(string) error { panic("boom") })
+	}()
+	if len(s.Steps) != 0 {
+		t.Errorf("after a panic, steps left %v", s.Steps)
+	}
+}
+
+// A pool whose creation fails half way leaves nothing behind.
+func TestCreatePoolCleansUp(t *testing.T) {
+	boom := errors.New("boom")
+	s := &Script{Steps: []Step{{Prefix: "lvm pvcreate"}, {Prefix: "lvm vgcreate"}, {Prefix: "lvm vgs", Out: "10737418240 4194304\n"},
+		{Prefix: "lvm lvcreate"}, {Prefix: "lvm lvchange", Err: boom}, {Prefix: "lvm vgremove"}, {Prefix: "lvm pvremove"}}}
+	if err := (&Plane{Run: s}).CreatePool(context.Background(), PoolSpec{VG: "vg", Device: "/dev/md/a", Thin: "thin", DataPercent: 90}); !errors.Is(err, boom) || len(s.Steps) != 0 {
+		t.Fatalf("%v, steps left %v (calls %v)", err, s.Steps, s.Calls)
+	}
+}
+
+// LVM's reports are reused until something changes or they are too old; a report made while
+// something changed isn't kept.
+func TestInventoryReuse(t *testing.T) {
+	var calls []string
+	var p *Plane
+	during := func() {}
+	p = &Plane{InventoryTTL: time.Minute, Run: runnerFunc(func(_ context.Context, _ string, args ...string) ([]byte, error) {
+		calls = append(calls, args[0])
+		if args[0] == "lvs" {
+			during()
+		}
+		return []byte(`{"report":[]}`), nil
+	})}
+	ctx := context.Background()
+	list := func() int {
+		n := len(calls)
+		if _, err := p.ListVolumes(ctx, ""); err != nil {
+			t.Fatal(err)
+		}
+		return len(calls) - n
+	}
+	if list() != 1 || list() != 0 {
+		t.Fatalf("not reused: %v", calls)
+	}
+	if err := p.RemoveVolume(ctx, "vg", "v"); err != nil {
+		t.Fatal(err)
+	}
+	during = func() { during = func() {}; _ = p.RemoveVolume(ctx, "vg", "w") }
+	if list() == 0 {
+		t.Fatal("reused after a change")
+	}
+	if list() != 1 || list() != 0 {
+		t.Fatalf("a report made during a change was kept: %v", calls)
+	}
+	if n := len(calls); n == 0 {
+		t.Fatal("no calls")
+	}
+	p.InventoryTTL = time.Nanosecond
+	if list() != 1 {
+		t.Fatal("an old report was reused")
+	}
+	p.InventoryTTL = 0
+	if n := list() + list(); n != 2 {
+		t.Fatal("reused with no TTL")
+	}
+}
+
+func TestWrapperCurrent(t *testing.T) {
+	root := t.TempDir()
+	put := func(p, s string) {
+		p = filepath.Join(root, p)
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(s), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	put("dev/dm-1", "")
+	put("dev/dm-2", "")
+	put("dev/mapper/x", "")
+	put("dev/vg/x", "")
+	for l, to := range map[string]string{"dev/mapper/velocor-v": "../dm-2", "dev/vg/v": "../dm-1"} {
+		if err := os.Symlink(to, filepath.Join(root, l)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	put("sys/block/dm-1/size", "2048\n")
+	put("sys/block/dm-2/size", "2048\n")
+	put("sys/block/dm-2/slaves/dm-1/x", "")
+	p := &Plane{SysRoot: filepath.Join(root, "sys"), DevRoot: filepath.Join(root, "dev")}
+	lower := filepath.Join(root, "dev/vg/v")
+	if !p.WrapperCurrent("v", lower) {
+		t.Fatal("a wrapper that matches")
+	}
+	put("sys/block/dm-1/size", "4096\n") // grown
+	if p.WrapperCurrent("v", lower) {
+		t.Fatal("the volume grew")
+	}
+	put("sys/block/dm-1/size", "2048\n")
+	put("sys/block/dm-2/slaves/dm-9/x", "")
+	if p.WrapperCurrent("v", lower) || p.WrapperCurrent("other", lower) {
+		t.Fatal("another device under it, or no wrapper")
 	}
 }

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/velocor/velocor/internal/store"
 )
@@ -17,11 +18,54 @@ func (p *Plane) NVMeHealth(ctx context.Context, d *store.Disk) (*store.SmartHeal
 	if err != nil {
 		return nil, err
 	}
+	if st := p.nvmeState(ctrl); st.health != nil {
+		h := *st.health
+		return &h, nil
+	}
 	out, err := p.k.Run.Run(ctx, "nvme", "smart-log", ctrl, "-o", "json")
 	if err != nil {
 		return nil, err
 	}
-	return parseSmartLog(out)
+	h, err := parseSmartLog(out)
+	if err != nil {
+		return nil, err
+	}
+	keep := *h
+	p.keepNVMe(ctrl, func(st *nvmeState) { st.health = &keep })
+	return h, nil
+}
+
+// nvmeTTL is how long a drive's SMART log and write-cache state are reused: they are read on every
+// reconciler pass, and each read is an admin command through nvme-cli.
+const nvmeTTL = time.Minute
+
+type nvmeState struct {
+	at     time.Time
+	health *store.SmartHealth
+	cache  store.WriteCacheState
+}
+
+func (p *Plane) nvmeState(ctrl string) nvmeState {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if st := p.nvme[ctrl]; time.Since(st.at) < nvmeTTL {
+		return st
+	}
+	return nvmeState{}
+}
+
+func (p *Plane) keepNVMe(ctrl string, set func(*nvmeState)) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	st := p.nvme[ctrl]
+	if time.Since(st.at) >= nvmeTTL {
+		st = nvmeState{at: time.Now()}
+	}
+	set(&st)
+	if p.nvme == nil {
+		p.nvme = map[string]nvmeState{}
+	}
+	p.nvme[ctrl] = st
 }
 
 func parseSmartLog(out []byte) (*store.SmartHealth, error) {
@@ -64,6 +108,9 @@ func (p *Plane) NVMeWriteCache(ctx context.Context, d *store.Disk) (store.WriteC
 	if err != nil {
 		return store.WriteCacheUnknown, err
 	}
+	if st := p.nvmeState(ctrl); st.cache != "" && st.cache != store.WriteCacheUnknown {
+		return st.cache, nil
+	}
 	out, err := p.k.Run.Run(ctx, "nvme", "get-feature", ctrl, "--feature-id=6")
 	if err != nil {
 		return store.WriteCacheUnknown, err
@@ -72,10 +119,12 @@ func (p *Plane) NVMeWriteCache(ctx context.Context, d *store.Disk) (store.WriteC
 	if err != nil {
 		return store.WriteCacheUnknown, err
 	}
+	state := store.WriteCacheWriteThrough
 	if v&1 != 0 {
-		return store.WriteCacheWriteBack, nil
+		state = store.WriteCacheWriteBack
 	}
-	return store.WriteCacheWriteThrough, nil
+	p.keepNVMe(ctrl, func(st *nvmeState) { st.cache = state })
+	return state, nil
 }
 
 // SetNVMeWriteCache sets WCE, saved across power cycles where the drive can (else for the
@@ -85,6 +134,7 @@ func (p *Plane) SetNVMeWriteCache(ctx context.Context, d *store.Disk, enabled bo
 	if err != nil {
 		return store.WriteCacheUnknown, err
 	}
+	p.keepNVMe(ctrl, func(st *nvmeState) { *st = nvmeState{} }) // read it back below
 	v := "--value=0"
 	if enabled {
 		v = "--value=1"
@@ -115,6 +165,8 @@ func parseFeatureValue(out string) (uint64, error) {
 	if !ok {
 		return 0, fmt.Errorf("nvme get-feature: unexpected output %q", strings.TrimSpace(out))
 	}
-	v = strings.TrimPrefix(strings.TrimSpace(strings.Fields(v + " ")[0]), "0x")
+	v, _, _ = strings.Cut(strings.TrimSpace(v), " ")
+	v, _, _ = strings.Cut(v, "\n")
+	v = strings.TrimPrefix(strings.TrimSpace(v), "0x")
 	return strconv.ParseUint(v, 16, 64)
 }

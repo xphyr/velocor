@@ -10,7 +10,6 @@ import (
 	"regexp"
 	"sort"
 	"strings"
-
 )
 
 // OSDeployment describes a single bootc OS deployment entry (booted, staged, or rollback).

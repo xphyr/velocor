@@ -631,6 +631,10 @@ func TestChangedBlocksExact(t *testing.T) {
 		t.Fatal(err)
 	}
 	s1, s2 := pl.lv("s1"), pl.lv("s2")
+	// A metadata snapshot a crashed velod left reserved doesn't block it.
+	if _, err := e.p.Run.Run(e.ctx, "dmsetup", "message", dmName(pl.vg, pl.thin)+"-tpool", "0", "reserve_metadata_snap"); err != nil {
+		t.Fatal(err)
+	}
 	got, err := e.p.ChangedBlocks(e.ctx, pl.vg, pl.thin, s1.ThinID, s2.ThinID, size)
 	if err != nil {
 		t.Fatal(err)

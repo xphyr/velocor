@@ -66,16 +66,16 @@ func (p *Plane) ThinPools(ctx context.Context, name, uuid string) ([]dataplane.T
 	if err != nil {
 		return nil, err
 	}
+	lvs, err := p.k.ListVolumes(ctx, "")
+	if err != nil {
+		return nil, err
+	}
 	var out []dataplane.ThinPool
 	for _, vg := range vgs {
 		if name != "" && vg.Name != name || uuid != "" && vg.UUID != uuid {
 			continue
 		}
-		lvs, err := p.k.ListVolumes(ctx, vg.Name)
-		if err != nil {
-			return nil, err
-		}
-		i := slices.IndexFunc(lvs, func(lv kernel.LV) bool { return lv.SegType == "thin-pool" && lv.Name == thinLV })
+		i := slices.IndexFunc(lvs, func(lv kernel.LV) bool { return lv.VG == vg.Name && lv.SegType == "thin-pool" && lv.Name == thinLV })
 		if i < 0 {
 			continue
 		}
@@ -101,10 +101,9 @@ func (p *Plane) arrayName(pv string) string {
 	return pv
 }
 
-// CreateThinPool puts a volume group named name on the array, with its thin pool. The chunk
-// size is the kernel data plane's own (64 KiB, kernel.ChunkSize), whatever SPDK's cluster size
-// was.
-func (p *Plane) CreateThinPool(ctx context.Context, array, name string, _ uint32) (string, error) {
+// CreateThinPool puts a volume group named name on the array, with its thin pool (64 KiB chunks,
+// kernel.ChunkSize).
+func (p *Plane) CreateThinPool(ctx context.Context, array, name string) (string, error) {
 	if err := p.k.CreatePool(ctx, kernel.PoolSpec{VG: name, Device: p.k.ArrayPath(array), Thin: thinLV, DataPercent: dataPercent}); err != nil {
 		return "", err
 	}
@@ -131,11 +130,11 @@ func (p *Plane) GrowMetadata(ctx context.Context, uuid string) (uint64, error) {
 		return 0, notFound("thin pool %s not found", uuid)
 	}
 	vg := vgs[i]
-	lvs, err := p.k.ListVolumes(ctx, vg.Name)
+	lvs, err := p.k.ListVolumes(ctx, "")
 	if err != nil {
 		return 0, err
 	}
-	j := slices.IndexFunc(lvs, func(lv kernel.LV) bool { return lv.SegType == "thin-pool" && lv.Name == thinLV })
+	j := slices.IndexFunc(lvs, func(lv kernel.LV) bool { return lv.VG == vg.Name && lv.SegType == "thin-pool" && lv.Name == thinLV })
 	if j < 0 || lvs[j].MetadataSize == 0 {
 		return 0, nil
 	}
@@ -171,6 +170,8 @@ func (p *Plane) DeleteThinPool(ctx context.Context, uuid, name string) error {
 	if err != nil {
 		return err
 	}
+	p.wrapMu.Lock() // until the LVs are gone, or Settle puts the wrappers back
+	defer p.wrapMu.Unlock()
 	for _, lv := range lvs {
 		if err := p.removeWrapper(ctx, lv.Name); err != nil {
 			return fmt.Errorf("remove the wrapper of %s: %w", lv.Name, err)
@@ -201,7 +202,7 @@ func (p *Plane) Volumes(ctx context.Context) ([]dataplane.Volume, error) {
 		}
 		out = append(out, dataplane.Volume{
 			UUID: volumeUUID(lv), Name: lv.Name, Alias: lv.VG + "/" + lv.Name, Pool: vgUUID[lv.VG],
-			Thin: lv.SegType == "thin", Snapshot: isSnapshot(lv), AllocatedBytes: allocated(lv),
+			Thin: lv.SegType == "thin", Snapshot: isSnapshot(lv), AllocatedBytes: allocated(lv), Seq: lv.ThinID,
 		})
 	}
 	return out, nil
@@ -215,7 +216,7 @@ func (p *Plane) CreateVolume(ctx context.Context, pool, name string, sizeBytes u
 	}
 	if !thin {
 		// A thick LV gets whatever its extents held: a deleted volume's data, or (seen on the lab
-		// VM) an earlier pool's metadata copy. Zero it, as SPDK's thick volumes read zeros; the
+		// VM) an earlier pool's metadata copy. Zero it; the
 		// thin pool zeroes new chunks itself.
 		if _, err := p.k.Run.Run(ctx, "blkdiscard", "--zeroout", p.k.LVPath(pool, name)); err != nil {
 			_ = p.k.RemoveVolume(context.WithoutCancel(ctx), pool, name)
@@ -223,7 +224,7 @@ func (p *Plane) CreateVolume(ctx context.Context, pool, name string, sizeBytes u
 		}
 	}
 	if name != metaLV {
-		if err := p.k.EnsureWrapper(ctx, name, p.k.LVPath(pool, name)); err != nil {
+		if err := p.ensureWrapper(ctx, kernel.LV{VG: pool, Name: name}); err != nil {
 			_ = p.k.RemoveVolume(context.WithoutCancel(ctx), pool, name)
 			return "", fmt.Errorf("wrapper: %w", err)
 		}
@@ -240,7 +241,7 @@ func (p *Plane) ResizeVolume(ctx context.Context, volume string, sizeBytes uint6
 	if err := p.k.ResizeVolume(ctx, lv.VG, lv.Name, sizeBytes); err != nil {
 		return err
 	}
-	if err := p.k.EnsureWrapper(ctx, lv.Name, p.k.LVPath(lv.VG, lv.Name)); err != nil {
+	if err := p.ensureWrapper(ctx, lv); err != nil {
 		return err
 	}
 	wrapper := p.k.WrapperPath(lv.Name)
@@ -260,6 +261,8 @@ func (p *Plane) DeleteVolume(ctx context.Context, volume string) error {
 	if err != nil {
 		return err
 	}
+	p.wrapMu.Lock() // until the LV is gone, or Settle puts the wrapper back
+	defer p.wrapMu.Unlock()
 	if err := p.removeWrapper(ctx, lv.Name); err != nil {
 		return err
 	}
@@ -293,6 +296,8 @@ func (p *Plane) Snapshot(ctx context.Context, volume, name string) (string, erro
 func (p *Plane) SnapshotGroup(ctx context.Context, entries []dataplane.GroupEntry, quiesce time.Duration) ([]string, error) {
 	members := make([]kernel.GroupMember, len(entries))
 	uuids := make([]string, len(entries))
+	p.wrapMu.Lock()
+	defer p.wrapMu.Unlock()
 	for i, e := range entries {
 		lv, err := p.resolve(ctx, e.Volume)
 		if err != nil {
@@ -305,7 +310,7 @@ func (p *Plane) SnapshotGroup(ctx context.Context, entries []dataplane.GroupEntr
 		members[i] = kernel.GroupMember{Volume: lv.Name, VG: lv.VG, LV: lv.Name, Snap: e.Snapshot, Tags: []string{tagUUID + uuids[i], tagSnapshot}}
 	}
 	if err := p.k.GroupSnapshotWithin(ctx, members, quiesce); err != nil {
-		if errors.Is(err, context.DeadlineExceeded) {
+		if errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil { // not the caller's own deadline
 			return nil, &tagged{err: err, kind: dataplane.ErrQuiesceTimeout}
 		}
 		return nil, err
@@ -323,7 +328,7 @@ func (p *Plane) Clone(ctx context.Context, snapshot, name string) (string, error
 	if err := p.k.Clone(ctx, lv.VG, lv.Name, name, tagUUID+u); err != nil {
 		return "", err
 	}
-	if err := p.k.EnsureWrapper(ctx, name, p.k.LVPath(lv.VG, name)); err != nil {
+	if err := p.ensureWrapper(ctx, kernel.LV{VG: lv.VG, Name: name}); err != nil {
 		_ = p.k.RemoveVolume(context.WithoutCancel(ctx), lv.VG, name)
 		return "", fmt.Errorf("wrapper: %w", err)
 	}

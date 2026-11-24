@@ -45,10 +45,11 @@ type Store interface {
 	UpsertDisk(disk *Disk) error
 	SyncDiscoveredDisk(disk *Disk) error
 	GetDisk(id string) (*Disk, error)
+	UpdateSpaceUsage(volumes, snapshots map[string]uint64) error
 	ListDisks() ([]*Disk, error)
 	// MutateDisk atomically applies fn to the current Disk record inside one transaction.
 	MutateDisk(id string, fn func(*Disk) error) (*Disk, error)
-	ClaimDisk(id string, driverState DiskDriverState, spdkBdevName string) (*Disk, error)
+	ClaimDisk(id string, driverState DiskDriverState, handle string) (*Disk, error)
 	ReleaseDisk(id string) (*Disk, error)
 	DeleteDisk(id string) error
 
@@ -68,7 +69,7 @@ type Store interface {
 	// ReleasePoolDisk unbinds a detached disk from its pool.
 	ReleasePoolDisk(poolID, diskID string) (*Pool, error)
 	// RelinkPoolMember moves a member to the record of the same disk under a new ID.
-	RelinkPoolMember(poolID, oldDiskID, newDiskID, bdevUUID string) (*Pool, error)
+	RelinkPoolMember(poolID, oldDiskID, newDiskID string) (*Pool, error)
 	GetSettings() (*Settings, error)
 	SaveSettings(st *Settings) error
 	// GetScrubRecord returns a pool's scrub record (ErrNotFound if it was never scrubbed).

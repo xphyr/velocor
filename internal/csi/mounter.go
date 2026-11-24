@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log"
 	"net"
 	"os"
@@ -14,6 +15,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -391,10 +393,20 @@ func iscsiLogoutTargets(ctx context.Context, match func(target string) bool) err
 	return nil
 }
 
+// ErrDeviceGone is FlushDevice's error for a block device that isn't there any more.
+var ErrDeviceGone = errors.New("the block device is gone")
+
 // FlushDevice writes out what the kernel still holds for a raw block device. Raw block
 // volumes go through the page cache with no filesystem to flush them; tearing the connection
 // down first would race the data against the next node's reads.
 func (m *LinuxMounter) FlushDevice(ctx context.Context, devicePath string) error {
+	f, err := os.Open(devicePath)
+	if errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ENXIO) || errors.Is(err, syscall.ENODEV) {
+		return fmt.Errorf("%w: %v", ErrDeviceGone, err)
+	}
+	if err == nil {
+		_ = f.Close()
+	}
 	if out, err := exec.CommandContext(ctx, "blockdev", "--flushbufs", devicePath).CombinedOutput(); err != nil {
 		return fmt.Errorf("blockdev --flushbufs %s: %w (%s)", devicePath, err, strings.TrimSpace(string(out)))
 	}

@@ -69,7 +69,6 @@ func TestHardwareDiscoveryBootGuardAndVFIOBinding(t *testing.T) {
 		t.Fatalf("symlink data driver: %v", err)
 	}
 	mustWriteFile(t, filepath.Join(sysfs, "bus", "pci", "drivers_probe"), "")
-	mustWriteFile(t, filepath.Join(sysfs, "module", "vfio", "parameters", "enable_unsafe_noiommu_mode"), "0\n")
 
 	// 4. Setup /sys/block/sda (boot SSD) and /sys/block/sdb (data SSD) sharing the same SATA HBA PCIe BDF,
 	// plus /sys/block/sdc (rotational HDD).
@@ -108,16 +107,10 @@ func TestHardwareDiscoveryBootGuardAndVFIOBinding(t *testing.T) {
 		t.Fatalf("symlink sdd device: %v", err)
 	}
 
-	// 5. Setup hugepages in sysfs.
-	hpDir := filepath.Join(sysfs, "kernel", "mm", "hugepages", "hugepages-2048kB")
-	mustWriteFile(t, filepath.Join(hpDir, "nr_hugepages"), "0\n")
-	mustWriteFile(t, filepath.Join(hpDir, "free_hugepages"), "0\n")
-
 	mgr, err := NewManager(Config{
-		SysfsRoot:          sysfs,
-		ProcRoot:           procfs,
-		DevRoot:            devfs,
-		AllowUnsafeNoIOMMU: true,
+		SysfsRoot: sysfs,
+		ProcRoot:  procfs,
+		DevRoot:   devfs,
 	})
 	if err != nil {
 		t.Fatalf("NewManager failed: %v", err)
@@ -164,58 +157,15 @@ func TestHardwareDiscoveryBootGuardAndVFIOBinding(t *testing.T) {
 		t.Fatalf("expected virtual QEMU HARDDISK sdd to be discovered as non-boot: %+v", byID["ssd-sdd"])
 	}
 
-	// Verify BindNVMeToUserspace refuses the boot NVMe controller.
-	if _, err := mgr.BindNVMeToUserspace("0000:00:04.0", "vfio-pci"); !errors.Is(err, store.ErrBootDeviceProtected) {
+	// The boot NVMe controller can't be rebound.
+	if err := mgr.BindNVMeToKernel("0000:00:04.0"); !errors.Is(err, store.ErrBootDeviceProtected) {
 		t.Fatalf("expected ErrBootDeviceProtected on boot NVMe, got %v", err)
 	}
-
-	// Verify BindNVMeToUserspace succeeds on the data NVMe controller and enables noiommu mode.
-	state, err := mgr.BindNVMeToUserspace("0000:01:00.0", "vfio-pci")
-	if err != nil || state != store.DiskDriverStateVfioPCI {
-		t.Fatalf("BindNVMeToUserspace(0000:01:00.0) got (%s, %v), want VFIO_PCI", state, err)
-	}
-	override := readSysfsString(filepath.Join(dataPCIDir, "driver_override"))
-	if override != "vfio-pci" {
-		t.Fatalf("expected driver_override=vfio-pci, got %q", override)
-	}
-	noiommu := readSysfsString(filepath.Join(sysfs, "module", "vfio", "parameters", "enable_unsafe_noiommu_mode"))
-	if noiommu != "1" {
-		t.Fatalf("expected vfio enable_unsafe_noiommu_mode=1 when no IOMMU groups exist, got %q", noiommu)
-	}
-
-	// Verify EnsureHugepages allocates 1024 MiB (512 x 2 MiB pages).
-	hpStatus, err := mgr.EnsureHugepages(1024)
-	if err != nil {
-		t.Fatalf("EnsureHugepages(1024) failed: %v", err)
-	}
-	if hpStatus.TotalPages != 512 || hpStatus.TotalMB != 1024 {
-		t.Fatalf("unexpected HugepageStatus: %+v", hpStatus)
-	}
 }
 
-func TestReleaseHugepages(t *testing.T) {
-	root := t.TempDir()
-	dir := filepath.Join(root, "kernel", "mm", "hugepages", "hugepages-2048kB")
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	for f, v := range map[string]string{"nr_hugepages": "512\n", "free_hugepages": "512\n"} {
-		if err := os.WriteFile(filepath.Join(dir, f), []byte(v), 0o644); err != nil {
-			t.Fatal(err)
-		}
-	}
-	m := &Manager{cfg: Config{SysfsRoot: root}}
-	if _, err := m.ReleaseHugepages(); err != nil {
-		t.Fatal(err)
-	}
-	if b, _ := os.ReadFile(filepath.Join(dir, "nr_hugepages")); string(b) != "0\n" {
-		t.Errorf("nr_hugepages = %q", b)
-	}
-}
-
-// A drive on vfio-pci was put there by SPDK: claimed with the SPDK data plane, but not with
-// the kernel one, which would otherwise take it from whatever holds it.
-func TestDiscoveryVFIODriveClaimedOnlyWithSPDK(t *testing.T) {
+// A drive on vfio-pci (passed through to a VM, say) belongs to whatever put it there: listed as on a
+// userspace driver, never as claimed.
+func TestDiscoveryLeavesUserspaceDrives(t *testing.T) {
 	root := t.TempDir()
 	sysfs := filepath.Join(root, "sys")
 	dev := filepath.Join(sysfs, "bus", "pci", "devices", "0000:01:00.0")
@@ -227,14 +177,12 @@ func TestDiscoveryVFIODriveClaimedOnlyWithSPDK(t *testing.T) {
 		t.Fatal(err)
 	}
 	mustWriteFile(t, filepath.Join(root, "proc", "self", "mountinfo"), "")
-	for _, kernel := range []bool{false, true} {
-		m := &Manager{cfg: Config{SysfsRoot: sysfs, ProcRoot: filepath.Join(root, "proc"), DevRoot: filepath.Join(root, "dev"), KernelDataPlane: kernel}}
-		disks, err := m.DiscoverDisks()
-		if err != nil || len(disks) != 1 {
-			t.Fatalf("kernel=%v: %+v %v", kernel, disks, err)
-		}
-		if d := disks[0]; d.DriverState != store.DiskDriverStateVfioPCI || d.Claimed == kernel {
-			t.Errorf("kernel data plane %v: driver %s, claimed %v", kernel, d.DriverState, d.Claimed)
-		}
+	m := &Manager{cfg: Config{SysfsRoot: sysfs, ProcRoot: filepath.Join(root, "proc"), DevRoot: filepath.Join(root, "dev")}}
+	disks, err := m.DiscoverDisks()
+	if err != nil || len(disks) != 1 {
+		t.Fatalf("%+v %v", disks, err)
+	}
+	if d := disks[0]; d.DriverState != store.DiskDriverStateUserspace || d.Claimed {
+		t.Errorf("driver %s, claimed %v", d.DriverState, d.Claimed)
 	}
 }

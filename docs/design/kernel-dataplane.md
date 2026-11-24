@@ -1,6 +1,6 @@
 # Design: moving the data plane from SPDK to the Linux kernel storage stack
 
-**Status:** decided 2026-11-20; design under review; no code yet.
+**Status:** decided 2026-11-20; implemented 2026-11-23, SPDK removed 2026-11-24 (K-4).
 **Decision:** Velocor's data plane moves from SPDK (RAID bdev, lvol, SPDK NVMe/TCP and iSCSI
 targets) to the kernel's storage stack: md RAID, LVM thin provisioning, the kernel NVMe/TCP
 target (`nvmet`) and LIO for iSCSI. velod, its API, the store, the CSI driver, the UI and

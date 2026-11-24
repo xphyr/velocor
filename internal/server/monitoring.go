@@ -87,14 +87,6 @@ func (s *Server) rotateScrapeToken() (string, error) {
 	return secret, err
 }
 
-// reactorCPUs lists the CPUs the data plane polls on.
-func (s *Server) reactorCPUs(ctx context.Context) ([]int, error) {
-	if s.dp == nil {
-		return nil, fmt.Errorf("no data plane")
-	}
-	return s.dp.PollingCPUs(ctx)
-}
-
 func (s *Server) handleGetMonitoring(w http.ResponseWriter, r *http.Request) {
 	if s.monitoring == nil {
 		writeJSON(w, http.StatusOK, map[string]any{"available": false})

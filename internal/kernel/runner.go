@@ -13,6 +13,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os/exec"
 	"strings"
 	"sync"
@@ -49,8 +50,26 @@ type Exec struct {
 	HostNamespace bool
 }
 
-// Run implements Runner.
-func (x Exec) Run(ctx context.Context, name string, args ...string) ([]byte, error) {
+// Streamer is a Runner that can hand a command's output to fn as it comes, for output that can be
+// large.
+type Streamer interface {
+	Stream(ctx context.Context, fn func(io.Reader) error, name string, args ...string) error
+}
+
+// stream runs a command and hands its output to fn: as it comes if the Runner can.
+func (p *Plane) stream(ctx context.Context, fn func(io.Reader) error, name string, args ...string) error {
+	if s, ok := p.Run.(Streamer); ok {
+		return s.Stream(ctx, fn, name, args...)
+	}
+	out, err := p.Run.Run(ctx, name, args...)
+	if err != nil {
+		return err
+	}
+	return fn(bytes.NewReader(out))
+}
+
+// command is the command as this host runs it.
+func (x Exec) command(name string, args []string) (string, []string) {
 	if x.HostNamespace {
 		// The IPC namespace too: LVM and dmsetup wait for udev through SysV semaphores, which
 		// udev on the host completes in the host's IPC namespace (in velod's own, they wait
@@ -58,6 +77,47 @@ func (x Exec) Run(ctx context.Context, name string, args ...string) ([]byte, err
 		args = append([]string{"-t", "1", "-m", "-i", "--", name}, args...)
 		name = "nsenter"
 	}
+	return name, args
+}
+
+// Stream implements Streamer. fn's error wins over the command's, which fn stopping early causes.
+func (x Exec) Stream(ctx context.Context, fn func(io.Reader) error, name string, args ...string) error {
+	name, args = x.command(name, args)
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, name, args...)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	out, err := cmd.StdoutPipe()
+	if err != nil {
+		return err
+	}
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	ferr := fn(out)
+	if ferr != nil {
+		cancel()
+	} else {
+		_, _ = io.Copy(io.Discard, out)
+	}
+	if err := cmd.Wait(); err != nil {
+		code := -1
+		var exit *exec.ExitError
+		if errors.As(err, &exit) {
+			code = exit.ExitCode()
+		}
+		cerr := &CommandError{Cmd: name + " " + strings.Join(args, " "), Code: code, Stderr: stderr.String(), Err: err}
+		if ferr == nil || stderr.Len() > 0 { // the output broke off because the command failed
+			return errors.Join(cerr, ferr)
+		}
+	}
+	return ferr
+}
+
+// Run implements Runner.
+func (x Exec) Run(ctx context.Context, name string, args ...string) ([]byte, error) {
+	name, args = x.command(name, args)
 	cmd := exec.CommandContext(ctx, name, args...)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr

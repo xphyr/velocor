@@ -14,7 +14,7 @@ var keySettings = []byte("settings")
 
 // PoolMembers returns a pool's RAID slots. Pools created before member tracking have none
 // recorded: their slots are their disks, in creation (slot) order, assumed active until the
-// reconciler reads the real state from SPDK.
+// reconciler reads the real state from the data plane.
 func PoolMembers(p *Pool) []PoolMember {
 	if len(p.Members) > 0 {
 		return slices.Clone(p.Members)
@@ -82,12 +82,11 @@ func (s *BoltStore) ReplacePoolMember(poolID string, slot int, newDiskID string)
 }
 
 // RelinkPoolMember moves a pool member to the record of the same disk under a new ID (docs/review-history.md
-// P1-14): newDiskID takes oldDiskID's place in the pool's slots, keeps the bdev UUID the RAID
-// superblock knows the member by (SPDK; "" with md, which knows its members itself), and
-// inherits the operator's settings for the disk. It is claimed (the reconciler attaches it to
+// P1-14): newDiskID takes oldDiskID's place in the pool's slots and inherits the operator's settings
+// for the disk. It is claimed (the reconciler attaches it to
 // the data plane). The old record, of a disk that is no longer
 // there under that ID, is deleted.
-func (s *BoltStore) RelinkPoolMember(poolID, oldDiskID, newDiskID, bdevUUID string) (*Pool, error) {
+func (s *BoltStore) RelinkPoolMember(poolID, oldDiskID, newDiskID string) (*Pool, error) {
 	var out Pool
 	err := s.db.Update(func(tx *bolt.Tx) error {
 		poolsB, disksB := tx.Bucket(bucketPools), tx.Bucket(bucketDisks)
@@ -123,7 +122,7 @@ func (s *BoltStore) RelinkPoolMember(poolID, oldDiskID, newDiskID, bdevUUID stri
 		if i := slices.Index(out.DetachedDiskIDs, oldDiskID); i >= 0 {
 			out.DetachedDiskIDs[i] = newDiskID
 		}
-		d.Claimed, d.PoolID, d.MemberUUID = true, poolID, bdevUUID
+		d.Claimed, d.PoolID = true, poolID
 		d.DriverState, d.Handle, d.HealthStatus = DiskDriverStateUnspecified, "", HealthStatusOnline
 		d.WriteCachePolicy, d.PowerLossProtected = old.WriteCachePolicy, old.PowerLossProtected
 		d.UpdatedAt = time.Now().UTC()

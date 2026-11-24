@@ -137,13 +137,13 @@ func (s *Server) updatePoolSpace(poolID string) {
 	})
 }
 
-// lvolHeldBytes returns how many bytes a volume holds now (its allocated space).
-func (s *Server) lvolHeldBytes(ctx context.Context, uuid string) (uint64, error) {
-	lvols, err := s.dp.Volumes(ctx)
+// volumeHeldBytes returns how many bytes a volume holds now (its allocated space).
+func (s *Server) volumeHeldBytes(ctx context.Context, uuid string) (uint64, error) {
+	dpVols, err := s.dp.Volumes(ctx)
 	if err != nil {
-		return 0, fmt.Errorf("list lvols: %w", err)
+		return 0, fmt.Errorf("list volumes: %w", err)
 	}
-	for _, l := range lvols {
+	for _, l := range dpVols {
 		if l.UUID == uuid {
 			return l.AllocatedBytes, nil
 		}

@@ -70,7 +70,7 @@ func main() {
 		insecure:   *insecure,
 		jsonOutput: *jsonOut,
 		// Per-request timeouts (see request): reads are quick, changes can take as long as
-		// SPDK needs (a new pool unmaps whole disks).
+		// the data plane needs (a new pool discards whole disks).
 		httpClient: &http.Client{Transport: &http.Transport{TLSClientConfig: tlsCfg}},
 	}
 
@@ -528,13 +528,12 @@ func runSystem(cfg *cliConfig, args []string) error {
 			return printJSON(resp)
 		}
 		node, _ := resp["node"].(map[string]any)
-		spdkSt, _ := resp["data_plane"].(map[string]any)
+		planeSt, _ := resp["data_plane"].(map[string]any)
 		recSt, _ := resp["reconciler"].(map[string]any)
 		fmt.Printf("Overall Health:     %v\n", resp["overall_health"])
 		fmt.Printf("Node ID / Hostname: %v (%v)\n", node["node_id"], node["hostname"])
 		fmt.Printf("Velocor Version:    %v (commit %v)\n", node["version"], node["commit"])
-		fmt.Printf("Data plane:         connected %v (%v, %v)\n", spdkSt["connected"], node["data_plane_version"], spdkSt["endpoint"])
-		fmt.Printf("Hugepages (MiB):    %v total / %v free\n", spdkSt["hugepages_total_mb"], spdkSt["hugepages_free_mb"])
+		fmt.Printf("Data plane:         connected %v (%v, %v)\n", planeSt["connected"], node["data_plane_version"], planeSt["endpoint"])
 		fmt.Printf("Drift Repaired:     %v\n", recSt["drift_repaired_count"])
 		if degraded, _ := recSt["degraded_resources"].([]any); len(degraded) > 0 {
 			fmt.Printf("Needing Attention:  %v\n", degraded)
@@ -569,7 +568,7 @@ func runSystem(cfg *cliConfig, args []string) error {
 			return printJSON(resp)
 		}
 		tw := newTabWriter()
-		fmt.Fprintln(tw, "BDEV\tREAD OPS\tWRITE OPS\tBYTES READ\tBYTES WRITTEN")
+		fmt.Fprintln(tw, "DEVICE\tREAD OPS\tWRITE OPS\tBYTES READ\tBYTES WRITTEN")
 		for _, item := range sliceOfMaps(resp["stats"]) {
 			fmt.Fprintf(tw, "%v\t%v\t%v\t%v\t%v\n",
 				item["name"], item["num_read_ops"], item["num_write_ops"], item["bytes_read"], item["bytes_written"])
@@ -842,18 +841,16 @@ func runPool(cfg *cliConfig, args []string) error {
 		name := fs.String("name", "", "Pool name")
 		raid := fs.String("raid", "RAID0", "RAID level: RAID0 | RAID1 (RAID10 is not supported yet)")
 		disksCSV := fs.String("disks", "", "Comma-separated disk IDs")
-		clusterSz := fs.Uint("chunk-size", 1<<20, "Thin allocation unit in bytes (SPDK: the lvstore cluster, default 1 MiB; the kernel data plane always uses 64 KiB)")
 		policy := spacePolicyFlags(fs)
 		_ = fs.Parse(args[1:])
 		if *name == "" || *disksCSV == "" {
 			return fmt.Errorf("--name and --disks are required")
 		}
 		resp, err := cfg.request("POST", "/api/v1/pools", map[string]any{
-			"name":             *name,
-			"raid_level":       strings.ToUpper(*raid),
-			"disk_ids":         strings.Split(*disksCSV, ","),
-			"chunk_size_bytes": *clusterSz,
-			"space_policy":     policy(),
+			"name":         *name,
+			"raid_level":   strings.ToUpper(*raid),
+			"disk_ids":     strings.Split(*disksCSV, ","),
+			"space_policy": policy(),
 		})
 		if err != nil {
 			return err
@@ -1033,7 +1030,7 @@ func runPool(cfg *cliConfig, args []string) error {
 
 func runVolume(cfg *cliConfig, args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("subcommand required: list | get | usage | create | resize | qos | protect | delete | deleted | restore | purge")
+		return fmt.Errorf("subcommand required: list | get | usage | create | resize | protect | delete | deleted | restore | purge")
 	}
 	switch args[0] {
 	case "get":
@@ -1062,7 +1059,7 @@ func runVolume(cfg *cliConfig, args []string) error {
 		if size > 0 {
 			pct = 100 * float64(alloc) / float64(size)
 		}
-		fmt.Printf("Allocated: %s of %s (%.1f%%), thin=%v\n", humanBytes(alloc), humanBytes(size), pct, resp["thin_provision"])
+		fmt.Printf("Allocated: %s of %s (%.1f%%)\n", humanBytes(alloc), humanBytes(size), pct)
 		return nil
 
 	case "list":
@@ -1074,11 +1071,11 @@ func runVolume(cfg *cliConfig, args []string) error {
 			return printJSON(resp)
 		}
 		tw := newTabWriter()
-		fmt.Fprintln(tw, "ID\tNAME\tPOOL\tSIZE\tALLOCATED\tTHIN\tATTACHMENT\tBDEV\tHEALTH")
+		fmt.Fprintln(tw, "ID\tNAME\tPOOL\tSIZE\tALLOCATED\tATTACHMENT\tDEVICE\tHEALTH")
 		for _, v := range sliceOfMaps(resp["volumes"]) {
-			fmt.Fprintf(tw, "%v\t%v\t%v\t%s\t%s\t%v\t%v\t%v\t%v\n",
+			fmt.Fprintf(tw, "%v\t%v\t%v\t%s\t%s\t%v\t%v\t%v\n",
 				v["id"], v["name"], v["pool_id"], humanBytes(uint64FromAny(v["size_bytes"])), humanBytes(uint64FromAny(v["allocated_bytes"])),
-				v["thin_provision"], v["attachment_state"], v["device"], v["health_status"])
+				v["attachment_state"], v["device"], v["health_status"])
 		}
 		return tw.Flush()
 
@@ -1087,7 +1084,6 @@ func runVolume(cfg *cliConfig, args []string) error {
 		name := fs.String("name", "", "Volume name")
 		poolID := fs.String("pool", "", "Pool ID")
 		sizeGiB := fs.Uint64("size-gib", 10, "Volume size in GiB")
-		thin := fs.Bool("thin", true, "Thin provision volume")
 		protect := fs.Bool("protect", false, "Refuse deletion until an administrator turns protection off")
 		_ = fs.Parse(args[1:])
 		if *name == "" || *poolID == "" {
@@ -1097,7 +1093,6 @@ func runVolume(cfg *cliConfig, args []string) error {
 			"name":                *name,
 			"pool_id":             *poolID,
 			"size_bytes":          *sizeGiB * 1024 * 1024 * 1024,
-			"thin_provision":      *thin,
 			"deletion_protection": *protect,
 		})
 		if err != nil {
@@ -1115,26 +1110,6 @@ func runVolume(cfg *cliConfig, args []string) error {
 		}
 		resp, err := cfg.request("POST", "/api/v1/volumes/"+*id+":resize", map[string]any{
 			"new_size_bytes": *sizeGiB * 1024 * 1024 * 1024,
-		})
-		if err != nil {
-			return err
-		}
-		return printJSON(resp)
-
-	case "qos":
-		fs := flag.NewFlagSet("volume qos", flag.ExitOnError)
-		id := fs.String("id", "", "Volume ID")
-		iops := fs.Uint64("rw-iops", 0, "Max RW IOPS (0 for unlimited)")
-		mbps := fs.Uint64("rw-mbps", 0, "Max RW MiB/s (0 for unlimited)")
-		_ = fs.Parse(args[1:])
-		if *id == "" {
-			return fmt.Errorf("--id is required")
-		}
-		resp, err := cfg.request("PUT", "/api/v1/volumes/"+*id+"/qos", map[string]any{
-			"qos_policy": map[string]any{
-				"rw_ios_per_sec":    *iops,
-				"rw_mbytes_per_sec": *mbps,
-			},
 		})
 		if err != nil {
 			return err
@@ -1415,9 +1390,9 @@ func runPortal(cfg *cliConfig, args []string) error {
 	case "create":
 		fs := flag.NewFlagSet("portal create", flag.ExitOnError)
 		name := fs.String("name", "", "Portal name")
-		proto := fs.String("protocol", "NVMEOF_TCP", "Protocol: NVMEOF_TCP | NVMEOF_RDMA | ISCSI")
+		proto := fs.String("protocol", "NVMEOF_TCP", "Protocol: NVMEOF_TCP | ISCSI")
 		ip := fs.String("ip", "", "Listen IP address")
-		port := fs.Uint("port", 4420, "Listen TCP/RDMA port")
+		port := fs.Uint("port", 0, "Listen port (default: 4420 for NVMe, 3260 for iSCSI)")
 		_ = fs.Parse(args[1:])
 		if *name == "" || *ip == "" {
 			return fmt.Errorf("--name and --ip are required")
@@ -1685,7 +1660,7 @@ func runExport(cfg *cliConfig, args []string) error {
 		fs := flag.NewFlagSet("export create", flag.ExitOnError)
 		name := fs.String("name", "", "Export name")
 		volID := fs.String("volume", "", "Volume ID")
-		proto := fs.String("protocol", "NVMEOF_TCP", "Protocol: NVMEOF_TCP | NVMEOF_RDMA | ISCSI")
+		proto := fs.String("protocol", "NVMEOF_TCP", "Protocol: NVMEOF_TCP | ISCSI")
 		portals := fs.String("portals", "", "Comma-separated Portal IDs")
 		igs := fs.String("initiator-groups", "", "Comma-separated InitiatorGroup IDs")
 		allowAny := fs.Bool("allow-any-host", false, "Allow any host NQN/IQN")
@@ -1778,7 +1753,7 @@ func (c *cliConfig) request(method, path string, body any) (map[string]any, erro
 }
 
 func printUsage() {
-	fmt.Fprintf(os.Stderr, `veloctl - CLI for Velocor SPDK All-Flash SAN/NAS Appliances
+	fmt.Fprintf(os.Stderr, `veloctl - CLI for Velocor All-Flash SAN Appliances
 
 Usage:
   veloctl [global-flags] <command> <subcommand> [flags]
@@ -1791,7 +1766,7 @@ Commands:
   system            Appliance status, containers, bootc upgrade/rollback, database backup/restore
   disk              List, scan, claim, release drives; set write cache / power-loss protection
   pool              Create, list, inspect or delete pools; space policy; replace a disk, start a pool degraded; import a pool
-  volume            Create, list, get, show usage, resize, set QoS, or delete volumes
+  volume            Create, list, get, show usage, resize, or delete volumes
   snapshot          Create, list, clone and delete snapshots; changed-block tracking
   group-snapshot    Create, list, get, or delete consistency group snapshots
   portal            Manage NVMe-oF and iSCSI network portals

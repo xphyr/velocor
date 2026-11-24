@@ -15,7 +15,7 @@ import (
 
 // ApplyExport exports the volume's wrapper: an nvmet subsystem with its allowed hosts and a
 // listener per portal, or a LIO target with an ACL per initiator and a network portal per
-// portal. Portals whose address isn't on this host are skipped and reported, as with SPDK.
+// portal. Portals whose address isn't on this host are skipped and reported.
 func (p *Plane) ApplyExport(ctx context.Context, exp *store.Export, vol *store.Volume, acl dataplane.ACL, portals []*store.Portal) error {
 	if err := p.k.LoadTargetModules(ctx); err != nil {
 		return fmt.Errorf("load target modules: %w", err)
@@ -26,7 +26,7 @@ func (p *Plane) ApplyExport(ctx context.Context, exp *store.Export, vol *store.V
 			return err
 		}
 	}
-	if err := p.k.EnsureWrapper(ctx, lv.Name, p.k.LVPath(lv.VG, lv.Name)); err != nil {
+	if err := p.ensureWrapper(ctx, lv); err != nil {
 		return fmt.Errorf("wrapper of %s: %w", lv.Name, err)
 	}
 	device := p.k.WrapperPath(lv.Name)
@@ -40,6 +40,8 @@ func (p *Plane) ApplyExport(ctx context.Context, exp *store.Export, vol *store.V
 		present = append(present, pt)
 	}
 
+	p.targetMu.Lock()
+	defer p.targetMu.Unlock()
 	switch {
 	case exp.Protocol == store.ExportProtocolNVMeoFRDMA:
 		return fmt.Errorf("%w: NVMe over RDMA", dataplane.ErrUnsupported)
@@ -85,9 +87,10 @@ func (p *Plane) nvmePort(addr string, port int) (int, error) {
 	return next, p.k.EnsureNVMePort(kernelNVMePort(next, addr, port))
 }
 
-// serial is the export's NVMe serial / SCSI unit serial: "VELO" and the export ID, as SPDK had.
-func serial(exp *store.Export) string {
-	s := "VELO" + strings.ToUpper(strings.ReplaceAll(exp.ID, "-", ""))
+// serial is an NVMe export's serial ("VELO" and the export ID) or a SCSI unit serial ("VELO" and
+// the volume ID: its exports share a backstore, so they are paths to one disk).
+func serial(id string) string {
+	s := "VELO" + strings.ToUpper(strings.ReplaceAll(id, "-", ""))
 	if len(s) > 20 {
 		s = s[:20]
 	}
@@ -97,6 +100,8 @@ func serial(exp *store.Export) string {
 // RemoveTarget removes the export's subsystem or target; nvmet listeners no subsystem uses any
 // more go with it.
 func (p *Plane) RemoveTarget(_ context.Context, exp *store.Export) error {
+	p.targetMu.Lock()
+	defer p.targetMu.Unlock()
 	if !dataplane.IsNVMe(exp.Protocol) {
 		return p.k.RemoveISCSIExport(exp.TargetIQN, exp.VolumeID)
 	}
@@ -154,9 +159,13 @@ func (p *Plane) Connections(ctx context.Context, exp *store.Export) ([]dataplane
 		}
 		return out, nil
 	}
-	_, addrs := p.k.ISCSISessions(exp.TargetIQN)
-	for _, a := range addrs {
-		out = append(out, dataplane.Connection{Address: a})
+	names, addrs := p.k.ISCSISessions(exp.TargetIQN)
+	for i, a := range addrs {
+		c := dataplane.Connection{Address: a}
+		if a == "" {
+			c.Host = names[i]
+		}
+		out = append(out, c)
 	}
 	return out, nil
 }
@@ -182,7 +191,7 @@ func (p *Plane) Unmanaged(ctx context.Context, known dataplane.Known) ([]datapla
 	for _, vg := range vgs {
 		if !known.ThinPools[vg.UUID] {
 			out = append(out, dataplane.UnmanagedObject{Kind: "VOLUME_GROUP", Name: vg.Name, UUID: vg.UUID,
-				Detail: fmt.Sprintf("on %s, %s used", vg.PV, humanBytes(vg.Size-vg.Free))})
+				Detail: fmt.Sprintf("on %s, %s used", vg.PV, store.HumanBytes(vg.Size-vg.Free))})
 		}
 	}
 	lvs, err := p.k.ListVolumes(ctx, "")
@@ -220,28 +229,17 @@ func (p *Plane) Unmanaged(ctx context.Context, known dataplane.Known) ([]datapla
 	return out, nil
 }
 
-func humanBytes(b uint64) string {
-	switch {
-	case b >= 1<<40:
-		return fmt.Sprintf("%.1f TiB", float64(b)/(1<<40))
-	case b >= 1<<30:
-		return fmt.Sprintf("%.1f GiB", float64(b)/(1<<30))
-	default:
-		return fmt.Sprintf("%.1f MiB", float64(b)/(1<<20))
-	}
-}
-
 func kernelNVMePort(id int, addr string, port int) kernel.NVMePort {
 	return kernel.NVMePort{ID: id, Address: addr, Port: port}
 }
 
 func kernelNVMeExport(exp *store.Export, vol *store.Volume, device string, acl dataplane.ACL, ports []int) kernel.NVMeExport {
-	return kernel.NVMeExport{NQN: exp.SubsystemNQN, Serial: serial(exp), UUID: vol.UUID, Device: device,
+	return kernel.NVMeExport{NQN: exp.SubsystemNQN, Serial: serial(exp.ID), UUID: vol.UUID, Device: device,
 		Hosts: acl.HostNQNs, AllowAnyHost: exp.AllowAnyHost, Ports: ports}
 }
 
 func kernelISCSIExport(exp *store.Export, vol *store.Volume, device string, acl dataplane.ACL, portals []string) kernel.ISCSIExport {
-	return kernel.ISCSIExport{IQN: exp.TargetIQN, Backstore: exp.VolumeID, Serial: serial(exp), Device: device,
+	return kernel.ISCSIExport{IQN: exp.TargetIQN, Backstore: exp.VolumeID, Serial: serial(exp.VolumeID), Device: device,
 		Portals: portals, Initiators: acl.IQNs, AnyInitiator: exp.AllowAnyHost}
 }
 

@@ -16,16 +16,13 @@ import (
 
 	"github.com/velocor/velocor/internal/auth"
 	"github.com/velocor/velocor/internal/backup"
-	"github.com/velocor/velocor/internal/dataplane"
 	"github.com/velocor/velocor/internal/dataplane/kernelplane"
-	"github.com/velocor/velocor/internal/dataplane/spdkplane"
 	"github.com/velocor/velocor/internal/hardware"
 	"github.com/velocor/velocor/internal/kernel"
 	"github.com/velocor/velocor/internal/meta"
 	"github.com/velocor/velocor/internal/monitoring"
 	"github.com/velocor/velocor/internal/reconciler"
 	"github.com/velocor/velocor/internal/server"
-	"github.com/velocor/velocor/internal/spdk"
 	"github.com/velocor/velocor/internal/store"
 	"github.com/velocor/velocor/internal/version"
 )
@@ -47,16 +44,13 @@ func main() {
 	var (
 		listenAddr        = flag.String("listen", envOrDefault("VELOCOR_LISTEN", ":8443"), "Address and port for the unified API/UI server")
 		dbPath            = flag.String("db", envOrDefault("VELOCOR_DB_PATH", "/var/lib/velocor/velocor.db"), "Path to persistent bbolt state database")
-		dataPlane         = flag.String("data-plane", envOrDefault("VELOCOR_DATA_PLANE", "spdk"), "The data plane: spdk (spdk_tgt) or kernel (md, LVM thin, nvmet and LIO; docs/design/kernel-dataplane.md)")
-		spdkSocket        = flag.String("spdk-socket", envOrDefault("VELOCOR_SPDK_SOCKET", spdk.DefaultSocketPath), "Path to spdk_tgt JSON-RPC 2.0 UNIX socket")
-		hugepagesMB       = flag.Uint64("hugepages-mb", 0, "Ensure at least N MiB of 2 MiB hugepages on startup (0 to skip)")
+		runDir            = flag.String("run-dir", envOrDefault("VELOCOR_RUN_DIR", "/run/velocor"), "Directory for state that a reboot clears, as the kernel's is (running scrubs)")
 		reconcileInterval = flag.Duration("reconcile-interval", 15*time.Second, "Background state reconciliation interval")
 		tlsCertFile       = flag.String("tls-cert", os.Getenv("VELOCOR_TLS_CERT"), "TLS certificate file (auto-generates self-signed ECDSA cert if empty)")
 		tlsKeyFile        = flag.String("tls-key", os.Getenv("VELOCOR_TLS_KEY"), "TLS private key file")
 		insecureHTTP      = flag.Bool("insecure-http", os.Getenv("VELOCOR_INSECURE_HTTP") == "true", "Serve plain HTTP instead of HTTPS")
-		ssdBdev           = flag.String("ssd-bdev", envOrDefault("VELOCOR_SSD_BDEV", "auto"), "How SSDs are attached to SPDK: auto (default: io_uring if spdk_tgt can use it, else AIO), uring, or aio")
 		metricsPublic     = flag.Bool("metrics-public", os.Getenv("VELOCOR_METRICS_PUBLIC") == "true", "Serve /metrics without authentication (default: requires a READONLY token)")
-		metaCopies        = flag.Bool("meta-copies", os.Getenv("VELOCOR_META_COPIES") != "false", "Keep a copy of each pool's configuration on the pool (needs SPDK built with ublk and the ublk_drv module)")
+		metaCopies        = flag.Bool("meta-copies", os.Getenv("VELOCOR_META_COPIES") != "false", "Keep a copy of each pool's configuration on the pool")
 		monitoringDir     = flag.String("monitoring-dir", envOrDefault("VELOCOR_MONITORING_DIR", "/var/lib/velocor-monitoring"), "Directory for the built-in Prometheus/Alertmanager's config and data; the feature is offered only where it exists (the appliance image creates it)")
 		showVersion       = flag.Bool("version", false, "Print version information and exit")
 	)
@@ -73,27 +67,12 @@ func main() {
 		"commit", version.Commit,
 		"listen", *listenAddr,
 		"db", *dbPath,
-		"spdk_socket", *spdkSocket,
 	)
 
-	if *dataPlane != "spdk" && *dataPlane != "kernel" {
-		logger.Error("invalid --data-plane; use spdk or kernel", "value", *dataPlane)
-		os.Exit(1)
+	if (*tlsCertFile == "") != (*tlsKeyFile == "") {
+		logger.Error("--tls-cert and --tls-key go together: give both, or neither for a self-signed certificate")
+		os.Exit(2)
 	}
-	spdkplane.Logger = logger
-	switch *ssdBdev {
-	case "auto", "uring", "aio":
-		spdkplane.SSDBackend = *ssdBdev
-	default:
-		logger.Error("invalid --ssd-bdev; use auto, uring or aio", "value", *ssdBdev)
-		os.Exit(1)
-	}
-	if *ssdBdev == "uring" && *dataPlane == "spdk" {
-		if probe := hardware.ProbeIOURing(); !probe.Usable {
-			logger.Warn("--ssd-bdev=uring although io_uring may not work for spdk_tgt; a failed io_uring setup crashes it (use auto or aio)", "reason", probe.Reason)
-		}
-	}
-
 	if err := os.MkdirAll(filepath.Dir(*dbPath), 0700); err != nil {
 		logger.Error("failed to create state directory", "path", filepath.Dir(*dbPath), "err", err)
 		os.Exit(1)
@@ -109,30 +88,11 @@ func main() {
 	}
 	defer func() { _ = st.Close() }()
 
-	hwMgr, err := hardware.NewManager(hardware.Config{
-		AllowUnsafeNoIOMMU: os.Getenv("VELOCOR_ALLOW_UNSAFE_NOIOMMU") == "true",
-		KernelDataPlane:    *dataPlane == "kernel",
-	})
+	hwMgr, err := hardware.NewManager(hardware.Config{})
 	if err != nil {
 		// Without the hardware manager there is no boot-disk guard; fail closed.
 		logger.Error("hardware manager initialization failed; refusing to start without the boot-disk guard", "err", err)
 		os.Exit(1)
-	}
-
-	if *dataPlane == "kernel" && hwMgr != nil {
-		// The image reserves hugepages at boot for spdk_tgt, which doesn't run with this data plane.
-		if hp, err := hwMgr.ReleaseHugepages(); err != nil {
-			logger.Warn("failed to release hugepages", "err", err)
-		} else {
-			logger.Info("hugepages released (not needed by the kernel data plane)", "total_mb", hp.TotalMB)
-		}
-	}
-	if *hugepagesMB > 0 && hwMgr != nil && *dataPlane == "spdk" {
-		if hp, err := hwMgr.EnsureHugepages(*hugepagesMB); err != nil {
-			logger.Warn("failed to allocate hugepages", "requested_mb", *hugepagesMB, "err", err)
-		} else {
-			logger.Info("hugepages ready", "total_mb", hp.TotalMB, "free_mb", hp.FreeMB)
-		}
 	}
 
 	initPassword := os.Getenv("VELOCOR_INIT_PASSWORD")
@@ -157,30 +117,18 @@ func main() {
 		os.Exit(1)
 	}
 
-	var (
-		dp         dataplane.Plane
-		spdkClient *spdk.Client
-		kp         *kernelplane.Plane
-	)
-	if *dataPlane == "kernel" {
-		// In velod's container (host PID namespace), the storage tools run in the host's mount
-		// namespace, where their configuration and udev's /dev links are.
-		kp = kernelplane.New(kernel.New(kernel.Exec{HostNamespace: inContainer()}), hwMgr)
-		kp.StateDir = filepath.Dir(*spdkSocket) // /run/velocor: cleared at boot, as md's state is
-		if err := kp.LoadState(); err != nil {
-			logger.Warn("kernel data plane state not loaded", "err", err)
-		}
-		dp = kp
-	} else {
-		spdkClient = spdk.NewClient(*spdkSocket)
-		dp = spdkplane.New(spdkClient, hwMgr)
+	// In velod's container (host PID namespace), the storage tools run in the host's mount
+	// namespace, where their configuration and udev's /dev links are.
+	dp := kernelplane.New(kernel.New(kernel.Exec{HostNamespace: inContainer()}), hwMgr)
+	if err := os.MkdirAll(*runDir, 0o755); err != nil {
+		logger.Warn("state directory not created", "path", *runDir, "err", err)
 	}
-	logger.Info("data plane", "kind", *dataPlane, "endpoint", dp.Endpoint())
+	dp.StateDir = *runDir
+	if err := dp.LoadState(); err != nil {
+		logger.Warn("kernel data plane state not loaded", "err", err)
+	}
+	logger.Info("data plane", "endpoint", dp.Endpoint())
 	rec := reconciler.New(st, dp, hwMgr, logger)
-	if kp != nil {
-		// No spdk_tgt whose restart (empty again) velod must restore after.
-		rec.SetDataPlaneInstance(func() string { return "" })
-	}
 	var metaDev meta.Device
 	if *metaCopies {
 		self, err := os.Executable()
@@ -193,11 +141,7 @@ func main() {
 			nodeID = cfg.NodeID
 		}
 		// One device for the reconciler (writes) and pool import (reads): it serializes them.
-		if kp != nil {
-			metaDev = &meta.BlockDevice{Path: kp.VolumePath, Helper: self}
-		} else {
-			metaDev = &meta.UblkDevice{SPDK: spdkClient, Helper: self, StateDir: filepath.Dir(*spdkSocket), ID: metaUblkID, Logger: logger}
-		}
+		metaDev = &meta.BlockDevice{Path: dp.VolumePath, Helper: self}
 		rec.SetMetaDevice(metaDev, nodeID, version.Version)
 	}
 
@@ -289,9 +233,6 @@ func envOrDefault(key, def string) string {
 	}
 	return def
 }
-
-// metaUblkID is the ublk device ID reserved for metadata I/O (/dev/ublkb<id>).
-const metaUblkID = 100
 
 // healthcheck GETs /healthz from the velod listening on -listen (on the loopback interface).
 func healthcheck(args []string) int {

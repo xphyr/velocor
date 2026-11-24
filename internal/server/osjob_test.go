@@ -142,7 +142,7 @@ func TestUpgradeThatDidntTakeEffect(t *testing.T) {
 func TestRebootNamesConnectedHosts(t *testing.T) {
 	h := newHarness(t)
 	exp, _, _ := h.nvmeExport("nqn.2026-01.io.example:host-a")
-	h.fake.ConnectHost(exp["subsystem_nqn"].(string), "nqn.2026-01.io.example:host-a")
+	h.fake.Connect(exp["subsystem_nqn"].(string), "nqn.2026-01.io.example:host-a")
 	code, out := h.do("POST", "/api/v1/system/reboot", h.admin, map[string]any{})
 	if code != http.StatusConflict || !strings.Contains(fmt.Sprint(out["error"]), "host-a") {
 		t.Fatalf("reboot with a connected host: %d %v", code, out)

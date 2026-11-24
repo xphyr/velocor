@@ -25,7 +25,7 @@ func (r *Reconciler) purgeDeletedVolumes(ctx context.Context, p *pass, poolOnlin
 			continue
 		}
 		vol, err := store.StartPurge(r.store, v.ID, now)
-		if errors.Is(err, store.ErrNotDue) || errors.Is(err, store.ErrNotFound) {
+		if errors.Is(err, store.ErrNotDue) || errors.Is(err, store.ErrNotFound) || errors.Is(err, store.ErrInvalidArgument) {
 			continue // restored or purged since the listing
 		}
 		if err == nil {

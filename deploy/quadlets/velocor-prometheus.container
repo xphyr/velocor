@@ -19,7 +19,7 @@ Exec=--config.file=/etc/velocor-monitoring/prometheus.yml \
      --web.enable-lifecycle
 
 [Service]
-# Never compete with SPDK or velod for memory; velod also keeps it off SPDK's cores.
+# Never compete with the data plane or velod for memory.
 MemoryMax=768M
 CPUWeight=20
 Restart=on-failure

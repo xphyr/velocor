@@ -22,14 +22,11 @@ message NodeInfo {
   uint64 uptime_seconds = 10;
 }
 
-// DataPlaneStatus describes the runtime state of the data plane (spdk_tgt, or the kernel's).
+// DataPlaneStatus describes the runtime state of the data plane (the kernel's: md, LVM thin, nvmet, LIO).
 message DataPlaneStatus {
   bool connected = 1;
   string endpoint = 2;
-  int32 pid = 3;
-  string reactor_mask = 4;
-  uint64 hugepages_total_mb = 5;
-  uint64 hugepages_free_mb = 6;
+  reserved 3, 4, 5, 6; // pid, reactor_mask and hugepages, of the SPDK data plane
 }
 
 // ReconcileState reports the status of the control-plane desired-state reconciler.

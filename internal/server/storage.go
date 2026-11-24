@@ -3,13 +3,13 @@ package server
 // Data-plane handlers (disks, pools, volumes, snapshots, exports).
 //
 // Invariants enforced here (see TODO C2-C4):
-//   - SPDK is called first; the store is only updated after SPDK succeeds, and any
-//     partially created SPDK object is rolled back if the store write fails.
-//   - Deletes validate store preconditions, then delete in SPDK (missing objects are
-//     fine), then delete the record, so a failed SPDK delete never leaks an object
+//   - The data plane is called first; the store is only updated after it succeeds, and any
+//     partially created data-plane object is rolled back if the store write fails.
+//   - Deletes validate store preconditions, then delete in the data plane (missing objects are
+//     fine), then delete the record, so a failed delete never leaks an object
 //     that the store has forgotten.
-//   - SPDK object names are derived from resource IDs, never from user-supplied names,
-//     so they are unique across volumes/snapshots and always fit SPDK's limits.
+//   - Data-plane object names are derived from resource IDs, never from user-supplied names,
+//     so they are unique across volumes/snapshots and always fit its limits.
 
 import (
 	"context"
@@ -36,7 +36,7 @@ func (s *Server) requireDataPlane() error {
 	return nil
 }
 
-// validateDisplayName checks user-facing resource names (not used in SPDK identifiers).
+// validateDisplayName checks user-facing resource names (not used in data-plane names).
 func validateDisplayName(kind, name string) error {
 	if name == "" || len(name) > 128 {
 		return fmt.Errorf("%w: %s name must be 1-128 characters", store.ErrInvalidArgument, kind)
@@ -129,7 +129,7 @@ func (s *Server) claimDisk(w http.ResponseWriter, r *http.Request, id string) {
 	writeJSON(w, http.StatusOK, map[string]any{"disk": updated})
 }
 
-// attachAndClaim hands an unclaimed disk to SPDK and records it as claimed; on failure the
+// attachAndClaim hands an unclaimed disk to the data plane and records it as claimed; on failure the
 // disk is returned to the kernel. force skips the existing-data check (never the in-use or
 // boot-disk checks).
 func (s *Server) attachAndClaim(ctx context.Context, d *store.Disk, force bool) (*store.Disk, error) {
@@ -143,7 +143,7 @@ func (s *Server) attachAndClaim(ctx context.Context, d *store.Disk, force bool) 
 			return nil, err
 		}
 	}
-	bdev, drv, err := s.dp.AttachDisk(ctx, d)
+	handle, drv, err := s.dp.AttachDisk(ctx, d)
 	if err != nil {
 		return nil, err
 	}
@@ -152,7 +152,7 @@ func (s *Server) attachAndClaim(ctx context.Context, d *store.Disk, force bool) 
 		// The kernel no longer sees the drive: switch its cache off through the data plane
 		// before anything is written to it.
 		attached := *d
-		attached.Handle = bdev
+		attached.Handle = handle
 		if cacheState, err = s.dp.SetNVMeWriteCache(ctx, &attached, false); err != nil {
 			_ = s.dp.DetachDisk(context.WithoutCancel(ctx), &attached)
 			if s.hw != nil {
@@ -161,13 +161,13 @@ func (s *Server) attachAndClaim(ctx context.Context, d *store.Disk, force bool) 
 			return nil, fmt.Errorf("%w: %v", store.ErrInvalidArgument, err)
 		}
 	}
-	updated, err := s.store.ClaimDisk(d.ID, drv, bdev)
+	updated, err := s.store.ClaimDisk(d.ID, drv, handle)
 	if err == nil && cacheState != store.WriteCacheUnknown {
 		updated, err = s.store.MutateDisk(d.ID, func(cur *store.Disk) error { cur.WriteCache = cacheState; return nil })
 	}
 	if err != nil {
 		attached := *d
-		attached.Handle = bdev
+		attached.Handle = handle
 		_ = s.dp.DetachDisk(context.WithoutCancel(ctx), &attached)
 		if d.Type == store.DiskTypeNVMe && s.hw != nil {
 			_ = s.hw.BindNVMeToKernel(d.PCIAddress)
@@ -217,13 +217,12 @@ func (s *Server) releaseDisk(w http.ResponseWriter, r *http.Request, id string) 
 
 func (s *Server) handleCreatePool(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Name           string             `json:"name"`
-		RaidLevel      store.RaidLevel    `json:"raid_level"`
-		DiskIDs        []string           `json:"disk_ids"`
-		StripSizeKB    uint32             `json:"strip_size_kb"`
-		ChunkSizeBytes uint32             `json:"chunk_size_bytes"`
-		FilterPolicy   store.FilterPolicy `json:"filter_policy"`
-		SpacePolicy    store.SpacePolicy  `json:"space_policy"`
+		Name         string             `json:"name"`
+		RaidLevel    store.RaidLevel    `json:"raid_level"`
+		DiskIDs      []string           `json:"disk_ids"`
+		StripSizeKB  uint32             `json:"strip_size_kb"`
+		FilterPolicy store.FilterPolicy `json:"filter_policy"`
+		SpacePolicy  store.SpacePolicy  `json:"space_policy"`
 	}
 	if err := decodeJSON(r, &req); err != nil {
 		writeError(w, err)
@@ -239,9 +238,6 @@ func (s *Server) handleCreatePool(w http.ResponseWriter, r *http.Request) {
 	if req.StripSizeKB == 0 {
 		req.StripSizeKB = 64
 	}
-	if req.ChunkSizeBytes == 0 {
-		req.ChunkSizeBytes = store.DefaultChunkSizeBytes
-	}
 	for _, err := range []error{
 		validateDisplayName("pool", req.Name),
 		s.requireDataPlane(),
@@ -255,7 +251,7 @@ func (s *Server) handleCreatePool(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var totalRaw uint64
-	baseBdevs := make([]string, 0, len(req.DiskIDs))
+	members := make([]string, 0, len(req.DiskIDs))
 	for _, diskID := range req.DiskIDs {
 		d, err := s.store.GetDisk(diskID)
 		if err != nil {
@@ -267,25 +263,24 @@ func (s *Server) handleCreatePool(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		totalRaw += d.SizeBytes
-		baseBdevs = append(baseBdevs, d.Handle)
+		members = append(members, d.Handle)
 	}
 
 	id := newResourceID("pool")
 	pool := &store.Pool{
-		ID:             id,
-		Name:           req.Name,
-		RaidLevel:      req.RaidLevel,
-		DiskIDs:        req.DiskIDs,
-		StripSizeKB:    req.StripSizeKB,
-		ChunkSizeBytes: req.ChunkSizeBytes,
-		ArrayName:      "raid_" + id,
-		Device:         "raid_" + id,
-		ThinPoolName:   "lvs_" + id,
-		TotalBytes:     totalRaw,
-		FreeBytes:      totalRaw,
-		FilterPolicy:   req.FilterPolicy,
-		SpacePolicy:    req.SpacePolicy,
-		// The reconciler leaves RECONCILING pools without an lvstore UUID alone.
+		ID:           id,
+		Name:         req.Name,
+		RaidLevel:    req.RaidLevel,
+		DiskIDs:      req.DiskIDs,
+		StripSizeKB:  req.StripSizeKB,
+		ArrayName:    "raid_" + id,
+		Device:       "raid_" + id,
+		ThinPoolName: "lvs_" + id,
+		TotalBytes:   totalRaw,
+		FreeBytes:    totalRaw,
+		FilterPolicy: req.FilterPolicy,
+		SpacePolicy:  req.SpacePolicy,
+		// The reconciler leaves RECONCILING pools without a thin pool UUID alone.
 		HealthStatus:  store.HealthStatusReconciling,
 		StatusMessage: "creating",
 	}
@@ -298,9 +293,8 @@ func (s *Server) handleCreatePool(w http.ResponseWriter, r *http.Request) {
 	cleanup := context.WithoutCancel(ctx)
 	fail := func(raidCreated bool, err error) {
 		if raidCreated {
-			// The lvstore may exist even though creating it "failed" (e.g. a timeout while
-			// spdk_tgt went on and finished), and a RAID can't be deleted from under it: the
-			// delete would hang half-done. Remove the lvstore first.
+			// The thin pool may exist even though creating it "failed" (e.g. on a timeout), and
+			// the array can't be deleted from under it: remove the thin pool first.
 			if derr := s.dp.DeleteThinPool(cleanup, "", pool.ThinPoolName); derr != nil && !dataplane.IsNotFound(derr) {
 				err = fmt.Errorf("%w (rollback: delete thin pool %s: %v; array %s left in place)", err, pool.ThinPoolName, derr, pool.ArrayName)
 				_ = s.store.DeletePool(pool.ID)
@@ -312,11 +306,11 @@ func (s *Server) handleCreatePool(w http.ResponseWriter, r *http.Request) {
 		_ = s.store.DeletePool(pool.ID)
 		writeError(w, err)
 	}
-	if err := s.dp.CreateArray(ctx, pool.ArrayName, pool.RaidLevel, pool.StripSizeKB, baseBdevs); err != nil {
+	if err := s.dp.CreateArray(ctx, pool.ArrayName, pool.RaidLevel, pool.StripSizeKB, members); err != nil {
 		fail(false, fmt.Errorf("create the array: %w", err))
 		return
 	}
-	lvsUUID, err := s.dp.CreateThinPool(ctx, pool.Device, pool.ThinPoolName, pool.ChunkSizeBytes)
+	lvsUUID, err := s.dp.CreateThinPool(ctx, pool.Device, pool.ThinPoolName)
 	if err != nil {
 		fail(true, fmt.Errorf("create the thin pool: %w", err))
 		return
@@ -326,10 +320,7 @@ func (s *Server) handleCreatePool(w http.ResponseWriter, r *http.Request) {
 		p.HealthStatus, p.StatusMessage = store.HealthStatusOnline, ""
 		if stores, err := s.dp.ThinPools(ctx, "", lvsUUID); err == nil && len(stores) > 0 {
 			p.TotalBytes, p.FreeBytes = stores[0].TotalBytes, stores[0].FreeBytes
-			if stores[0].ChunkBytes > 0 {
-				// What the data plane used: the kernel one's thin pools always take 64 KiB.
-				p.ChunkSizeBytes = stores[0].ChunkBytes
-			}
+			p.ChunkSizeBytes = stores[0].ChunkBytes
 			p.AllocatedBytes = p.TotalBytes - p.FreeBytes
 		}
 		p.SpaceState = store.SpaceStateOf(p)
@@ -337,7 +328,7 @@ func (s *Server) handleCreatePool(w http.ResponseWriter, r *http.Request) {
 		return nil
 	})
 	if err != nil {
-		writeError(w, err)
+		fail(true, err)
 		return
 	}
 	writeJSON(w, http.StatusCreated, map[string]any{"pool": updated})
@@ -358,7 +349,6 @@ func (s *Server) handleDeletePool(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
-	// SPDK treats uuid and lvs_name as mutually exclusive.
 	lvsUUID, lvsName := pool.ThinPoolUUID, ""
 	if lvsUUID == "" {
 		lvsName = pool.ThinPoolName
@@ -391,18 +381,43 @@ func poolUsable(pool *store.Pool) error {
 	return nil
 }
 
-func qosSet(q store.QosPolicy) bool {
-	return q != (store.QosPolicy{})
+// rejectQoS refuses I/O limits: the kernel targets have none, so they can't be honoured
+// (docs/design/kernel-dataplane.md, section 6). Limits of zero ask for nothing.
+func rejectQoS(raw json.RawMessage) error {
+	var q map[string]uint64
+	if len(raw) == 0 || string(raw) == "null" {
+		return nil
+	}
+	if err := json.Unmarshal(raw, &q); err != nil {
+		return fmt.Errorf("%w: qos_policy: %v", store.ErrInvalidArgument, err)
+	}
+	for k, v := range q {
+		if v != 0 {
+			return fmt.Errorf("%w: I/O limits (qos_policy.%s) are not supported", store.ErrInvalidArgument, k)
+		}
+	}
+	return nil
+}
+
+// volumeSizeUnit is the data plane's allocation unit for volume sizes (an LVM extent).
+const volumeSizeUnit = 4 << 20
+
+// roundVolumeSize rounds a volume's size up to what the data plane will make it, so that the
+// record says what hosts see.
+func roundVolumeSize(n uint64) uint64 {
+	return (n + volumeSizeUnit - 1) / volumeSizeUnit * volumeSizeUnit
 }
 
 func (s *Server) handleCreateVolume(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Name          string             `json:"name"`
-		PoolID        string             `json:"pool_id"`
-		SizeBytes     uint64             `json:"size_bytes"`
+		Name      string `json:"name"`
+		PoolID    string `json:"pool_id"`
+		SizeBytes uint64 `json:"size_bytes"`
+		// ThinProvision is accepted and ignored: every volume is thin, and the space accounting
+		// counts its full size as committed.
 		ThinProvision bool               `json:"thin_provision"`
 		FilterPolicy  store.FilterPolicy `json:"filter_policy"`
-		QosPolicy     store.QosPolicy    `json:"qos_policy"`
+		QosPolicy     json.RawMessage    `json:"qos_policy"` // refused
 		Labels        map[string]string  `json:"labels"`
 		// DeletionProtection refuses deletion until an administrator turns it off.
 		DeletionProtection bool `json:"deletion_protection"`
@@ -419,7 +434,8 @@ func (s *Server) handleCreateVolume(w http.ResponseWriter, r *http.Request) {
 		writeError(w, fmt.Errorf("%w: size_bytes must be > 0", store.ErrInvalidArgument))
 		return
 	}
-	if err := rejectFilters(req.FilterPolicy); err != nil {
+	req.SizeBytes = roundVolumeSize(req.SizeBytes)
+	if err := errors.Join(rejectFilters(req.FilterPolicy), rejectQoS(req.QosPolicy)); err != nil {
 		writeError(w, err)
 		return
 	}
@@ -456,7 +472,7 @@ func (s *Server) handleCreateVolume(w http.ResponseWriter, r *http.Request) {
 	}
 	defer release()
 	alias := pool.ThinPoolName + "/" + id
-	uuid, err := s.dp.CreateVolume(r.Context(), pool.ThinPoolName, id, req.SizeBytes, req.ThinProvision)
+	uuid, err := s.dp.CreateVolume(r.Context(), pool.ThinPoolName, id, req.SizeBytes, true)
 	if err != nil {
 		writeError(w, fmt.Errorf("create the volume: %w", err))
 		return
@@ -469,9 +485,8 @@ func (s *Server) handleCreateVolume(w http.ResponseWriter, r *http.Request) {
 		Handle:             alias,
 		Device:             alias,
 		SizeBytes:          req.SizeBytes,
-		ThinProvision:      req.ThinProvision,
+		ThinProvision:      true,
 		FilterPolicy:       req.FilterPolicy,
-		QosPolicy:          req.QosPolicy,
 		AttachmentState:    store.AttachmentStateUnattached,
 		HealthStatus:       store.HealthStatusOnline,
 		Labels:             req.Labels,
@@ -480,19 +495,12 @@ func (s *Server) handleCreateVolume(w http.ResponseWriter, r *http.Request) {
 	s.finishVolumeCreate(w, r, vol, http.StatusCreated)
 }
 
-// finishVolumeCreate applies QoS and persists a volume whose lvol already exists in SPDK,
-// deleting the lvol again if either step fails.
+// finishVolumeCreate persists a volume that already exists in the data plane, deleting it there
+// again if that fails.
 func (s *Server) finishVolumeCreate(w http.ResponseWriter, r *http.Request, vol *store.Volume, status int) {
 	rollback := func(err error) {
 		_ = s.dp.DeleteVolume(context.WithoutCancel(r.Context()), vol.UUID)
 		writeError(w, err)
-	}
-	if qosSet(vol.QosPolicy) {
-		q := vol.QosPolicy
-		if err := s.dp.SetQoS(r.Context(), vol.Device, q); err != nil {
-			rollback(fmt.Errorf("apply QoS: %w", err))
-			return
-		}
 	}
 	if err := s.store.CreateVolume(vol); err != nil {
 		rollback(err)
@@ -523,6 +531,7 @@ func (s *Server) resizeVolume(w http.ResponseWriter, r *http.Request, id string)
 		writeError(w, err)
 		return
 	}
+	req.NewSizeBytes = roundVolumeSize(req.NewSizeBytes)
 	if req.NewSizeBytes < vol.SizeBytes {
 		writeError(w, fmt.Errorf("%w: new_size_bytes (%d) must be >= current size (%d)", store.ErrInvalidArgument, req.NewSizeBytes, vol.SizeBytes))
 		return
@@ -547,40 +556,6 @@ func (s *Server) resizeVolume(w http.ResponseWriter, r *http.Request, id string)
 	}
 	updated, err := s.store.MutateVolume(id, func(v *store.Volume) error {
 		v.SizeBytes = max(v.SizeBytes, req.NewSizeBytes)
-		return nil
-	})
-	if err != nil {
-		writeError(w, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"volume": updated})
-}
-
-func (s *Server) handleSetVolumeQoS(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
-	var req struct {
-		QosPolicy store.QosPolicy `json:"qos_policy"`
-	}
-	if err := decodeJSON(r, &req); err != nil {
-		writeError(w, err)
-		return
-	}
-	vol, err := s.liveVolume(id)
-	if err != nil {
-		writeError(w, err)
-		return
-	}
-	if err := s.requireDataPlane(); err != nil {
-		writeError(w, err)
-		return
-	}
-	q := req.QosPolicy
-	if err := s.dp.SetQoS(r.Context(), vol.Device, q); err != nil {
-		writeError(w, fmt.Errorf("apply QoS: %w", err))
-		return
-	}
-	updated, err := s.store.MutateVolume(id, func(v *store.Volume) error {
-		v.QosPolicy = q
 		return nil
 	})
 	if err != nil {
@@ -640,14 +615,14 @@ func (s *Server) handleCreateSnapshot(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, map[string]any{"snapshot": snap})
 }
 
-// takeSnapshot creates the SPDK snapshot lvol (named after the new snapshot ID) and
+// takeSnapshot creates the snapshot (named after the new snapshot ID) and
 // returns an unsaved Snapshot record for it.
 //
 // The snapshot takes over the clusters the volume holds, which then count as committed space:
 // the space is reserved first, and release must be called once the snapshot is in the store
 // (or was rolled back).
 func (s *Server) takeSnapshot(ctx context.Context, vol *store.Volume, pool *store.Pool, name string) (*store.Snapshot, func(), error) {
-	held, err := s.lvolHeldBytes(ctx, vol.UUID)
+	held, err := s.volumeHeldBytes(ctx, vol.UUID)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -686,7 +661,7 @@ func (s *Server) cloneSnapshot(w http.ResponseWriter, r *http.Request, snapID st
 	var req struct {
 		CloneName    string             `json:"clone_name"`
 		FilterPolicy store.FilterPolicy `json:"filter_policy"`
-		QosPolicy    store.QosPolicy    `json:"qos_policy"`
+		QosPolicy    json.RawMessage    `json:"qos_policy"` // refused
 		Labels       map[string]string  `json:"labels"`
 	}
 	if err := decodeJSON(r, &req); err != nil {
@@ -697,7 +672,7 @@ func (s *Server) cloneSnapshot(w http.ResponseWriter, r *http.Request, snapID st
 		writeError(w, err)
 		return
 	}
-	if err := rejectFilters(req.FilterPolicy); err != nil {
+	if err := errors.Join(rejectFilters(req.FilterPolicy), rejectQoS(req.QosPolicy)); err != nil {
 		writeError(w, err)
 		return
 	}
@@ -752,7 +727,6 @@ func (s *Server) cloneSnapshot(w http.ResponseWriter, r *http.Request, snapID st
 		ThinProvision:    true,
 		ParentSnapshotID: snap.ID,
 		FilterPolicy:     req.FilterPolicy,
-		QosPolicy:        req.QosPolicy,
 		AttachmentState:  store.AttachmentStateUnattached,
 		HealthStatus:     store.HealthStatusOnline,
 		Labels:           req.Labels,
@@ -971,7 +945,7 @@ func (s *Server) handleCreateVolumeGroupSnapshot(w http.ResponseWriter, r *http.
 	snaps := make([]*store.Snapshot, 0, len(targets))
 	entries := make([]dataplane.GroupEntry, 0, len(targets))
 	for _, t := range targets {
-		held, err := s.lvolHeldBytes(ctx, t.vol.UUID)
+		held, err := s.volumeHeldBytes(ctx, t.vol.UUID)
 		if err != nil {
 			writeError(w, err)
 			return
@@ -997,7 +971,7 @@ func (s *Server) handleCreateVolumeGroupSnapshot(w http.ResponseWriter, r *http.
 
 	// The data plane pauses I/O to every member (hosts' writes wait, nothing fails), snapshots
 	// them all at that instant and resumes I/O, so the snapshots are consistent with each other
-	// whether or not hosts are writing (docs/review-history.md P1-15, SPDK patch 0003).
+	// whether or not hosts are writing (docs/review-history.md P1-15).
 	uuids, err := s.dp.SnapshotGroup(ctx, entries, groupSnapshotQuiesceTimeout)
 	if err != nil {
 		// It may stop at the first failed snapshot and leave earlier ones; remove them.
@@ -1144,14 +1118,28 @@ func (s *Server) handleCreateExport(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if dataplane.IsNVMe(req.Protocol) && req.SubsystemNQN == "" {
-		req.SubsystemNQN = "nqn.2026-11.io.velocor:" + req.Name
+	if dataplane.IsNVMe(req.Protocol) {
+		if req.SubsystemNQN == "" {
+			req.SubsystemNQN = "nqn.2026-11.io.velocor:" + req.Name
+		}
+		if err := dataplane.ValidateNQN(req.SubsystemNQN); err != nil {
+			writeError(w, fmt.Errorf("%w: %v", store.ErrInvalidArgument, err))
+			return
+		}
+		req.TargetIQN = ""
 	}
 	if req.NamespaceID == 0 {
 		req.NamespaceID = 1
 	}
-	if req.Protocol == store.ExportProtocolISCSI && req.TargetIQN == "" {
-		req.TargetIQN = "iqn.2026-11.io.velocor:" + strings.ToLower(req.Name)
+	if req.Protocol == store.ExportProtocolISCSI {
+		if req.TargetIQN == "" {
+			req.TargetIQN = "iqn.2026-11.io.velocor:" + strings.ToLower(req.Name)
+		}
+		if err := dataplane.ValidateIQN(req.TargetIQN); err != nil {
+			writeError(w, fmt.Errorf("%w: %v", store.ErrInvalidArgument, err))
+			return
+		}
+		req.SubsystemNQN = ""
 	}
 
 	exp := &store.Export{

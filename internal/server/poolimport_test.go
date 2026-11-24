@@ -9,17 +9,15 @@ import (
 
 	"github.com/velocor/velocor/internal/auth"
 	"github.com/velocor/velocor/internal/dataplane"
-	"github.com/velocor/velocor/internal/dataplane/spdkplane"
-	"github.com/velocor/velocor/internal/hardware"
+	"github.com/velocor/velocor/internal/dataplane/planetest"
 	"github.com/velocor/velocor/internal/meta"
 	"github.com/velocor/velocor/internal/reconciler"
-	"github.com/velocor/velocor/internal/spdk/spdktest"
 	"github.com/velocor/velocor/internal/store"
 )
 
 // appliance builds a velod (store, reconciler, API) on fake, with dev as its metadata device
 // (nil: copies disabled). A new appliance on the same fake is a velod that lost its database.
-func appliance(t *testing.T, f *spdktest.Fake, dev meta.Device) *harness {
+func appliance(t *testing.T, f *planetest.Fake, dev meta.Device) *harness {
 	t.Helper()
 	st, err := store.OpenBoltStore(filepath.Join(t.TempDir(), "velocor.db"))
 	if err != nil {
@@ -31,18 +29,11 @@ func appliance(t *testing.T, f *spdktest.Fake, dev meta.Device) *harness {
 		t.Fatal(err)
 	}
 	clearMustChange(t, st)
-	dp := spdkplane.New(f.Client(), nil)
-	dp.ReadSuperblock = func(d *store.Disk) (*hardware.RaidSuperblock, error) {
-		if d.PCIAddress == "" {
-			return f.SuperblockOf(d.DevicePath), nil
-		}
-		return f.SuperblockOf(d.PCIAddress), nil
-	}
-	rec := reconciler.New(st, dp, nil, nil)
+	rec := reconciler.New(st, f, nil, nil)
 	if dev != nil {
 		rec.SetMetaDevice(dev, "node-1", "test")
 	}
-	srv := New(st, dp, nil, authMgr, rec, nil, WithMetaDevice(dev))
+	srv := New(st, f, nil, authMgr, rec, nil, WithMetaDevice(dev))
 	h := &harness{t: t, st: st, fake: f, ts: httptest.NewServer(srv.Handler())}
 	t.Cleanup(h.ts.Close)
 	_, resp := h.do("POST", "/api/v1/auth/login", "", map[string]any{"username": "admin", "password": "admin-pass-123"})
@@ -53,7 +44,7 @@ func appliance(t *testing.T, f *spdktest.Fake, dev meta.Device) *harness {
 // discover records the disks as a hardware scan of a fresh appliance would: unclaimed.
 func (h *harness) discover(pcis map[string]string) {
 	for id, pci := range pcis {
-		if err := h.st.UpsertDisk(&store.Disk{ID: id, Name: id, Type: store.DiskTypeNVMe, PCIAddress: pci, SizeBytes: 1 << 40, DriverState: store.DiskDriverStateVfioPCI}); err != nil {
+		if err := h.st.UpsertDisk(&store.Disk{ID: id, Name: id, Type: store.DiskTypeNVMe, PCIAddress: pci, SizeBytes: 1 << 40}); err != nil {
 			h.t.Fatal(err)
 		}
 	}
@@ -61,7 +52,7 @@ func (h *harness) discover(pcis map[string]string) {
 
 // buildPool makes a RAID1 pool with one volume, a served export and one whose portal
 // address isn't local, and writes its metadata copy.
-func buildPool(t *testing.T, f *spdktest.Fake, dev meta.Device) (poolID, volID string) {
+func buildPool(t *testing.T, f *planetest.Fake, dev meta.Device) (poolID, volID string) {
 	defer dataplane.SetAddressCheck(func(string) bool { return true })() // the old appliance had 203.0.113.9
 	h := appliance(t, f, dev)
 	h.addDisk("d1", "0000:01:00.0")
@@ -91,11 +82,11 @@ func buildPool(t *testing.T, f *spdktest.Fake, dev meta.Device) (poolID, volID s
 var labDisks = map[string]string{"d1": "0000:01:00.0", "d2": "0000:02:00.0"}
 
 func TestImportFromManifestAfterLosingTheDatabase(t *testing.T) {
-	f := spdktest.New(t)
+	f := planetest.New(t)
 	dev := &meta.MemDevice{}
 	poolID, volID := buildPool(t, f, dev)
 
-	f.Restart() // reboot: SPDK starts empty
+	f.Reboot() // reboot
 	h := appliance(t, f, dev)
 	h.discover(labDisks)
 
@@ -149,15 +140,8 @@ func TestImportFromManifestAfterLosingTheDatabase(t *testing.T) {
 	if upd["disabled"] == true || upd["portal_ids"].([]any)[0] != local.PortalIDs[0] {
 		t.Fatalf("export after the portal change: %v", upd)
 	}
-	subs, _ := h.fake.Client().NvmfGetSubsystems(t.Context())
-	served := false
-	for _, sub := range subs {
-		if sub.Nqn == remote.SubsystemNQN {
-			served = len(sub.ListenAddresses) == 1 && sub.ListenAddresses[0].Traddr == "127.0.0.1"
-		}
-	}
-	if !served {
-		t.Fatalf("%s is not served on the local portal only: %+v", remote.SubsystemNQN, subs)
+	if sub, _ := h.fake.Target(remote.SubsystemNQN); len(sub.Listeners) != 1 || !strings.HasPrefix(sub.Listeners[0], "127.0.0.1:") {
+		t.Fatalf("%s is not served on the local portal only: %+v", remote.SubsystemNQN, sub)
 	}
 
 	// The next copy continues the pool's generations.
@@ -173,16 +157,16 @@ func TestImportFromManifestAfterLosingTheDatabase(t *testing.T) {
 // ssd records an unclaimed SSD at path, as a hardware scan would.
 func (h *harness) ssd(id, path string) {
 	h.t.Helper()
-	h.fake.AddFile(path)
+	h.fake.AddDisk(path)
 	if err := h.st.UpsertDisk(&store.Disk{ID: id, Name: id, Type: store.DiskTypeSSD, DevicePath: path, SizeBytes: 1 << 40, BlockSize: 512, DriverState: store.DiskDriverStateKernel}); err != nil {
 		h.t.Fatal(err)
 	}
 }
 
 // docs/review-history.md P1-14: disks moved to another appliance and to another controller on the way (new
-// IDs) are imported, keeping the member UUIDs their RAID knows them by.
+// IDs) are imported: the array metadata on them says which member each is.
 func TestImportMirrorUnderNewDiskIDs(t *testing.T) {
-	f := spdktest.New(t)
+	f := planetest.New(t)
 	dev := &meta.MemDevice{}
 	old := appliance(t, f, dev)
 	old.ssd("ssd-ata-1", "/dev/disk/by-id/ata-1")
@@ -191,9 +175,9 @@ func TestImportMirrorUnderNewDiskIDs(t *testing.T) {
 	old.volume(poolID, "db", 1<<30)
 	old.reconcile()
 
-	f.Restart()
-	f.MoveMedia("/dev/disk/by-id/ata-1", "/dev/disk/by-id/wwn-1")
-	f.MoveMedia("/dev/disk/by-id/ata-2", "/dev/disk/by-id/wwn-2")
+	f.Reboot()
+	f.MoveDisk("/dev/disk/by-id/ata-1", "/dev/disk/by-id/wwn-1")
+	f.MoveDisk("/dev/disk/by-id/ata-2", "/dev/disk/by-id/wwn-2")
 	h := appliance(t, f, dev)
 	for _, n := range []string{"1", "2"} {
 		if err := h.st.UpsertDisk(&store.Disk{ID: "ssd-wwn-" + n, Name: "sd", Type: store.DiskTypeSSD, DevicePath: "/dev/disk/by-id/wwn-" + n, SizeBytes: 1 << 40, BlockSize: 512, DriverState: store.DiskDriverStateKernel}); err != nil {
@@ -209,19 +193,19 @@ func TestImportMirrorUnderNewDiskIDs(t *testing.T) {
 	if p := h.getPool(poolID); p["health_status"] != "ONLINE" {
 		t.Fatalf("imported pool: %v %v", p["health_status"], p["status_message"])
 	}
-	// The kept UUIDs survive a restart.
-	f.Restart()
+	// And after a reboot.
+	f.Reboot()
 	h.reconcile()
 	h.reconcile()
 	if p := h.getPool(poolID); p["health_status"] != "ONLINE" {
-		t.Fatalf("after a restart: %v %v", p["health_status"], p["status_message"])
+		t.Fatalf("after a reboot: %v %v", p["health_status"], p["status_message"])
 	}
 }
 
 func TestImportSkeletonWithoutACopy(t *testing.T) {
-	f := spdktest.New(t)
+	f := planetest.New(t)
 	poolID, volID := buildPool(t, f, nil)
-	f.Restart()
+	f.Reboot()
 	h := appliance(t, f, nil)
 	h.discover(labDisks)
 
@@ -239,10 +223,10 @@ func TestImportSkeletonWithoutACopy(t *testing.T) {
 }
 
 func TestImportConflictRollsBack(t *testing.T) {
-	f := spdktest.New(t)
+	f := planetest.New(t)
 	dev := &meta.MemDevice{}
 	poolID, _ := buildPool(t, f, dev)
-	f.Restart()
+	f.Reboot()
 	h := appliance(t, f, dev)
 	h.discover(labDisks)
 	h.addDisk("d3", "0000:03:00.0")

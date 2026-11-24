@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/velocor/velocor/internal/dataplane/spdkplane"
+	"github.com/velocor/velocor/internal/dataplane/planetest"
 	"github.com/velocor/velocor/internal/hardware"
 	"github.com/velocor/velocor/internal/store"
 )
@@ -42,7 +42,7 @@ func TestRefusedWriteCacheIsRecordedNotRetried(t *testing.T) {
 		t.Fatal(err)
 	}
 	rec := func() *Reconciler {
-		r := New(e.st, spdkplane.New(e.fake.Client(), hw), hw, nil)
+		r := New(e.st, e.fake, hw, nil)
 		r.discover = func() ([]*store.Disk, error) { return []*store.Disk{}, nil }
 		return r
 	}
@@ -78,4 +78,36 @@ func readSysfs(t *testing.T, p string) string {
 		t.Fatal(err)
 	}
 	return string(b)
+}
+
+// An NVMe drive's write cache is switched off through the data plane even though the kernel-side
+// step (for SSDs) can't do it: that step leaves NVMe drives alone.
+func TestNVMeWriteCachePolicyWithHardware(t *testing.T) {
+	e := newEnv(t)
+	root := t.TempDir()
+	procfs := filepath.Join(root, "proc")
+	writeFile(t, filepath.Join(procfs, "self", "mountinfo"), "")
+	writeFile(t, filepath.Join(procfs, "swaps"), "Filename Type Size Used Priority\n")
+	hw, err := hardware.NewManager(hardware.Config{SysfsRoot: filepath.Join(root, "sys"), ProcRoot: procfs, DevRoot: filepath.Join(root, "dev")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.rec = New(e.st, e.fake, hw, nil)
+	e.rec.discover = func() ([]*store.Disk, error) { return []*store.Disk{}, nil }
+	e.fake.SetNVMeCache("0000:01:00.0", planetest.NVMeCache{Present: true, Enabled: true, Saveable: true})
+	d := e.addDisk(&store.Disk{ID: "nvme-1", Name: "nvme0n1", Type: store.DiskTypeNVMe, PCIAddress: "0000:01:00.0", SizeBytes: 1 << 40})
+	if _, err := e.st.MutateDisk(d.ID, func(d *store.Disk) error {
+		// The error an earlier release recorded for it.
+		d.WriteCachePolicy, d.WriteCacheError = store.WriteCachePolicyDisabled, "switching the write cache of this disk from the kernel is not supported"
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	_, _ = e.rec.ReconcileOnce(e.ctx)
+	if c := e.fake.NVMeCacheOf("0000:01:00.0"); c.Enabled {
+		t.Fatal("the drive's write cache is still on")
+	}
+	if d, _ := e.st.GetDisk(d.ID); d.WriteCacheError != "" || d.WriteCache != store.WriteCacheWriteThrough {
+		t.Fatalf("disk after the pass: %s %q", d.WriteCache, d.WriteCacheError)
+	}
 }

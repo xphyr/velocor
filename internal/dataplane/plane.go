@@ -11,15 +11,13 @@ import (
 // Plane is velod's data plane: the claimed disks, the RAID arrays built from them, the thin
 // pools on the arrays, the volumes and snapshots in the pools, and the NVMe-oF and iSCSI
 // targets that export them. velod's API handlers and reconciler reach the data plane only
-// through this interface, so the backend can change without them: SPDK today
-// (internal/dataplane/spdkplane), the kernel stack of md, LVM thin, nvmet and LIO next
-// (docs/design/kernel-dataplane.md, TODO K-2).
+// through this interface: kernelplane, on the kernel's md, LVM thin, nvmet and LIO
+// (docs/design/kernel-dataplane.md), and planetest, an in-memory one for tests.
 //
 // Objects are named by the handles velod keeps in its store records: an array by
 // Pool.ArrayName, a thin pool by Pool.ThinPoolUUID / Pool.ThinPoolName, a volume or snapshot by its
 // UUID (or its "pool/name" alias), a disk by Disk.Handle. The handles are opaque to
-// velod; each backend chooses and interprets them. (The store field names still say SPDK; they
-// are renamed when the kernel backend lands.)
+// velod; the backend chooses and interprets them.
 //
 // Every method is safe for concurrent use. Errors for objects that don't exist satisfy
 // IsNotFound.
@@ -33,9 +31,6 @@ type Plane interface {
 	Settle(ctx context.Context, claimed []string) error
 	// Endpoint describes how velod reaches the data plane (a socket path), for status output.
 	Endpoint() string
-	// PollingCPUs lists the CPUs the data plane busy-polls on, so other workloads can avoid
-	// them; nil when it doesn't poll.
-	PollingCPUs(ctx context.Context) ([]int, error)
 
 	// AttachDisk hands a claimed disk to the data plane and returns its handle (stored as
 	// Disk.Handle) and the driver state it is now in.
@@ -87,7 +82,7 @@ type Plane interface {
 	// ThinPools lists thin pools, all of them or the one with the given name or UUID.
 	ThinPools(ctx context.Context, name, uuid string) ([]ThinPool, error)
 	// CreateThinPool creates a thin pool named name on an array and returns its UUID.
-	CreateThinPool(ctx context.Context, array, name string, chunkBytes uint32) (string, error)
+	CreateThinPool(ctx context.Context, array, name string) (string, error)
 	// GrowMetadata grows a thin pool's metadata when it is filling, as far as the room under it
 	// allows, and returns its new size (0: unchanged). An error says it needed to and couldn't.
 	GrowMetadata(ctx context.Context, uuid string) (uint64, error)
@@ -100,7 +95,9 @@ type Plane interface {
 
 	// Volumes lists every volume and snapshot in every thin pool.
 	Volumes(ctx context.Context) ([]Volume, error)
-	// CreateVolume creates a volume named name in a thin pool (by name) and returns its UUID.
+	// CreateVolume creates a volume named name in a thin pool (by name) and returns its UUID. A
+	// volume that isn't thin is outside the pool and fully allocated, with no snapshots: velod's
+	// own metadata volume only.
 	CreateVolume(ctx context.Context, pool, name string, sizeBytes uint64, thin bool) (string, error)
 	// ResizeVolume grows a volume (by UUID or alias).
 	ResizeVolume(ctx context.Context, volume string, sizeBytes uint64) error
@@ -123,8 +120,6 @@ type Plane interface {
 	// with ErrCBTUnsupported when the data plane can't tell.
 	AllocatedBlocks(ctx context.Context, pool *store.Pool, target *store.Snapshot) ([]Extent, error)
 	ChangedBlocks(ctx context.Context, pool *store.Pool, base, target *store.Snapshot) ([]Extent, error)
-	// SetQoS applies a volume's I/O limits to its device (zero = unlimited).
-	SetQoS(ctx context.Context, device string, q store.QosPolicy) error
 
 	// ApplyExport converges the target for exp so that it exposes vol to exactly acl on the
 	// given portals. Portals whose address isn't on this host are left out and reported with
@@ -156,8 +151,6 @@ type DiskArray struct {
 	Generation uint64
 	SizeBytes  uint64
 	Members    []DiskMember
-	// Unplaced says why some disks couldn't be given their slots ("" when none).
-	Unplaced string
 }
 
 // DiskMember is one disk carrying an array's metadata.
@@ -166,10 +159,6 @@ type DiskMember struct {
 	Slot int // -1 when its metadata doesn't say
 	// Stale: the disk left the array (an older copy, or not one of its current members).
 	Stale bool
-	// Identity is how the array knows this disk when that differs from the disk's own: a
-	// member that came back under a new disk ID keeps the SPDK bdev UUID it was created with
-	// (Disk.MemberUUID). "" when no such thing is needed (md knows its members itself).
-	Identity string
 }
 
 // Device is a block device the data plane holds.
@@ -179,11 +168,9 @@ type Device struct {
 	UUID      string
 	Product   string // what the backend calls this kind of device, for reports
 	SizeBytes uint64
-	// QoS is the I/O limit currently applied to the device.
-	QoS store.QosPolicy
-	// ParentSnapshot is, for a volume or snapshot, the name of the snapshot it is based on
-	// ("" when it has none).
-	ParentSnapshot string
+	// Origin is, for a snapshot, the volume it was taken of, and for a clone the snapshot it was
+	// made from: names within the pool ("" when it has none, or when that is deleted).
+	Origin string
 }
 
 // Array states.
@@ -214,7 +201,7 @@ type Array struct {
 	Scrub *Scrub
 	// UnreadableBytes is how much of the array no member can supply: bad blocks recorded on
 	// every copy. Reads (and writes) there fail; the data is lost. 0 where the backend keeps
-	// no bad-block log (SPDK).
+	// no bad-block log.
 	UnreadableBytes uint64
 }
 
@@ -234,7 +221,7 @@ type LostExtent struct {
 	Kind   string
 	UUID   string // LostVolume: the volume's or snapshot's UUID
 	Name   string // LostOther: the LV
-	Offset uint64 // LostVolume: within the volume; otherwise within the array
+	Offset uint64 // within the volume (LostVolume) or LV (LostOther, LostPoolMetadata); otherwise informative only
 	Length uint64
 }
 
@@ -263,6 +250,13 @@ const (
 	ScrubFailed    = "failed"
 )
 
+// Why a scrub stopped (Scrub.Status, negative errno).
+const (
+	ScrubStatusMemberRemoved = -19  // ENODEV: a member left the array
+	ScrubStatusRebuild       = -16  // EBUSY: a rebuild started
+	ScrubStatusCanceled      = -125 // ECANCELED: on request
+)
+
 // Scrub is an array's running or last scrub. Offsets and counts are in blocks of the members'
 // data area; the counters cover the run since StartOffsetBlocks.
 type Scrub struct {
@@ -288,7 +282,7 @@ type ThinPool struct {
 	TotalBytes uint64
 	FreeBytes  uint64
 	// MetadataBytes and MetadataUsedBytes are the thin pool's own metadata (the kernel's
-	// dm-thin), finite and worse to fill than the data: 0 where there is none to watch (SPDK).
+	// dm-thin), finite and worse to fill than the data: 0 where there is none to watch.
 	MetadataBytes     uint64
 	MetadataUsedBytes uint64
 }
@@ -302,6 +296,8 @@ type Volume struct {
 	Thin           bool
 	Snapshot       bool
 	AllocatedBytes uint64
+	// Seq grows with each volume and snapshot created in the pool: the order they were made in.
+	Seq int
 }
 
 // GroupEntry is one volume of a SnapshotGroup: the volume (UUID or alias) and the name for its
@@ -350,8 +346,8 @@ type Known struct {
 
 // UnmanagedObject is a data-plane object velod has no record of.
 type UnmanagedObject struct {
-	// Kind is what the backend calls it (LVSTORE, LVOL, RAID, BDEV, NVMF_SUBSYSTEM,
-	// ISCSI_TARGET for SPDK).
+	// Kind is what the backend calls it (MD_ARRAY, VOLUME_GROUP, LV, NVMET_SUBSYSTEM,
+	// ISCSI_TARGET).
 	Kind string `json:"kind"`
 	Name string `json:"name"`
 	UUID string `json:"uuid,omitempty"`

@@ -10,15 +10,14 @@ import (
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/velocor/velocor/internal/auth"
-	"github.com/velocor/velocor/internal/dataplane/spdkplane"
+	"github.com/velocor/velocor/internal/dataplane/planetest"
 	"github.com/velocor/velocor/internal/server"
-	"github.com/velocor/velocor/internal/spdk/spdktest"
 	"github.com/velocor/velocor/internal/store"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
 
-func sharedHarness(t *testing.T) (*ControllerServer, *spdktest.Fake) {
+func sharedHarness(t *testing.T) (*ControllerServer, *planetest.Fake) {
 	t.Helper()
 	st, err := store.OpenBoltStore(filepath.Join(t.TempDir(), "velocor.db"))
 	if err != nil {
@@ -37,7 +36,7 @@ func sharedHarness(t *testing.T) (*ControllerServer, *spdktest.Fake) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ts := httptest.NewServer(server.New(st, spdkplane.New(fake.Client(), nil), nil, authMgr, nil, nil).Handler())
+	ts := httptest.NewServer(server.New(st, fake, nil, authMgr, nil, nil).Handler())
 	t.Cleanup(ts.Close)
 	return NewControllerServer(NewHTTPClient(ts.URL, pat, true)), fake
 }
@@ -82,16 +81,12 @@ func TestSharedBlockVolumeAcrossNodes(t *testing.T) {
 	}
 	hosts := func(nqn string) []string {
 		t.Helper()
-		sub, ok := fake.Subsystem(nqn)
+		sub, ok := fake.Target(nqn)
 		if !ok {
 			return nil
 		}
-		var out []string
-		for _, h := range sub.Hosts {
-			out = append(out, h.Nqn)
-		}
-		slices.Sort(out)
-		return out
+		slices.Sort(sub.Hosts)
+		return sub.Hosts
 	}
 
 	a := publish("node-a")
@@ -123,7 +118,7 @@ func TestSharedBlockVolumeAcrossNodes(t *testing.T) {
 	if _, err := cs.ControllerUnpublishVolume(ctx, &csi.ControllerUnpublishVolumeRequest{VolumeId: id, NodeId: "node-b"}); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := fake.Subsystem(nqn); ok {
+	if _, ok := fake.Target(nqn); ok {
 		t.Fatal("shared subsystem left behind after the last node unpublished")
 	}
 	// Now it can be used by a single node again.

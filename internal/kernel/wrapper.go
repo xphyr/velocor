@@ -21,6 +21,9 @@ func (p *Plane) WrapperPath(volume string) string {
 // EnsureWrapper makes the volume's wrapper a dm-linear map of all of lower: created when
 // missing, reloaded when lower changed or grew (a resize).
 func (p *Plane) EnsureWrapper(ctx context.Context, volume, lower string) error {
+	if p.WrapperCurrent(volume, lower) {
+		return nil
+	}
 	sectors, err := p.blockSectors(ctx, lower)
 	if err != nil {
 		return err
@@ -66,8 +69,36 @@ func (p *Plane) ResumeWrapper(ctx context.Context, volume string) error {
 	return err
 }
 
-// WrapperSuspended reports whether the wrapper is suspended (velod resumes wrappers left
-// suspended by a crash in the middle of a group snapshot).
+// SuspendedWrappers lists the suspended wrappers' volumes (velod resumes wrappers left suspended
+// by a crash in the middle of a group snapshot).
+func (p *Plane) SuspendedWrappers(ctx context.Context) ([]string, error) {
+	out, err := p.Run.Run(ctx, "dmsetup", "info", "-c", "--noheadings", "--separator", " ", "-o", "name,suspended")
+	if err != nil {
+		return nil, err
+	}
+	var vols []string
+	for _, line := range strings.Split(string(out), "\n") {
+		f := strings.Fields(line)
+		if len(f) != 2 || f[1] != "Suspended" {
+			continue
+		}
+		if v, ok := strings.CutPrefix(f[0], WrapperName("")); ok {
+			vols = append(vols, v)
+		}
+	}
+	return vols, nil
+}
+
+// dmsetupAll runs one dmsetup command on several volumes' wrappers.
+func (p *Plane) dmsetupAll(ctx context.Context, volumes []string, args ...string) error {
+	for _, v := range volumes {
+		args = append(args, WrapperName(v))
+	}
+	_, err := p.Run.Run(ctx, "dmsetup", args...)
+	return err
+}
+
+// WrapperSuspended reports whether the wrapper is suspended.
 func (p *Plane) WrapperSuspended(ctx context.Context, volume string) (bool, error) {
 	out, err := p.Run.Run(ctx, "dmsetup", "info", "-c", "--noheadings", "-o", "suspended", WrapperName(volume))
 	if err != nil {
@@ -95,17 +126,24 @@ func (p *Plane) GroupSnapshot(ctx context.Context, members []GroupMember) error 
 }
 
 // GroupSnapshotWithin is GroupSnapshot with quiesce (if > 0) bounding only the pause: in-flight
-// I/O must drain from every member within it (velod gives it a few seconds, as SPDK patch 0003
-// did), or no snapshot is taken and the error wraps context.DeadlineExceeded. Taking the
+// I/O must drain from every member within it (velod gives it a few seconds), or no snapshot is taken and the error wraps context.DeadlineExceeded. Taking the
 // snapshots afterwards is bounded by ctx alone.
 func (p *Plane) GroupSnapshotWithin(ctx context.Context, members []GroupMember, quiesce time.Duration) error {
 	var suspended []string
 	var taken []GroupMember
 	resumeAll := func() error {
+		if len(suspended) == 0 {
+			return nil
+		}
+		// A fresh context: resuming must happen even when ctx has run out. All at once; dmsetup
+		// stops at the first that fails, so then one by one.
+		cleanup := context.WithoutCancel(ctx)
+		if p.dmsetupAll(cleanup, suspended, "resume") == nil {
+			return nil
+		}
 		var errs []error
 		for _, v := range suspended {
-			// A fresh context: resuming must happen even when ctx has run out.
-			if err := p.ResumeWrapper(context.WithoutCancel(ctx), v); err != nil {
+			if err := p.ResumeWrapper(cleanup, v); err != nil {
 				errs = append(errs, fmt.Errorf("resume %s: %w", v, err))
 			}
 		}
@@ -125,14 +163,17 @@ func (p *Plane) GroupSnapshotWithin(ctx context.Context, members []GroupMember, 
 		sctx, cancel = context.WithTimeout(ctx, quiesce)
 	}
 	defer cancel()
+	// All counted as suspended even if the command fails: it may have got to some of them, and
+	// killed at the deadline, dmsetup may already have suspended one (it still waits for udev
+	// then). Resuming a wrapper that isn't suspended does nothing.
 	for _, m := range members {
-		if err := p.SuspendWrapper(sctx, m.Volume); err != nil {
-			if sctx.Err() != nil {
-				err = fmt.Errorf("%w: %v", sctx.Err(), err)
-			}
-			return fail(fmt.Errorf("suspend %s: %w", m.Volume, err))
-		}
 		suspended = append(suspended, m.Volume)
+	}
+	if err := p.dmsetupAll(sctx, suspended, "suspend", "--nolockfs"); err != nil {
+		if sctx.Err() != nil {
+			err = fmt.Errorf("%w: %v", sctx.Err(), err)
+		}
+		return fail(fmt.Errorf("suspend %s: %w", strings.Join(suspended, ", "), err))
 	}
 	for _, m := range members {
 		if err := p.Snapshot(ctx, m.VG, m.LV, m.Snap, m.Tags...); err != nil {
@@ -140,7 +181,10 @@ func (p *Plane) GroupSnapshotWithin(ctx context.Context, members []GroupMember, 
 		}
 		taken = append(taken, m)
 	}
-	return resumeAll()
+	if err := resumeAll(); err != nil {
+		return fail(err) // which tries again, and removes the snapshots the caller won't know of
+	}
+	return nil
 }
 
 func (p *Plane) blockSectors(ctx context.Context, dev string) (uint64, error) {

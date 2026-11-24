@@ -158,6 +158,8 @@ func mapGroupControllerError(err error) error {
 			return status.Error(codes.AlreadyExists, apiErr.Message)
 		case 412:
 			return status.Error(codes.FailedPrecondition, apiErr.Message)
+		case 507:
+			return status.Error(codes.ResourceExhausted, apiErr.Message)
 		case 503: // e.g. the members' I/O didn't pause in time: retry later
 			return status.Error(codes.Unavailable, apiErr.Message)
 		default:

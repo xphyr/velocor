@@ -3,6 +3,7 @@ package kernel
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -16,10 +17,6 @@ const lvmConfig = `devices { use_devicesfile = 0 filter = [ "a|^/dev/md|", "r|.*
 // ChunkSize is the thin pools' chunk size: 64 KiB with zeroing on, measured 2026-11-20
 // (docs/performance.md "LVM thin chunk size and zeroing").
 const ChunkSize = 64 << 10
-
-func (p *Plane) lvm(ctx context.Context, cmd string, args ...string) ([]byte, error) {
-	return p.Run.Run(ctx, "lvm", append([]string{cmd, "--config", lvmConfig}, args...)...)
-}
 
 // PoolSpec describes the volume group and thin pool on an md array.
 type PoolSpec struct {
@@ -48,16 +45,32 @@ func MetadataSize(dataBytes uint64) uint64 {
 // CreatePool puts a volume group on the array and a thin pool in it: 64 KiB chunks, new chunks
 // zeroed (a partial write must not expose a deleted volume's data), and a full pool fails writes
 // with ENOSPC at once instead of queueing them (TODO.md L-6).
-func (p *Plane) CreatePool(ctx context.Context, s PoolSpec) error {
+func (p *Plane) CreatePool(ctx context.Context, s PoolSpec) (err error) {
 	if s.DataPercent <= 0 || s.DataPercent > 95 {
 		return fmt.Errorf("data percent %d out of range 1-95", s.DataPercent)
 	}
 	if _, err := p.lvm(ctx, "pvcreate", "--quiet", "--yes", s.Device); err != nil {
 		return err
 	}
+	vg := false
+	defer func() { // leave nothing behind, so creating it again works
+		if err == nil {
+			return
+		}
+		cleanup := context.WithoutCancel(ctx)
+		if vg {
+			if _, e := p.lvm(cleanup, "vgremove", "--quiet", "--force", s.VG); e != nil {
+				err = errors.Join(err, fmt.Errorf("clean up: %w", e))
+			}
+		}
+		if _, e := p.lvm(cleanup, "pvremove", "--quiet", "--force", s.Device); e != nil {
+			err = errors.Join(err, fmt.Errorf("clean up: %w", e))
+		}
+	}()
 	if _, err := p.lvm(ctx, "vgcreate", "--quiet", s.VG, s.Device); err != nil {
 		return err
 	}
+	vg = true
 	// Size the data from the VG's real size: LVM puts the pool's metadata and a spare copy of it
 	// (for repairs) beside the data, and "--extents N%VG" doesn't leave room for them (on a small
 	// VG lvm2 2.03.43 even fails an internal assertion).

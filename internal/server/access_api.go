@@ -1,7 +1,7 @@
 package server
 
 // Endpoints for editing who may reach an export, seeing who is connected, and live volume
-// usage. Access changes are applied to SPDK before (or, for shared initiator groups, right
+// usage. Access changes are applied to the data plane before (or, for shared initiator groups, right
 // after) they are persisted, and never leave an export open to everyone by accident.
 
 import (
@@ -122,7 +122,7 @@ func (s *Server) handleExportConnections(w http.ResponseWriter, r *http.Request)
 
 // handleUpdateInitiatorGroup edits a group's members and re-applies every export that uses
 // it. A change that would leave an export (without allow_any_host) reachable by nobody is
-// refused up front: such an export could not be converged, and SPDK would keep the old ACL.
+// refused up front: such an export could not be converged, and the target would keep the old ACL.
 func (s *Server) handleUpdateInitiatorGroup(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	var req struct {
@@ -135,13 +135,16 @@ func (s *Server) handleUpdateInitiatorGroup(w http.ResponseWriter, r *http.Reque
 		writeError(w, err)
 		return
 	}
+	var nqns, iqns []string
 	if req.HostNQNs != nil {
-		for _, nqn := range *req.HostNQNs {
-			if err := dataplane.ValidateNQN(strings.TrimSpace(nqn)); err != nil {
-				writeError(w, fmt.Errorf("%w: %v", store.ErrInvalidArgument, err))
-				return
-			}
-		}
+		nqns = *req.HostNQNs
+	}
+	if req.InitiatorIQNs != nil {
+		iqns = *req.InitiatorIQNs
+	}
+	if err := validateInitiators(nqns, iqns); err != nil {
+		writeError(w, err)
+		return
 	}
 	current, err := s.store.GetInitiatorGroup(id)
 	if err != nil {
@@ -260,12 +263,12 @@ func (s *Server) handleVolumeUsage(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
-	lvols, err := s.dp.Volumes(r.Context())
+	dpVols, err := s.dp.Volumes(r.Context())
 	if err != nil {
 		writeError(w, err)
 		return
 	}
-	for _, l := range lvols {
+	for _, l := range dpVols {
 		if l.UUID == vol.UUID {
 			writeJSON(w, http.StatusOK, map[string]any{
 				"size_bytes":      vol.SizeBytes,

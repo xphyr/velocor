@@ -12,7 +12,7 @@ import (
 const defaultMetadataChunkSize = 256
 
 // SnapshotMetadataServer implements the CSI SnapshotMetadata service (CBT / KEP-3314). velod
-// answers from SPDK's per-layer cluster maps (bdev_lvol_get_fragmap, SPDK patch 0005): the
+// answers from the thin pool's block mappings (thin_delta, thin_dump): the
 // allocated blocks of a snapshot are the clusters of its whole chain, the changed blocks
 // between two snapshots of a volume those of the layers after the base, up to the target. The
 // driver registers and advertises it only when enabled (--snapshot-metadata), since it also

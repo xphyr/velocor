@@ -14,7 +14,7 @@ func memberTestPool(t *testing.T) *BoltStore {
 			t.Fatal(err)
 		}
 		if id != "boot" {
-			if _, err := st.ClaimDisk(id, DiskDriverStateUringClaimed, "uring_"+id); err != nil {
+			if _, err := st.ClaimDisk(id, DiskDriverStateKernel, "/dev/disk/by-id/"+id); err != nil {
 				t.Fatal(err)
 			}
 		}

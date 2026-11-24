@@ -1,30 +1,20 @@
 package reconciler
 
 import (
+	"context"
 	"strings"
 	"testing"
+	"time"
 
-	"github.com/velocor/velocor/internal/dataplane/spdkplane"
+	"github.com/velocor/velocor/internal/dataplane"
+	"github.com/velocor/velocor/internal/dataplane/planetest"
 	"github.com/velocor/velocor/internal/store"
 )
 
 // spareDisk claims an extra NVMe disk that belongs to no pool.
 func (e *env) spareDisk(id, pci string) *store.Disk {
 	e.t.Helper()
-	e.fake.AddNVMe(pci)
-	d := &store.Disk{ID: id, Name: "nvme", Type: store.DiskTypeNVMe, PCIAddress: pci, SizeBytes: 1 << 40, DriverState: store.DiskDriverStateVfioPCI}
-	if err := e.st.UpsertDisk(d); err != nil {
-		e.t.Fatal(err)
-	}
-	bdev, drv, err := spdkplane.AttachDisk(e.ctx, e.fake.Client(), nil, d)
-	if err != nil {
-		e.t.Fatal(err)
-	}
-	out, err := e.st.ClaimDisk(d.ID, drv, bdev)
-	if err != nil {
-		e.t.Fatal(err)
-	}
-	return out
+	return e.addDisk(&store.Disk{ID: id, Name: "nvme", Type: store.DiskTypeNVMe, PCIAddress: pci, SizeBytes: 1 << 40})
 }
 
 func (e *env) pool() *store.Pool {
@@ -44,7 +34,7 @@ func TestOnlineMemberFailureIsDegraded(t *testing.T) {
 		t.Fatalf("healthy mirror: %s %q", p.HealthStatus, p.StatusMessage)
 	}
 
-	e.fake.FailMedia("0000:02:00.0")
+	e.fake.FailDisk("0000:02:00.0")
 	e.reconcile()
 	p := e.pool()
 	if p.HealthStatus != store.HealthStatusDegraded || !strings.Contains(p.StatusMessage, "disk-b") {
@@ -61,14 +51,14 @@ func TestOnlineMemberFailureIsDegraded(t *testing.T) {
 func TestRebuildProgressAndCompletion(t *testing.T) {
 	e := newEnv(t)
 	pool, _ := e.provision(store.RaidLevel1, "0000:01:00.0", "0000:02:00.0")
-	e.fake.FailMedia("0000:02:00.0")
+	e.fake.FailDisk("0000:02:00.0")
 	e.reconcile()
 
 	spare := e.spareDisk("disk-c", "0000:03:00.0")
 	if _, err := e.st.ReplacePoolMember(pool.ID, 1, spare.ID); err != nil {
 		t.Fatal(err)
 	}
-	if err := e.fake.Client().BdevRaidAddBaseBdev(e.ctx, pool.ArrayName, spare.Handle); err != nil {
+	if err := e.fake.AddMember(e.ctx, pool.ArrayName, spare.Handle); err != nil {
 		t.Fatal(err)
 	}
 	e.fake.SetRebuildProgress(pool.ArrayName, 37)
@@ -89,53 +79,14 @@ func TestRebuildProgressAndCompletion(t *testing.T) {
 	}
 }
 
-func TestInterruptedRebuildIsRestarted(t *testing.T) {
+// A member that failed (an I/O error took it out) while its drive is still there must not be
+// put back: that would rebuild onto a disk that just failed. It stays out until an operator acts.
+func TestFailedMemberIsNotPutBack(t *testing.T) {
 	e := newEnv(t)
-	pool, _ := e.provision(store.RaidLevel1, "0000:01:00.0", "0000:02:00.0")
-	e.fake.FailMedia("0000:02:00.0")
+	e.provision(store.RaidLevel1, "0000:01:00.0", "0000:02:00.0")
 	e.reconcile()
-	spare := e.spareDisk("disk-c", "0000:03:00.0")
-	if _, err := e.st.ReplacePoolMember(pool.ID, 1, spare.ID); err != nil {
-		t.Fatal(err)
-	}
-	if err := e.fake.Client().BdevRaidAddBaseBdev(e.ctx, pool.ArrayName, spare.Handle); err != nil {
-		t.Fatal(err)
-	}
-	e.fake.SetRebuildProgress(pool.ArrayName, 60)
-	e.reconcile()
-
-	// spdk_tgt restarts mid-rebuild: the array comes back degraded without the target.
-	e.fake.Restart()
-	e.reconcile() // re-attaches the disks, SPDK re-assembles the array, the target is re-added
-	p := e.pool()
-	if p.HealthStatus != store.HealthStatusRebuilding || p.Members[1].State != store.MemberStateRebuilding ||
-		!strings.Contains(p.StatusMessage, "restarted") {
-		t.Fatalf("after restart: %s %q %+v, want the rebuild restarted", p.HealthStatus, p.StatusMessage, p.Members)
-	}
-	e.reconcile()
-	if p = e.pool(); p.Members[1].State != store.MemberStateRebuilding {
-		t.Fatalf("next pass: %+v, want still rebuilding", p.Members)
-	}
-	if n := e.fake.CallCount("bdev_raid_add_base_bdev"); n != 2 {
-		t.Fatalf("bdev_raid_add_base_bdev called %d times, want 2 (replace + restart)", n)
-	}
-	e.fake.SetRebuildProgress(pool.ArrayName, 100)
-	e.reconcile()
-	if p = e.pool(); p.HealthStatus != store.HealthStatusOnline {
-		t.Fatalf("after the restarted rebuild: %s %q", p.HealthStatus, p.StatusMessage)
-	}
-}
-
-// A member whose bdev disappears while its drive is still there (an I/O error took it out,
-// a transient disconnect) must not be re-attached: SPDK would re-add it and rebuild onto a
-// disk that just failed. It stays out until an operator acts.
-func TestFailedMemberIsNotReattached(t *testing.T) {
-	e := newEnv(t)
-	pool, _ := e.provision(store.RaidLevel1, "0000:01:00.0", "0000:02:00.0")
-	e.reconcile()
-	if err := e.fake.Client().BdevNvmeDetachController(e.ctx, "Nvme_0000_02_00_0"); err != nil {
-		t.Fatal(err)
-	}
+	e.fake.FailDisk("0000:02:00.0")
+	before := len(e.fake.Calls())
 	for range 3 {
 		e.reconcile()
 	}
@@ -143,11 +94,74 @@ func TestFailedMemberIsNotReattached(t *testing.T) {
 	if p.HealthStatus != store.HealthStatusDegraded || p.Members[1].State != store.MemberStateFailed {
 		t.Fatalf("after the member failed: %s %q %+v", p.HealthStatus, p.StatusMessage, p.Members)
 	}
-	if n := e.fake.CallCount("bdev_nvme_attach_controller"); n != 2 {
-		t.Fatalf("the failed member was re-attached (%d attaches, want the 2 at provisioning)", n)
+	for _, c := range e.fake.Calls()[before:] {
+		if c == "AddMember" || c == "AttachDisk" {
+			t.Fatalf("%s on the failed disk: %v", c, e.fake.Calls()[before:])
+		}
 	}
-	if n := e.fake.CallCount("bdev_raid_add_base_bdev"); n != 0 {
-		t.Fatalf("a rebuild was started onto the failed disk")
+}
+
+// racing runs a function in the middle of every pass, after the pools and arrays were read.
+type racing struct {
+	*planetest.Fake
+	during func()
+}
+
+func (r *racing) ThinPools(ctx context.Context, name, uuid string) ([]dataplane.ThinPool, error) {
+	if f := r.during; f != nil {
+		r.during = nil
+		f()
 	}
-	_ = pool
+	return r.Fake.ThinPools(ctx, name, uuid)
+}
+
+// A disk replaced while a pass looks at the pool keeps its slot: the pass doesn't write back the
+// members it read before.
+func TestReplaceDuringAPassIsKept(t *testing.T) {
+	e := newEnv(t)
+	e.provision(store.RaidLevel1, "0000:01:00.0", "0000:02:00.0")
+	e.fake.FailDisk("0000:02:00.0")
+	plane := &racing{Fake: e.fake}
+	e.rec = New(e.st, plane, nil, nil)
+	e.reconcile()
+	c := e.addDisk(&store.Disk{ID: "disk-c", Name: "nvme", Type: store.DiskTypeNVMe, PCIAddress: "0000:03:00.0", SizeBytes: 1 << 40})
+	plane.during = func() {
+		if _, err := e.st.ReplacePoolMember("pool-1", 1, c.ID); err != nil {
+			t.Error(err)
+		}
+	}
+	e.reconcile()
+	if p := e.pool(); p.Members[1].DiskID != "disk-c" || p.Members[1].State != store.MemberStateRebuilding {
+		t.Fatalf("slot 1 after the pass: %+v", p.Members[1])
+	}
+}
+
+func TestInRaidIgnoresEmptySlots(t *testing.T) {
+	raids := []dataplane.Array{{Members: []dataplane.ArrayMember{{Name: "a"}, {Name: ""}}}}
+	if inRaid(raids, "") || !inRaid(raids, "a") {
+		t.Fatal("an empty slot has no member")
+	}
+}
+
+// Restoring lasts until a pass has brought up the pools, not just until one has run.
+func TestRestoringUntilThePoolsAreUp(t *testing.T) {
+	e := newEnv(t)
+	e.provision(store.RaidLevel1, "0000:01:00.0", "0000:02:00.0")
+	if !e.rec.Restoring() {
+		t.Fatal("not restoring before the first pass")
+	}
+	e.fake.Fail("Settle", 1)
+	e.reconcile()
+	if !e.rec.Restoring() {
+		t.Fatal("not restoring after a pass that couldn't bring up the pools")
+	}
+	e.reconcile()
+	if e.rec.Restoring() {
+		t.Fatal("still restoring")
+	}
+	e.rec = New(e.st, e.fake, nil, nil)
+	e.rec.started = time.Now().Add(-restoreTimeout)
+	if e.rec.Restoring() {
+		t.Fatal("restoring for ever")
+	}
 }

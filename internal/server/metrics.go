@@ -92,13 +92,14 @@ func (m *metricSet) writeTo(w io.Writer) error {
 
 // escapeLabel escapes a label value as the text format requires: backslash, double quote and
 // line feed; everything else, including non-ASCII, is written as UTF-8.
-func escapeLabel(s string) string {
-	return strings.NewReplacer(`\`, `\\`, `"`, `\"`, "\n", `\n`).Replace(s)
-}
+func escapeLabel(s string) string { return labelEscaper.Replace(s) }
 
-func escapeHelp(s string) string {
-	return strings.NewReplacer(`\`, `\\`, "\n", `\n`).Replace(s)
-}
+func escapeHelp(s string) string { return helpEscaper.Replace(s) }
+
+var (
+	labelEscaper = strings.NewReplacer(`\`, `\\`, `"`, `\"`, "\n", `\n`)
+	helpEscaper  = strings.NewReplacer(`\`, `\\`, "\n", `\n`)
+)
 
 func formatValue(v float64) string {
 	switch {
@@ -187,13 +188,13 @@ func (s *Server) reconcilerMetrics(m *metricSet) {
 		m.gauge("velocor_reconciler_last_run_timestamp_seconds", "When the reconciler last completed a pass.", unixSeconds(st.LastReconciledAt))
 	}
 	m.gauge("velocor_reconciler_last_run_failed", "Whether the reconciler's last pass ended with an error.", b2f(st.LastError != ""))
-	m.gauge("velocor_dataplane_restoring", "Whether the data plane was (re)started after the reconciler's last completed pass, so what velod built in it isn't all restored yet.",
+	m.gauge("velocor_dataplane_restoring", "Whether velod has just started and no pass has brought up everything on the claimed disks yet, so after a reboot the pools, volumes and exports may not be back yet.",
 		b2f(s.reconciler.Restoring()))
 	counts := map[string]int{}
 	for _, o := range st.Unmanaged {
 		counts[o.Kind]++
 	}
-	for _, k := range []string{"BDEV", "ISCSI_TARGET", "LVOL", "LVSTORE", "NVMF_SUBSYSTEM", "RAID"} {
+	for _, k := range []string{"ISCSI_TARGET", "LV", "MD_ARRAY", "NVMET_SUBSYSTEM", "VOLUME_GROUP"} {
 		m.gauge("velocor_unmanaged_objects", "Objects in the data plane that no Velocor record accounts for, by kind.", float64(counts[k]), "kind", k)
 	}
 }
@@ -354,7 +355,7 @@ func (s *Server) backupMetrics(m *metricSet) {
 	}
 }
 
-// ioMetrics reads SPDK's I/O counters, per volume and per pool (for the history graphs and
+// ioMetrics reads the devices' I/O counters, per volume and per pool (for the history graphs and
 // for rate() in Prometheus), and reports whether the data plane answers at all.
 func (s *Server) ioMetrics(ctx context.Context, m *metricSet, pools []*store.Pool, disks []*store.Disk, vols []*store.Volume) {
 	const hUp = "Whether the data plane answers velod."
@@ -382,7 +383,6 @@ func (s *Server) ioMetrics(ctx context.Context, m *metricSet, pools []*store.Poo
 			continue
 		}
 		o := owner{"volume", v.Name, poolName[v.PoolID]}
-		// SPDK names an lvol bdev by its UUID; the store keeps its alias.
 		for _, n := range []string{v.UUID, v.Device, v.Handle} {
 			if n != "" {
 				byBdev[n] = o
@@ -401,7 +401,7 @@ func (s *Server) ioMetrics(ctx context.Context, m *metricSet, pools []*store.Poo
 	}
 	tick := float64(iostat.TickRate)
 	for _, b := range iostat.Devices {
-		// Raw per-bdev counters, as before (any bdev, managed or not).
+		// Raw per-device counters (any device, managed or not).
 		m.counter("velocor_device_read_ops_total", "Read operations on a data plane device.", float64(b.NumReadOps), "device", b.Name)
 		m.counter("velocor_device_write_ops_total", "Write operations on a data plane device.", float64(b.NumWriteOps), "device", b.Name)
 		o, ok := byBdev[b.Name]
@@ -465,7 +465,7 @@ func (s *Server) scrubMetrics(m *metricSet, pools []*store.Pool, now time.Time) 
 			m.gauge("velocor_pool_scrub_last_completed_timestamp_seconds", hLast, unixSeconds(rec.LastCompletedAt), l...)
 		}
 		since := maxTime(rec.LastCompletedAt, p.CreatedAt)
-		m.gauge("velocor_pool_scrub_overdue", hOverdue, b2f(!cfg.Disabled && now.Sub(since) > 2*interval), l...)
+		m.gauge("velocor_pool_scrub_overdue", hOverdue, b2f(!cfg.Disabled && redundant(p.RaidLevel) && now.Sub(since) > 2*interval), l...)
 		c := rec.Total()
 		m.gauge("velocor_pool_scrub_repaired_blocks", hRepaired, float64(c.RepairedBlocks), l...)
 		m.gauge("velocor_pool_scrub_mismatched_blocks", hMismatch, float64(c.MismatchedBlocks), l...)

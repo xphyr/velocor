@@ -48,6 +48,9 @@ func (m *Manager) kernelNameForMount(majMin, source string) string {
 
 // kernelNameForPath resolves a /dev path (possibly a by-id / mapper symlink) to a kernel name.
 func (m *Manager) kernelNameForPath(p string) string {
+	if p == "" {
+		return ""
+	}
 	rel := strings.TrimPrefix(strings.TrimPrefix(p, m.cfg.DevRoot+"/"), "/dev/")
 	if resolved, err := filepath.EvalSymlinks(filepath.Join(m.cfg.DevRoot, rel)); err == nil {
 		rel = filepath.Base(resolved)
@@ -117,7 +120,7 @@ func (m *Manager) markDisk(sets guardSets, kname string, boot bool) {
 		if boot {
 			sets.bootDevs[disk] = true
 		}
-		// Whole NVMe controllers are unbound to vfio, so protect their PCI address. SATA/SAS
+		// An NVMe drive is known by its PCI address, so protect that. SATA/SAS
 		// HBAs can host both OS and data disks and are never unbound, so their BDF is not marked.
 		if strings.HasPrefix(disk, "nvme") {
 			for _, pci := range m.pciAddressesForDisk(disk) {
@@ -245,10 +248,14 @@ func detectSignature(dev string) (string, error) {
 	return "", nil
 }
 
-// CheckClaimable refuses to hand a disk to SPDK when it backs the OS, is mounted, is used as
+// CheckClaimable refuses to hand a disk to the data plane when it backs the OS, is mounted, is used as
 // swap, has stacked holders (LVM/md/LUKS), or carries partition-table or filesystem
 // signatures. Signature/partition checks can be overridden with force; the others cannot.
 func (m *Manager) CheckClaimable(d *store.Disk, force bool) error {
+	// What is mounted or swapped on right now, not at the last periodic refresh.
+	if err := m.RefreshBootGuard(); err != nil {
+		return fmt.Errorf("check which disks are in use: %w", err)
+	}
 	if d.IsBootDevice || m.IsBootDevice(d.PCIAddress, d.DevicePath) {
 		return fmt.Errorf("%w: disk %s backs the OS or is mounted / used as swap", store.ErrBootDeviceProtected, d.ID)
 	}
@@ -257,7 +264,7 @@ func (m *Manager) CheckClaimable(d *store.Disk, force bool) error {
 		kname = m.kernelNameForPath(d.DevicePath)
 	}
 	if kname == "" {
-		// e.g. an NVMe controller already bound to vfio-pci: no kernel view to inspect.
+		// e.g. an NVMe controller still bound to vfio-pci: no kernel view to inspect.
 		return nil
 	}
 	if h := m.holders(kname); len(h) > 0 {

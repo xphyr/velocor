@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Remove outdated dev-<sha> builds from the registry.
 #
-# A dev build is the set of images tagged dev-<sha> (velocor-spdk, -velod, -csi, -os); builds
+# A dev build is the set of images tagged dev-<sha> (velocor-velod, -csi, -os; -spdk before K-4); builds
 # are ranked by commit order from git and kept or removed as a whole. Only dev-* tags are ever
 # considered: latest, v* and any other tag are never touched. Deletion is by tag
 # (DELETE /v2/<repo>/manifests/<tag>), never by digest, because consecutive builds often share

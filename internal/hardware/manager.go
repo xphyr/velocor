@@ -17,7 +17,6 @@ import (
 
 const (
 	nvmePCIClass = "0x010802"
-	hugepageSize = 2 // 2 MiB per hugepage
 )
 
 var (
@@ -37,28 +36,9 @@ type Config struct {
 	SysfsRoot string
 	ProcRoot  string
 	DevRoot   string
-	// AllowUnsafeNoIOMMU permits binding NVMe drives to vfio-pci in "unsafe noiommu" mode (or
-	// to uio_pci_generic) when the host has no IOMMU. Without an IOMMU, SPDK can DMA anywhere
-	// in host memory, so this is only appropriate for VMs/labs and must be opted into.
-	AllowUnsafeNoIOMMU bool
-	// KernelDataPlane: drives stay on their kernel drivers, so an NVMe drive on a userspace
-	// driver (vfio-pci, uio) is not taken as claimed by discovery (with SPDK it is: only SPDK
-	// binds drives there). Such a drive is left alone until an operator claims it; otherwise
-	// the kernel data plane would take it from whatever holds it (found on the lab VM, where it
-	// took two drives from a running spdk_tgt).
-	KernelDataPlane bool
 }
 
-// HugepageStatus reports 2 MiB hugepage allocation on the node.
-type HugepageStatus struct {
-	TotalPages uint64
-	FreePages  uint64
-	TotalMB    uint64
-	FreeMB     uint64
-}
-
-// Manager handles Linux block/PCIe hardware discovery, boot-disk protection,
-// hugepage allocation, and VFIO/UIO driver binding.
+// Manager handles Linux block/PCIe hardware discovery and boot-disk protection.
 type Manager struct {
 	cfg Config
 
@@ -93,11 +73,6 @@ func NewManager(cfg Config) (*Manager, error) {
 		return nil, err
 	}
 	return m, nil
-}
-
-// UnsafeNoIOMMUAllowed reports whether binding drives without an IOMMU was opted into.
-func (m *Manager) UnsafeNoIOMMUAllowed() bool {
-	return m.cfg.AllowUnsafeNoIOMMU
 }
 
 // RefreshBootGuard parses /proc/self/mountinfo, /proc/1/mountinfo and /proc/swaps to find
@@ -170,15 +145,11 @@ func (m *Manager) DiscoverDisks() ([]*store.Disk, error) {
 			}
 
 			driverName := readSymlinkBase(filepath.Join(devDir, "driver"))
+			// A drive on a userspace driver (passed through to a VM, say) belongs to whatever
+			// put it there: it is listed, and left alone until an operator claims it.
 			driverState := store.DiskDriverStateKernel
-			claimed := false
-			switch driverName {
-			case "vfio-pci":
-				driverState = store.DiskDriverStateVfioPCI
-				claimed = !m.cfg.KernelDataPlane
-			case "uio_pci_generic", "igb_uio":
-				driverState = store.DiskDriverStateUioPCIGeneric
-				claimed = !m.cfg.KernelDataPlane
+			if driverName == "vfio-pci" || driverName == "uio_pci_generic" || driverName == "igb_uio" {
+				driverState = store.DiskDriverStateUserspace
 			}
 
 			numaNode := int32(readSysfsInt(filepath.Join(devDir, "numa_node"), 0))
@@ -203,9 +174,6 @@ func (m *Manager) DiscoverDisks() ([]*store.Disk, error) {
 			id := "nvme-" + strings.ReplaceAll(strings.ReplaceAll(bdf, ":", "-"), ".", "-")
 
 			isBoot := m.IsBootDevice(bdf, devPath)
-			if isBoot {
-				claimed = false
-			}
 
 			disks = append(disks, &store.Disk{
 				ID:               id,
@@ -221,7 +189,6 @@ func (m *Manager) DiscoverDisks() ([]*store.Disk, error) {
 				BlockSize:        blockSize,
 				DriverState:      driverState,
 				IsBootDevice:     isBoot,
-				Claimed:          claimed,
 				HealthStatus:     store.HealthStatusOnline,
 				WriteCache:       m.writeCacheState(blockName),
 				UpdatedAt:        time.Now().UTC(),
@@ -286,7 +253,6 @@ func (m *Manager) DiscoverDisks() ([]*store.Disk, error) {
 				BlockSize:        logicalBlockSize,
 				DriverState:      store.DiskDriverStateKernel,
 				IsBootDevice:     isBoot,
-				Claimed:          false,
 				HealthStatus:     store.HealthStatusOnline,
 				WriteCache:       m.writeCacheState(devName),
 				UpdatedAt:        time.Now().UTC(),
@@ -300,147 +266,7 @@ func (m *Manager) DiscoverDisks() ([]*store.Disk, error) {
 	return disks, nil
 }
 
-// GetHugepageStatus reads current 2 MiB hugepage counts from sysfs.
-func (m *Manager) GetHugepageStatus() (*HugepageStatus, error) {
-	hpDir := filepath.Join(m.cfg.SysfsRoot, "kernel", "mm", "hugepages", "hugepages-2048kB")
-	totalRaw, err := os.ReadFile(filepath.Join(hpDir, "nr_hugepages"))
-	if err != nil {
-		return nil, fmt.Errorf("read nr_hugepages: %w", err)
-	}
-	freeRaw, err := os.ReadFile(filepath.Join(hpDir, "free_hugepages"))
-	if err != nil {
-		return nil, fmt.Errorf("read free_hugepages: %w", err)
-	}
-
-	totalPages, err := strconv.ParseUint(strings.TrimSpace(string(totalRaw)), 10, 64)
-	if err != nil {
-		return nil, fmt.Errorf("parse nr_hugepages: %w", err)
-	}
-	freePages, err := strconv.ParseUint(strings.TrimSpace(string(freeRaw)), 10, 64)
-	if err != nil {
-		return nil, fmt.Errorf("parse free_hugepages: %w", err)
-	}
-
-	return &HugepageStatus{
-		TotalPages: totalPages,
-		FreePages:  freePages,
-		TotalMB:    totalPages * hugepageSize,
-		FreeMB:     freePages * hugepageSize,
-	}, nil
-}
-
-// EnsureHugepages ensures at least minMB of 2 MiB hugepages are allocated in the kernel.
-func (m *Manager) EnsureHugepages(minMB uint64) (*HugepageStatus, error) {
-	requiredPages := (minMB + hugepageSize - 1) / hugepageSize
-	hpDir := filepath.Join(m.cfg.SysfsRoot, "kernel", "mm", "hugepages", "hugepages-2048kB")
-	nrPath := filepath.Join(hpDir, "nr_hugepages")
-
-	status, err := m.GetHugepageStatus()
-	if err == nil && status.TotalPages >= requiredPages {
-		return status, nil
-	}
-
-	if err := os.WriteFile(nrPath, []byte(fmt.Sprintf("%d\n", requiredPages)), 0644); err != nil {
-		return nil, fmt.Errorf("write %d to %s: %w", requiredPages, nrPath, err)
-	}
-
-	status, err = m.GetHugepageStatus()
-	if err != nil {
-		return nil, err
-	}
-	if status.TotalPages < requiredPages {
-		return status, fmt.Errorf("hugepage allocation short: requested %d pages (%d MiB), got %d pages (%d MiB)",
-			requiredPages, minMB, status.TotalPages, status.TotalMB)
-	}
-	return status, nil
-}
-
-// ReleaseHugepages gives every free 2 MiB hugepage back to the kernel (the kernel data plane
-// uses none; the image reserves them for SPDK at boot).
-func (m *Manager) ReleaseHugepages() (*HugepageStatus, error) {
-	nrPath := filepath.Join(m.cfg.SysfsRoot, "kernel", "mm", "hugepages", "hugepages-2048kB", "nr_hugepages")
-	if err := os.WriteFile(nrPath, []byte("0\n"), 0644); err != nil {
-		return nil, fmt.Errorf("write 0 to %s: %w", nrPath, err)
-	}
-	return m.GetHugepageStatus()
-}
-
-// BindNVMeToUserspace unbinds an NVMe controller at pciAddr from the Linux kernel nvme driver
-// and binds it to vfio-pci (or uio_pci_generic), automatically enabling vfio noiommu mode
-// if running in a VM without an IOMMU. Refuses if the device is protected by the boot-disk guard.
-func (m *Manager) BindNVMeToUserspace(pciAddr string, preferredDriver string) (store.DiskDriverState, error) {
-	bdf := strings.ToLower(strings.TrimSpace(pciAddr))
-	if !pciBDFRegex.MatchString(bdf) {
-		return "", fmt.Errorf("%w: invalid PCIe BDF address %q", store.ErrInvalidArgument, pciAddr)
-	}
-
-	if m.IsBootDevice(bdf, "") {
-		return "", fmt.Errorf("%w: refusing to unbind boot NVMe controller %s", store.ErrBootDeviceProtected, bdf)
-	}
-
-	devDir := filepath.Join(m.cfg.SysfsRoot, "bus", "pci", "devices", bdf)
-	if _, err := os.Stat(devDir); err != nil {
-		return "", fmt.Errorf("pci device %s: %w", bdf, store.ErrNotFound)
-	}
-
-	// Double-check whether any child block device under this PCI controller is a boot device.
-	if blockName, _, _, _, _, _ := m.inspectNVMeSysfs(devDir); blockName != "" {
-		if m.IsBootDevice(bdf, filepath.Join(m.cfg.DevRoot, blockName)) {
-			return "", fmt.Errorf("%w: refusing to unbind boot NVMe block device %s (%s)", store.ErrBootDeviceProtected, blockName, bdf)
-		}
-	}
-
-	targetDriver := preferredDriver
-	if targetDriver == "" {
-		targetDriver = "vfio-pci"
-	}
-
-	if targetDriver == "vfio-pci" && !m.hasHardwareIOMMU(devDir) {
-		if !m.cfg.AllowUnsafeNoIOMMU {
-			return "", fmt.Errorf("%w: no IOMMU is available for %s; enable the IOMMU (intel_iommu=on / amd_iommu=on) "+
-				"or explicitly allow unsafe no-IOMMU DMA with VELOCOR_ALLOW_UNSAFE_NOIOMMU=true", store.ErrInvalidArgument, bdf)
-		}
-		// In VMs without vIOMMU, enable vfio unsafe noiommu mode if supported.
-		noiommuParam := filepath.Join(m.cfg.SysfsRoot, "module", "vfio", "parameters", "enable_unsafe_noiommu_mode")
-		if _, err := os.Stat(noiommuParam); err == nil {
-			if err := os.WriteFile(noiommuParam, []byte("1\n"), 0644); err != nil {
-				return "", fmt.Errorf("enable vfio noiommu mode: %w", err)
-			}
-		} else if _, err := os.Stat(filepath.Join(m.cfg.SysfsRoot, "bus", "pci", "drivers", "uio_pci_generic")); err == nil {
-			targetDriver = "uio_pci_generic"
-		}
-	}
-
-	currentDriver := readSymlinkBase(filepath.Join(devDir, "driver"))
-	if currentDriver != "" && currentDriver != targetDriver {
-		unbindPath := filepath.Join(devDir, "driver", "unbind")
-		if err := os.WriteFile(unbindPath, []byte(bdf), 0200); err != nil {
-			return "", fmt.Errorf("unbind %s from %s: %w", bdf, currentDriver, err)
-		}
-	}
-
-	overridePath := filepath.Join(devDir, "driver_override")
-	if err := os.WriteFile(overridePath, []byte(targetDriver+"\n"), 0644); err != nil {
-		return "", fmt.Errorf("write driver_override %s for %s: %w", targetDriver, bdf, err)
-	}
-
-	probePath := filepath.Join(m.cfg.SysfsRoot, "bus", "pci", "drivers_probe")
-	if err := os.WriteFile(probePath, []byte(bdf), 0200); err != nil {
-		bindPath := filepath.Join(m.cfg.SysfsRoot, "bus", "pci", "drivers", targetDriver, "bind")
-		if bindErr := os.WriteFile(bindPath, []byte(bdf), 0200); bindErr != nil {
-			return "", fmt.Errorf("probe/bind %s to %s: %w", bdf, targetDriver, err)
-		}
-	}
-
-	if targetDriver == "uio_pci_generic" {
-		return store.DiskDriverStateUioPCIGeneric, nil
-	}
-	return store.DiskDriverStateVfioPCI, nil
-}
-
 // PCIDriver returns the driver a PCI device is bound to right now ("" if none or unknown).
-// Bindings don't survive a reboot: an NVMe drive given to vfio-pci comes back on the kernel
-// nvme driver, so callers must check this rather than a recorded state.
 func (m *Manager) PCIDriver(pciAddr string) string {
 	bdf := strings.ToLower(strings.TrimSpace(pciAddr))
 	if !pciBDFRegex.MatchString(bdf) {
@@ -449,8 +275,8 @@ func (m *Manager) PCIDriver(pciAddr string) string {
 	return readSymlinkBase(filepath.Join(m.cfg.SysfsRoot, "bus", "pci", "devices", bdf, "driver"))
 }
 
-// BindNVMeToKernel unbinds an NVMe controller at pciAddr from vfio-pci/uio_pci_generic
-// and rebinds it to the Linux kernel nvme driver.
+// BindNVMeToKernel unbinds an NVMe controller at pciAddr from a userspace driver (vfio-pci, uio)
+// and rebinds it to the kernel's nvme driver.
 func (m *Manager) BindNVMeToKernel(pciAddr string) error {
 	bdf := strings.ToLower(strings.TrimSpace(pciAddr))
 	if !pciBDFRegex.MatchString(bdf) {
@@ -483,16 +309,11 @@ func (m *Manager) BindNVMeToKernel(pciAddr string) error {
 	if err := os.WriteFile(probePath, []byte(bdf), 0200); err != nil {
 		return fmt.Errorf("drivers_probe %s: %w", bdf, err)
 	}
-	return nil
-}
-
-func (m *Manager) hasHardwareIOMMU(devDir string) bool {
-	if _, err := os.Stat(filepath.Join(devDir, "iommu")); err == nil {
-		return true
+	// Writing to drivers_probe succeeds whether or not a driver took the device.
+	if d := readSymlinkBase(filepath.Join(devDir, "driver")); d != "nvme" {
+		return fmt.Errorf("the nvme driver didn't take %s (driver now: %q)", bdf, d)
 	}
-	groupsDir := filepath.Join(m.cfg.SysfsRoot, "kernel", "iommu_groups")
-	entries, err := os.ReadDir(groupsDir)
-	return err == nil && len(entries) > 0
+	return nil
 }
 
 func (m *Manager) resolveBlockDevicePCIAddress(baseDev string) string {

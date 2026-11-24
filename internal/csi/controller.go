@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log"
 	"net"
 	"net/http"
 	"slices"
@@ -109,6 +110,12 @@ func (s *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVolu
 	}
 	for _, v := range existingVols {
 		if v.Name == req.GetName() {
+			if int64(v.SizeBytes) < reqBytes && clonedFrom(v, req.GetVolumeContentSource()) {
+				// Cloned by an earlier try that couldn't grow it.
+				if v, err = s.client.ResizeVolume(ctx, v.ID, uint64(reqBytes)); err != nil {
+					return nil, mapAPIError(err)
+				}
+			}
 			if int64(v.SizeBytes) < reqBytes {
 				return nil, status.Errorf(codes.AlreadyExists, "volume %q already exists with smaller size (%d < %d)", req.GetName(), v.SizeBytes, reqBytes)
 			}
@@ -129,16 +136,11 @@ func (s *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVolu
 		if err != nil {
 			return nil, err
 		}
-		thin := true
-		if strings.EqualFold(req.GetParameters()["thin"], "false") {
-			thin = false
-		}
 		vol, err = s.client.CreateVolume(ctx, CreateVolumeRequest{
-			Name:          req.GetName(),
-			PoolID:        poolID,
-			SizeBytes:     uint64(reqBytes),
-			ThinProvision: thin,
-			Labels:        map[string]string{"csi.velocor.io/provisioned": "true"},
+			Name:      req.GetName(),
+			PoolID:    poolID,
+			SizeBytes: uint64(reqBytes),
+			Labels:    map[string]string{"csi.velocor.io/provisioned": "true"},
 		})
 		if err != nil {
 			return nil, mapAPIError(err)
@@ -148,6 +150,17 @@ func (s *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVolu
 	return &csi.CreateVolumeResponse{
 		Volume: toCSIVolume(vol, req.GetParameters(), req.GetVolumeContentSource()),
 	}, nil
+}
+
+// clonedFrom reports whether createFromSource made v from src.
+func clonedFrom(v *store.Volume, src *csi.VolumeContentSource) bool {
+	switch t := src.GetType().(type) {
+	case *csi.VolumeContentSource_Snapshot:
+		return v.ParentSnapshotID != "" && v.ParentSnapshotID == t.Snapshot.GetSnapshotId()
+	case *csi.VolumeContentSource_Volume:
+		return v.ParentSnapshotID != "" && v.Labels[labelCSISourceVolume] == t.Volume.GetVolumeId()
+	}
+	return false
 }
 
 func (s *ControllerServer) createFromSource(ctx context.Context, name string, reqBytes uint64, src *csi.VolumeContentSource) (*store.Volume, error) {
@@ -190,6 +203,11 @@ func (s *ControllerServer) createFromSource(ctx context.Context, name string, re
 			labelCSISourceVolume:         srcVolID,
 		})
 		if err != nil {
+			// Don't keep the intermediate snapshot: a retry takes a new one. (If the clone was made
+			// after all, deleting it waits for the clone.)
+			if derr := s.client.DeleteSnapshot(context.WithoutCancel(ctx), snap.ID); derr != nil && !isNotFoundErr(derr) {
+				log.Printf("clone of volume %s: snapshot %s left behind: %v", srcVolID, snap.ID, derr)
+			}
 			return nil, mapAPIError(err)
 		}
 		if reqBytes > vol.SizeBytes {
@@ -213,7 +231,7 @@ func (s *ControllerServer) DeleteVolume(ctx context.Context, req *csi.DeleteVolu
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	exports, err := s.client.ListExports(ctx)
+	exports, err := s.client.ListVolumeExports(ctx, req.GetVolumeId())
 	if err == nil {
 		for _, exp := range exports {
 			if exp.VolumeID == req.GetVolumeId() {
@@ -279,7 +297,7 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 	}
 
 	proto := normalizeProtocol(req.GetVolumeContext()["protocol"])
-	exports, err := s.client.ListExports(ctx)
+	exports, err := s.client.ListVolumeExports(ctx, req.GetVolumeId())
 	if err != nil {
 		return nil, mapAPIError(err)
 	}
@@ -399,7 +417,7 @@ func (s *ControllerServer) ControllerUnpublishVolume(ctx context.Context, req *c
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	exports, err := s.client.ListExports(ctx)
+	exports, err := s.client.ListVolumeExports(ctx, req.GetVolumeId())
 	if err != nil {
 		return nil, mapAPIError(err)
 	}
@@ -603,14 +621,10 @@ func (s *ControllerServer) ControllerExpandVolume(ctx context.Context, req *csi.
 		}
 	}
 
-	nodeExpansionRequired := true
-	if cap := req.GetVolumeCapability(); cap != nil && cap.GetBlock() != nil {
-		nodeExpansionRequired = false
-	}
-
+	// Raw block volumes too: the node must see the new size (an iSCSI session needs a rescan).
 	return &csi.ControllerExpandVolumeResponse{
 		CapacityBytes:         int64(vol.SizeBytes),
-		NodeExpansionRequired: nodeExpansionRequired,
+		NodeExpansionRequired: true,
 	}, nil
 }
 
@@ -784,6 +798,8 @@ func normalizeProtocol(p string) store.ExportProtocol {
 	switch strings.ToUpper(strings.TrimSpace(p)) {
 	case "ISCSI":
 		return store.ExportProtocolISCSI
+	case "NVMEOF_RDMA":
+		return store.ExportProtocolNVMeoFRDMA // which the appliance refuses
 	default:
 		return store.ExportProtocolNVMeoFTCP
 	}

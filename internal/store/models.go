@@ -62,7 +62,7 @@ type LostExtent struct {
 
 // Settings holds operator-adjustable, node-wide settings.
 type Settings struct {
-	// RebuildMaxMBps limits RAID rebuild bandwidth (SPDK applies it to every array); 0 means
+	// RebuildMaxMBps limits RAID rebuild bandwidth (for every array); 0 means
 	// unlimited.
 	RebuildMaxMBps uint32 `json:"rebuild_max_mbps"`
 	// VolumeRetentionHours is how long a deleted volume is kept (unexported, hidden, its data
@@ -144,7 +144,7 @@ type ScrubState string
 
 const (
 	ScrubRunning ScrubState = "RUNNING"
-	// ScrubPaused: a run that will resume where it stopped (its window ended, velod or SPDK
+	// ScrubPaused: a run that will resume where it stopped (its window ended, velod or the appliance
 	// restarted, a member was removed or a rebuild started).
 	ScrubPaused    ScrubState = "PAUSED"
 	ScrubCompleted ScrubState = "COMPLETED"
@@ -176,7 +176,7 @@ func (c ScrubCounts) Add(o ScrubCounts) ScrubCounts {
 	}
 }
 
-// ScrubRecord is a pool's current or last scrub run. A run can span several SPDK scrubs
+// ScrubRecord is a pool's current or last scrub run. A run can span several scrubs of the array
 // ("segments"): each resumes at the offset the previous one reached.
 type ScrubRecord struct {
 	PoolID string     `json:"pool_id"`
@@ -192,13 +192,13 @@ type ScrubRecord struct {
 	// Progress, in blocks of the members' data area.
 	OffsetBlocks uint64 `json:"offset_blocks"`
 	TotalBlocks  uint64 `json:"total_blocks"`
-	// SegmentStartBlocks is where the current SPDK scrub started; Counts covers the finished
+	// SegmentStartBlocks is where the current scrub of the array started; Counts covers the finished
 	// segments and Segment the current one.
 	SegmentStartBlocks uint64      `json:"segment_start_blocks"`
 	Counts             ScrubCounts `json:"counts"`
 	Segment            ScrubCounts `json:"segment"`
-	// Stopping is the state velod asked SPDK's scrub to stop into (PAUSED at the end of the
-	// window, STOPPED by an operator); it takes effect once SPDK reports the scrub stopped.
+	// Stopping is the state velod asked the scrub to stop into (PAUSED at the end of the
+	// window, STOPPED by an operator); it takes effect once the data plane reports the scrub stopped.
 	Stopping ScrubState `json:"stopping,omitempty"`
 	// Note explains a pause, a stop or a failure.
 	Note string `json:"note,omitempty"`
@@ -271,19 +271,17 @@ const (
 	DiskTypeSSD         DiskType = "SSD"
 )
 
-// DiskDriverState indicates kernel vs SPDK user-space driver binding.
+// DiskDriverState says whether a disk is on its kernel driver or on a userspace one (an NVMe
+// drive bound to vfio-pci or uio, e.g. passed through to a VM).
 type DiskDriverState string
 
 const (
-	DiskDriverStateUnspecified   DiskDriverState = "UNSPECIFIED"
-	DiskDriverStateKernel        DiskDriverState = "KERNEL"
-	DiskDriverStateVfioPCI       DiskDriverState = "VFIO_PCI"
-	DiskDriverStateUioPCIGeneric DiskDriverState = "UIO_PCI_GENERIC"
-	DiskDriverStateUringClaimed  DiskDriverState = "URING_CLAIMED"
-	DiskDriverStateAIOClaimed    DiskDriverState = "AIO_CLAIMED"
+	DiskDriverStateUnspecified DiskDriverState = "UNSPECIFIED"
+	DiskDriverStateKernel      DiskDriverState = "KERNEL"
+	DiskDriverStateUserspace   DiskDriverState = "USERSPACE"
 )
 
-// RaidLevel enumerates SPDK bdev_raid levels supported for Pools.
+// RaidLevel enumerates the RAID levels of pools.
 type RaidLevel string
 
 const (
@@ -291,10 +289,9 @@ const (
 	RaidLevel0           RaidLevel = "RAID0"
 	RaidLevel1           RaidLevel = "RAID1"
 	RaidLevel10          RaidLevel = "RAID10"
-	RaidLevel5F          RaidLevel = "RAID5F"
 )
 
-// CompressionAlgorithm defines supported SPDK bdev_compress algorithms.
+// CompressionAlgorithm names compression algorithms (not implemented: FilterPolicy).
 type CompressionAlgorithm string
 
 const (
@@ -304,7 +301,7 @@ const (
 )
 
 // AttachmentState enforces exclusive ownership of a Volume between SAN exports
-// and Phase 2 local NAS filesystem attachment (SPDK ublk).
+// and Phase 2 local NAS filesystem attachment.
 type AttachmentState string
 
 const (
@@ -344,28 +341,12 @@ const (
 	RoleReadOnly       Role = "READONLY"
 )
 
-// DefaultChunkSizeBytes is the default SPDK lvol_store cluster size (1 MiB).
-//
-// SPDK reserves one metadata page (4 KiB) per cluster, and after an unclean stop recovery reads
-// all of them: with 64 KiB clusters a 500 GB pool carried ~30 GiB of metadata (6% of the pool)
-// and took 16 minutes to recover on velocor-1, long enough for hosts to give up. 1 MiB keeps
-// that to ~0.4% and about a minute, while thin allocation stays fine-grained.
-const DefaultChunkSizeBytes uint32 = 1 << 20
-
-// FilterPolicy defines stackable SPDK filter bdev layers (crypto / compression).
+// FilterPolicy asks for encryption or compression of a volume (refused: not implemented).
 type FilterPolicy struct {
 	EncryptionEnabled  bool                 `json:"encryption_enabled"`
 	KeyID              string               `json:"key_id,omitempty"`
 	CompressionEnabled bool                 `json:"compression_enabled"`
 	CompressionAlgo    CompressionAlgorithm `json:"compression_algo,omitempty"`
-}
-
-// QosPolicy configures SPDK bdev rate limits (IOPS and bandwidth).
-type QosPolicy struct {
-	RwIosPerSec    uint64 `json:"rw_ios_per_sec"`
-	RwMbytesPerSec uint64 `json:"rw_mbytes_per_sec"`
-	RMbytesPerSec  uint64 `json:"r_mbytes_per_sec"`
-	WMbytesPerSec  uint64 `json:"w_mbytes_per_sec"`
 }
 
 // SmartHealth captures NVMe/SSD S.M.A.R.T. health telemetry.
@@ -400,14 +381,10 @@ type Disk struct {
 	Claimed          bool            `json:"claimed"`
 	PoolID           string          `json:"pool_id,omitempty"`
 	Handle           string          `json:"handle,omitempty"`
-	// MemberUUID is the UUID of the disk's SPDK base bdev when it differs from the one derived
-	// from the disk ID: a pool member that came back under a new ID keeps the UUID its RAID
-	// superblock knows it by (docs/review-history.md P1-14). Empty: derived from the ID.
-	MemberUUID   string       `json:"member_uuid,omitempty"`
-	HealthStatus HealthStatus `json:"health_status"`
-	Smart        SmartHealth  `json:"smart"`
+	HealthStatus     HealthStatus    `json:"health_status"`
+	Smart            SmartHealth     `json:"smart"`
 	// WriteCache is what the hardware reports (refreshed by every scan; the last known value is
-	// kept while SPDK owns the device and the kernel can't see it).
+	// kept when a scan can't read it).
 	WriteCache WriteCacheState `json:"write_cache"`
 	// PowerLossProtected is declared by an operator: there is no standard field for it, and
 	// drives with power-loss protection usually still report a volatile write cache.
@@ -444,8 +421,8 @@ type Durability string
 const (
 	DurabilityDurable Durability = "DURABLE"
 	// DurabilityAtRisk: the drive caches writes in volatile memory and isn't declared
-	// power-loss protected. SPDK v26.09 never passes FLUSH through lvols and RAID (TODO P0-4,
-	// L-1), so acknowledged writes can be lost on power failure.
+	// power-loss protected: writes it has acknowledged can be lost on power failure unless the
+	// host flushed them (flushes and FUA writes do reach the drives).
 	DurabilityAtRisk  Durability = "AT_RISK"
 	DurabilityUnknown Durability = "UNKNOWN"
 )
@@ -473,7 +450,7 @@ func (d Disk) MarshalJSON() ([]byte, error) {
 	}{plain(d), d.Durability()})
 }
 
-// Pool aggregates one or more claimed Disks into an SPDK RAID bdev + lvol_store.
+// Pool aggregates one or more claimed Disks into an array with a thin pool on it.
 type Pool struct {
 	ID        string    `json:"id"`
 	Name      string    `json:"name"`
@@ -483,7 +460,7 @@ type Pool struct {
 	// Durability is the weakest of the member disks' (maintained by the reconciler): AT_RISK
 	// when any member can lose acknowledged writes on power loss (docs/review-history.md P0-4).
 	Durability Durability `json:"durability,omitempty"`
-	// Members is the state of every RAID slot (maintained by the reconciler from SPDK).
+	// Members is the state of every RAID slot (maintained by the reconciler from the data plane).
 	Members []PoolMember `json:"members,omitempty"`
 	// DetachedDiskIDs are disks that left the RAID (failed, removed or replaced) but stay
 	// bound to the pool until an operator releases them, so they can't be reused by accident.
@@ -510,9 +487,9 @@ type Pool struct {
 	// LostData is what the unreadable part held, where the data plane worked it out.
 	LostData []LostExtent `json:"lost_data,omitempty"`
 
-	// On-pool metadata copy (P0-3): the velocor-meta lvol and the last manifest written to it.
+	// On-pool metadata copy (P0-3): the velocor-meta volume and the last manifest written to it.
 	// ThinMetadataBytes and ThinMetadataUsedBytes are the thin pool's own metadata (kernel data
-	// plane): finite, and worse to fill than the data. 0 where there is none (SPDK).
+	// plane): finite, and worse to fill than the data.
 	ThinMetadataBytes     uint64       `json:"thin_metadata_bytes,omitempty"`
 	ThinMetadataUsedBytes uint64       `json:"thin_metadata_used_bytes,omitempty"`
 	MetaVolumeUUID        string       `json:"meta_volume_uuid,omitempty"`
@@ -526,7 +503,7 @@ type Pool struct {
 	CreatedAt             time.Time    `json:"created_at"`
 }
 
-// Volume represents a logical volume (SPDK bdev_lvol) inside a Pool.
+// Volume represents a volume inside a Pool.
 type Volume struct {
 	ID               string            `json:"id"`
 	Name             string            `json:"name"`
@@ -540,7 +517,6 @@ type Volume struct {
 	ReadOnly         bool              `json:"read_only"`
 	ParentSnapshotID string            `json:"parent_snapshot_id,omitempty"`
 	FilterPolicy     FilterPolicy      `json:"filter_policy"`
-	QosPolicy        QosPolicy         `json:"qos_policy"`
 	AttachmentState  AttachmentState   `json:"attachment_state"`
 	HealthStatus     HealthStatus      `json:"health_status"`
 	StatusMessage    string            `json:"status_message,omitempty"`
@@ -562,7 +538,7 @@ type Volume struct {
 // Deleted reports whether the volume is deleted and waiting to be purged.
 func (v *Volume) Deleted() bool { return v.DeletedAt != nil }
 
-// Snapshot represents an immutable point-in-time SPDK bdev_lvol_snapshot.
+// Snapshot represents an immutable point-in-time copy of a volume.
 type Snapshot struct {
 	ID               string    `json:"id"`
 	Name             string    `json:"name"`
@@ -602,9 +578,7 @@ type Portal struct {
 	Protocol  ExportProtocol `json:"protocol"`
 	IPAddress string         `json:"ip_address"`
 	Port      uint32         `json:"port"`
-	// IscsiPgTag is the SPDK iSCSI portal group tag for ISCSI portals (unique, allocated by the store).
-	IscsiPgTag int       `json:"iscsi_pg_tag,omitempty"`
-	CreatedAt  time.Time `json:"created_at"`
+	CreatedAt time.Time      `json:"created_at"`
 }
 
 // Host represents a registered SAN initiator host (ESXi, Linux, Kubernetes worker)
@@ -654,16 +628,14 @@ type Export struct {
 	// NodeIDs lists the nodes it's published to, each allowed in through its initiator group.
 	Shared  bool     `json:"shared,omitempty"`
 	NodeIDs []string `json:"node_ids,omitempty"`
-	// Disabled exports are not served (SPDK objects removed). A pool import restores an export
+	// Disabled exports are not served (no target). A pool import restores an export
 	// disabled when it can't be served as recorded (its portal addresses aren't on this
 	// appliance, or its CHAP secrets must be set again); DisabledReason says why.
-	Disabled       bool   `json:"disabled,omitempty"`
-	DisabledReason string `json:"disabled_reason,omitempty"`
-	// IscsiIgTag is the SPDK iSCSI initiator group tag owned by this export (unique, allocated by the store).
-	IscsiIgTag    int          `json:"iscsi_ig_tag,omitempty"`
-	HealthStatus  HealthStatus `json:"health_status"`
-	StatusMessage string       `json:"status_message,omitempty"`
-	CreatedAt     time.Time    `json:"created_at"`
+	Disabled       bool         `json:"disabled,omitempty"`
+	DisabledReason string       `json:"disabled_reason,omitempty"`
+	HealthStatus   HealthStatus `json:"health_status"`
+	StatusMessage  string       `json:"status_message,omitempty"`
+	CreatedAt      time.Time    `json:"created_at"`
 }
 
 // AdminUser stores local user credentials and RBAC role.

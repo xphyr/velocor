@@ -8,7 +8,7 @@ import "velocor/v1/common.proto";
 
 option go_package = "github.com/velocor/velocor/api/gen/go/velocor/v1;velocorv1";
 
-// RaidLevel enumerates SPDK bdev_raid levels supported for storage pools.
+// RaidLevel enumerates the md RAID levels supported for storage pools.
 enum RaidLevel {
   RAID_LEVEL_UNSPECIFIED = 0;
   RAID_LEVEL_RAID0 = 1;
@@ -17,18 +17,18 @@ enum RaidLevel {
   RAID_LEVEL_RAID5F = 4;
 }
 
-// Pool aggregates one or more claimed Disks into an SPDK RAID bdev + lvol_store.
+// Pool aggregates one or more claimed Disks into an md array with an LVM thin pool on it.
 message Pool {
   string id = 1;
   string name = 2;
   RaidLevel raid_level = 3;
   repeated string disk_ids = 4;
   uint32 strip_size_kb = 5;
-  // SPDK lvol_store cluster allocation unit (default 1 MiB).
+  // The thin pool's chunk size (64 KiB).
   uint32 chunk_size_bytes = 6;
-  // Underlying RAID or single-disk SPDK bdev name.
+  // The md array's name.
   string array_name = 7;
-  // Top-level bdev name consumed by lvol_store after applying optional filter bdevs.
+  // The device the thin pool is on.
   string device = 8;
   string thin_pool_uuid = 9;
   string thin_pool_name = 10;

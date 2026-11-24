@@ -125,8 +125,8 @@ func TestGuardResolvesMultipathNVMeBootToController(t *testing.T) {
 	if !m.IsBootDevice("0000:03:00.0", "") {
 		t.Fatalf("boot NVMe controller behind a multipath head must be protected")
 	}
-	if _, err := m.BindNVMeToUserspace("0000:03:00.0", ""); !errors.Is(err, store.ErrBootDeviceProtected) {
-		t.Fatalf("binding the boot NVMe must be refused, got %v", err)
+	if err := m.BindNVMeToKernel("0000:03:00.0"); !errors.Is(err, store.ErrBootDeviceProtected) {
+		t.Fatalf("rebinding the boot NVMe must be refused, got %v", err)
 	}
 	disks, err := m.DiscoverDisks()
 	if err != nil {

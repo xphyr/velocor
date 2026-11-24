@@ -18,6 +18,7 @@ function token() {
 
 function saveToken(value) {
   memoryToken = value;
+  meAt = 0;
   try {
     if (value) sessionStorage.setItem(TOKEN_KEY, value);
     else sessionStorage.removeItem(TOKEN_KEY);
@@ -38,7 +39,24 @@ async function request(method, path, body) {
 }
 
 const api = (path) => request("GET", path);
-const send = (method, path, body) => request(method, path, body);
+const send = (method, path, body) => { slowAnswers.clear(); meAt = 0; return request(method, path, body); };
+
+// The status is asked for once per refresh, though the frame and some screens both show it.
+let statusAnswer = null;
+const systemStatus = () => (statusAnswer ||= api("/system/status"));
+
+// What the host takes a while to answer and seldom changes is asked for again after a minute, or
+// once something was changed here.
+const SLOW_MS = 60000;
+const slowAnswers = new Map();
+function slow(path) {
+  const kept = slowAnswers.get(path);
+  if (kept && Date.now() - kept.at < SLOW_MS) return kept.answer;
+  const answer = api(path);
+  slowAnswers.set(path, { at: Date.now(), answer });
+  answer.catch(() => slowAnswers.delete(path));
+  return answer;
+}
 
 // raw sends a file as the request body (database restore).
 async function raw(method, path, file) {
@@ -351,6 +369,7 @@ const confirmDialog = (opts) => openDialog({ danger: true, ...opts });
 // --- Who's signed in, and what they may do ---
 
 let me = { username: "", role: "" };
+let meAt = 0; // when the API last said so
 const RANK = { READONLY: 1, CSI_PROVISIONER: 2, ADMIN: 3 };
 const can = {
   get provision() { return (RANK[me.role] || 0) >= 2; },
@@ -372,9 +391,7 @@ function diskState(d, poolsById) {
 function claimDialog(d) {
   openDialog({
     title: `Claim ${d.name || d.id}`,
-    intro: d.type === "NVME"
-      ? "The drive is handed to the data plane. With SPDK it is taken from the Linux nvme driver and polled directly, and the host can no longer see it; with the kernel data plane it stays on the nvme driver."
-      : "The data plane takes the disk (SPDK opens it through io_uring). Nothing else on the host should use it afterwards.",
+    intro: "The data plane takes the disk, for use in a pool. Nothing else on the host should use it afterwards.",
     submit: "Claim",
     action: async () => {
       try {
@@ -482,17 +499,15 @@ async function createPoolDialog() {
   const free = (await list("/disks", "disks")).filter((d) => d.claimed && !d.pool_id && !d.is_boot_device);
   openDialog({
     title: "Create a pool",
-    intro: "This builds a RAID array across the disks (SPDK RAID, or md with the kernel data plane), with its layout recorded on them so it reassembles after a restart, and a thin pool on top.",
+    intro: "This builds a RAID array across the disks (md), with its layout recorded on them so it reassembles after a restart, and a thin pool on top.",
     submit: "Create",
     fields: [
       { name: "name", label: "Name", required: true },
       { name: "level", kind: "radio", label: "RAID level", value: "RAID1", options: RAID_LEVELS },
       { name: "disks", kind: "checks", label: "Disks", options: free.map((d) => ({ value: d.id, label: `${d.name || d.id} (${d.type}, ${humanSize(d.size_bytes)})` })), empty: "No claimed disks are free. Claim some on the Disks screen first." },
       { name: "strip", label: "Strip size", when: (v) => v.level !== "RAID1", value: "64", options: ["16", "32", "64", "128", "256"].map((k) => ({ value: k, label: `${k} KiB` })) },
-      { name: "cluster", label: "Chunk size", value: String(1 << 20), hint: "The unit of thin allocation (SPDK; the kernel data plane always uses 64 KiB). Smaller chunks cost more metadata and make recovery after a crash slower.",
-        options: [[64 * 1024, "64 KiB"], [1 << 20, "1 MiB"], [4 << 20, "4 MiB"]].map(([v, l]) => ({ value: String(v), label: l })) },
     ],
-    action: (v) => send("POST", "/pools", { name: v.name, raid_level: v.level, disk_ids: v.disks, strip_size_kb: Number(v.strip), chunk_size_bytes: Number(v.cluster) }),
+    action: (v) => send("POST", "/pools", { name: v.name, raid_level: v.level, disk_ids: v.disks, strip_size_kb: Number(v.strip) }),
     done: (r) => { notify(`Created ${r.pool.name}.`); location.hash = hash("pool", r.pool.id); },
   });
 }
@@ -820,10 +835,9 @@ async function createVolumeDialog(poolId) {
       { name: "name", label: "Name", required: true },
       ...(items.length > 1 || !poolId ? [{ name: "pool", label: "Pool", value: poolId || (items[0] || {}).id, options: items.map((p) => ({ value: p.id, label: `${p.name} (${humanSize(p.free_bytes)} free)` })) }] : []),
       { name: "size", label: "Size", size: true, required: true, value: 10 * 2 ** 30 },
-      { name: "thin", kind: "tick", value: true, text: "Thin provisioned: space is only allocated as it's written" },
       { name: "protect", kind: "tick", value: false, text: "Deletion protection: refuse deletes until an administrator turns it off" },
     ],
-    action: (v) => send("POST", "/volumes", { name: v.name, pool_id: v.pool || poolId, size_bytes: v.size, thin_provision: v.thin, deletion_protection: v.protect }),
+    action: (v) => send("POST", "/volumes", { name: v.name, pool_id: v.pool || poolId, size_bytes: v.size, deletion_protection: v.protect }),
     done: (r) => { notify(`Created ${r.volume.name}.`); location.hash = hash("volume", r.volume.id); },
   });
 }
@@ -836,26 +850,6 @@ function growDialog(v) {
     fields: [{ name: "size", label: "New size", size: true, required: true, value: v.size_bytes }],
     action: (x) => send("POST", `/volumes/${encodeURIComponent(v.id)}:resize`, { new_size_bytes: x.size }),
     done: (r) => { notify(`${v.name} is now ${humanSize(r.volume.size_bytes)}.`); rerender(); },
-  });
-}
-
-function qosDialog(v) {
-  const q = v.qos_policy || {};
-  const n = (x) => (x ? String(x) : "");
-  openDialog({
-    title: `Limits for ${v.name}`,
-    intro: "Leave a limit empty, or 0, for none. They apply at once.",
-    submit: "Save",
-    fields: [
-      { name: "iops", label: "Read + write IOPS", number: true, value: n(q.rw_ios_per_sec) },
-      { name: "rw", label: "Read + write MB/s", number: true, value: n(q.rw_mbytes_per_sec) },
-      { name: "r", label: "Read MB/s", number: true, value: n(q.r_mbytes_per_sec) },
-      { name: "w", label: "Write MB/s", number: true, value: n(q.w_mbytes_per_sec) },
-    ],
-    action: (x) => send("PUT", `/volumes/${encodeURIComponent(v.id)}/qos`, { qos_policy: {
-      rw_ios_per_sec: Number(x.iops) || 0, rw_mbytes_per_sec: Number(x.rw) || 0, r_mbytes_per_sec: Number(x.r) || 0, w_mbytes_per_sec: Number(x.w) || 0,
-    } }),
-    done: () => { notify("Limits saved."); rerender(); },
   });
 }
 
@@ -978,7 +972,7 @@ function volumeTable(items, poolList, options = {}) {
     { title: "Name", cell: (v) => [el("strong", {}, link(v.name, "volume", v.id)), v.parent_snapshot_id && el("span", { class: "sub" }, "clone of a snapshot")], text: (v) => `${v.name} ${v.id} ${labelsText(v.labels)}` },
     { title: "Health", cell: health, text: (v) => v.health_status },
     { title: "Pool", cell: (v) => (poolsById[v.pool_id] ? link(poolsById[v.pool_id].name, "pool", v.pool_id) : mono(v.pool_id)), text: (v) => (poolsById[v.pool_id] || {}).name || "" },
-    { title: "Size", num: true, cell: (v) => [humanSize(v.size_bytes), el("span", { class: "sub" }, v.thin_provision ? "thin" : "thick")] },
+    { title: "Size", num: true, cell: (v) => humanSize(v.size_bytes) },
     { title: "Allocated", num: true, cell: (v) => humanSize(v.allocated_bytes || 0) },
     { title: "Exported", cell: (v) => (v.attachment_state === "BLOCK_EXPORT" ? pill("Exported", "ok") : pill("Not exported", "quiet")), text: (v) => v.attachment_state },
     { title: "Labels", cell: (v) => labelsText(v.labels) || "-" },
@@ -1025,9 +1019,6 @@ async function volume(id) {
     list("/volume-group-snapshots", "volume_group_snapshots"),
   ]);
   const p = poolList.find((x) => x.id === v.pool_id);
-  const q = v.qos_policy || {};
-  const qos = [q.rw_ios_per_sec && `${q.rw_ios_per_sec} IOPS`, q.rw_mbytes_per_sec && `${q.rw_mbytes_per_sec} MB/s`,
-    q.r_mbytes_per_sec && `${q.r_mbytes_per_sec} MB/s read`, q.w_mbytes_per_sec && `${q.w_mbytes_per_sec} MB/s write`].filter(Boolean).join(", ");
   const groupOf = groupBySnapshot(vgs);
   return [
     el("p", { class: "crumb" }, el("a", { href: "#/volumes" }, "Volumes")),
@@ -1036,7 +1027,6 @@ async function volume(id) {
       action(can.provision, { class: "primary", id: "export-volume", onclick: () => exportDialog(v) }, "Export"),
       action(can.provision, { id: "take-snapshot", onclick: () => snapshotDialog(v) }, "Take snapshot"),
       action(can.provision, { id: "grow-volume", onclick: () => growDialog(v) }, "Grow"),
-      action(can.provision, { id: "qos-volume", onclick: () => qosDialog(v) }, "Limits"),
       action(can.admin, { id: "protect-volume", onclick: () => protectionDialog(v) }, v.deletion_protection ? "Unprotect" : "Protect"),
       action(can.provision, { class: "danger-quiet", id: "delete-volume", disabled: exps.length > 0 || v.deletion_protection, onclick: () => deleteVolumeDialog(v) }, "Delete"),
       exps.length > 0 && can.provision && el("span", { class: "muted" }, "It can't be deleted while it's exported."),
@@ -1045,10 +1035,8 @@ async function volume(id) {
       fact("Health", health(v)),
       fact("Space", usage ? [bar(usage.allocated_bytes, usage.size_bytes), el("span", { class: "sub" }, "Includes what it shares with its snapshots.")] : el("span", { class: "muted" }, "The data plane can't say at the moment.")),
       fact("Pool", p ? link(p.name, "pool", p.id) : mono(v.pool_id)),
-      fact("Provisioning", v.thin_provision ? "Thin" : "Thick"),
       fact("Exported", exps.length ? exps.map((e) => el("div", {}, link(e.name, "export", e.id), ` (${protoName(e.protocol)})`)) : pill("Not exported", "quiet")),
       v.parent_snapshot_id && fact("Cloned from", `snapshot ${v.parent_snapshot_id}`),
-      fact("Limits", qos || "None"),
       fact("Deletion protection", v.deletion_protection ? pill("On", "ok") : "Off"),
       fact("UUID", mono(v.uuid)),
       fact("Data plane name", mono(v.handle)),
@@ -1646,7 +1634,7 @@ function rebootDialog(hostname) {
 
 async function system() {
   const soft = (err) => { if (err instanceof Unauthorized) throw err; return null; };
-  const [st, os, kopts, containers, rebuild, backups, retention, mon, upg, scrubCfg] = await Promise.all([api("/system/status"), api("/system/os").catch(soft), api("/system/kernel-options").then((r) => r.init_on_alloc).catch(soft), api("/system/containers").catch(soft), api("/system/rebuild").catch(soft),
+  const [st, os, kopts, containers, rebuild, backups, retention, mon, upg, scrubCfg] = await Promise.all([systemStatus(), slow("/system/os").catch(soft), slow("/system/kernel-options").then((r) => r.init_on_alloc).catch(soft), slow("/system/containers").catch(soft), api("/system/rebuild").catch(soft),
     can.admin ? api("/system/backups").catch(soft) : null, api("/system/volume-retention").catch(soft), api("/system/monitoring").catch(soft), api("/system/upgrade").catch(soft),
     api("/system/scrub").then((r) => r.scrub).catch(soft)]);
   const ctr = containers || { available: false };
@@ -1796,7 +1784,7 @@ function monitoringDialog(enabled) {
     title: enabled ? "Turn off monitoring" : "Turn on monitoring",
     intro: enabled
       ? "Prometheus and Alertmanager stop, and no alerts are evaluated until monitoring is turned on again. Their history stays on disk."
-      : `Starts Prometheus and Alertmanager on the appliance, listening only on localhost. They use some memory and CPU, kept off the cores the data plane polls on (SPDK), and up to 2 GB of the boot disk for history.`,
+      : `Starts Prometheus and Alertmanager on the appliance, listening only on localhost. They use some memory and CPU, and up to 2 GB of the boot disk for history.`,
     submit: enabled ? "Turn off" : "Turn on",
     danger: enabled,
     fields: [],
@@ -2030,24 +2018,24 @@ const perSecond = (bytes) => humanSize(Math.round(bytes)) + "/s";
 
 async function dashboard() {
   const [st, diskList, poolList, vols, snaps, exps, hostList, portalList, io] = await Promise.all([
-    api("/system/status"), list("/disks", "disks"), list("/pools", "pools"), list("/volumes", "volumes"), list("/snapshots", "snapshots"),
+    systemStatus(), list("/disks", "disks"), list("/pools", "pools"), list("/volumes", "volumes"), list("/snapshots", "snapshots"),
     list("/exports", "exports"), list("/hosts", "hosts"), list("/portals", "portals"),
     api("/system/iostats").catch((err) => { if (err instanceof Unauthorized) throw err; return null; }),
   ]);
   const card = (label, value, href) => el(href ? "a" : "div", { class: "card", href }, el("div", { class: "value" }, value), el("div", { class: "label" }, label));
-  const node = st.node || {}, spdk = st.data_plane || {}, rec = st.reconciler || {};
+  const node = st.node || {}, plane = st.data_plane || {}, rec = st.reconciler || {};
   const unhealthy = [
     ...poolList.map((x) => ["Pool", "pool", x]), ...vols.map((x) => ["Volume", "volume", x]), ...exps.map((x) => ["Export", "export", x]),
   ].filter(([, , x]) => x.health_status && x.health_status !== "ONLINE");
   const badDisks = diskList.filter((d) => d.claimed && d.health_status && d.health_status !== "ONLINE");
-  // SPDK names a volume's device by its UUID, the kernel data plane by its handle (vg/lv).
-  const volByDevice = Object.fromEntries(vols.flatMap((v) => [[v.uuid, v], v.handle && [v.handle, v]].filter(Boolean)));
+  // The data plane names a volume's device by its handle (vg/lv).
+  const volByDevice = Object.fromEntries(vols.filter((v) => v.handle).map((v) => [v.handle, v]));
   const rates = io && ioRates(io.stats || []);
   const volRates = (rates || []).filter((r) => volByDevice[r.name]).map((r) => ({ ...r, vol: volByDevice[r.name] }));
   return [
     el("h1", {}, "Overview"),
-    !spdk.connected && el("div", { class: "panel-notice bad" }, `The data plane isn't reachable (${spdk.endpoint || "unknown"}), so nothing is being served.`),
-    spdk.connected && spdk.restoring && el("div", { class: "panel-notice warn" }, "The data plane has just started: velod is restoring pools, volumes and exports. Hosts reconnect once their exports are back."),
+    !plane.connected && el("div", { class: "panel-notice bad" }, `The data plane isn't reachable (${plane.endpoint || "unknown"}), so nothing is being served.`),
+    plane.connected && plane.restoring && el("div", { class: "panel-notice warn" }, "The data plane has just started: velod is restoring pools, volumes and exports. Hosts reconnect once their exports are back."),
     el("div", { class: "cards" },
       card("Disks claimed", `${diskList.filter((d) => d.claimed).length} / ${diskList.length}`, "#/disks"),
       card("Pools", poolList.length, "#/pools"), card("Volumes", vols.length, "#/volumes"), card("Snapshots", snaps.length, "#/snapshots"),
@@ -2079,8 +2067,7 @@ async function dashboard() {
     el("dl", { class: "facts" },
       fact("Hostname", node.hostname), fact("Node ID", mono(node.node_id)),
       fact("Version", `${node.version || "-"}${node.commit ? ` (${String(node.commit).slice(0, 12)})` : ""}`),
-      fact("Data plane", spdk.connected ? [pill("Connected", "ok"), " ", node.data_plane_version] : pill("Not reachable", "bad")),
-      fact("Hugepages", `${spdk.hugepages_free_mb ?? "-"} of ${spdk.hugepages_total_mb ?? "-"} MiB free`),
+      fact("Data plane", plane.connected ? [pill("Connected", "ok"), " ", node.data_plane_version] : pill("Not reachable", "bad")),
       fact("Up for", humanDuration(node.uptime_seconds)),
       fact("Reconciled", [humanTime(rec.last_reconciled_at), el("span", { class: "sub" }, `${rec.drift_repaired_count || 0} repairs so far`)])),
   ];
@@ -2529,9 +2516,13 @@ async function rerender() {
   const { nav: current, draw } = route();
   try {
     if (!token()) throw new Unauthorized();
-    me = await api("/auth/me");
+    if (Date.now() - meAt >= SLOW_MS) {
+      me = await api("/auth/me");
+      meAt = Date.now();
+    }
+    statusAnswer = null;
     if (me.must_change_password) throw new MustChangePassword();
-    const [content, st] = await Promise.all([draw(), api("/system/status").catch(() => ({}))]);
+    const [content, st] = await Promise.all([draw(), systemStatus().catch(() => ({}))]);
     if (mine !== generation) return;
     drawNav(current);
     drawAccount();

@@ -20,6 +20,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -110,7 +111,7 @@ func (e *env) pool() {
 		e.t.Fatal(err)
 	}
 	e.t.Cleanup(e.destroy)
-	u, err := e.p.CreateThinPool(e.ctx, e.array, e.vg, 1<<20)
+	u, err := e.p.CreateThinPool(e.ctx, e.array, e.vg)
 	if err != nil {
 		e.t.Fatal(err)
 	}
@@ -302,9 +303,29 @@ func TestVolumeLifecycle(t *testing.T) {
 
 	// A group snapshot of two volumes; a clone of the first snapshot reads its data.
 	_, volB := e.volume("vol-b", size)
+	// Reconciler passes meanwhile leave the group alone (and neither waits for the other for ever).
+	stop, passes := make(chan struct{}), make(chan error, 1)
+	go func() {
+		for {
+			if err := e.p.Settle(e.ctx, e.disks); err != nil {
+				passes <- err
+				return
+			}
+			select {
+			case <-stop:
+				passes <- nil
+				return
+			default:
+			}
+		}
+	}()
 	gu, err := e.p.SnapshotGroup(e.ctx, []dataplane.GroupEntry{{Volume: vol.UUID, Snapshot: "gsnap-a"}, {Volume: volB.UUID, Snapshot: "gsnap-b"}}, 5*time.Second)
 	if err != nil || len(gu) != 2 {
 		t.Fatalf("group snapshot %v %v", gu, err)
+	}
+	close(stop)
+	if err := <-passes; err != nil {
+		t.Errorf("a pass during the group snapshot: %v", err)
 	}
 	if s, _ := e.k.WrapperSuspended(e.ctx, "vol-a"); s {
 		t.Fatal("wrapper left suspended")
@@ -510,6 +531,45 @@ func TestExports(t *testing.T) {
 		t.Errorf("iSCSI connections %+v %v", conns, err)
 	}
 
+	// A second iSCSI export of the volume, open to any initiator, shares its backstore; the
+	// initiators on it are listed; removing it leaves the first one working.
+	open := &store.Export{ID: "exp-o" + e.id, VolumeID: vol.ID, Protocol: store.ExportProtocolISCSI, TargetIQN: iscsi.TargetIQN + "-open", AllowAnyHost: true}
+	if err := e.p.ApplyExport(e.ctx, open, vol, dataplane.ACL{}, ipt); err != nil {
+		t.Fatalf("a second iSCSI export of the volume: %v", err)
+	}
+	anyInit := "iqn.2026-11.io.velocor.test:kp-any"
+	odev, err := iscsiLogin(e, open.TargetIQN, anyInit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	verify(t, odev, 0, 4*mib, 4)
+	conns, err = e.p.Connections(e.ctx, open)
+	if err != nil || !slices.ContainsFunc(conns, func(c dataplane.Connection) bool { return c.Host == anyInit }) {
+		t.Errorf("connections of an open iSCSI export %+v %v: %s is missing", conns, err, anyInit)
+	}
+	if err := e.p.RemoveTarget(e.ctx, open); err != nil {
+		t.Fatalf("remove the second export: %v", err)
+	}
+	if err := e.p.ApplyExport(e.ctx, iscsi, vol, dataplane.ACL{IQNs: []string{init1}}, ipt); err != nil {
+		t.Fatalf("the first export after removing the second: %v", err)
+	}
+	verify(t, idev, 4*mib, 4*mib, 3)
+
+	// An NVMe export opens to every host and closes again, with a host linked each time.
+	openACL := *nvme
+	openACL.AllowAnyHost = true
+	for i := range 2 {
+		if err := e.p.ApplyExport(e.ctx, &openACL, vol, dataplane.ACL{}, portals[:1]); err != nil {
+			t.Fatalf("open the NVMe export (%d): %v", i, err)
+		}
+		if _, err := os.Stat("/sys/kernel/config/nvmet/hosts/" + hostNQN); err == nil {
+			t.Errorf("the host object stays after its last subsystem dropped it")
+		}
+		if err := e.p.ApplyExport(e.ctx, nvme, vol, dataplane.ACL{HostNQNs: []string{hostNQN}}, portals[:1]); err != nil {
+			t.Fatalf("close the NVMe export (%d): %v", i, err)
+		}
+	}
+
 	// A volume can't be deleted while exported (its wrapper is busy).
 	if err := e.p.DeleteVolume(e.ctx, vol.UUID); err == nil {
 		t.Fatal("deleted an exported volume")
@@ -518,6 +578,42 @@ func TestExports(t *testing.T) {
 	if !slices.ContainsFunc(un, func(o dataplane.UnmanagedObject) bool { return o.Kind == "ISCSI_TARGET" && o.Name == iscsi.TargetIQN }) ||
 		slices.ContainsFunc(un, func(o dataplane.UnmanagedObject) bool { return o.Name == nvme.SubsystemNQN }) {
 		t.Errorf("unmanaged targets: %+v", un)
+	}
+}
+
+// Exports applied and removed at once each get a listener of their own, on their own port.
+func TestConcurrentExports(t *testing.T) {
+	e := newEnv(t)
+	e.pool()
+	_, vol := e.volume("vol-c", 32*mib)
+	acl := dataplane.ACL{HostNQNs: []string{hostNQN}}
+	const n = 8
+	for round := range 5 {
+		exps := make([]*store.Export, n)
+		errs := make([]error, n)
+		var wg sync.WaitGroup
+		each := func(f func(i int)) {
+			for i := range n {
+				wg.Go(func() { f(i) })
+			}
+			wg.Wait()
+		}
+		each(func(i int) {
+			exps[i] = &store.Export{ID: fmt.Sprintf("exp-c%d%s", i, e.id), VolumeID: vol.ID, Protocol: store.ExportProtocolNVMeoFTCP,
+				SubsystemNQN: fmt.Sprintf("nqn.2026-11.io.velocor.test:%s-%d", e.id, i)}
+			errs[i] = e.p.ApplyExport(e.ctx, exps[i], vol, acl, []*store.Portal{{ID: "pt", IPAddress: "127.0.0.1", Port: uint32(15000 + i)}})
+		})
+		for i, err := range errs {
+			if err != nil {
+				t.Errorf("round %d, export %d: %v", round, i, err)
+			} else if pts := e.k.NVMeSubsystemPorts(exps[i].SubsystemNQN); len(pts) != 1 || pts[0].Port != 15000+i {
+				t.Errorf("round %d, export %d listens on %+v", round, i, pts)
+			}
+		}
+		each(func(i int) { errs[i] = e.p.RemoveTarget(context.Background(), exps[i]) })
+		if err := errors.Join(errs...); err != nil {
+			t.Errorf("round %d: remove: %v", round, err)
+		}
 	}
 }
 
@@ -644,7 +740,40 @@ func TestSettleAfterReboot(t *testing.T) {
 		t.Fatalf("started degraded: %+v", a)
 	}
 	verify(t, dev, 0, 32*mib, 6)
-	_, _ = e.k.Run.Run(e.ctx, "losetup", e.disks[1], lost) // back, for the cleanup
+
+	// It ran degraded and was written to, so it comes back degraded by itself after another
+	// reboot (until the first write md may not have recorded that the member is gone).
+	fill(t, dev, 0, 32*mib, 8)
+	reboot()
+	if err := e.p.Settle(e.ctx, e.disks); err != nil {
+		t.Fatal(err)
+	}
+	if a := e.arrayOf(); a.State != dataplane.ArrayOnline || a.Operational != 1 {
+		t.Fatalf("degraded before the reboot: %+v", a)
+	}
+	verify(t, dev, 0, 32*mib, 8)
+
+	// The disk that missed all that comes back stale: it takes no part, and alone (its metadata
+	// still says both members are active) it can't start the array.
+	_, _ = e.k.Run.Run(e.ctx, "losetup", e.disks[1], lost)
+	reboot()
+	if err := e.p.Settle(e.ctx, e.disks); err != nil {
+		t.Fatal(err)
+	}
+	if a := e.arrayOf(); a.State != dataplane.ArrayOnline || a.Operational != 1 || a.Members[0].Name != e.disks[0] {
+		t.Fatalf("with the stale member back: %+v", a)
+	}
+	verify(t, dev, 0, 32*mib, 8)
+	reboot()
+	if err := e.p.Settle(e.ctx, e.disks[1:]); err != nil {
+		t.Fatal(err)
+	}
+	if a := e.arrayOf(); a.State != dataplane.ArrayConfiguring {
+		t.Fatalf("the stale member alone started the array: %+v", a)
+	}
+	if err := e.p.Settle(e.ctx, e.disks); err != nil { // running again, for the cleanup
+		t.Fatal(err)
+	}
 }
 
 // ExamineDisks finds a stopped pool's array on its disks, each member in its slot, and a member
@@ -742,7 +871,7 @@ func TestRAID10(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(e.destroy)
-	if _, err := e.p.CreateThinPool(e.ctx, e.array, e.vg, 1<<20); err != nil {
+	if _, err := e.p.CreateThinPool(e.ctx, e.array, e.vg); err != nil {
 		t.Fatal(err)
 	}
 	if a := e.arrayOf(); a.Level != "raid10" || a.Slots != 4 || a.State != dataplane.ArrayOnline {

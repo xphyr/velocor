@@ -1,5 +1,5 @@
 // Package meta keeps a copy of each pool's metadata on the pool itself (TODO P0-3;
-// docs/design/p0-3-metadata-recovery.md): a small thick lvol, velocor-meta, holds the pool's
+// docs/design/p0-3-metadata-recovery.md): a small linear LV, velocor-meta, holds the pool's
 // manifest in two alternating slots, so a pool's disks carry what is needed to bring it back
 // on any appliance. Accounts, tokens and node secrets are never part of it.
 package meta
@@ -18,12 +18,12 @@ import (
 )
 
 const (
-	// LvolName is the name of the metadata lvol in every pool's volume store.
-	LvolName = "velocor-meta"
-	// LvolBytes is its size: two slots.
-	LvolBytes = store.MetaLvolBytes
+	// VolumeName is the name of the metadata volume in every pool's volume group.
+	VolumeName = "velocor-meta"
+	// VolumeBytes is its size: two slots.
+	VolumeBytes = store.MetaVolumeBytes
 	// SlotBytes is one slot: a header block plus the manifest.
-	SlotBytes = LvolBytes / 2
+	SlotBytes = VolumeBytes / 2
 	// HeaderBytes is the header block at the start of a slot (one direct-I/O block).
 	HeaderBytes = 4096
 	// FormatVersion of the manifest layout.
@@ -62,6 +62,7 @@ func (m *Manifest) Content() []byte {
 	p := c.Pool
 	p.TotalBytes, p.FreeBytes, p.AllocatedBytes, p.CommittedBytes, p.AvailableBytes = 0, 0, 0, 0, 0
 	p.SpaceState, p.HealthStatus, p.StatusMessage, p.Members = "", "", "", nil
+	p.ThinMetadataBytes, p.ThinMetadataUsedBytes, p.UnreadableBytes, p.LostData, p.Durability = 0, 0, 0, nil, ""
 	p.MetaGeneration, p.MetaHash, p.MetaWrittenAt, p.MetaError = 0, "", time.Time{}, ""
 	c.Pool = p
 	disks := make([]store.Disk, len(c.Disks))
@@ -224,7 +225,7 @@ func EncodeSlot(m *Manifest) ([]byte, error) {
 	return out, nil
 }
 
-// SlotOffset is where slot i (0 or 1) starts in the metadata lvol.
+// SlotOffset is where slot i (0 or 1) starts in the metadata volume.
 func SlotOffset(i int) int64 { return int64(i) * SlotBytes }
 
 // SlotFor is the slot a generation is written to: generations alternate, so the previous one
@@ -240,7 +241,7 @@ func DecodeSlot(b []byte) (*Manifest, bool) {
 	if err := binary.Read(bytes.NewReader(b[:binary.Size(h)]), binary.LittleEndian, &h); err != nil {
 		return nil, false
 	}
-	if h.Magic != magic || h.Format != FormatVersion || h.Length == 0 || HeaderBytes+h.Length > uint64(len(b)) {
+	if h.Magic != magic || h.Format != FormatVersion || h.Length == 0 || h.Length > uint64(len(b)-HeaderBytes) {
 		return nil, false
 	}
 	body := b[HeaderBytes : HeaderBytes+h.Length]

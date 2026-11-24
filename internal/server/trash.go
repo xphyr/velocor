@@ -11,7 +11,7 @@ import (
 )
 
 // Deleting a volume (P1-4) moves it to a recycle state for the configured retention period:
-// it disappears from the API, can't be exported, snapshotted or resized, and its lvol stays
+// it disappears from the API, can't be exported, snapshotted or resized, and its LV stays
 // untouched, so an administrator can restore it. The reconciler purges it when the period
 // ends; an administrator can purge it sooner. Volumes with deletion protection can't be
 // deleted at all until an administrator turns the protection off.
@@ -86,7 +86,7 @@ func (s *Server) handleDeleteVolume(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"volume": trashed})
 }
 
-// purgeVolume deletes a volume's lvol and record for good.
+// purgeVolume deletes a volume's data and record for good.
 func (s *Server) purgeVolume(ctx context.Context, vol *store.Volume) error {
 	if err := s.requireDataPlane(); err != nil {
 		return err
@@ -122,11 +122,9 @@ func (s *Server) handleRestoreVolume(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Name string `json:"name"`
 	}
-	if r.ContentLength != 0 {
-		if err := decodeJSON(r, &req); err != nil {
-			writeError(w, err)
-			return
-		}
+	if err := decodeOptionalJSON(r, &req); err != nil {
+		writeError(w, err)
+		return
 	}
 	if req.Name != "" {
 		if err := validateDisplayName("volume", req.Name); err != nil {

@@ -1,6 +1,7 @@
 package kernel
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -9,6 +10,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Plane drives the kernel data plane: md, LVM, device-mapper and nvmet.
@@ -18,11 +20,16 @@ type Plane struct {
 	SysRoot string
 	// DevRoot is "/dev"; md arrays appear as DevRoot/md/<name>.
 	DevRoot string
+	// InventoryTTL is how long LVM's reports may be reused (0: not at all); anything this Plane
+	// changes drops them at once. They say how full volumes are, which changes with I/O.
+	InventoryTTL time.Duration
+
+	inv inventory
 }
 
 // New returns a Plane on this host's /sys and /dev.
 func New(r Runner) *Plane {
-	return &Plane{Run: r, SysRoot: "/sys", DevRoot: "/dev"}
+	return &Plane{Run: r, SysRoot: "/sys", DevRoot: "/dev", InventoryTTL: 2 * time.Second}
 }
 
 // ArraySpec describes an md array to create.
@@ -46,6 +53,7 @@ func (p *Plane) ArrayPath(name string) string { return filepath.Join(p.DevRoot, 
 // the error to the reader and keeps the array running (TODO.md P0-7, checked by
 // TestLastCopyReadErrorKeepsThePool).
 func (p *Plane) CreateArray(ctx context.Context, s ArraySpec) (string, error) {
+	defer p.DropInventory()
 	if s.Level != "raid0" && s.Level != "raid1" && s.Level != "raid10" {
 		return "", fmt.Errorf("unsupported level %q", s.Level)
 	}
@@ -81,6 +89,7 @@ func (p *Plane) CreateArray(ctx context.Context, s ArraySpec) (string, error) {
 // AssembleArray starts an existing array from its members. Without allowDegraded mdadm starts it
 // only with every member present (an operator decides on a degraded start: TODO.md P1-8).
 func (p *Plane) AssembleArray(ctx context.Context, name, uuid string, devices []string, allowDegraded bool) error {
+	defer p.DropInventory()
 	args := []string{"--assemble", p.ArrayPath(name), "--uuid=" + uuid, "--quiet"}
 	if allowDegraded {
 		args = append(args, "--run")
@@ -91,6 +100,7 @@ func (p *Plane) AssembleArray(ctx context.Context, name, uuid string, devices []
 
 // StopArray stops an array (its volume group must be deactivated first).
 func (p *Plane) StopArray(ctx context.Context, name string) error {
+	defer p.DropInventory()
 	_, err := p.Run.Run(ctx, "mdadm", "--stop", p.ArrayPath(name))
 	return err
 }
@@ -272,12 +282,20 @@ func parseBadBlocks(s string, offset uint64) []SectorRange {
 			n -= offset - start
 			start = offset
 		}
-		r := SectorRange{start - offset, n}
-		if !slices.Contains(out, r) {
-			out = append(out, r)
-		}
+		out = append(out, SectorRange{start - offset, n})
 	}
-	return out
+	// The two logs can overlap: each sector once.
+	slices.SortFunc(out, func(a, b SectorRange) int { return cmp.Compare(a.Start, b.Start) })
+	merged := out[:0]
+	for _, r := range out {
+		if n := len(merged); n > 0 && r.Start < merged[n-1].Start+merged[n-1].Sectors {
+			last := &merged[n-1]
+			last.Sectors = max(last.Start+last.Sectors, r.Start+r.Sectors) - last.Start
+			continue
+		}
+		merged = append(merged, r)
+	}
+	return merged
 }
 
 // arrayKernelName resolves DevRoot/md/<name> to the kernel's md device (md127).
@@ -361,10 +379,17 @@ func parseExamineScan(out string) []ExaminedArray {
 				}
 			}
 			arrays = append(arrays, a)
-		case len(f) == 1 && strings.HasPrefix(f[0], "devices=") && len(arrays) > 0:
-			for _, d := range strings.Split(strings.TrimPrefix(f[0], "devices="), ",") {
-				if d != "" {
-					arrays[len(arrays)-1].Found = append(arrays[len(arrays)-1].Found, d)
+		case len(arrays) > 0:
+			// "devices=/dev/sda,/dev/sdb", after "spares=1" on the same line if there are spares.
+			for _, kv := range f {
+				v, ok := strings.CutPrefix(kv, "devices=")
+				if !ok {
+					continue
+				}
+				for _, d := range strings.Split(v, ",") {
+					if d != "" {
+						arrays[len(arrays)-1].Found = append(arrays[len(arrays)-1].Found, d)
+					}
 				}
 			}
 		}
@@ -372,24 +397,24 @@ func parseExamineScan(out string) []ExaminedArray {
 	return arrays
 }
 
+// RunArray starts an assembled but inactive array with the members it has.
+func (p *Plane) RunArray(ctx context.Context, name string) error {
+	defer p.DropInventory()
+	_, err := p.Run.Run(ctx, "mdadm", "--run", p.ArrayPath(name))
+	return err
+}
+
 // MemberRole returns a device's slot in its array from its md metadata, or -1 for a spare (or
 // a device md doesn't place).
 func (p *Plane) MemberRole(ctx context.Context, dev string) (int, error) {
-	out, err := p.Run.Run(ctx, "mdadm", "--examine", dev)
+	m, err := p.ExamineMember(ctx, dev)
 	if err != nil {
 		return -1, err
 	}
-	for _, line := range strings.Split(string(out), "\n") {
-		k, v, ok := strings.Cut(line, ":")
-		if !ok || strings.TrimSpace(k) != "Device Role" {
-			continue
-		}
-		if n, err := strconv.Atoi(strings.TrimPrefix(strings.TrimSpace(v), "Active device ")); err == nil {
-			return n, nil
-		}
-		return -1, nil
+	if m == nil {
+		return -1, fmt.Errorf("mdadm --examine %s: no md metadata", dev)
 	}
-	return -1, fmt.Errorf("mdadm --examine %s: no device role", dev)
+	return m.Role, nil
 }
 
 // ZeroSuperblock erases md metadata from a device that left its array.
@@ -427,6 +452,12 @@ func (p *Plane) ExamineMember(ctx context.Context, dev string) (*MemberInfo, err
 	return parseExamine(string(out))
 }
 
+// firstField is the first word of s, "" if it has none.
+func firstField(s string) string {
+	s, _, _ = strings.Cut(strings.TrimSpace(s), " ")
+	return s
+}
+
 func parseExamine(out string) (*MemberInfo, error) {
 	m := &MemberInfo{Role: -1}
 	for _, line := range strings.Split(out, "\n") {
@@ -443,13 +474,13 @@ func parseExamine(out string) (*MemberInfo, error) {
 			if _, n, ok := strings.Cut(v, ":"); ok {
 				m.Name = n
 			}
-			m.Name = strings.Fields(m.Name + " ")[0] // "name  (local to host x)"
+			m.Name = firstField(m.Name) // "name  (local to host x)"
 		case "Raid Level":
 			m.Level = v
 		case "Raid Devices":
 			m.RaidDevices, _ = strconv.Atoi(v)
 		case "Array Size":
-			m.ArrayKiB, _ = strconv.ParseUint(strings.Fields(v + " ")[0], 10, 64)
+			m.ArrayKiB, _ = strconv.ParseUint(firstField(v), 10, 64)
 		case "Device UUID":
 			m.DeviceUUID = v
 		case "Events":
@@ -459,7 +490,7 @@ func parseExamine(out string) (*MemberInfo, error) {
 				m.Role = n
 			}
 		case "Array State":
-			m.ArrayState = strings.Fields(v + " ")[0]
+			m.ArrayState = firstField(v)
 		}
 	}
 	if m.ArrayUUID == "" {

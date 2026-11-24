@@ -5,18 +5,19 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"slices"
 	"time"
 
 	"github.com/velocor/velocor/internal/dataplane"
 	"github.com/velocor/velocor/internal/store"
 )
 
-// Background scrubs of the pools (docs/review-history.md P2-2). SPDK patch 0004 does the reading, comparing and
+// Background scrubs of the pools (docs/review-history.md P2-2). md does the reading, comparing and
 // repairing; velod schedules it, follows it and keeps the results:
 //
-//   - a run covers a pool once. It can span several SPDK scrubs ("segments"): a scheduled run
+//   - a run covers a pool once. It can span several md checks ("segments"): a scheduled run
 //     pauses when its window ends and resumes at the offset it reached in the next window; a run
-//     interrupted by a velod or spdk_tgt restart, a member removal or a rebuild resumes the same
+//     interrupted by a restart, a member removal or a rebuild resumes the same
 //     way once the pool is ONLINE again.
 //   - at most one scheduled scrub runs at a time (they share the data plane's one reactor with
 //     host I/O); operator-started ones run at once and ignore the window.
@@ -24,13 +25,6 @@ import (
 
 // scrubTickInterval is how often the scheduler follows running scrubs and starts due ones.
 const scrubTickInterval = 30 * time.Second
-
-// Why the data plane stopped a scrub (Scrub.Status, negative errno).
-const (
-	scrubStatusMemberRemoved = -19  // ENODEV
-	scrubStatusRebuild       = -16  // EBUSY
-	scrubStatusCanceled      = -125 // ECANCELED
-)
 
 // RunScrubScheduler follows and schedules pool scrubs until ctx ends.
 func (s *Server) RunScrubScheduler(ctx context.Context) {
@@ -61,12 +55,14 @@ func scrubCounts(sc *dataplane.Scrub) store.ScrubCounts {
 // scrubEligible reports why a pool can't be scrubbed now ("" if it can).
 func scrubEligible(pool *store.Pool, rb *dataplane.Array) string {
 	switch {
+	case !redundant(pool.RaidLevel):
+		return fmt.Sprintf("it is %s, which keeps no second copy to check against", pool.RaidLevel)
 	case rb == nil:
 		return "its RAID isn't in the data plane"
 	case rb.State != "online":
 		return "its RAID isn't online"
 	case rb.Operational < rb.Slots:
-		// SPDK's count, not only the pool's health: the reconciler records a member that just
+		// md's count, not only the pool's health: the reconciler records a member that just
 		// failed (e.g. a scrub's failed repair write) up to a pass later, and a scrub resumed in
 		// between would scan a single copy and record the pool as scrubbed.
 		return fmt.Sprintf("it is degraded (%d of %d members)", rb.Operational, rb.Slots)
@@ -146,33 +142,38 @@ func (s *Server) scrubTick(ctx context.Context, now time.Time) error {
 	if cfg.Disabled || !inWindow || scheduledRunning {
 		return nil
 	}
-	var pick *store.Pool
-	var pickDue time.Time
+	type candidate struct {
+		pool *store.Pool
+		due  time.Time
+	}
+	var due []candidate
 	for _, p := range pools {
 		rec := recs[p.ID]
 		if scrubEligible(p, raids[p.ArrayName]) != "" || (rec != nil && rec.State == store.ScrubRunning) {
 			continue
 		}
-		due := scrubDue(p, rec, cfg)
+		at := scrubDue(p, rec, cfg)
 		if rec != nil && rec.State == store.ScrubPaused {
-			due = time.Time{} // an unfinished run goes first
+			at = time.Time{} // an unfinished run goes first
 		}
-		if due.After(now) {
-			continue
-		}
-		if pick == nil || due.Before(pickDue) {
-			pick, pickDue = p, due
+		if !at.After(now) {
+			due = append(due, candidate{p, at})
 		}
 	}
-	if pick == nil {
-		return nil
+	// One at a time, the most overdue first; a pool whose scrub won't start doesn't keep the others
+	// from theirs.
+	slices.SortStableFunc(due, func(a, b candidate) int { return a.due.Compare(b.due) })
+	var errs []error
+	for _, c := range due {
+		rec := recs[c.pool.ID]
+		resume := rec != nil && rec.State == store.ScrubPaused
+		err := s.startScrub(ctx, c.pool, rec, resume, false, true, *cfg.MaxMBps, now)
+		if err == nil {
+			break
+		}
+		errs = append(errs, fmt.Errorf("start scheduled scrub of pool %s: %w", c.pool.Name, err))
 	}
-	rec := recs[pick.ID]
-	resume := rec != nil && rec.State == store.ScrubPaused
-	if err := s.startScrub(ctx, pick, rec, resume, false, true, *cfg.MaxMBps, now); err != nil {
-		return fmt.Errorf("start scheduled scrub of pool %s: %w", pick.Name, err)
-	}
-	return nil
+	return errors.Join(errs...)
 }
 
 // scrubDue is when a pool's next scheduled scrub is due.
@@ -212,7 +213,7 @@ func (s *Server) raidsByName(ctx context.Context) (map[string]*dataplane.Array, 
 	return out, nil
 }
 
-// syncScrub brings a pool's scrub record up to date with what SPDK reports and returns it (nil
+// syncScrub brings a pool's scrub record up to date with what md reports and returns it (nil
 // if the pool was never scrubbed).
 func (s *Server) syncScrub(ctx context.Context, p *store.Pool, rb *dataplane.Array, now time.Time) (*store.ScrubRecord, error) {
 	rec, err := s.store.GetScrubRecord(p.ID)
@@ -249,11 +250,11 @@ func (s *Server) syncScrub(ctx context.Context, p *store.Pool, rb *dataplane.Arr
 				r.Note = fmt.Sprintf("the data plane's scrub failed (error %d)", sc.Status)
 			default: // stopped
 				switch {
-				case r.Stopping != "" && sc.Status == scrubStatusCanceled:
+				case r.Stopping != "" && sc.Status == dataplane.ScrubStatusCanceled:
 					r.State = r.Stopping
-				case sc.Status == scrubStatusMemberRemoved:
+				case sc.Status == dataplane.ScrubStatusMemberRemoved:
 					r.State, r.Note = store.ScrubPaused, "a member left the RAID; the scrub resumes once the pool is ONLINE"
-				case sc.Status == scrubStatusRebuild:
+				case sc.Status == dataplane.ScrubStatusRebuild:
 					r.State, r.Note = store.ScrubPaused, "a rebuild started; the scrub resumes after it"
 				default:
 					r.State, r.Note = store.ScrubPaused, fmt.Sprintf("the data plane stopped the scrub (error %d)", sc.Status)
@@ -270,7 +271,7 @@ func (s *Server) syncScrub(ctx context.Context, p *store.Pool, rb *dataplane.Arr
 		}
 		return out, err
 	case tracking:
-		// SPDK has no scrub (or another one): spdk_tgt restarted, or velod lost track.
+		// md has no scrub (or another one): the appliance restarted, or velod lost track.
 		return s.store.MutateScrubRecord(p.ID, func(r *store.ScrubRecord) error {
 			r.Counts = r.Counts.Add(r.Segment)
 			r.Segment = store.ScrubCounts{}
@@ -279,7 +280,7 @@ func (s *Server) syncScrub(ctx context.Context, p *store.Pool, rb *dataplane.Arr
 			return nil
 		})
 	case sc != nil && sc.State == dataplane.ScrubRunning:
-		// A scrub velod didn't start (e.g. by hand through SPDK's RPC): follow it.
+		// A scrub velod didn't start (e.g. by hand through sysfs): follow it.
 		return s.store.MutateScrubRecord(p.ID, func(r *store.ScrubRecord) error {
 			r.State, r.Manual, r.Repair, r.StartedAt, r.UpdatedAt = store.ScrubRunning, true, sc.Repair, now, now
 			r.FinishedAt, r.Note, r.Stopping = time.Time{}, "started outside velod", ""
@@ -308,7 +309,7 @@ func (s *Server) logScrubEnd(p *store.Pool, r *store.ScrubRecord) {
 	}
 }
 
-// startScrub starts an SPDK scrub of the pool's RAID: a new run, or (resume) the paused run at
+// startScrub starts a scrub of the pool's RAID: a new run, or (resume) the paused run at
 // the offset it reached.
 func (s *Server) startScrub(ctx context.Context, p *store.Pool, rec *store.ScrubRecord, resume, manual, repair bool, maxMBps uint32, now time.Time) error {
 	offset := uint64(0)
@@ -337,8 +338,8 @@ func (s *Server) startScrub(ctx context.Context, p *store.Pool, rec *store.Scrub
 	return err
 }
 
-// requestScrubStop asks SPDK to stop a pool's running scrub; the record moves to state (PAUSED
-// or STOPPED) once SPDK reports it stopped.
+// requestScrubStop asks md to stop a pool's running scrub; the record moves to state (PAUSED
+// or STOPPED) once md reports it stopped.
 func (s *Server) requestScrubStop(ctx context.Context, p *store.Pool, state store.ScrubState, note string) error {
 	if _, err := s.store.MutateScrubRecord(p.ID, func(r *store.ScrubRecord) error {
 		r.Stopping, r.Note = state, note
@@ -466,7 +467,7 @@ func (s *Server) handleGetPoolScrub(w http.ResponseWriter, r *http.Request) {
 	if s.dp != nil {
 		if raids, err := s.raidsByName(r.Context()); err == nil {
 			rb = raids[p.ArrayName]
-			// Bring the record up to date with SPDK, so progress is current.
+			// Bring the record up to date with md, so progress is current.
 			s.scrubMu.Lock()
 			rec, err = s.syncScrub(r.Context(), p, rb, time.Now())
 			s.scrubMu.Unlock()
@@ -590,7 +591,7 @@ func (s *Server) handleStopPoolScrub(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if rec.State == store.ScrubPaused {
-		// Nothing runs in SPDK: end the run here.
+		// Nothing runs: end the run here.
 		rec, err = s.store.MutateScrubRecord(p.ID, func(r *store.ScrubRecord) error {
 			r.State, r.FinishedAt, r.Note, r.UpdatedAt = store.ScrubStopped, time.Now(), "stopped by an operator", time.Now()
 			return nil

@@ -12,7 +12,6 @@ import (
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/velocor/velocor/internal/auth"
-	"github.com/velocor/velocor/internal/dataplane/spdkplane"
 	"github.com/velocor/velocor/internal/server"
 	"github.com/velocor/velocor/internal/store"
 	"google.golang.org/grpc/codes"
@@ -87,7 +86,7 @@ func TestPublishIsPerNode(t *testing.T) {
 	}
 	authMgr, _ := auth.NewManager(st, "pass-123456")
 	_, tok, _ := authMgr.CreateApiToken("csi", store.RoleCSIProvisioner, time.Hour)
-	ts := httptest.NewServer(server.New(st, spdkplane.New(fake.Client(), nil), nil, authMgr, nil, nil).Handler())
+	ts := httptest.NewServer(server.New(st, fake, nil, authMgr, nil, nil).Handler())
 	defer ts.Close()
 	ctrl := NewControllerServer(NewHTTPClient(ts.URL, tok, true))
 	ctx := context.Background()
@@ -133,5 +132,63 @@ func TestPublishIsPerNode(t *testing.T) {
 	}
 	if _, err := ctrl.ControllerPublishVolume(ctx, &csi.ControllerPublishVolumeRequest{VolumeId: volID, NodeId: "node-b", VolumeCapability: capab}); err != nil {
 		t.Fatalf("after unpublish, node-b must be able to attach: %v", err)
+	}
+}
+
+// A clone whose growth failed is grown by the retry, and a failed clone leaves no intermediate
+// snapshot; expanding a raw block volume tells the node.
+func TestCloneRetryAndBlockExpand(t *testing.T) {
+	tmp := t.TempDir()
+	st, err := store.OpenBoltStore(filepath.Join(tmp, "v.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+	fake := seedBackend(t, st, "pool-1")
+	if err := st.CreatePortal(&store.Portal{ID: "pt", Name: "pt", Protocol: store.ExportProtocolNVMeoFTCP, IPAddress: "10.0.0.1", Port: 4420}); err != nil {
+		t.Fatal(err)
+	}
+	authMgr, _ := auth.NewManager(st, "pass-123456")
+	_, tok, _ := authMgr.CreateApiToken("csi", store.RoleCSIProvisioner, time.Hour)
+	ts := httptest.NewServer(server.New(st, fake, nil, authMgr, nil, nil).Handler())
+	defer ts.Close()
+	ctrl := NewControllerServer(NewHTTPClient(ts.URL, tok, true))
+	ctx := context.Background()
+	block := &csi.VolumeCapability{
+		AccessType: &csi.VolumeCapability_Block{Block: &csi.VolumeCapability_BlockVolume{}},
+		AccessMode: &csi.VolumeCapability_AccessMode{Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER},
+	}
+	src, err := ctrl.CreateVolume(ctx, &csi.CreateVolumeRequest{Name: "src", VolumeCapabilities: []*csi.VolumeCapability{block}, CapacityRange: &csi.CapacityRange{RequiredBytes: 1 << 30}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	srcID := src.GetVolume().GetVolumeId()
+	clone := &csi.CreateVolumeRequest{Name: "copy", VolumeCapabilities: []*csi.VolumeCapability{block}, CapacityRange: &csi.CapacityRange{RequiredBytes: 2 << 30},
+		VolumeContentSource: &csi.VolumeContentSource{Type: &csi.VolumeContentSource_Volume{Volume: &csi.VolumeContentSource_VolumeSource{VolumeId: srcID}}}}
+
+	fake.Fail("Clone", 1)
+	if _, err := ctrl.CreateVolume(ctx, clone); err == nil {
+		t.Fatal("a failed clone succeeded")
+	}
+	if snaps, _ := st.ListSnapshots(srcID, ""); len(snaps) != 0 {
+		t.Errorf("a failed clone left %d snapshots", len(snaps))
+	}
+	fake.Fail("ResizeVolume", 1)
+	if _, err := ctrl.CreateVolume(ctx, clone); err == nil {
+		t.Fatal("a failed growth succeeded")
+	}
+	got, err := ctrl.CreateVolume(ctx, clone)
+	if err != nil || got.GetVolume().GetCapacityBytes() != 2<<30 {
+		t.Fatalf("retry: %v %v", got, err)
+	}
+	// Not a clone of that source: the name is taken.
+	other := &csi.CreateVolumeRequest{Name: "src", VolumeCapabilities: []*csi.VolumeCapability{block}, CapacityRange: &csi.CapacityRange{RequiredBytes: 2 << 30}}
+	if _, err := ctrl.CreateVolume(ctx, other); status.Code(err) != codes.AlreadyExists {
+		t.Fatalf("a bigger volume of the same name: %v", err)
+	}
+
+	exp, err := ctrl.ControllerExpandVolume(ctx, &csi.ControllerExpandVolumeRequest{VolumeId: srcID, VolumeCapability: block, CapacityRange: &csi.CapacityRange{RequiredBytes: 3 << 30}})
+	if err != nil || !exp.GetNodeExpansionRequired() || exp.GetCapacityBytes() != 3<<30 {
+		t.Fatalf("expand: %v %v", exp, err)
 	}
 }

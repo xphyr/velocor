@@ -3,9 +3,11 @@ package kernel
 import (
 	"context"
 	"encoding/json"
-	"encoding/xml"
 	"errors"
 	"fmt"
+	"io"
+	"maps"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -57,16 +59,14 @@ func (p *Plane) RangeOwners(ctx context.Context, vg, pool string, ranges []Exten
 	if len(tdata) == 0 {
 		return owners, nil
 	}
-	var dump []byte
+	var thin []RangeOwner
 	if err := p.withMetadataSnap(ctx, vg, pool, func(meta string) error {
-		dump, err = p.Run.Run(ctx, "thin_dump", "--metadata-snap", meta)
-		return err
+		return p.stream(ctx, func(r io.Reader) (err error) {
+			thin, err = thinOwners(r, tdata)
+			return err
+		}, "thin_dump", "--metadata-snap", meta)
 	}); err != nil {
 		return nil, fmt.Errorf("read the thin pool's mappings: %w", err)
-	}
-	thin, err := thinOwners(dump, tdata)
-	if err != nil {
-		return nil, err
 	}
 	return append(owners, thin...), nil
 }
@@ -191,91 +191,39 @@ func lvmOwners(ranges []Extent, peStart uint64, segs []segment, pool string) (ow
 	return owners, tdata
 }
 
-// thinMappings is a <device> or <def> of thin_dump's XML: mappings, and references to defs.
-// thin_dump writes subtrees devices share (a volume and its snapshots) once, as a named <def>
-// the devices (and other defs) refer to with <ref name>.
-type thinMappings struct {
-	Ranges []struct {
-		Origin uint64 `xml:"origin_begin,attr"`
-		Data   uint64 `xml:"data_begin,attr"`
-		Length uint64 `xml:"length,attr"`
-	} `xml:"range_mapping"`
-	Singles []struct {
-		Origin uint64 `xml:"origin_block,attr"`
-		Data   uint64 `xml:"data_block,attr"`
-	} `xml:"single_mapping"`
-	Refs []struct {
-		Name string `xml:"name,attr"`
-	} `xml:"ref"`
-}
-
 // thinOwners maps ranges of the thin pool's data LV to the thin volumes whose blocks they are,
-// from thin_dump's XML of every device; blocks no device maps hold nothing.
-func thinOwners(dump []byte, tdata []Extent) ([]RangeOwner, error) {
-	var doc struct {
-		BlockSize uint64 `xml:"data_block_size,attr"`
-		Defs      []struct {
-			Name string `xml:"name,attr"`
-			thinMappings
-		} `xml:"def"`
-		Devices []struct {
-			ID int `xml:"dev_id,attr"`
-			thinMappings
-		} `xml:"device"`
-	}
-	if err := xml.Unmarshal(dump, &doc); err != nil {
-		return nil, fmt.Errorf("thin_dump output: %w", err)
-	}
-	bs := doc.BlockSize * 512
-	if bs == 0 {
-		return nil, errors.New("thin_dump output has no data_block_size")
-	}
-	defs := map[string]*thinMappings{}
-	for i := range doc.Defs {
-		defs[doc.Defs[i].Name] = &doc.Defs[i].thinMappings
-	}
-	type mapping struct {
-		dev                int
-		origin, data, size uint64 // bytes
-	}
-	var maps []mapping
-	var walk func(dev int, m *thinMappings, depth int) error
-	walk = func(dev int, m *thinMappings, depth int) error {
-		if depth > 64 {
-			return errors.New("thin_dump output: references nest too deep")
-		}
-		for _, r := range m.Ranges {
-			maps = append(maps, mapping{dev, r.Origin * bs, r.Data * bs, r.Length * bs})
-		}
-		for _, s := range m.Singles {
-			maps = append(maps, mapping{dev, s.Origin * bs, s.Data * bs, bs})
-		}
-		for _, ref := range m.Refs {
-			d := defs[ref.Name]
-			if d == nil {
-				return fmt.Errorf("thin_dump output: reference to an unknown def %q", ref.Name)
-			}
-			if err := walk(dev, d, depth+1); err != nil {
-				return err
+// from thin_dump's XML of every device; blocks no device maps hold nothing. Only the mappings
+// in the ranges are kept, so a large pool's don't fill memory.
+func thinOwners(r io.Reader, tdata []Extent) ([]RangeOwner, error) {
+	bs, devices, defs, err := parseMappings(r, func(bs uint64, n *thinNode, m thinMap) { // <superblock> comes first
+		bs *= 512
+		for _, t := range tdata {
+			if m.data*bs < t.Offset+t.Length && t.Offset < (m.data+m.length)*bs {
+				n.maps = append(n.maps, m)
+				return
 			}
 		}
-		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
-	for i := range doc.Devices {
-		if err := walk(doc.Devices[i].ID, &doc.Devices[i].thinMappings, 0); err != nil {
-			return nil, err
-		}
-	}
+	bs *= 512
+	ids := slices.Sorted(maps.Keys(devices))
 	var owners []RangeOwner
 	for _, t := range tdata {
 		mapped := []Extent{}
-		for _, m := range maps {
-			lo, hi := max(t.Offset, m.data), min(t.Offset+t.Length, m.data+m.size)
-			if lo >= hi {
-				continue
+		for _, id := range ids {
+			if err := eachMapping(devices[id], defs, 0, func(m thinMap) {
+				data, size := m.data*bs, m.length*bs
+				lo, hi := max(t.Offset, data), min(t.Offset+t.Length, data+size)
+				if lo >= hi {
+					return
+				}
+				owners = append(owners, RangeOwner{Kind: OwnerThin, ThinID: id, Offset: m.origin*bs + lo - data, Length: hi - lo})
+				mapped = append(mapped, Extent{Offset: lo, Length: hi - lo})
+			}); err != nil {
+				return nil, err
 			}
-			owners = append(owners, RangeOwner{Kind: OwnerThin, ThinID: m.dev, Offset: m.origin + lo - m.data, Length: hi - lo})
-			mapped = append(mapped, Extent{Offset: lo, Length: hi - lo})
 		}
 		for _, f := range uncovered(t, mapped) {
 			owners = append(owners, RangeOwner{Kind: OwnerFree, Offset: f.Offset, Length: f.Length})

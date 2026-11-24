@@ -18,7 +18,7 @@ make push IMAGE_PREFIX="$IMAGE_PREFIX" TAG="$TAG" BUILD_LABELS="quay.expires-aft
 
 echo "=== quadlets in $IMAGE_PREFIX/velocor-os:$TAG"
 podman run --rm --entrypoint grep "$IMAGE_PREFIX/velocor-os:$TAG" -h '^Image=' \
-  /usr/share/containers/systemd/velocor-spdk.container /usr/share/containers/systemd/velocor-velod.container |
+  /usr/share/containers/systemd/velocor-velod.container |
   tee /dev/stderr | grep -q "^Image=$IMAGE_PREFIX/velocor-velod@sha256:" ||
   { echo "OS image is not pinned to velod $TAG by digest" >&2; exit 1; }
 echo "=== DONE $TAG"

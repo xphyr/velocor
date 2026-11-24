@@ -156,7 +156,10 @@ func (s *NodeServer) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstage
 		var meta stageMetadata
 		if json.Unmarshal(raw, &meta) == nil {
 			if meta.IsBlock && meta.DevicePath != "" {
-				if err := s.mounter.FlushDevice(ctx, meta.DevicePath); err != nil {
+				// A device that is gone (a node reboot, a lost session, an unstage tried before)
+				// has nothing left to flush, and failing here would keep the volume from ever
+				// being detached.
+				if err := s.mounter.FlushDevice(ctx, meta.DevicePath); err != nil && !errors.Is(err, ErrDeviceGone) {
 					return nil, status.Errorf(codes.Internal, "flush %s: %v", meta.DevicePath, err)
 				}
 			}
@@ -301,6 +304,12 @@ func (s *NodeServer) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandVo
 	if _, err := os.Stat(req.GetVolumePath()); os.IsNotExist(err) {
 		return nil, status.Errorf(codes.NotFound, "volume_path %q does not exist", req.GetVolumePath())
 	}
+
+	unlock, err := s.lockVolume(req.GetVolumeId())
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
 
 	var meta stageMetadata
 	stagingPath := req.GetStagingTargetPath() // optional in the CSI spec

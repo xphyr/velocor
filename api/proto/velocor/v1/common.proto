@@ -17,21 +17,21 @@ enum HealthStatus {
 // DiskType categorizes physical flash media tiers.
 enum DiskType {
   DISK_TYPE_UNSPECIFIED = 0;
-  // PCIe NVMe flash bound to vfio-pci/uio and polled via SPDK bdev_nvme.
+  // PCIe NVMe flash.
   DISK_TYPE_NVME = 1;
-  // SATA/SAS SSD claimed exclusively via Linux io_uring (SPDK bdev_uring).
+  // SATA/SAS SSD.
   DISK_TYPE_SSD = 2;
 }
 
-// CompressionAlgorithm defines supported SPDK bdev_compress algorithms.
+// CompressionAlgorithm defines the compression algorithms.
 enum CompressionAlgorithm {
   COMPRESSION_ALGORITHM_UNSPECIFIED = 0;
   COMPRESSION_ALGORITHM_LZ4 = 1;
   COMPRESSION_ALGORITHM_DEFLATE = 2;
 }
 
-// FilterPolicy defines stackable SPDK filter bdev layers (crypto / compression)
-// applied transparently over a Pool base bdev or Volume lvol bdev.
+// FilterPolicy defines stackable filter layers (crypto / compression)
+// applied transparently over a Pool or Volume.
 message FilterPolicy {
   bool encryption_enabled = 1;
   string key_id = 2;

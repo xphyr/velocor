@@ -15,14 +15,14 @@ func (r *Reconciler) reconcileSpace(ctx context.Context, p *pass, poolOnline map
 	if err != nil || len(pools) == 0 {
 		return
 	}
-	lvols, err := r.dp.Volumes(ctx)
+	dpVols, err := r.dp.Volumes(ctx)
 	if err != nil {
-		p.errs = append(p.errs, fmt.Sprintf("list lvols: %v", err))
+		p.errs = append(p.errs, fmt.Sprintf("list volumes: %v", err))
 		return
 	}
 	// Bytes each volume and snapshot holds.
-	held := make(map[string]uint64, len(lvols))
-	for _, l := range lvols {
+	held := make(map[string]uint64, len(dpVols))
+	for _, l := range dpVols {
 		held[l.UUID] = l.AllocatedBytes
 	}
 
@@ -40,21 +40,19 @@ func (r *Reconciler) reconcileSpace(ctx context.Context, p *pass, poolOnline map
 			p.errs = append(p.errs, fmt.Sprintf("list snapshots of %s: %v", pool.ID, err))
 			continue
 		}
+		volHeld, snapHeld := map[string]uint64{}, map[string]uint64{}
 		for _, v := range volumes {
 			if b, ok := held[v.UUID]; ok && b != v.AllocatedBytes {
-				v.AllocatedBytes = b
-				if _, err := r.store.MutateVolume(v.ID, func(cur *store.Volume) error { cur.AllocatedBytes = b; return nil }); err != nil {
-					p.errs = append(p.errs, fmt.Sprintf("update volume %s: %v", v.ID, err))
-				}
+				v.AllocatedBytes, volHeld[v.ID] = b, b
 			}
 		}
 		for _, s := range snapshots {
 			if b, ok := held[s.UUID]; ok && b != s.AllocatedBytes {
-				s.AllocatedBytes = b
-				if _, err := r.store.MutateSnapshot(s.ID, func(cur *store.Snapshot) error { cur.AllocatedBytes = b; return nil }); err != nil {
-					p.errs = append(p.errs, fmt.Sprintf("update snapshot %s: %v", s.ID, err))
-				}
+				s.AllocatedBytes, snapHeld[s.ID] = b, b
 			}
+		}
+		if err := r.store.UpdateSpaceUsage(volHeld, snapHeld); err != nil {
+			p.errs = append(p.errs, fmt.Sprintf("update the space held in %s: %v", pool.ID, err))
 		}
 
 		committed := store.CommittedBytes(volumes, snapshots)

@@ -26,7 +26,6 @@ while read -r _ ifname _ cidr _; do
   fi
 done < <(ip -4 -o addr show scope global 2>/dev/null | grep -v -E '^\S+\s+(lo|veth|podman|cni-|docker)' || true)
 
-SPDK_STATE="$(systemctl is-active velocor-spdk.service 2>/dev/null || echo "inactive")"
 VELOD_STATE="$(systemctl is-active velocor-velod.service 2>/dev/null || echo "inactive")"
 
 if [ -n "$PRIMARY_IP" ]; then
@@ -42,7 +41,7 @@ TMP_ISSUE="$(mktemp /run/velocor-issue.XXXXXX)"
 cat >"$TMP_ISSUE" <<EOF
 
 ================================================================================
-  VELOCOR // All-Flash SPDK Storage Appliance (\S)
+  VELOCOR // All-Flash Storage Appliance (\S)
 ================================================================================
   Hostname   : ${HOSTNAME_VAL}
   Primary IP : ${PRIMARY_LINE}
@@ -51,7 +50,7 @@ cat >"$TMP_ISSUE" <<EOF
   Web UI     : ${WEB_UI_URL}
   CLI Login  : veloctl -endpoint ${WEB_UI_URL} login
 
-  Services   : spdk=${SPDK_STATE}   velod=${VELOD_STATE}
+  Services   : velod=${VELOD_STATE}
   Console    : \l   (\t)
 ================================================================================
 

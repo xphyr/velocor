@@ -10,7 +10,6 @@ import (
 	"regexp"
 	"strings"
 	"time"
-
 )
 
 // NetworkInterface describes a host network interface and its active IP/NetworkManager state.

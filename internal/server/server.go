@@ -118,9 +118,6 @@ func (s *Server) warnings() []string {
 				"Import the pool or restore a database backup if they are yours; remove them by hand only once you know what they are.")
 		}
 	}
-	if s.hw != nil && s.hw.UnsafeNoIOMMUAllowed() {
-		out = append(out, "Unsafe no-IOMMU mode is allowed: SPDK (its vfio NVMe driver) can DMA anywhere in host memory. Use this only in lab VMs.")
-	}
 	if w := s.monitoringWarning(); w != "" {
 		out = append(out, w)
 	}
@@ -172,9 +169,6 @@ func New(
 		if m.NewToken == nil {
 			m.NewToken = s.rotateScrapeToken
 		}
-		if m.ReactorCPUs == nil {
-			m.ReactorCPUs = s.reactorCPUs
-		}
 		if m.Run == nil {
 			m.Run = func(ctx context.Context, name string, args ...string) ([]byte, error) {
 				return hostCommand(ctx, name, args...).CombinedOutput()
@@ -201,9 +195,9 @@ func (s *Server) Handler() http.Handler {
 		}
 		r.Body = http.MaxBytesReader(w, r.Body, limit)
 		if r.Method != http.MethodGet && r.Method != http.MethodHead {
-			// A client that disconnects or times out must not abort a change halfway: SPDK
+			// A client that disconnects or times out must not abort a change halfway: the data plane
 			// finishes what it was asked to do regardless, and a rollback based on a cancelled
-			// call acts on a state it no longer knows. SPDK calls carry their own timeouts.
+			// call acts on a state it no longer knows. Data-plane calls carry their own timeouts.
 			r = r.WithContext(context.WithoutCancel(r.Context()))
 		}
 		s.mux.ServeHTTP(w, r)
@@ -259,7 +253,6 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /api/v1/volumes", s.withAuth(store.RoleReadOnly, s.handleListVolumes))
 	s.mux.HandleFunc("POST /api/v1/volumes", s.withAuth(store.RoleCSIProvisioner, s.handleCreateVolume))
 	s.mux.HandleFunc("GET /api/v1/volumes/{id}", s.withAuth(store.RoleReadOnly, s.handleGetVolume))
-	s.mux.HandleFunc("PUT /api/v1/volumes/{id}/qos", s.withAuth(store.RoleCSIProvisioner, s.handleSetVolumeQoS))
 	s.mux.HandleFunc("POST /api/v1/volumes/{volume_id}/snapshots", s.withAuth(store.RoleCSIProvisioner, s.handleCreateSnapshot))
 	s.mux.HandleFunc("POST /api/v1/volumes/", s.withAuth(store.RoleCSIProvisioner, s.handleVolumeAction))
 	s.mux.HandleFunc("DELETE /api/v1/volumes/{id}", s.withAuth(store.RoleCSIProvisioner, s.handleDeleteVolume))
@@ -847,6 +840,12 @@ func (s *Server) handleCreateHost(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	if iqn := strings.TrimSpace(req.InitiatorIQN); iqn != "" {
+		if err := dataplane.ValidateIQN(iqn); err != nil {
+			writeError(w, fmt.Errorf("%w: %v", store.ErrInvalidArgument, err))
+			return
+		}
+	}
 	host := &store.Host{
 		ID:           newResourceID("host"),
 		Name:         req.Name,
@@ -900,11 +899,9 @@ func (s *Server) handleCreateInitiatorGroup(w http.ResponseWriter, r *http.Reque
 		writeError(w, fmt.Errorf("%w: invalid json body", store.ErrInvalidArgument))
 		return
 	}
-	for _, nqn := range req.HostNQNs {
-		if err := dataplane.ValidateNQN(strings.TrimSpace(nqn)); err != nil {
-			writeError(w, fmt.Errorf("%w: %v", store.ErrInvalidArgument, err))
-			return
-		}
+	if err := validateInitiators(req.HostNQNs, req.InitiatorIQNs); err != nil {
+		writeError(w, err)
+		return
 	}
 	if strings.TrimSpace(req.CHAPUser) != "" {
 		// Accepting CHAP settings without enforcing them would be a false sense of security.
@@ -925,6 +922,25 @@ func (s *Server) handleCreateInitiatorGroup(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	writeJSON(w, http.StatusCreated, map[string]any{"initiator_group": group})
+}
+
+// validateInitiators checks an initiator group's host NQNs and initiator IQNs (empty entries are
+// dropped when the group is applied).
+func validateInitiators(nqns, iqns []string) error {
+	for _, nqn := range nqns {
+		if err := dataplane.ValidateNQN(strings.TrimSpace(nqn)); err != nil {
+			return fmt.Errorf("%w: %v", store.ErrInvalidArgument, err)
+		}
+	}
+	for _, iqn := range iqns {
+		if iqn = strings.TrimSpace(iqn); iqn == "" {
+			continue
+		}
+		if err := dataplane.ValidateIQN(iqn); err != nil {
+			return fmt.Errorf("%w: %v", store.ErrInvalidArgument, err)
+		}
+	}
+	return nil
 }
 
 func (s *Server) handleDeleteInitiatorGroup(w http.ResponseWriter, r *http.Request) {
@@ -975,14 +991,6 @@ func (s *Server) handleSystemStatus(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	var hpTotalMB, hpFreeMB uint64
-	if s.hw != nil {
-		if hp, err := s.hw.GetHugepageStatus(); err == nil {
-			hpTotalMB = hp.TotalMB
-			hpFreeMB = hp.FreeMB
-		}
-	}
-
 	var recState reconciler.State
 	restoring := false
 	if s.reconciler != nil {
@@ -995,8 +1003,8 @@ func (s *Server) handleSystemStatus(w http.ResponseWriter, r *http.Request) {
 	case !dpConnected || len(recState.DegradedResources) > 0:
 		overall = store.HealthStatusDegraded
 	case restoring:
-		// spdk_tgt answers, but it was (re)started after the last completed pass: pools,
-		// volumes and exports aren't back yet (docs/review-history.md P2-11).
+		// velod has just started: until its first pass ends, the pools, volumes and exports may
+		// not be back (docs/review-history.md P2-11).
 		overall = store.HealthStatusReconciling
 	}
 
@@ -1012,11 +1020,9 @@ func (s *Server) handleSystemStatus(w http.ResponseWriter, r *http.Request) {
 			"uptime_seconds":     uint64(time.Since(s.startedAt).Seconds()),
 		},
 		"data_plane": map[string]any{
-			"connected":          dpConnected,
-			"restoring":          restoring,
-			"endpoint":           socketPath,
-			"hugepages_total_mb": hpTotalMB,
-			"hugepages_free_mb":  hpFreeMB,
+			"connected": dpConnected,
+			"restoring": restoring,
+			"endpoint":  socketPath,
 		},
 		"reconciler": recState,
 		"warnings":   s.warnings(),
@@ -1033,12 +1039,12 @@ func (s *Server) handleTriggerReconcile(w http.ResponseWriter, r *http.Request) 
 }
 
 func (s *Server) handleGetIoStats(w http.ResponseWriter, r *http.Request) {
-	bdevName := r.URL.Query().Get("device")
+	handle := r.URL.Query().Get("device")
 	if s.dp == nil {
 		writeJSON(w, http.StatusOK, map[string]any{"tick_rate": 0, "stats": []any{}})
 		return
 	}
-	res, err := s.dp.IOStats(r.Context(), bdevName)
+	res, err := s.dp.IOStats(r.Context(), handle)
 	if err != nil {
 		writeError(w, err)
 		return

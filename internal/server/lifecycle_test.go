@@ -3,6 +3,7 @@ package server
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -10,9 +11,8 @@ import (
 	"testing"
 
 	"github.com/velocor/velocor/internal/auth"
-	"github.com/velocor/velocor/internal/dataplane/spdkplane"
+	"github.com/velocor/velocor/internal/dataplane/planetest"
 	"github.com/velocor/velocor/internal/reconciler"
-	"github.com/velocor/velocor/internal/spdk"
 	"github.com/velocor/velocor/internal/store"
 )
 
@@ -24,13 +24,13 @@ func TestLifecycleEndpointsAndRBAC(t *testing.T) {
 	}
 	defer func() { _ = st.Close() }()
 
-	spdkClient := spdk.NewClient(filepath.Join(t.TempDir(), "unused.sock"))
 	authMgr, err := auth.NewManager(st, "admin-pass-123")
 	if err != nil {
 		t.Fatalf("auth.NewManager failed: %v", err)
 	}
 	clearMustChange(t, st)
-	dp := spdkplane.New(spdkClient, nil)
+	dp := planetest.New(t)
+	dp.Down = errors.New("the data plane is not reachable")
 	rec := reconciler.New(st, dp, nil, nil)
 	srv := New(st, dp, nil, authMgr, rec, nil)
 	ts := httptest.NewServer(srv.Handler())

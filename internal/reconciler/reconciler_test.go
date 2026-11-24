@@ -7,15 +7,14 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/velocor/velocor/internal/dataplane/spdkplane"
-	"github.com/velocor/velocor/internal/spdk/spdktest"
+	"github.com/velocor/velocor/internal/dataplane/planetest"
 	"github.com/velocor/velocor/internal/store"
 )
 
 type env struct {
 	t    *testing.T
 	ctx  context.Context
-	fake *spdktest.Fake
+	fake *planetest.Fake
 	st   *store.BoltStore
 	rec  *Reconciler
 }
@@ -27,57 +26,66 @@ func newEnv(t *testing.T) *env {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = st.Close() })
-	f := spdktest.New(t)
-	return &env{t: t, ctx: context.Background(), fake: f, st: st, rec: New(st, spdkplane.New(f.Client(), nil), nil, nil)}
+	f := planetest.New(t)
+	return &env{t: t, ctx: context.Background(), fake: f, st: st, rec: New(st, f, nil, nil)}
 }
 
-// provision builds a pool + volume through the real SPDK client calls, exactly the way the
+// addDisk adds a disk to the machine and claims it, the way the API does.
+func (e *env) addDisk(d *store.Disk) *store.Disk {
+	e.t.Helper()
+	key := d.DevicePath
+	if d.Type == store.DiskTypeNVMe {
+		key = d.PCIAddress
+	}
+	e.fake.AddDisk(key)
+	if err := e.st.UpsertDisk(d); err != nil {
+		e.t.Fatal(err)
+	}
+	handle, drv, err := e.fake.AttachDisk(e.ctx, d)
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	out, err := e.st.ClaimDisk(d.ID, drv, handle)
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	return out
+}
+
+// provision builds a pool and a volume on NVMe drives through the data plane, exactly the way the
 // API does, and records them in the store. It returns the pool and volume.
 func (e *env) provision(level store.RaidLevel, pcis ...string) (*store.Pool, *store.Volume) {
 	e.t.Helper()
-	c := e.fake.Client()
-	var diskIDs, bdevs []string
+	var ids []string
+	var handles []string
 	for i, pci := range pcis {
-		e.fake.AddNVMe(pci)
-		d := &store.Disk{ID: "disk-" + string(rune('a'+i)), Name: "nvme", Type: store.DiskTypeNVMe, PCIAddress: pci, SizeBytes: 1 << 40, DriverState: store.DiskDriverStateVfioPCI}
-		if err := e.st.UpsertDisk(d); err != nil {
-			e.t.Fatal(err)
-		}
-		bdev, drv, err := spdkplane.AttachDisk(e.ctx, c, nil, d)
+		d := e.addDisk(&store.Disk{ID: "disk-" + string(rune('a'+i)), Name: "nvme", Type: store.DiskTypeNVMe, PCIAddress: pci, SizeBytes: 1 << 40})
+		ids, handles = append(ids, d.ID), append(handles, d.Handle)
+	}
+	return e.provisionOn("pool-1", "p1", "vol-1", level, ids, handles)
+}
+
+func (e *env) provisionOn(poolID, name, volID string, level store.RaidLevel, ids, handles []string) (*store.Pool, *store.Volume) {
+	e.t.Helper()
+	must := func(err error) {
+		e.t.Helper()
 		if err != nil {
 			e.t.Fatal(err)
 		}
-		if _, err := e.st.ClaimDisk(d.ID, drv, bdev); err != nil {
-			e.t.Fatal(err)
-		}
-		diskIDs = append(diskIDs, d.ID)
-		bdevs = append(bdevs, bdev)
 	}
-	pool := &store.Pool{ID: "pool-1", Name: "p1", RaidLevel: level, DiskIDs: diskIDs, StripSizeKB: 64}
-	if err := e.st.CreatePool(pool); err != nil {
-		e.t.Fatal(err)
-	}
-	if err := c.BdevRaidCreate(e.ctx, pool.ArrayName, string(level), 64, bdevs, true); err != nil {
-		e.t.Fatal(err)
-	}
-	lvsUUID, err := c.BdevLvolCreateLvstore(e.ctx, pool.Device, pool.ThinPoolName, 0, "")
-	if err != nil {
-		e.t.Fatal(err)
-	}
-	if _, err := e.st.MutatePool(pool.ID, func(p *store.Pool) error { p.ThinPoolUUID = lvsUUID; return nil }); err != nil {
-		e.t.Fatal(err)
-	}
-	vol := &store.Volume{ID: "vol-1", Name: "vol-1", PoolID: pool.ID, SizeBytes: 1 << 30, QosPolicy: store.QosPolicy{RwIosPerSec: 5000}}
-	if err := e.st.CreateVolume(vol); err != nil {
-		e.t.Fatal(err)
-	}
-	uuid, err := c.BdevLvolCreate(e.ctx, pool.ThinPoolName, vol.Name, vol.SizeBytes, false, "")
-	if err != nil {
-		e.t.Fatal(err)
-	}
-	if _, err := e.st.MutateVolume(vol.ID, func(v *store.Volume) error { v.UUID = uuid; return nil }); err != nil {
-		e.t.Fatal(err)
-	}
+	pool := &store.Pool{ID: poolID, Name: name, RaidLevel: level, DiskIDs: ids, StripSizeKB: 64}
+	must(e.st.CreatePool(pool))
+	must(e.fake.CreateArray(e.ctx, pool.ArrayName, level, 64, handles))
+	tp, err := e.fake.CreateThinPool(e.ctx, pool.ArrayName, pool.ThinPoolName)
+	must(err)
+	_, err = e.st.MutatePool(pool.ID, func(p *store.Pool) error { p.ThinPoolUUID = tp; return nil })
+	must(err)
+	vol := &store.Volume{ID: volID, Name: volID, PoolID: pool.ID, SizeBytes: 1 << 30}
+	must(e.st.CreateVolume(vol))
+	uuid, err := e.fake.CreateVolume(e.ctx, pool.ThinPoolName, vol.Name, vol.SizeBytes, true)
+	must(err)
+	_, err = e.st.MutateVolume(vol.ID, func(v *store.Volume) error { v.UUID = uuid; return nil })
+	must(err)
 	p, _ := e.st.GetPool(pool.ID)
 	v, _ := e.st.GetVolume(vol.ID)
 	return p, v
@@ -89,44 +97,57 @@ func (e *env) reconcile() State {
 	return st
 }
 
-func TestRestartWithLazyExamineNeverWipesLvstore(t *testing.T) {
+func TestRebootBringsEverythingBackWithoutRecreatingIt(t *testing.T) {
 	e := newEnv(t)
 	pool, vol := e.provision(store.RaidLevel1, "0000:01:00.0", "0000:02:00.0")
+	before := len(e.fake.Calls())
 
-	e.fake.LazyExamine = true
-	e.fake.Restart()
+	e.fake.Reboot()
 	st := e.reconcile()
 
-	if gen := e.fake.LvstoreGeneration(pool.ThinPoolName); gen != 1 {
-		t.Fatalf("lvstore was re-initialised (generation %d): pool data destroyed", gen)
+	if gen := e.fake.PoolGeneration(pool.ThinPoolName); gen != 1 {
+		t.Fatalf("thin pool created again (generation %d): pool data destroyed", gen)
 	}
-	if e.fake.CallCount("bdev_lvol_create_lvstore") != 1 || e.fake.CallCount("bdev_raid_create") != 1 {
-		t.Fatalf("reconciler created storage instead of letting examine assemble it: %v", e.fake.Calls())
+	for _, c := range e.fake.Calls()[before:] {
+		if slices.Contains([]string{"CreateArray", "CreateThinPool", "CreateVolume", "DeleteArray", "DeleteThinPool", "DeleteVolume"}, c) {
+			t.Fatalf("reconciler issued %s instead of letting the data plane settle: %v", c, e.fake.Calls()[before:])
+		}
 	}
-	if !e.fake.LvolExists(vol.Handle) {
-		t.Fatalf("volume lvol lost")
+	if !e.fake.VolumeExists(vol.Handle) {
+		t.Fatal("volume lost")
 	}
 	p, _ := e.st.GetPool(pool.ID)
 	v, _ := e.st.GetVolume(vol.ID)
 	if p.HealthStatus != store.HealthStatusOnline || v.HealthStatus != store.HealthStatusOnline {
 		t.Fatalf("pool=%s (%s) vol=%s (%s); reconciler state %+v", p.HealthStatus, p.StatusMessage, v.HealthStatus, v.StatusMessage, st)
 	}
-	if got := e.fake.QoS(vol.UUID).RwIosPerSec; got != 5000 {
-		t.Fatalf("QoS not restored: %d", got)
+}
+
+// Only disks velod has claimed take part: an array on an unclaimed disk is left alone.
+func TestRebootAssemblesOnlyClaimedDisks(t *testing.T) {
+	e := newEnv(t)
+	pool, _ := e.provision(store.RaidLevel1, "0000:01:00.0", "0000:02:00.0")
+	e.fake.Reboot()
+	if _, err := e.st.MutateDisk("disk-b", func(d *store.Disk) error { d.Claimed = false; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	e.reconcile()
+	if p, _ := e.st.GetPool(pool.ID); p.HealthStatus != store.HealthStatusUnavailable {
+		t.Fatalf("pool %s %q, want UNAVAILABLE: half its members aren't velod's", p.HealthStatus, p.StatusMessage)
 	}
 }
 
-func TestMissingLvstoreIsFaultedNotReinitialised(t *testing.T) {
+func TestMissingThinPoolIsFaultedNotReinitialised(t *testing.T) {
 	e := newEnv(t)
 	pool, _ := e.provision(store.RaidLevel0, "0000:01:00.0")
-	// Simulate the lvstore being unreadable: pretend the recorded UUID belongs to something else.
+	// Simulate the thin pool being unreadable: pretend the recorded UUID belongs to something else.
 	if _, err := e.st.MutatePool(pool.ID, func(p *store.Pool) error { p.ThinPoolUUID = "deadbeef"; return nil }); err != nil {
 		t.Fatal(err)
 	}
-	e.fake.Restart()
+	e.fake.Reboot()
 	e.reconcile()
-	if n := e.fake.CallCount("bdev_lvol_create_lvstore"); n != 1 {
-		t.Fatalf("reconciler initialised an lvstore over a pool with recorded data (%d calls)", n)
+	if n := e.fake.CallCount("CreateThinPool"); n != 1 {
+		t.Fatalf("reconciler initialised a thin pool over a pool with recorded data (%d calls)", n)
 	}
 	p, _ := e.st.GetPool(pool.ID)
 	if p.HealthStatus != store.HealthStatusFaulted {
@@ -134,15 +155,15 @@ func TestMissingLvstoreIsFaultedNotReinitialised(t *testing.T) {
 	}
 }
 
-func TestMissingLvolIsFaultedNotRecreated(t *testing.T) {
+func TestMissingVolumeIsFaultedNotRecreated(t *testing.T) {
 	e := newEnv(t)
 	_, vol := e.provision(store.RaidLevel0, "0000:01:00.0")
-	if err := e.fake.Client().BdevLvolDelete(e.ctx, vol.UUID); err != nil {
+	if err := e.fake.DeleteVolume(e.ctx, vol.UUID); err != nil {
 		t.Fatal(err)
 	}
 	e.reconcile()
-	if e.fake.CallCount("bdev_lvol_create") != 1 {
-		t.Fatalf("reconciler re-created a blank lvol for a lost volume")
+	if e.fake.CallCount("CreateVolume") != 1 {
+		t.Fatal("reconciler re-created a blank volume for a lost one")
 	}
 	v, _ := e.st.GetVolume(vol.ID)
 	if v.HealthStatus != store.HealthStatusFaulted || v.StatusMessage == "" {
@@ -150,13 +171,13 @@ func TestMissingLvolIsFaultedNotRecreated(t *testing.T) {
 	}
 }
 
-func TestDegradedRaidStaysUntouched(t *testing.T) {
+func TestIncompleteArrayStaysUntouched(t *testing.T) {
 	e := newEnv(t)
 	pool, _ := e.provision(store.RaidLevel1, "0000:01:00.0", "0000:02:00.0")
-	e.fake.RemoveMedia("0000:02:00.0")
-	e.fake.Restart()
+	e.fake.Reboot()
+	e.fake.RemoveDisk("0000:02:00.0")
 	e.reconcile()
-	if e.fake.CallCount("bdev_raid_create") != 1 || e.fake.CallCount("bdev_lvol_create_lvstore") != 1 {
+	if e.fake.CallCount("CreateArray") != 1 || e.fake.CallCount("CreateThinPool") != 1 || e.fake.CallCount("StartDegraded") != 0 {
 		t.Fatalf("reconciler mutated an incomplete array: %v", e.fake.Calls())
 	}
 	// The array serves nothing while it waits for the missing disk: UNAVAILABLE, naming it.
@@ -166,6 +187,47 @@ func TestDegradedRaidStaysUntouched(t *testing.T) {
 	}
 	if m := p.Members[1]; m.State != store.MemberStateMissing || m.DiskID != "disk-b" {
 		t.Fatalf("slot 1: %+v, want MISSING disk-b", m)
+	}
+}
+
+// A pool that was degraded before the reboot comes back degraded, without an operator.
+func TestDegradedPoolComesBackAfterReboot(t *testing.T) {
+	e := newEnv(t)
+	pool, vol := e.provision(store.RaidLevel1, "0000:01:00.0", "0000:02:00.0")
+	e.fake.RemoveDisk("0000:02:00.0")
+	e.reconcile()
+	e.fake.Reboot()
+	e.reconcile()
+	p, _ := e.st.GetPool(pool.ID)
+	v, _ := e.st.GetVolume(vol.ID)
+	if p.HealthStatus != store.HealthStatusDegraded || v.HealthStatus != store.HealthStatusOnline {
+		t.Fatalf("pool %s %q, volume %s, want DEGRADED and ONLINE", p.HealthStatus, p.StatusMessage, v.HealthStatus)
+	}
+}
+
+// A rebuild a reboot interrupts goes on by itself.
+func TestRebuildGoesOnAfterReboot(t *testing.T) {
+	e := newEnv(t)
+	pool, _ := e.provision(store.RaidLevel1, "0000:01:00.0", "0000:02:00.0")
+	e.fake.FailDisk("0000:02:00.0")
+	e.reconcile()
+	spare := e.spareDisk("disk-c", "0000:03:00.0")
+	if _, err := e.st.ReplacePoolMember(pool.ID, 1, spare.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.fake.AddMember(e.ctx, pool.ArrayName, spare.Handle); err != nil {
+		t.Fatal(err)
+	}
+	e.fake.SetRebuildProgress(pool.ArrayName, 60)
+	e.reconcile()
+	e.fake.Reboot()
+	e.reconcile()
+	p := e.pool()
+	if p.HealthStatus != store.HealthStatusRebuilding || p.Members[1].State != store.MemberStateRebuilding {
+		t.Fatalf("after the reboot: %s %q %+v", p.HealthStatus, p.StatusMessage, p.Members)
+	}
+	if n := e.fake.CallCount("AddMember"); n != 1 {
+		t.Fatalf("AddMember called %d times, want once: md goes on by itself", n)
 	}
 }
 
@@ -188,47 +250,35 @@ func TestExportsRestoredWithACLsAfterRestart(t *testing.T) {
 	must(e.st.CreateExport(&store.Export{ID: "exp-i", Name: "i", VolumeID: vol.ID, Protocol: store.ExportProtocolISCSI,
 		TargetIQN: "iqn.2026-11.io.velocor:i", PortalIDs: []string{"pt-i"}, InitiatorGroupIDs: []string{"ig-1"}}))
 
-	e.fake.Restart()
+	e.fake.Reboot()
 	st := e.reconcile()
 
-	sub, ok := e.fake.Subsystem("nqn.2026-11.io.velocor:n")
+	sub, ok := e.fake.Target("nqn.2026-11.io.velocor:n")
 	if !ok {
-		t.Fatalf("nvmf subsystem not restored: %+v", st)
+		t.Fatalf("NVMe subsystem not restored: %+v", st)
 	}
-	if sub.AllowAnyHost || len(sub.Hosts) != 1 || sub.Hosts[0].Nqn != hostNQN {
-		t.Fatalf("nvmf ACL wrong: %+v", sub)
+	if sub.AnyHost || !slices.Equal(sub.Hosts, []string{hostNQN}) {
+		t.Fatalf("NVMe ACL wrong: %+v", sub)
 	}
-	if len(sub.Namespaces) != 1 || sub.Namespaces[0].UUID != vol.UUID {
-		t.Fatalf("namespace must carry the lvol UUID: %+v", sub.Namespaces)
+	if sub.Device != vol.UUID {
+		t.Fatalf("subsystem exports %s, want the volume %s", sub.Device, vol.UUID)
 	}
-	if len(sub.ListenAddresses) != 1 || sub.ListenAddresses[0].Adrfam != "IPv6" {
-		t.Fatalf("IPv6 listener wrong: %+v", sub.ListenAddresses)
+	if !slices.Equal(sub.Listeners, []string{"fd00::10:4420"}) {
+		t.Fatalf("IPv6 listener wrong: %+v", sub.Listeners)
+	}
+	tgt, ok := e.fake.Target("iqn.2026-11.io.velocor:i")
+	if !ok {
+		t.Fatalf("iSCSI target not restored: %+v", st)
+	}
+	if tgt.AnyHost || !slices.Equal(tgt.Hosts, []string{hostIQN}) {
+		t.Fatalf("iSCSI ACL must be restricted to %s: %+v", hostIQN, tgt)
 	}
 
-	exp, _ := e.st.GetExport("exp-i")
-	node, ok := e.fake.TargetNode("iqn.2026-11.io.velocor:i")
-	if !ok {
-		t.Fatalf("iscsi target not restored: %+v", st)
-	}
-	if len(node.PgIgMaps) != 1 || node.PgIgMaps[0].IgTag != exp.IscsiIgTag {
-		t.Fatalf("iscsi pg/ig maps wrong: %+v (export ig tag %d)", node.PgIgMaps, exp.IscsiIgTag)
-	}
-	ig, _ := e.fake.InitiatorGroup(exp.IscsiIgTag)
-	if slices.Contains(ig.Initiators, "ANY") || !slices.Contains(ig.Initiators, hostIQN) {
-		t.Fatalf("iscsi initiator group must be restricted to %s: %+v", hostIQN, ig)
-	}
-
-	// A second pass is a no-op: no creates and no store writes needed.
+	// A second pass is a no-op: nothing changed in the data plane.
 	before := len(e.fake.Calls())
 	e.reconcile()
-	for _, c := range e.fake.Calls()[before:] {
-		if c != "spdk_get_version" && c != "bdev_wait_for_examine" && !slices.Contains([]string{
-			"bdev_get_bdevs", "bdev_raid_get_bdevs", "bdev_lvol_get_lvstores", "bdev_nvme_get_controller_health_info", "framework_get_config", "bdev_lvol_get_lvols",
-			"nvmf_get_transports", "nvmf_get_subsystems", "iscsi_get_portal_groups", "iscsi_get_initiator_groups", "iscsi_get_target_nodes",
-			"bdev_nvme_send_cmd", // NVMe write cache reads (Identify, Get Features); the drives here have no cache to set
-		}, c) {
-			t.Fatalf("steady-state pass issued mutating call %s", c)
-		}
+	if c := e.fake.Calls()[before:]; len(c) != 0 {
+		t.Fatalf("a steady-state pass changed things: %v", c)
 	}
 }
 
@@ -243,7 +293,7 @@ func TestIscsiExportRefusesImplicitAnyAccess(t *testing.T) {
 		t.Fatal(err)
 	}
 	e.reconcile()
-	if _, ok := e.fake.TargetNode("iqn.2026-11.io.velocor:i"); ok {
+	if _, ok := e.fake.Target("iqn.2026-11.io.velocor:i"); ok {
 		t.Fatalf("iscsi target with no initiators must not be exposed")
 	}
 	exp, _ := e.st.GetExport("exp-i")
@@ -252,46 +302,13 @@ func TestIscsiExportRefusesImplicitAnyAccess(t *testing.T) {
 	}
 }
 
-// SSD (io_uring/AIO) members must get a stable bdev UUID, or SPDK won't re-assemble their
-// superblock RAID after a restart (found against real SPDK by internal/integration).
-func TestSSDPoolReassemblesAfterRestart(t *testing.T) {
+func TestSSDPoolReassemblesAfterReboot(t *testing.T) {
 	e := newEnv(t)
-	c := e.fake.Client()
-	var ids, bdevs []string
-	for _, f := range []string{"/dev/disk/by-id/wwn-a", "/dev/disk/by-id/wwn-b"} {
-		e.fake.AddFile(f)
-		d := &store.Disk{ID: "ssd-" + f[len(f)-1:], Name: f, Type: store.DiskTypeSSD, DevicePath: f, SizeBytes: 1 << 40}
-		if err := e.st.UpsertDisk(d); err != nil {
-			t.Fatal(err)
-		}
-		bdev, drv, err := spdkplane.AttachDisk(e.ctx, c, nil, d)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if _, err := e.st.ClaimDisk(d.ID, drv, bdev); err != nil {
-			t.Fatal(err)
-		}
-		ids, bdevs = append(ids, d.ID), append(bdevs, bdev)
-	}
-	pool := &store.Pool{ID: "pool-ssd", Name: "ssd", RaidLevel: store.RaidLevel1, DiskIDs: ids}
-	if err := e.st.CreatePool(pool); err != nil {
-		t.Fatal(err)
-	}
-	if err := c.BdevRaidCreate(e.ctx, pool.ArrayName, "raid1", 0, bdevs, true); err != nil {
-		t.Fatal(err)
-	}
-	uuid, err := c.BdevLvolCreateLvstore(e.ctx, pool.Device, pool.ThinPoolName, 0, "")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := e.st.MutatePool(pool.ID, func(p *store.Pool) error { p.ThinPoolUUID = uuid; return nil }); err != nil {
-		t.Fatal(err)
-	}
-
-	e.fake.Restart()
+	pool := e.ssdPool(store.RaidLevel1, "/dev/disk/by-id/wwn-a", "/dev/disk/by-id/wwn-b")
+	e.fake.Reboot()
 	e.reconcile()
 	p, _ := e.st.GetPool(pool.ID)
 	if p.HealthStatus != store.HealthStatusOnline {
-		t.Fatalf("SSD pool did not come back after restart: %s %s", p.HealthStatus, p.StatusMessage)
+		t.Fatalf("SSD pool did not come back after a reboot: %s %s", p.HealthStatus, p.StatusMessage)
 	}
 }

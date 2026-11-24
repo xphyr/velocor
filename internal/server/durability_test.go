@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/velocor/velocor/internal/spdk/spdktest"
+	"github.com/velocor/velocor/internal/dataplane/planetest"
 	"github.com/velocor/velocor/internal/store"
 )
 
@@ -80,16 +80,16 @@ func TestRefusedWriteCacheWarning(t *testing.T) {
 	}
 }
 
-// NVMe drives: the policy is applied through SPDK once SPDK owns the drive, and at claim for a
+// NVMe drives: the policy is applied to the drive once it is claimed, and at claim for a
 // drive the policy was set on before (docs/review-history.md P0-4).
 func TestNVMeWriteCachePolicyAPI(t *testing.T) {
 	h := newHarness(t)
 	h.addDisk("nv1", "0000:01:00.0")
 	h.addDisk("nv2", "0000:02:00.0")
 	h.addDisk("nv3", "0000:03:00.0")
-	h.fake.SetNVMeCache("0000:01:00.0", spdktest.NVMeCache{Present: true, Enabled: true})
-	h.fake.SetNVMeCache("0000:02:00.0", spdktest.NVMeCache{Present: true, Enabled: true})
-	h.fake.SetNVMeCache("0000:03:00.0", spdktest.NVMeCache{Present: true, Enabled: true, Refuse: true})
+	h.fake.SetNVMeCache("0000:01:00.0", planetest.NVMeCache{Present: true, Enabled: true})
+	h.fake.SetNVMeCache("0000:02:00.0", planetest.NVMeCache{Present: true, Enabled: true})
+	h.fake.SetNVMeCache("0000:03:00.0", planetest.NVMeCache{Present: true, Enabled: true, Refuse: true})
 	disabled := map[string]any{"write_cache_policy": "DISABLED"}
 
 	// Claimed: switched off right away.

@@ -30,7 +30,7 @@ containers that ship with the OS image (pinned by digest, updated with OS upgrad
 - **Alertmanager** on `127.0.0.1:19093`, without clustering.
 
 Both listen on localhost only, are limited in memory (768 MB and 256 MB) and CPU weight, and
-velod keeps them off the cores SPDK polls on. Their units have no `[Install]` section: velod
+Their units have no `[Install]` section: velod
 starts them at boot when the setting is on. Turning monitoring off stops them and keeps their
 data.
 
@@ -70,7 +70,7 @@ self-signed one (`/var/lib/velocor/tls.crt` on the appliance). Then merge
 `prometheus.yml` and copy [`velocor-alerts.rules.yml`](../deploy/monitoring/velocor-alerts.rules.yml)
 next to it. The rules expect the scrape job to be named `velocor`.
 
-A 30-second scrape interval is enough; each scrape reads the database and asks SPDK for its I/O
+A 30-second scrape interval is enough; each scrape reads the database and asks the kernel for its I/O
 counters once.
 
 ### OpenShift and the Prometheus Operator
@@ -111,7 +111,7 @@ selector plus an `Endpoints` and a `ServiceMonitor`) with `job: velocor`, the to
 | `VelocorScrubOverdue` | warning | A pool hasn't completed a scheduled scrub for twice the interval |
 | `VelocorPoolSpaceWarning` | warning | A pool is at WARNING for 10 minutes |
 | `VelocorPoolFillsWithin24h` | warning | A pool over 50% used will be full within a day at the rate of the last 6 hours |
-| `VelocorPoolThinMetadataFilling` | warning | A pool's thin metadata (kernel data plane) is over 80% full for 10 minutes: velod grows it from half full and couldn't |
+| `VelocorPoolThinMetadataFilling` | warning | A pool's thin metadata is over 80% full for 10 minutes: velod grows it from half full and couldn't |
 | `VelocorPoolThinMetadataFull` | critical | A pool's thin metadata is over 95% full: writes to new space are about to fail |
 | `VelocorPoolDataUnreadable` | critical | Part of a pool can be read from no disk: bad blocks are recorded on every copy, the data there is lost |
 | `VelocorPoolMemberBadBlocks` | warning | A pool member has bad blocks recorded for 10 minutes: the pool has a copy fewer there until the disk is replaced |
@@ -122,7 +122,7 @@ selector plus an `Endpoints` and a `ServiceMonitor`) with `job: velocor`, the to
 | `VelocorVolumeUnhealthy` | warning | A volume isn't ONLINE for 5 minutes |
 | `VelocorReconcilerStalled` | warning | The reconciler hasn't completed a pass for 10 minutes |
 | `VelocorReconcilerFailing` | warning | Reconciler passes keep failing for 15 minutes |
-| `VelocorUnmanagedSPDKObjects` | warning | SPDK holds objects no Velocor record accounts for (P1-5) |
+| `VelocorUnmanagedObjects` | warning | The data plane holds objects no Velocor record accounts for (P1-5) |
 | `VelocorBackupMissing` | warning | No hourly database backup for 3 hours, or no daily one for 2 days |
 | `VelocorWatchdog` | none | Always: route it to a dead man's switch |
 
@@ -155,7 +155,7 @@ ends and a new one starts.
 | `velocor_pool_durability` | `pool`, `durability` | DURABLE, AT_RISK or UNKNOWN |
 | `velocor_pool_space_state` | `pool`, `state` | 0 OK, 1 WARNING, 2 CRITICAL, 3 FULL |
 | `velocor_pool_used_ratio` | `pool` | Allocated fraction of the volume store |
-| `velocor_pool_thin_metadata_used_ratio` | `pool` | How full the thin pool's metadata is (kernel data plane only) |
+| `velocor_pool_thin_metadata_used_ratio` | `pool` | How full the thin pool's metadata is |
 | `velocor_pool_total_bytes`, `velocor_pool_free_bytes` | `pool`, `raid` | Capacity and free space |
 | `velocor_pool_committed_bytes`, `velocor_pool_available_bytes` | `pool` | Space promised, and how much more the space policy accepts |
 | `velocor_pool_metadata_copy_failed` | `pool` | The on-pool metadata copy failed on the last write |

@@ -9,7 +9,6 @@ keywords:
   - storage
   - nvme-of
   - iscsi
-  - spdk
   - velocor
 home: https://github.com/velocor/velocor
 maintainers:

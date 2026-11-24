@@ -61,11 +61,10 @@ type VolumeGroupSnapshotResult struct {
 
 // CreateVolumeRequest specifies parameters for creating a Velocor volume.
 type CreateVolumeRequest struct {
-	Name          string            `json:"name"`
-	PoolID        string            `json:"pool_id"`
-	SizeBytes     uint64            `json:"size_bytes"`
-	ThinProvision bool              `json:"thin_provision"`
-	Labels        map[string]string `json:"labels,omitempty"`
+	Name      string            `json:"name"`
+	PoolID    string            `json:"pool_id"`
+	SizeBytes uint64            `json:"size_bytes"`
+	Labels    map[string]string `json:"labels,omitempty"`
 }
 
 // CreateExportRequest specifies parameters for exporting a Velocor volume.
@@ -117,6 +116,7 @@ type VelocorClient interface {
 	ListInitiatorGroups(ctx context.Context) ([]*store.InitiatorGroup, error)
 	CreateInitiatorGroup(ctx context.Context, name string, hostIDs []string) (*store.InitiatorGroup, error)
 	ListExports(ctx context.Context) ([]*store.Export, error)
+	ListVolumeExports(ctx context.Context, volumeID string) ([]*store.Export, error)
 	CreateExport(ctx context.Context, req CreateExportRequest) (*store.Export, error)
 	DeleteExport(ctx context.Context, id string) error
 	UpdateExport(ctx context.Context, id string, req UpdateExportRequest) (*store.Export, error)
@@ -150,7 +150,11 @@ func NewHTTPClientWithCA(endpoint, token string, insecureSkipVerify bool, caPEM 
 		}
 		tlsCfg.RootCAs = pool
 	}
-	tr := &http.Transport{TLSClientConfig: tlsCfg}
+	// The default transport's timeouts and HTTP/2, with enough idle connections for the sidecars'
+	// parallel calls.
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	tr.TLSClientConfig = tlsCfg
+	tr.MaxIdleConnsPerHost = 16
 	return &HTTPClient{
 		baseURL: endpoint,
 		token:   strings.TrimSpace(token),
@@ -396,6 +400,15 @@ func (c *HTTPClient) ListExports(ctx context.Context) ([]*store.Export, error) {
 		Exports []*store.Export `json:"exports"`
 	}
 	err := c.doJSON(ctx, http.MethodGet, "/api/v1/exports", nil, &resp)
+	return resp.Exports, err
+}
+
+// ListVolumeExports lists one volume's exports.
+func (c *HTTPClient) ListVolumeExports(ctx context.Context, volumeID string) ([]*store.Export, error) {
+	var resp struct {
+		Exports []*store.Export `json:"exports"`
+	}
+	err := c.doJSON(ctx, http.MethodGet, "/api/v1/exports?volume_id="+url.QueryEscape(volumeID), nil, &resp)
 	return resp.Exports, err
 }
 

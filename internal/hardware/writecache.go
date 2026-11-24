@@ -12,7 +12,7 @@ import (
 )
 
 // ErrWriteCacheUnsupported is returned when Velocor can't switch a disk's write cache itself
-// from the kernel side (e.g. NVMe drives, which are handled through SPDK once claimed).
+// from the kernel side (e.g. NVMe drives, which are handled through nvme-cli once claimed).
 var ErrWriteCacheUnsupported = errors.New("switching the write cache of this disk from the kernel is not supported")
 
 // writeCacheState reads the kernel's view of a block device's volatile write cache. For NVMe

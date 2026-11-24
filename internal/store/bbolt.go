@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -76,33 +77,17 @@ func OpenBoltStore(path string) (*BoltStore, error) {
 	return &BoltStore{db: db}, nil
 }
 
-// iscsiTagBase is the first SPDK iSCSI portal/initiator group tag the store hands out.
-const iscsiTagBase = 1
-
-func nextPortalPgTag(b *bolt.Bucket) (int, error) {
-	maxTag := iscsiTagBase - 1
-	err := b.ForEach(func(_, v []byte) error {
-		var p Portal
-		if err := json.Unmarshal(v, &p); err != nil {
-			return err
-		}
-		maxTag = max(maxTag, p.IscsiPgTag)
-		return nil
-	})
-	return maxTag + 1, err
-}
-
-func nextExportIgTag(b *bolt.Bucket) (int, error) {
-	maxTag := iscsiTagBase - 1
-	err := b.ForEach(func(_, v []byte) error {
-		var e Export
-		if err := json.Unmarshal(v, &e); err != nil {
-			return err
-		}
-		maxTag = max(maxTag, e.IscsiIgTag)
-		return nil
-	})
-	return maxTag + 1, err
+// putChanged is putJSON, or ErrSkipWrite (no commit, so no fsync) when the record already says
+// exactly that.
+func putChanged(b *bolt.Bucket, key []byte, v any) error {
+	raw, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+	if bytes.Equal(raw, b.Get(key)) {
+		return ErrSkipWrite
+	}
+	return b.Put(key, raw)
 }
 
 // mutateRecord atomically loads the JSON record id from bucket, applies fn and stores
@@ -122,7 +107,7 @@ func mutateRecord[T any](db *bolt.DB, bucket []byte, id string, fn func(*T) erro
 			return err
 		}
 		keepID(&rec, id)
-		return putJSON(b, []byte(id), &rec)
+		return putChanged(b, []byte(id), &rec)
 	})
 	if errors.Is(err, ErrSkipWrite) {
 		err = db.View(func(tx *bolt.Tx) error {
@@ -407,16 +392,18 @@ func (s *BoltStore) upsertDisk(disk *Disk, syncBoot bool) error {
 	if cp.UpdatedAt.IsZero() {
 		cp.UpdatedAt = time.Now().UTC()
 	}
-	return s.db.Update(func(tx *bolt.Tx) error {
+	err := s.db.Update(func(tx *bolt.Tx) error {
 		b := tx.Bucket(bucketDisks)
 		var existing Disk
+		found := false
 		if err := getJSON(b, []byte(cp.ID), &existing); err == nil {
+			found = true
 			// Once marked as a boot device, non-authoritative upserts preserve boot protection.
 			if !syncBoot && existing.IsBootDevice {
 				cp.IsBootDevice = true
 			}
 			if syncBoot && existing.Claimed {
-				// A hardware scan only refreshes identity/capacity. Claim and SPDK binding state
+				// A hardware scan only refreshes identity/capacity. Claim and handle
 				// are owned by the claim/release API and the reconciler, and are preserved here
 				// inside the same transaction so a concurrent claim can never be lost.
 				cp.Claimed = true
@@ -438,8 +425,8 @@ func (s *BoltStore) upsertDisk(disk *Disk, syncBoot bool) error {
 			if existing.PoolID != "" && cp.PoolID == "" {
 				cp.PoolID = existing.PoolID
 			}
-			// Preserve hardware identity & capacity when an NVMe drive is bound to vfio-pci/uio
-			// and its kernel nvme sysfs node is no longer present.
+			// Preserve hardware identity and capacity while an NVMe drive is on a userspace driver,
+			// so without its kernel device.
 			if cp.SizeBytes == 0 && existing.SizeBytes > 0 {
 				cp.SizeBytes = existing.SizeBytes
 			}
@@ -459,12 +446,9 @@ func (s *BoltStore) upsertDisk(disk *Disk, syncBoot bool) error {
 				cp.Name = existing.Name
 			}
 			// Operator declarations are never touched by a hardware scan, and the last known
-			// write-cache state survives while SPDK owns the device and the kernel can't see it.
+			// write-cache state survives a scan that can't read it.
 			cp.PowerLossProtected = existing.PowerLossProtected
 			cp.WriteCachePolicy = existing.WriteCachePolicy
-			if cp.MemberUUID == "" {
-				cp.MemberUUID = existing.MemberUUID
-			}
 			cp.WriteCacheError = existing.WriteCacheError
 			if cp.WriteCache == WriteCacheUnknown {
 				cp.WriteCache = existing.WriteCache
@@ -472,8 +456,24 @@ func (s *BoltStore) upsertDisk(disk *Disk, syncBoot bool) error {
 		} else if cp.IsBootDevice && cp.Claimed {
 			return ErrBootDeviceProtected
 		}
+		if syncBoot && found {
+			// A scan runs on every reconciler pass: one that found nothing new writes nothing.
+			same := cp
+			same.UpdatedAt = existing.UpdatedAt
+			raw, err := json.Marshal(&same)
+			if err != nil {
+				return err
+			}
+			if bytes.Equal(raw, b.Get([]byte(cp.ID))) {
+				return ErrSkipWrite
+			}
+		}
 		return putJSON(b, []byte(cp.ID), &cp)
 	})
+	if errors.Is(err, ErrSkipWrite) {
+		return nil
+	}
+	return err
 }
 
 // GetDisk retrieves a Disk by ID.
@@ -511,8 +511,8 @@ func (s *BoltStore) ListDisks() ([]*Disk, error) {
 	return disks, nil
 }
 
-// ClaimDisk marks a non-boot Disk as claimed by SPDK.
-func (s *BoltStore) ClaimDisk(id string, driverState DiskDriverState, spdkBdevName string) (*Disk, error) {
+// ClaimDisk marks a non-boot Disk as claimed.
+func (s *BoltStore) ClaimDisk(id string, driverState DiskDriverState, handle string) (*Disk, error) {
 	var updated Disk
 	err := s.db.Update(func(tx *bolt.Tx) error {
 		b := tx.Bucket(bucketDisks)
@@ -526,8 +526,8 @@ func (s *BoltStore) ClaimDisk(id string, driverState DiskDriverState, spdkBdevNa
 		if driverState != "" && driverState != DiskDriverStateUnspecified {
 			updated.DriverState = driverState
 		}
-		if spdkBdevName != "" {
-			updated.Handle = spdkBdevName
+		if handle != "" {
+			updated.Handle = handle
 		}
 		if updated.HealthStatus == "" || updated.HealthStatus == HealthStatusUnspecified {
 			updated.HealthStatus = HealthStatusOnline
@@ -555,7 +555,6 @@ func (s *BoltStore) ReleaseDisk(id string) (*Disk, error) {
 		updated.Claimed = false
 		updated.DriverState = DiskDriverStateKernel
 		updated.Handle = ""
-		updated.MemberUUID = "" // a kept member UUID only matters while the disk is in its pool
 		updated.UpdatedAt = time.Now().UTC()
 		return putJSON(b, []byte(id), &updated)
 	})
@@ -589,9 +588,6 @@ func (s *BoltStore) CreatePool(pool *Pool) error {
 	cp.DiskIDs = slices.Clone(pool.DiskIDs)
 	if len(cp.Members) == 0 {
 		SetPoolMembers(&cp, PoolMembers(&cp))
-	}
-	if cp.ChunkSizeBytes == 0 {
-		cp.ChunkSizeBytes = DefaultChunkSizeBytes
 	}
 	if cp.ArrayName == "" {
 		cp.ArrayName = fmt.Sprintf("raid_%s", cp.Name)
@@ -983,7 +979,7 @@ func (s *BoltStore) CheckVolumeDeletable(id string) error {
 
 // checkVolumeDeletableTx validates that a Volume is unattached and unexported.
 // Snapshots deliberately do NOT block deletion: CSI requires VolumeSnapshots to
-// outlive their source PVC, and SPDK snapshots are independent of the deleted clone.
+// outlive their source PVC, and snapshots are independent of the deleted clone.
 func checkVolumeDeletableTx(tx *bolt.Tx, id string) error {
 	volsB := tx.Bucket(bucketVolumes)
 	var vol Volume
@@ -1378,13 +1374,6 @@ func (s *BoltStore) CreatePortal(portal *Portal) error {
 		})
 		if err != nil {
 			return err
-		}
-		if cp.Protocol == ExportProtocolISCSI && cp.IscsiPgTag == 0 {
-			tag, err := nextPortalPgTag(b)
-			if err != nil {
-				return err
-			}
-			cp.IscsiPgTag = tag
 		}
 		if err := putJSON(b, []byte(cp.ID), &cp); err != nil {
 			return err
@@ -1800,14 +1789,6 @@ func (s *BoltStore) CreateExport(exp *Export) error {
 			return err
 		}
 
-		if cp.Protocol == ExportProtocolISCSI && cp.IscsiIgTag == 0 {
-			tag, err := nextExportIgTag(expsB)
-			if err != nil {
-				return err
-			}
-			cp.IscsiIgTag = tag
-		}
-
 		// Transition volume attachment state to BLOCK_EXPORT.
 		if vol.AttachmentState != AttachmentStateBlockExport {
 			vol.AttachmentState = AttachmentStateBlockExport
@@ -1951,4 +1932,52 @@ func getJSON(b *bolt.Bucket, key []byte, dest any) error {
 		return fmt.Errorf("unmarshal json: %w", err)
 	}
 	return nil
+}
+
+// UpdateSpaceUsage records how much volumes and snapshots (by ID) hold, in one transaction.
+func (s *BoltStore) UpdateSpaceUsage(volumes, snapshots map[string]uint64) error {
+	if len(volumes)+len(snapshots) == 0 {
+		return nil
+	}
+	err := s.db.Update(func(tx *bolt.Tx) error {
+		changed := false
+		for _, kind := range []struct {
+			bucket []byte
+			held   map[string]uint64
+		}{{bucketVolumes, volumes}, {bucketSnapshots, snapshots}} {
+			b := tx.Bucket(kind.bucket)
+			for id, n := range kind.held {
+				var rec struct {
+					v Volume
+					s Snapshot
+				}
+				var dst any = &rec.v
+				held := &rec.v.AllocatedBytes
+				if bytes.Equal(kind.bucket, bucketSnapshots) {
+					dst, held = &rec.s, &rec.s.AllocatedBytes
+				}
+				if err := getJSON(b, []byte(id), dst); errors.Is(err, ErrNotFound) {
+					continue // deleted meanwhile
+				} else if err != nil {
+					return err
+				}
+				if *held == n {
+					continue
+				}
+				*held = n
+				if err := putJSON(b, []byte(id), dst); err != nil {
+					return err
+				}
+				changed = true
+			}
+		}
+		if !changed {
+			return ErrSkipWrite
+		}
+		return nil
+	})
+	if errors.Is(err, ErrSkipWrite) {
+		return nil
+	}
+	return err
 }

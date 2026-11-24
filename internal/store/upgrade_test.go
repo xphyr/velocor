@@ -47,7 +47,7 @@ func TestLegacyKeysUpgraded(t *testing.T) {
 	p, _ := st.GetPool("p1")
 	v, _ := st.GetVolume("v1")
 	s, _ := st.GetSnapshot("s1")
-	if d.Handle != "Nvme_0000_01_00_0n1" || d.MemberUUID != "u1" {
+	if d.Handle != "Nvme_0000_01_00_0n1" {
 		t.Errorf("disk %+v", d)
 	}
 	if p.ArrayName != "raid_p1" || p.Device != "raid_p1" || p.ThinPoolUUID != "lu" || p.ThinPoolName != "lvs_p1" || p.ChunkSizeBytes != 1<<20 || p.MetaVolumeUUID != "mu" {

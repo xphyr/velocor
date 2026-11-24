@@ -10,7 +10,7 @@ import (
 
 func TestHelperWriteRead(t *testing.T) {
 	dev := filepath.Join(t.TempDir(), "dev")
-	if err := os.WriteFile(dev, make([]byte, LvolBytes), 0o600); err != nil {
+	if err := os.WriteFile(dev, make([]byte, VolumeBytes), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	img, _ := EncodeSlot(manifest(3, "p"))

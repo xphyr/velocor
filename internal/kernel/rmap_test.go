@@ -1,6 +1,7 @@
 package kernel
 
 import (
+	"bytes"
 	"slices"
 	"testing"
 )
@@ -52,7 +53,7 @@ func TestRangeOwners(t *testing.T) {
 	if !slices.Equal(tdata, []Extent{{Offset: 3*64*kib + 512, Length: 4 * kib}, {Offset: 5 * 64 * kib, Length: 4 * kib}}) {
 		t.Fatalf("thin data ranges %+v", tdata)
 	}
-	thin, err := thinOwners([]byte(dumpXML), tdata)
+	thin, err := thinOwners(bytes.NewReader([]byte(dumpXML)), tdata)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -92,7 +93,7 @@ const dumpSharedXML = `<superblock uuid="" time="1" transaction="2" version="2" 
 
 func TestThinOwnersSharedDefs(t *testing.T) {
 	const kib = 1 << 10
-	got, err := thinOwners([]byte(dumpSharedXML), []Extent{{Offset: 31587*64*kib + 4*kib, Length: 4 * kib}, {Offset: 50000 * 64 * kib, Length: 512}})
+	got, err := thinOwners(bytes.NewReader([]byte(dumpSharedXML)), []Extent{{Offset: 31587*64*kib + 4*kib, Length: 4 * kib}, {Offset: 50000 * 64 * kib, Length: 512}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -104,7 +105,7 @@ func TestThinOwnersSharedDefs(t *testing.T) {
 	if !slices.Equal(got, want) {
 		t.Fatalf("owners:\n got  %+v\n want %+v", got, want)
 	}
-	if _, err := thinOwners([]byte(`<superblock data_block_size="128"><device dev_id="1"><ref name="9"/></device></superblock>`), nil); err == nil {
+	if _, err := thinOwners(bytes.NewReader([]byte(`<superblock data_block_size="128"><device dev_id="1"><ref name="9"/></device></superblock>`)), []Extent{{Length: 1}}); err == nil {
 		t.Error("a reference to a missing def accepted")
 	}
 }

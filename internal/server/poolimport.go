@@ -21,7 +21,7 @@ import (
 //	POST /api/v1/pool-imports {pool_id}  import one
 //
 // The configuration comes from the copy on the pool (internal/meta); without a readable copy
-// the pool, its volumes and snapshots are rebuilt from what SPDK knows (the "skeleton").
+// the pool, its volumes and snapshots are rebuilt from what the data plane knows (the "skeleton").
 
 // WithMetaDevice gives the server access to the on-pool metadata copies (pool import).
 func WithMetaDevice(dev meta.Device) Option {
@@ -48,7 +48,7 @@ type ImportCandidate struct {
 type ImportMember struct {
 	DiskID string `json:"disk_id"`
 	Serial string `json:"serial_number,omitempty"`
-	Slot   *int   `json:"slot,omitempty"` // known for io_uring/AIO disks
+	Slot   *int   `json:"slot,omitempty"` // from the array metadata
 	// Stale: the disk's superblock is older than its array's (it left the array earlier).
 	Stale bool `json:"stale,omitempty"`
 }
@@ -166,8 +166,6 @@ func (s *Server) importCandidates() ([]ImportCandidate, map[string][]dataplane.D
 		}
 		if _, err := s.store.GetPool(c.PoolID); err == nil {
 			c.Importable, c.Reason = false, "a pool with this ID already exists"
-		} else if a.Unplaced != "" && c.Importable {
-			c.Reason = strings.TrimPrefix(c.Reason+"; ", "; ") + a.Unplaced
 		}
 		out = append(out, c)
 	}
@@ -187,7 +185,7 @@ func (s *Server) handleListImportCandidates(w http.ResponseWriter, _ *http.Reque
 // ImportResult reports what an import recovered.
 type ImportResult struct {
 	Pool *store.Pool `json:"pool"`
-	// Source is "manifest" (the copy on the pool) or "skeleton" (rebuilt from SPDK).
+	// Source is "manifest" (the copy on the pool) or "skeleton" (rebuilt from the data plane).
 	Source           string    `json:"source"`
 	Generation       uint64    `json:"generation,omitempty"`
 	WrittenAt        time.Time `json:"written_at,omitzero"`
@@ -261,8 +259,8 @@ func (s *Server) importPool(ctx context.Context, poolID, rename string, allowDeg
 		}
 	}()
 
-	// 1. Claim the members (no wipe: they carry our RAID by design). SPDK examines each one
-	//    and assembles the array from the superblocks.
+	// 1. Claim the members (no wipe: they carry our array by design). The data plane
+	//    assembles the array from the claimed disks' metadata.
 	var claimed []*store.Disk
 	for _, f := range found[cand.RaidUUID] {
 		if f.Stale {
@@ -272,33 +270,16 @@ func (s *Server) importPool(ctx context.Context, poolID, rename string, allowDeg
 			claimed = append(claimed, f.Disk)
 			continue
 		}
-		disk := f.Disk
-		if f.Identity != "" {
-			// A member under a new disk ID keeps the identity its array knows it by, and must
-			// keep it after restarts: record it before the data plane sees the disk.
-			cp := *f.Disk
-			cp.MemberUUID = f.Identity
-			disk = &cp
-			if _, merr := s.store.MutateDisk(f.Disk.ID, func(cur *store.Disk) error {
-				cur.MemberUUID = f.Identity
-				return nil
-			}); merr != nil {
-				return nil, fmt.Errorf("record the member UUID of disk %s: %w", f.Disk.ID, merr)
-			}
-		}
-		d, cerr := s.attachAndClaim(ctx, disk, true)
+		d, cerr := s.attachAndClaim(ctx, f.Disk, true)
 		if cerr != nil {
 			return nil, fmt.Errorf("claim disk %s: %w", f.Disk.ID, cerr)
 		}
 		claimed = append(claimed, d)
 	}
 	// From here a failure undoes only the database records. The disks stay claimed and the
-	// array assembled, and a retry carries on from there: taking a running array apart again
-	// would change it (detaching RAID1 members one by one records the first as failed in the
-	// others' superblocks), and bdev_raid_delete under a loaded volume store leaves it
-	// half-deleted.
+	// array assembled, and a retry carries on from there.
 
-	// 2. Wait for the array, start it degraded if asked, then wait for the volume store.
+	// 2. Wait for the array, start it degraded if asked, then wait for the thin pool.
 	raid, err := s.waitForRaid(ctx, cand.RaidName, allowDegraded)
 	if err != nil {
 		return nil, err
@@ -312,18 +293,18 @@ func (s *Server) importPool(ctx context.Context, poolID, rename string, allowDeg
 			break
 		}
 		if time.Now().After(deadline) {
-			return nil, fmt.Errorf("the volume store %s did not load from RAID %s", lvsName, cand.RaidName)
+			return nil, fmt.Errorf("thin pool %s did not come up on array %s", lvsName, cand.RaidName)
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
 
-	// 3. What SPDK has in the volume store.
-	lvols, err := s.dp.Volumes(ctx)
+	// 3. What the thin pool holds.
+	dpVols, err := s.dp.Volumes(ctx)
 	if err != nil {
 		return nil, err
 	}
-	inLvs := map[string]dataplane.Volume{} // by lvol name
-	for _, l := range lvols {
+	inLvs := map[string]dataplane.Volume{} // by name
+	for _, l := range dpVols {
 		if l.Pool == lvs.UUID {
 			inLvs[l.Name] = l
 		}
@@ -333,7 +314,7 @@ func (s *Server) importPool(ctx context.Context, poolID, rename string, allowDeg
 	res = &ImportResult{Warnings: []string{}}
 	var plan *meta.Manifest
 	metaUUID := ""
-	if l, ok := inLvs[meta.LvolName]; ok {
+	if l, ok := inLvs[meta.VolumeName]; ok {
 		metaUUID = l.UUID
 		if s.metaDev == nil {
 			res.Warnings = append(res.Warnings, "on-pool metadata copies are disabled on this appliance; rebuilt the pool from the data plane")
@@ -362,7 +343,7 @@ func (s *Server) importPool(ctx context.Context, poolID, rename string, allowDeg
 		}
 	}
 
-	// 5. The pool record: member disks in slot order from what SPDK assembled.
+	// 5. The pool record: member disks in slot order from the array.
 	pool := plan.Pool
 	if rename != "" {
 		pool.Name = rename
@@ -370,13 +351,13 @@ func (s *Server) importPool(ctx context.Context, poolID, rename string, allowDeg
 	if err := validateDisplayName("pool", pool.Name); err != nil {
 		return nil, err
 	}
-	diskByBdev := map[string]string{}
+	diskByHandle := map[string]string{}
 	for _, d := range claimed {
-		diskByBdev[d.Handle] = d.ID
+		diskByHandle[d.Handle] = d.ID
 	}
 	pool.DiskIDs, pool.DetachedDiskIDs, pool.Members = nil, nil, nil
 	for _, b := range raid.Members {
-		if id, ok := diskByBdev[b.Name]; ok {
+		if id, ok := diskByHandle[b.Name]; ok {
 			pool.DiskIDs = append(pool.DiskIDs, id)
 		}
 	}
@@ -392,7 +373,7 @@ func (s *Server) importPool(ctx context.Context, poolID, rename string, allowDeg
 	pool.MetaWrittenAt = plan.WrittenAt
 
 	// 6. Check every record before writing any.
-	vols, snaps := s.importableLvols(plan, inLvs, res)
+	vols, snaps := s.importableVolumes(plan, inLvs, res)
 	if err := s.checkImportConflicts(&pool, plan); err != nil {
 		return nil, err
 	}
@@ -413,7 +394,7 @@ func (s *Server) importPool(ctx context.Context, poolID, rename string, allowDeg
 		}
 		_ = s.store.DeletePool(pool.ID)
 	})
-	if err := s.recordLvols(vols, snaps); err != nil {
+	if err := s.recordVolumes(vols, snaps); err != nil {
 		return nil, err
 	}
 	res.Volumes, res.Snapshots = len(vols), len(snaps)
@@ -464,9 +445,9 @@ func (s *Server) importPool(ctx context.Context, poolID, rename string, allowDeg
 	return res, nil
 }
 
-// recordLvols records volumes and snapshots in dependency order: a snapshot after its volume,
+// recordVolumes records volumes and snapshots in dependency order: a snapshot after its volume,
 // a clone after the snapshot it was made from.
-func (s *Server) recordLvols(vols []*store.Volume, snaps []*store.Snapshot) error {
+func (s *Server) recordVolumes(vols []*store.Volume, snaps []*store.Snapshot) error {
 	done := map[string]bool{}
 	for len(done) < len(vols)+len(snaps) {
 		progress := false
@@ -509,7 +490,7 @@ func (s *Server) recordLvols(vols []*store.Volume, snaps []*store.Snapshot) erro
 	return nil
 }
 
-// waitForRaid waits for SPDK to assemble name from its members' superblocks.
+// waitForRaid waits for the data plane to assemble array name from its members' metadata.
 func (s *Server) waitForRaid(ctx context.Context, name string, allowDegraded bool) (*dataplane.Array, error) {
 	startedDegraded := false
 	for deadline := time.Now().Add(30 * time.Second); ; {
@@ -545,8 +526,8 @@ func (s *Server) waitForRaid(ctx context.Context, name string, allowDegraded boo
 	}
 }
 
-// importableLvols returns the plan's volumes and snapshots whose lvols exist, ready to record.
-func (s *Server) importableLvols(plan *meta.Manifest, inLvs map[string]dataplane.Volume, res *ImportResult) ([]*store.Volume, []*store.Snapshot) {
+// importableVolumes returns the plan's volumes and snapshots whose dpVols exist, ready to record.
+func (s *Server) importableVolumes(plan *meta.Manifest, inLvs map[string]dataplane.Volume, res *ImportResult) ([]*store.Volume, []*store.Snapshot) {
 	lvsName := "lvs_" + plan.Pool.ID
 	var vols []*store.Volume
 	present := map[string]bool{}
@@ -659,7 +640,6 @@ func (s *Server) importAccess(plan *meta.Manifest, vols []*store.Volume, res *Im
 		if _, err := s.store.GetPortal(p.ID); err == nil {
 			continue
 		}
-		p.IscsiPgTag = 0 // tags are allocated per appliance
 		if err := s.store.CreatePortal(&p); err != nil {
 			return fmt.Errorf("record portal %s: %w", p.ID, err)
 		}
@@ -683,7 +663,6 @@ func (s *Server) importAccess(plan *meta.Manifest, vols []*store.Volume, res *Im
 				why = append(why, "initiator group "+gid+" uses CHAP; set its secrets again, then enable the export")
 			}
 		}
-		e.IscsiIgTag = 0
 		e.HealthStatus, e.StatusMessage = store.HealthStatusReconciling, ""
 		e.Disabled, e.DisabledReason = len(why) > 0, strings.Join(why, "; ")
 		if err := s.store.CreateExport(&e); err != nil {
@@ -699,102 +678,62 @@ func (s *Server) importAccess(plan *meta.Manifest, vols []*store.Volume, res *Im
 	return nil
 }
 
-// importSkeleton rebuilds a pool from what SPDK knows when the pool has no readable copy:
-// volumes and snapshots named by their IDs, with sizes and parentage; no exports.
+// importSkeleton rebuilds a pool from what the data plane knows when the pool has no readable
+// copy: volumes and snapshots named by their IDs, with sizes and parentage (LVM's origins: a
+// snapshot's volume, a clone's snapshot); no exports.
 func (s *Server) importSkeleton(ctx context.Context, poolID string, inLvs map[string]dataplane.Volume, raid *dataplane.Array, res *ImportResult) (*meta.Manifest, error) {
-	bdevs, err := s.dp.Devices(ctx)
+	devices, err := s.dp.Devices(ctx)
 	if err != nil {
 		return nil, err
 	}
-	type node struct {
-		l      dataplane.Volume
-		size   uint64
-		parent string // base snapshot's lvol name
-	}
-	nodes := map[string]*node{}
-	for name, l := range inLvs {
-		if name == meta.LvolName {
-			continue
-		}
-		n := &node{l: l}
-		for _, b := range bdevs {
-			if b.UUID != l.UUID {
-				continue
-			}
-			n.size, n.parent = b.SizeBytes, b.ParentSnapshot
-		}
-		nodes[name] = n
-	}
-	children := map[string][]string{}
-	names := make([]string, 0, len(nodes))
-	for name, n := range nodes {
-		names = append(names, name)
-		if n.parent != "" {
-			children[n.parent] = append(children[n.parent], name)
+	byUUID := map[string]dataplane.Device{}
+	for _, d := range devices {
+		if d.UUID != "" {
+			byUUID[d.UUID] = d
 		}
 	}
-	slices.Sort(names)
-	for _, c := range children {
-		slices.Sort(c)
+	var vols []dataplane.Volume
+	for name, v := range inLvs {
+		if name != meta.VolumeName {
+			vols = append(vols, v)
+		}
 	}
-	// A snapshot belongs to the volume reached through its snapshot children (the chain of
-	// later snapshots), else to its first volume child; other volume children are clones.
-	var owner func(snap string) string
-	owner = func(snap string) string {
-		for _, c := range children[snap] {
-			if nodes[c].l.Snapshot {
-				if o := owner(c); o != "" {
-					return o
-				}
-			}
+	slices.SortFunc(vols, func(a, b dataplane.Volume) int {
+		if a.Seq != b.Seq {
+			return a.Seq - b.Seq
 		}
-		var vols []string
-		for _, c := range children[snap] {
-			if !nodes[c].l.Snapshot {
-				vols = append(vols, c)
-			}
-		}
-		if len(vols) > 1 {
-			// SPDK keeps no creation order: the volume a snapshot was taken of and the
-			// clones made from it look alike.
-			res.Warnings = append(res.Warnings, fmt.Sprintf("snapshot %s has volumes %s: recorded as taken of %s, the others as its clones; correct this if needed",
-				snap, strings.Join(vols, ", "), vols[0]))
-		}
-		if len(vols) > 0 {
-			return vols[0]
-		}
-		return ""
-	}
+		return strings.Compare(a.Name, b.Name)
+	})
 	m := &meta.Manifest{Format: meta.FormatVersion, Pool: store.Pool{
 		ID: poolID, Name: poolID, RaidLevel: store.RaidLevel(strings.ToUpper(raid.Level)), CreatedAt: time.Now().UTC(),
 	}}
-	snapOwner := map[string]string{}
-	for _, name := range names {
-		if nodes[name].l.Snapshot {
-			snapOwner[name] = owner(name)
-		}
-	}
-	res.Warnings = append(res.Warnings, "recovered from the data plane only: names, labels, QoS, exports and access control are not restored; volumes and snapshots are named by their IDs")
-	for _, name := range names {
-		n := nodes[name]
-		if n.l.Snapshot {
+	res.Warnings = append(res.Warnings, "recovered from the data plane only: names, labels, exports and access control are not restored; volumes and snapshots are named by their IDs")
+	for _, v := range vols {
+		if v.Snapshot {
 			continue
 		}
-		v := store.Volume{ID: name, Name: name, PoolID: poolID, SizeBytes: n.size, ThinProvision: n.l.Thin}
-		if n.parent != "" && snapOwner[n.parent] != name {
-			v.ParentSnapshotID = n.parent // a clone
+		dev := byUUID[v.UUID]
+		out := store.Volume{ID: v.Name, Name: v.Name, PoolID: poolID, SizeBytes: dev.SizeBytes, ThinProvision: v.Thin}
+		if o, ok := inLvs[dev.Origin]; ok && o.Snapshot {
+			out.ParentSnapshotID = dev.Origin // a clone
 		}
-		m.Volumes = append(m.Volumes, v)
+		m.Volumes = append(m.Volumes, out)
 	}
 	seq := uint64(0)
-	for _, name := range names {
-		n := nodes[name]
-		if !n.l.Snapshot || snapOwner[name] == "" {
+	for _, v := range vols {
+		if !v.Snapshot {
+			continue
+		}
+		dev := byUUID[v.UUID]
+		owner, ok := inLvs[dev.Origin]
+		if !ok || owner.Snapshot {
+			// Its volume was deleted: there is nothing to record it under.
+			res.Warnings = append(res.Warnings, fmt.Sprintf("snapshot %s is left out: the volume it was taken of is gone (clone it by hand if its data is needed)", v.Name))
 			continue
 		}
 		seq++
-		m.Snapshots = append(m.Snapshots, store.Snapshot{ID: name, Name: name, VolumeID: snapOwner[name], PoolID: poolID,
-			SizeBytes: n.size, ParentSnapshotID: n.parent, SequenceNumber: seq})
+		m.Snapshots = append(m.Snapshots, store.Snapshot{ID: v.Name, Name: v.Name, VolumeID: owner.Name, PoolID: poolID,
+			SizeBytes: dev.SizeBytes, SequenceNumber: seq})
 	}
 	return m, nil
 }

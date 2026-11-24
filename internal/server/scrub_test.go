@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"slices"
 	"strings"
@@ -17,6 +18,7 @@ func scrubPool(t *testing.T) (*harness, string, string) {
 	h.addDisk("d1", "0000:01:00.0")
 	h.addDisk("d2", "0000:02:00.0")
 	id := h.pool("p", "RAID1", "d1", "d2")
+	h.reconcile() // the scheduler waits for velod's first pass
 	p, err := h.st.GetPool(id)
 	if err != nil {
 		t.Fatal(err)
@@ -58,7 +60,7 @@ func TestScrubScheduleWindowAndResume(t *testing.T) {
 		t.Fatalf("a new pool was scrubbed at once: %v", starts)
 	}
 
-	h.fake.SetScrubStep(1 << 18) // a quarter per bdev_raid_get_bdevs
+	h.fake.SetScrubStep(1 << 18) // a quarter per listing of the arrays
 	now = now.Add(25 * time.Hour)
 	h.tick(now)
 	if starts := h.fake.ScrubStarts(raid); !slices.Equal(starts, []uint64{0}) {
@@ -71,7 +73,7 @@ func TestScrubScheduleWindowAndResume(t *testing.T) {
 	h.fake.SetScrubFindings(raid, 2, 3, 0)
 	h.tick(now)
 
-	// The window ends: the run pauses (once SPDK reports it stopped) and keeps its findings.
+	// The window ends: the run pauses (once the data plane reports it stopped) and keeps its findings.
 	hour := now.Local().Hour()
 	h.expect(h.do("PUT", "/api/v1/system/scrub", h.admin, map[string]any{"window_start_hour": (hour + 2) % 24, "window_end_hour": (hour + 3) % 24}))(http.StatusOK)
 	h.tick(now)
@@ -140,7 +142,7 @@ func TestScrubManualInterruptionsAndStop(t *testing.T) {
 	now := time.Now()
 	h.tick(now)
 
-	// spdk_tgt restarted: the scrub is gone; velod notices and resumes it where it was.
+	// A reboot: the scrub is gone; velod notices and resumes it where it was.
 	reached := h.scrubRecord(id).OffsetBlocks
 	if reached == 0 {
 		t.Fatal("scrub made no progress")
@@ -154,7 +156,7 @@ func TestScrubManualInterruptionsAndStop(t *testing.T) {
 		t.Fatalf("resumed run lost its options: %+v", rec)
 	}
 
-	// An operator stop ends the run once SPDK reports it stopped; it isn't resumed.
+	// An operator stop ends the run once the data plane reports it stopped; it isn't resumed.
 	h.expect(h.do("DELETE", "/api/v1/pools/"+id+"/scrub", h.admin, nil))(http.StatusAccepted)
 	h.tick(now)
 	rec := h.scrubRecord(id)
@@ -169,10 +171,10 @@ func TestScrubManualInterruptionsAndStop(t *testing.T) {
 
 	// A member leaves: the run pauses, and isn't resumed while the pool is degraded.
 	h.expect(h.do("POST", "/api/v1/pools/"+id+"/scrub", h.admin, nil))(http.StatusAccepted)
-	h.fake.FailMedia("0000:02:00.0")
+	h.fake.FailDisk("0000:02:00.0")
 	// The scrub notices before the reconciler has recorded the failed member (as on the lab
 	// appliance, where a scrub's failed repair write failed the member): the pool still says
-	// ONLINE, but SPDK's member count must keep the run paused.
+	// ONLINE, but the array's member count must keep the run paused.
 	h.tick(now)
 	rec = h.scrubRecord(id)
 	if rec.State != store.ScrubPaused || !strings.Contains(rec.Note, "member") {
@@ -202,5 +204,39 @@ func TestScrubRecordGoesWithThePool(t *testing.T) {
 	h.expect(h.do("DELETE", "/api/v1/pools/"+id, h.admin, nil))(http.StatusOK)
 	if _, err := h.st.GetScrubRecord(id); err == nil {
 		t.Fatal("scrub record outlived its pool")
+	}
+}
+
+// A RAID0 pool (nothing to scrub) is never picked nor overdue, and a pool whose scrub won't start
+// doesn't keep the others from theirs.
+func TestScrubOfOnePoolDoesntStarveTheOthers(t *testing.T) {
+	h := newHarness(t)
+	for i, d := range []string{"d1", "d2", "d3", "d4", "d5"} {
+		h.addDisk(d, fmt.Sprintf("0000:0%d:00.0", i+1))
+	}
+	h.pool("stripe", "RAID0", "d1")
+	first, second := h.pool("m1", "RAID1", "d2", "d3"), h.pool("m2", "RAID1", "d4", "d5")
+	h.reconcile()
+	h.expect(h.do("PUT", "/api/v1/system/scrub", h.admin, map[string]any{"interval_days": 1, "window_start_hour": 0, "window_end_hour": 0}))(http.StatusOK)
+	now := time.Now().Add(72 * time.Hour)
+	h.fake.Fail("StartScrub", 1)
+	if err := h.srv.scrubTick(context.Background(), now); err == nil {
+		t.Error("the scrub that didn't start isn't reported")
+	}
+	r1, err1 := h.st.GetScrubRecord(first)
+	r2, err2 := h.st.GetScrubRecord(second)
+	if err2 != nil || r2.State != store.ScrubRunning {
+		t.Fatalf("the second mirror: %+v %v (first: %+v %v)", r2, err2, r1, err1)
+	}
+	if m := h.metrics(); strings.Contains(m, `velocor_pool_scrub_overdue{pool="stripe"} 1`) {
+		t.Error("a RAID0 pool is overdue for a scrub")
+	}
+	p, _ := h.st.ListPools()
+	for _, x := range p {
+		if x.Name == "stripe" {
+			if code, body := h.do("POST", "/api/v1/pools/"+x.ID+"/scrub", h.admin, map[string]any{}); code != http.StatusBadRequest && code != http.StatusConflict {
+				t.Errorf("scrub of a RAID0 pool: %d %v", code, body)
+			}
+		}
 	}
 }

@@ -2,15 +2,13 @@
 #
 # Images are $(IMAGE_PREFIX)/<name>:$(TAG). TAG defaults to dev-<short sha>, so nothing here
 # overwrites a shared tag by accident: `latest` and v* tags need RELEASE=true, a clean tree and a
-# commit tagged $(VERSION) (CI's release job). The OS image always embeds the spdk/velod images
-# of the same build, pinned by digest, so `push` builds and pushes them first.
+# commit tagged $(VERSION) (CI's release job). The OS image always embeds the velod image of the
+# same build, pinned by digest, so `push` builds and pushes it first.
 #
 #   make build test lint             Go binaries, unit tests, linters
 #   make images                      build all container images locally (except the OS image)
-#   make push                        push spdk/velod/csi, then build and push the OS image
-#   make test-integration            Go integration tests against a real spdk_tgt (rootless podman)
-#   make spdk-unit-tests             SPDK unit tests for the libraries our SPDK patches touch
-#   make test-kernel                 kernel data plane tests on real md/LVM/nvmet/LIO (runs sudo)
+#   make push                        push velod/csi, then build and push the OS image
+#   make test-kernel                 data plane tests on real md/LVM/nvmet/LIO (runs sudo)
 #   make test-kernel-vm              the same in a throwaway Fedora VM under KVM (no root; CI)
 #   make qcow2 QCOW2_KEYS=a.pub      bootable disk from the pushed OS image (needs KVM, no root)
 #
@@ -42,11 +40,9 @@ TAG ?= dev-$(GIT_SHA)$(if $(GIT_DIRTY),-dirty)
 # Additional tags pushed for the same images, e.g. EXTRA_TAGS="main" or (releases) "1.2 latest".
 EXTRA_TAGS ?=
 RELEASE ?= false
-SPDK_IMAGE = $(IMAGE_PREFIX)/velocor-spdk:$(TAG)
 VELOD_IMAGE = $(IMAGE_PREFIX)/velocor-velod:$(TAG)
 CSI_IMAGE = $(IMAGE_PREFIX)/velocor-csi:$(TAG)
 BOOTC_IMAGE = $(IMAGE_PREFIX)/velocor-os:$(TAG)
-SPDK_TEST_IMAGE ?= localhost/velocor-spdk:test
 CSI_PLATFORMS ?= linux/amd64
 # true only for CI builds of pull requests, which push to a throwaway local registry.
 INSECURE_REGISTRY ?= false
@@ -65,12 +61,10 @@ LABEL_ARGS := --label org.opencontainers.image.source=https://github.com/xphyr/v
 # The release tags come from the Containerfiles' ARG defaults (which Renovate updates), so a
 # Fedora release bump there is what builds use; hack/check-pins.sh checks they agree.
 base-arg = $(shell sed -n 's/^ARG $(1)=//p' $(2) | head -n1)
-FEDORA_IMAGE ?= $(call base-arg,FEDORA_IMAGE,deploy/containers/Containerfile.spdk)
 FEDORA_MINIMAL_IMAGE ?= $(call base-arg,FEDORA_MINIMAL_IMAGE,deploy/containers/Containerfile.velod)
 BOOTC_BASE_IMAGE ?= $(call base-arg,BOOTC_BASE_IMAGE,deploy/bootc/Containerfile)
 # BASE_PIN_DIR (optional; CI sets it): resolve each base once and reuse it for every build that
-# follows, so e.g. the integration-tested SPDK image and the pushed one share one base (and one
-# SPDK compile) even if Fedora publishes in between. The files there record what was used.
+# follows, even if Fedora publishes in between. The files there record what was used.
 BASE_PIN_DIR ?=
 # $(call base-pin,<build arg>,<image ref>): shell prefix setting $$base_args for podman build.
 define base-pin
@@ -84,9 +78,9 @@ endef
 GO_BUILD_ARGS := --build-arg VERSION=$(VERSION) --build-arg COMMIT=$(COMMIT) --build-arg BUILD_TIME=$(BUILD_TIME)
 DIGEST_DIR := $(BINARY_DIR)/digests
 
-.PHONY: build build-velod build-veloctl build-csi test test-integration test-kernel test-kernel-vm lint shellcheck check-pins check-alerts \
-	proto proto-lint clean images image-spdk image-spdk-test spdk-unit-tests image-velod image-csi image-os \
-	push push-spdk push-velod push-csi push-os check-push qcow2
+.PHONY: build build-velod build-veloctl build-csi test test-kernel test-kernel-vm lint shellcheck check-pins check-alerts \
+	proto proto-lint clean images image-velod image-csi image-os \
+	push push-velod push-csi push-os check-push qcow2
 
 ## Go ---------------------------------------------------------------------------------------
 
@@ -99,11 +93,7 @@ build-velod build-veloctl build-csi: build-%:
 test:
 	go test -race ./...
 
-# Real spdk_tgt in rootless podman (no root, hugepages or NVMe needed).
-test-integration: image-spdk-test
-	VELOCOR_IT_IMAGE=$(SPDK_TEST_IMAGE) go test -tags integration -count=1 -v -timeout 30m ./internal/integration/
-
-# The kernel data plane's integration tests (TODO.md K-1) against real md, LVM, device-mapper,
+# The data plane's integration tests against real md, LVM, device-mapper,
 # nvmet and LIO, on loop devices: they need root, the kernel modules and the storage tools, so
 # they run on the lab VM or CI's runner, never inside a container. KERNEL_TEST_RUN filters them.
 KERNEL_TEST_BIN ?= bin/kernel.test
@@ -126,8 +116,8 @@ SHELLCHECK ?= shellcheck
 
 lint: check-pins shellcheck check-alerts
 	go vet ./...
-	go vet -tags integration ./internal/integration/
-	$(GOLANGCI_LINT) run --build-tags integration ./...
+	go vet -tags kernelintegration ./internal/kernel ./internal/dataplane/kernelplane
+	$(GOLANGCI_LINT) run --build-tags kernelintegration ./...
 
 SHELL_SCRIPTS = $(shell git ls-files '*.sh' deploy/bootc/90-velocor-banner)
 shellcheck:
@@ -151,22 +141,7 @@ clean:
 
 ## Images -----------------------------------------------------------------------------------
 
-images: image-spdk image-velod image-csi
-
-# The test stage shares the builder stage, so building it first costs one SPDK compile in total.
-image-spdk-test:
-	$(call base-pin,FEDORA_IMAGE,$(FEDORA_IMAGE)) \
-	$(PODMAN) build $(LABEL_ARGS) $$base_args --target test -t $(SPDK_TEST_IMAGE) -f deploy/containers/Containerfile.spdk .
-
-# SPDK's unit tests for the libraries our patches (deploy/containers/spdk-patches) touch; the
-# build fails if one fails. A separate SPDK compile with unit tests enabled.
-spdk-unit-tests:
-	$(call base-pin,FEDORA_IMAGE,$(FEDORA_IMAGE)) \
-	$(PODMAN) build $$base_args --target unit-tests -t localhost/velocor-spdk:unit-tests -f deploy/containers/Containerfile.spdk .
-
-image-spdk:
-	$(call base-pin,FEDORA_IMAGE,$(FEDORA_IMAGE)) \
-	$(PODMAN) build $(LABEL_ARGS) $$base_args -t $(SPDK_IMAGE) -f deploy/containers/Containerfile.spdk .
+images: image-velod image-csi
 
 image-velod:
 	$(call base-pin,FEDORA_MINIMAL_IMAGE,$(FEDORA_MINIMAL_IMAGE)) \
@@ -180,25 +155,24 @@ image-csi:
 	$(PODMAN) build $(LABEL_ARGS) $$base_args $(GO_BUILD_ARGS) --platform $(CSI_PLATFORMS) --manifest $(CSI_IMAGE) \
 		-f deploy/containers/Containerfile.csi .
 
-# Needs the spdk and velod images in the registry: their digests are resolved there and pinned.
-# The build pulls them, so registry credentials (REGISTRY_AUTH_FILE, else podman's default auth
+# Needs the velod image in the registry: its digest is resolved there and pinned.
+# The build pulls it, so registry credentials (REGISTRY_AUTH_FILE, else podman's default auth
 # file) go in as a build secret, which is never stored in the image; without any, an empty file.
 REGISTRY_AUTH_FILE ?= $(XDG_RUNTIME_DIR)/containers/auth.json
 image-os:
 	auth="$(REGISTRY_AUTH_FILE)"; \
 	if [[ ! -s "$$auth" ]]; then mkdir -p $(BINARY_DIR) && echo '{}' > $(BINARY_DIR)/no-registry-auth.json && auth=$(BINARY_DIR)/no-registry-auth.json; fi; \
-	spdk=$$(INSECURE_REGISTRY=$(INSECURE_REGISTRY) hack/pin-image.sh $(SPDK_IMAGE)); \
 	velod=$$(INSECURE_REGISTRY=$(INSECURE_REGISTRY) hack/pin-image.sh $(VELOD_IMAGE)); \
-	echo "OS image pins $$spdk and $$velod"; \
+	echo "OS image pins $$velod"; \
 	$(call base-pin,BOOTC_BASE_IMAGE,$(BOOTC_BASE_IMAGE)) \
 	$(PODMAN) build $(LABEL_ARGS) $$base_args $(TLS_FLAG) $(if $(TLS_FLAG),--network=host) --secret id=registry-auth,src="$$auth" \
-		--build-arg SPDK_IMAGE=$$spdk --build-arg VELOD_IMAGE=$$velod --build-arg IMAGE_TAG=$(TAG) \
+		--build-arg VELOD_IMAGE=$$velod --build-arg IMAGE_TAG=$(TAG) \
 		--build-arg INSECURE_REGISTRY=$(INSECURE_REGISTRY) \
 		-t $(BOOTC_IMAGE) -f deploy/bootc/Containerfile .
 
 ## Push -------------------------------------------------------------------------------------
 
-push: push-spdk push-velod push-csi
+push: push-velod push-csi
 	$(MAKE) push-os
 
 # Refuse anything that could overwrite a shared tag or publish an unidentifiable build.
@@ -220,9 +194,6 @@ define push-one
 	for t in $(EXTRA_TAGS); do $(SKOPEO) copy -q $(SKOPEO_TLS) --all \
 	  docker://$(IMAGE_PREFIX)/$(2)@$$(cat $(DIGEST_DIR)/$(2)) docker://$(IMAGE_PREFIX)/$(2):$$t; done
 endef
-
-push-spdk: check-push image-spdk
-	$(call push-one,$(SPDK_IMAGE),velocor-spdk)
 
 push-velod: check-push image-velod
 	$(call push-one,$(VELOD_IMAGE),velocor-velod)

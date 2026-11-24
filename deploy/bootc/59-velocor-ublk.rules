@@ -1,5 +1,0 @@
-# velod's metadata device (ublk ID 100, internal/meta) exists for well under a second while the
-# on-pool configuration copy is written. Keep udev from probing it: a probe still running when
-# it's removed fails and logs "I/O error, dev ublkb100" although nothing is wrong. nowatch:
-# no re-probe after velod's write closes the device.
-KERNEL=="ublkb100", OPTIONS:="nowatch", ENV{UDEV_DISABLE_PERSISTENT_STORAGE_RULES_FLAG}="1", ENV{UDISKS_IGNORE}="1", ENV{SYSTEMD_READY}="0"

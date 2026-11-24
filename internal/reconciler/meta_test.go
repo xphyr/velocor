@@ -5,7 +5,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/velocor/velocor/internal/dataplane/spdkplane"
 	"github.com/velocor/velocor/internal/meta"
 	"github.com/velocor/velocor/internal/store"
 )
@@ -98,7 +97,7 @@ func TestMetaGenerationNeverGoesBackwards(t *testing.T) {
 		t.Fatal(err)
 	}
 	// A fresh velod process (new reconciler on the same store).
-	e.rec = New(e.st, spdkplane.New(e.fake.Client(), nil), nil, nil)
+	e.rec = New(e.st, e.fake, nil, nil)
 	e.rec.SetMetaDevice(dev, "node-1", "test")
 	e.reconcile()
 	if p := e.pool(); p.MetaGeneration != 8 {

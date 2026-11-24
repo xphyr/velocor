@@ -20,7 +20,7 @@ type metaSync struct {
 	synced map[string]bool
 }
 
-// SetMetaDevice enables the on-pool metadata copy. Without it (tests, or no ublk) the
+// SetMetaDevice enables the on-pool metadata copy. Without it (tests) the
 // reconciler writes no copies.
 func (r *Reconciler) SetMetaDevice(dev meta.Device, nodeID, version string) {
 	r.passMu.Lock()
@@ -28,30 +28,26 @@ func (r *Reconciler) SetMetaDevice(dev meta.Device, nodeID, version string) {
 	r.meta = &metaSync{dev: dev, nodeID: nodeID, version: version, synced: map[string]bool{}}
 }
 
-// reconcileMeta creates each online pool's velocor-meta lvol if needed and writes a new
+// reconcileMeta creates each online pool's velocor-meta volume if needed and writes a new
 // manifest generation whenever the pool's configuration changed.
 func (r *Reconciler) reconcileMeta(ctx context.Context, p *pass, poolOnline map[string]bool) {
 	if r.meta == nil {
-		return
-	}
-	if err := r.meta.dev.Recover(ctx); err != nil {
-		p.errs = append(p.errs, fmt.Sprintf("metadata device: %v", err))
 		return
 	}
 	pools, err := r.store.ListPools()
 	if err != nil || len(pools) == 0 {
 		return
 	}
-	lvols, err := r.dp.Volumes(ctx)
+	dpVols, err := r.dp.Volumes(ctx)
 	if err != nil {
-		p.errs = append(p.errs, fmt.Sprintf("list lvols: %v", err))
+		p.errs = append(p.errs, fmt.Sprintf("list volumes: %v", err))
 		return
 	}
 	for _, pool := range pools {
 		if !poolOnline[pool.ID] || pool.ThinPoolUUID == "" {
 			continue
 		}
-		if err := r.syncPoolMeta(ctx, pool, lvols); err != nil {
+		if err := r.syncPoolMeta(ctx, pool, dpVols); err != nil {
 			p.degrade("pool:"+pool.ID, "the on-pool metadata copy is out of date: "+err.Error())
 			if _, merr := r.store.MutatePool(pool.ID, func(cur *store.Pool) error {
 				if cur.MetaError == err.Error() {
@@ -66,18 +62,18 @@ func (r *Reconciler) reconcileMeta(ctx context.Context, p *pass, poolOnline map[
 	}
 }
 
-func (r *Reconciler) syncPoolMeta(ctx context.Context, pool *store.Pool, lvols []dataplane.Volume) error {
+func (r *Reconciler) syncPoolMeta(ctx context.Context, pool *store.Pool, dpVols []dataplane.Volume) error {
 	uuid := ""
-	for _, l := range lvols {
-		if l.Pool == pool.ThinPoolUUID && l.Name == meta.LvolName {
+	for _, l := range dpVols {
+		if l.Pool == pool.ThinPoolUUID && l.Name == meta.VolumeName {
 			uuid = l.UUID
 		}
 	}
 	if uuid == "" {
 		// Thick, so a full pool can never fail a metadata write.
-		created, err := r.dp.CreateVolume(ctx, pool.ThinPoolName, meta.LvolName, meta.LvolBytes, false)
+		created, err := r.dp.CreateVolume(ctx, pool.ThinPoolName, meta.VolumeName, meta.VolumeBytes, false)
 		if err != nil {
-			return fmt.Errorf("create the %s volume: %w", meta.LvolName, err)
+			return fmt.Errorf("create the %s volume: %w", meta.VolumeName, err)
 		}
 		uuid = created
 		r.logger.Info("created the metadata volume", "pool", pool.ID, "volume", uuid)

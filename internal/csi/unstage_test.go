@@ -2,6 +2,9 @@ package csi
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
@@ -119,5 +122,36 @@ func TestDisconnectVolumeWithoutISCSIAdm(t *testing.T) {
 	t.Cleanup(func() { hostISCSIAdmOnce, hostISCSIAdm = sync.Once{}, false })
 	if err := (&LinuxMounter{SysRoot: t.TempDir()}).DisconnectVolume(context.Background(), "vol-x"); err != nil {
 		t.Fatalf("without iscsiadm: %v", err)
+	}
+}
+
+// A raw block device that is gone (a node reboot, a lost session) doesn't keep its volume from
+// being unstaged; one that can't be flushed does.
+func TestUnstageOfAGoneBlockDevice(t *testing.T) {
+	if err := (&LinuxMounter{}).FlushDevice(context.Background(), filepath.Join(t.TempDir(), "gone")); !errors.Is(err, ErrDeviceGone) {
+		t.Fatalf("flush of a missing device: %v", err)
+	}
+	m := newFakeMounter()
+	ns := NewNodeServer("node-a", m)
+	staging := t.TempDir()
+	meta := filepath.Join(staging, stageMetaFilename)
+	b, _ := json.Marshal(stageMetadata{DevicePath: "/dev/nvme9n1", IsBlock: true})
+	if err := os.WriteFile(meta, b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	unstage := func() error {
+		_, err := ns.NodeUnstageVolume(context.Background(), &csi.NodeUnstageVolumeRequest{VolumeId: "vol-x", StagingTargetPath: staging})
+		return err
+	}
+	m.flushErr = errors.New("I/O error")
+	if err := unstage(); err == nil {
+		t.Fatal("unstaged a device that couldn't be flushed")
+	}
+	m.flushErr = fmt.Errorf("%w: no such file or directory", ErrDeviceGone)
+	if err := unstage(); err != nil {
+		t.Fatalf("unstage of a gone device: %v", err)
+	}
+	if _, err := os.Stat(meta); err == nil {
+		t.Fatal("the stage metadata stays")
 	}
 }

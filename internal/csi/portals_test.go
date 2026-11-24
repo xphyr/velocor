@@ -11,7 +11,6 @@ import (
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/velocor/velocor/internal/auth"
-	"github.com/velocor/velocor/internal/dataplane/spdkplane"
 	"github.com/velocor/velocor/internal/server"
 	"github.com/velocor/velocor/internal/store"
 	"google.golang.org/grpc/codes"
@@ -116,7 +115,7 @@ func TestPublishUsesTheClassPortals(t *testing.T) {
 	}
 	authMgr, _ := auth.NewManager(st, "pass-123456")
 	_, tok, _ := authMgr.CreateApiToken("csi", store.RoleCSIProvisioner, time.Hour)
-	ts := httptest.NewServer(server.New(st, spdkplane.New(fake.Client(), nil), nil, authMgr, nil, nil).Handler())
+	ts := httptest.NewServer(server.New(st, fake, nil, authMgr, nil, nil).Handler())
 	t.Cleanup(ts.Close)
 	ctrl := NewControllerServer(NewHTTPClient(ts.URL, tok, true))
 	ctx := context.Background()
@@ -160,7 +159,7 @@ func TestPublishUsesTheClassPortals(t *testing.T) {
 	}
 
 	// Volumes from before the parameter (no "portals" in their context) use the driver default.
-	old, err := ctrl.client.CreateVolume(ctx, CreateVolumeRequest{Name: "old", PoolID: "pool-1", SizeBytes: 1 << 30, ThinProvision: true})
+	old, err := ctrl.client.CreateVolume(ctx, CreateVolumeRequest{Name: "old", PoolID: "pool-1", SizeBytes: 1 << 30})
 	if err != nil {
 		t.Fatal(err)
 	}

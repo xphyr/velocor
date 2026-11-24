@@ -72,8 +72,7 @@ sidecars:
     resources: {}
 
 # Changed-block tracking for incremental backups (CSI SnapshotMetadata, KEP-3314; docs/review-history.md L-2).
-# Off by default. Needs the appliance's data plane with SPDK patch 0005 (bdev_lvol_get_fragmap),
-# the cluster's SnapshotMetadataService CRD (cbt.storage.k8s.io/v1beta1, installed from
+# Off by default. Needs the cluster's SnapshotMetadataService CRD (cbt.storage.k8s.io/v1beta1, installed from
 # kubernetes-csi/external-snapshot-metadata, like the VolumeSnapshot CRDs), and a TLS
 # certificate for the sidecar's service. The sidecar is pinned like the others above.
 snapshotMetadata:
@@ -97,6 +96,7 @@ storageClasses:
     reclaimPolicy: Delete
     volumeBindingMode: Immediate
     allowVolumeExpansion: true
+    # Volumes are always thin: kept because a StorageClass's parameters can't be changed by an upgrade.
     thin: "true"
     pool: ""
     fsType: ext4
@@ -149,7 +149,7 @@ cdi:
         volumeMode: Block
       - accessModes: [ReadWriteOnce]
         volumeMode: Filesystem
-    # Clones are made by the driver (thin lvol clones); no data is copied.
+    # Clones are made by the driver (thin clones); no data is copied.
     cloneStrategy: csi-clone
     # Golden images from DataImportCrons are kept as snapshots; VM disks are clones of them.
     dataImportCronSourceFormat: snapshot

@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Velocor Lightweight 2-Node QEMU/KVM Test Lab (3 GiB Total RAM)
-# Node 1 (velocor-san):       2048 MiB RAM, 2 vCPUs, 512 MiB hugepages, Fedora bootc 45 + Podman Quadlets
+# Node 1 (velocor-san):       2048 MiB RAM, 2 vCPUs, Fedora bootc 45 + Podman Quadlets
 # Node 2 (velocor-initiator): 1024 MiB RAM, 2 vCPUs, NVMe-oF/TCP & iSCSI client
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -33,7 +33,7 @@ Commands:
   build-bootc-disk Build bootable Fedora bootc 45 qcow2 disk (${BOOTC_DISK}) from ${BOOTC_IMAGE}
   init-disks       Create synthetic NVMe (.raw), SSD (.raw), and cloud-init seed ISOs in ${LAB_DIR}
   up               Start velocor-san (booting Fedora bootc 45) and velocor-initiator QEMU/KVM VMs
-  verify           Verify Fedora bootc 45 status, Podman Quadlets, SPDK JSON-RPC, and veloctl APIs
+  verify           Verify Fedora bootc 45 status, Podman Quadlets and veloctl APIs
   ssh-san          Run a command (or interactive shell) on velocor-san as root
   ssh-init         Run a command (or interactive shell) on velocor-initiator as fedora
   down             Stop running lab VMs cleanly
@@ -265,20 +265,18 @@ echo "--- bootc status ---"
 bootc status
 
 systemctl daemon-reload
-systemctl start velocor-spdk.service velocor-velod.service
+systemctl start velocor-velod.service
 
 echo ""
-echo "--- Waiting for Quadlet containers (velocor-spdk & velocor-velod) to pull and start ---"
+echo "--- Waiting for Quadlet container (velocor-velod) to start ---"
 for _ in $(seq 1 60); do
-  if systemctl is-active --quiet velocor-spdk.service && systemctl is-active --quiet velocor-velod.service; then
-    if [[ -S /run/velocor/spdk.sock ]]; then
-      break
-    fi
+  if systemctl is-active --quiet velocor-velod.service; then
+    break
   fi
   sleep 2
 done
 
-systemctl --no-pager status velocor-spdk.service velocor-velod.service
+systemctl --no-pager status velocor-velod.service
 echo ""
 echo "--- Running Podman Containers ---"
 podman ps
@@ -316,14 +314,14 @@ EOF
   fi
 
   echo ""
-  echo "=== Claiming Emulated NVMe (nvme-0000-00-03-0, nvme-0000-00-04-0 -> vfio-pci) & SSD (ssd-sda -> io_uring) ==="
+  echo "=== Claiming Emulated NVMe (nvme-0000-00-03-0, nvme-0000-00-04-0) & SSD (ssd-sda) ==="
   "${REPO_ROOT}/bin/veloctl" --endpoint "https://127.0.0.1:${SAN_API_PORT}" --insecure disk claim nvme-0000-00-03-0 >/dev/null
   "${REPO_ROOT}/bin/veloctl" --endpoint "https://127.0.0.1:${SAN_API_PORT}" --insecure disk claim nvme-0000-00-04-0 >/dev/null
   "${REPO_ROOT}/bin/veloctl" --endpoint "https://127.0.0.1:${SAN_API_PORT}" --insecure disk claim ssd-sda >/dev/null
   "${REPO_ROOT}/bin/veloctl" --endpoint "https://127.0.0.1:${SAN_API_PORT}" --insecure disk list
 
   echo ""
-  echo "=== Creating SPDK RAID1 Pool & Thin-Provisioned Volumes ==="
+  echo "=== Creating RAID1 Pool & Thin-Provisioned Volumes ==="
   local pool_id vol_nvmf_id vol_iscsi_id portal_nvmf_id portal_iscsi_id
   pool_id="$("${REPO_ROOT}/bin/veloctl" --endpoint "https://127.0.0.1:${SAN_API_PORT}" --insecure pool create --name nvme-pool --raid RAID1 --disks nvme-0000-00-03-0,nvme-0000-00-04-0 | jq -r '.pool.id')"
   vol_nvmf_id="$("${REPO_ROOT}/bin/veloctl" --endpoint "https://127.0.0.1:${SAN_API_PORT}" --insecure volume create --name vol-nvmf --pool "${pool_id}" --size-gib 2 --thin=true | jq -r '.volume.id')"

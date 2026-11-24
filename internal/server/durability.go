@@ -71,7 +71,7 @@ func (s *Server) handleUpdateDisk(w http.ResponseWriter, r *http.Request) {
 }
 
 // applyWriteCachePolicy makes the drive match d.WriteCachePolicy and returns its cache state.
-// An NVMe drive is switched through SPDK once SPDK owns it; before that its policy is only
+// An NVMe drive is switched by the reconciler once it is claimed; before that its policy is only
 // recorded, and applied when it is claimed.
 func (s *Server) applyWriteCachePolicy(ctx context.Context, d *store.Disk) (store.WriteCacheState, error) {
 	if d.Type == store.DiskTypeNVMe {
