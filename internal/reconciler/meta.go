@@ -34,10 +34,6 @@ func (r *Reconciler) reconcileMeta(ctx context.Context, p *pass, poolOnline map[
 	if r.meta == nil {
 		return
 	}
-	if err := r.meta.dev.Recover(ctx); err != nil {
-		p.errs = append(p.errs, fmt.Sprintf("metadata device: %v", err))
-		return
-	}
 	pools, err := r.store.ListPools()
 	if err != nil || len(pools) == 0 {
 		return

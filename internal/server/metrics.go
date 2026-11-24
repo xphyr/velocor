@@ -187,7 +187,7 @@ func (s *Server) reconcilerMetrics(m *metricSet) {
 		m.gauge("velocor_reconciler_last_run_timestamp_seconds", "When the reconciler last completed a pass.", unixSeconds(st.LastReconciledAt))
 	}
 	m.gauge("velocor_reconciler_last_run_failed", "Whether the reconciler's last pass ended with an error.", b2f(st.LastError != ""))
-	m.gauge("velocor_dataplane_restoring", "Whether the data plane was (re)started after the reconciler's last completed pass, so what velod built in it isn't all restored yet.",
+	m.gauge("velocor_dataplane_restoring", "Whether velod has just started and its first pass hasn't finished, so after a reboot the pools, volumes and exports may not be back yet.",
 		b2f(s.reconciler.Restoring()))
 	counts := map[string]int{}
 	for _, o := range st.Unmanaged {

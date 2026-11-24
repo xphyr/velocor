@@ -129,7 +129,6 @@ type Fake struct {
 	failErr      map[string]error
 	failAfter    map[string]int
 	volumes      int
-	instance     string
 }
 
 var _ dataplane.Plane = (*Fake)(nil)
@@ -988,7 +987,7 @@ func (f *Fake) ThinPools(_ context.Context, name, uuid string) ([]dataplane.Thin
 	return out, nil
 }
 
-func (f *Fake) CreateThinPool(_ context.Context, arrayName, name string, _ uint32) (string, error) {
+func (f *Fake) CreateThinPool(_ context.Context, arrayName, name string) (string, error) {
 	done, err := f.begin("CreateThinPool")
 	if err != nil {
 		return "", err
@@ -1381,13 +1380,6 @@ func (f *Fake) ChangedBlocks(_ context.Context, _ *store.Pool, base, target *sto
 		}
 	}
 	return merge(idx, t.size), nil
-}
-
-func (f *Fake) SetQoS(_ context.Context, _ string, q store.QosPolicy) error {
-	if q == (store.QosPolicy{}) {
-		return nil
-	}
-	return fmt.Errorf("%w: QoS limits", dataplane.ErrUnsupported)
 }
 
 // --- exports ---

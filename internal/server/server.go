@@ -118,9 +118,6 @@ func (s *Server) warnings() []string {
 				"Import the pool or restore a database backup if they are yours; remove them by hand only once you know what they are.")
 		}
 	}
-	if s.hw != nil && s.hw.UnsafeNoIOMMUAllowed() {
-		out = append(out, "Unsafe no-IOMMU mode is allowed: SPDK (its vfio NVMe driver) can DMA anywhere in host memory. Use this only in lab VMs.")
-	}
 	if w := s.monitoringWarning(); w != "" {
 		out = append(out, w)
 	}
@@ -259,7 +256,6 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /api/v1/volumes", s.withAuth(store.RoleReadOnly, s.handleListVolumes))
 	s.mux.HandleFunc("POST /api/v1/volumes", s.withAuth(store.RoleCSIProvisioner, s.handleCreateVolume))
 	s.mux.HandleFunc("GET /api/v1/volumes/{id}", s.withAuth(store.RoleReadOnly, s.handleGetVolume))
-	s.mux.HandleFunc("PUT /api/v1/volumes/{id}/qos", s.withAuth(store.RoleCSIProvisioner, s.handleSetVolumeQoS))
 	s.mux.HandleFunc("POST /api/v1/volumes/{volume_id}/snapshots", s.withAuth(store.RoleCSIProvisioner, s.handleCreateSnapshot))
 	s.mux.HandleFunc("POST /api/v1/volumes/", s.withAuth(store.RoleCSIProvisioner, s.handleVolumeAction))
 	s.mux.HandleFunc("DELETE /api/v1/volumes/{id}", s.withAuth(store.RoleCSIProvisioner, s.handleDeleteVolume))
@@ -975,14 +971,6 @@ func (s *Server) handleSystemStatus(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	var hpTotalMB, hpFreeMB uint64
-	if s.hw != nil {
-		if hp, err := s.hw.GetHugepageStatus(); err == nil {
-			hpTotalMB = hp.TotalMB
-			hpFreeMB = hp.FreeMB
-		}
-	}
-
 	var recState reconciler.State
 	restoring := false
 	if s.reconciler != nil {
@@ -995,8 +983,8 @@ func (s *Server) handleSystemStatus(w http.ResponseWriter, r *http.Request) {
 	case !dpConnected || len(recState.DegradedResources) > 0:
 		overall = store.HealthStatusDegraded
 	case restoring:
-		// spdk_tgt answers, but it was (re)started after the last completed pass: pools,
-		// volumes and exports aren't back yet (docs/review-history.md P2-11).
+		// velod has just started: until its first pass ends, the pools, volumes and exports may
+		// not be back (docs/review-history.md P2-11).
 		overall = store.HealthStatusReconciling
 	}
 
@@ -1012,11 +1000,9 @@ func (s *Server) handleSystemStatus(w http.ResponseWriter, r *http.Request) {
 			"uptime_seconds":     uint64(time.Since(s.startedAt).Seconds()),
 		},
 		"data_plane": map[string]any{
-			"connected":          dpConnected,
-			"restoring":          restoring,
-			"endpoint":           socketPath,
-			"hugepages_total_mb": hpTotalMB,
-			"hugepages_free_mb":  hpFreeMB,
+			"connected": dpConnected,
+			"restoring": restoring,
+			"endpoint":  socketPath,
 		},
 		"reconciler": recState,
 		"warnings":   s.warnings(),

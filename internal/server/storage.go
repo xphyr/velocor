@@ -217,13 +217,12 @@ func (s *Server) releaseDisk(w http.ResponseWriter, r *http.Request, id string) 
 
 func (s *Server) handleCreatePool(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Name           string             `json:"name"`
-		RaidLevel      store.RaidLevel    `json:"raid_level"`
-		DiskIDs        []string           `json:"disk_ids"`
-		StripSizeKB    uint32             `json:"strip_size_kb"`
-		ChunkSizeBytes uint32             `json:"chunk_size_bytes"`
-		FilterPolicy   store.FilterPolicy `json:"filter_policy"`
-		SpacePolicy    store.SpacePolicy  `json:"space_policy"`
+		Name         string             `json:"name"`
+		RaidLevel    store.RaidLevel    `json:"raid_level"`
+		DiskIDs      []string           `json:"disk_ids"`
+		StripSizeKB  uint32             `json:"strip_size_kb"`
+		FilterPolicy store.FilterPolicy `json:"filter_policy"`
+		SpacePolicy  store.SpacePolicy  `json:"space_policy"`
 	}
 	if err := decodeJSON(r, &req); err != nil {
 		writeError(w, err)
@@ -238,9 +237,6 @@ func (s *Server) handleCreatePool(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.StripSizeKB == 0 {
 		req.StripSizeKB = 64
-	}
-	if req.ChunkSizeBytes == 0 {
-		req.ChunkSizeBytes = store.DefaultChunkSizeBytes
 	}
 	for _, err := range []error{
 		validateDisplayName("pool", req.Name),
@@ -272,19 +268,18 @@ func (s *Server) handleCreatePool(w http.ResponseWriter, r *http.Request) {
 
 	id := newResourceID("pool")
 	pool := &store.Pool{
-		ID:             id,
-		Name:           req.Name,
-		RaidLevel:      req.RaidLevel,
-		DiskIDs:        req.DiskIDs,
-		StripSizeKB:    req.StripSizeKB,
-		ChunkSizeBytes: req.ChunkSizeBytes,
-		ArrayName:      "raid_" + id,
-		Device:         "raid_" + id,
-		ThinPoolName:   "lvs_" + id,
-		TotalBytes:     totalRaw,
-		FreeBytes:      totalRaw,
-		FilterPolicy:   req.FilterPolicy,
-		SpacePolicy:    req.SpacePolicy,
+		ID:           id,
+		Name:         req.Name,
+		RaidLevel:    req.RaidLevel,
+		DiskIDs:      req.DiskIDs,
+		StripSizeKB:  req.StripSizeKB,
+		ArrayName:    "raid_" + id,
+		Device:       "raid_" + id,
+		ThinPoolName: "lvs_" + id,
+		TotalBytes:   totalRaw,
+		FreeBytes:    totalRaw,
+		FilterPolicy: req.FilterPolicy,
+		SpacePolicy:  req.SpacePolicy,
 		// The reconciler leaves RECONCILING pools without an lvstore UUID alone.
 		HealthStatus:  store.HealthStatusReconciling,
 		StatusMessage: "creating",
@@ -298,9 +293,8 @@ func (s *Server) handleCreatePool(w http.ResponseWriter, r *http.Request) {
 	cleanup := context.WithoutCancel(ctx)
 	fail := func(raidCreated bool, err error) {
 		if raidCreated {
-			// The lvstore may exist even though creating it "failed" (e.g. a timeout while
-			// spdk_tgt went on and finished), and a RAID can't be deleted from under it: the
-			// delete would hang half-done. Remove the lvstore first.
+			// The thin pool may exist even though creating it "failed" (e.g. on a timeout), and
+			// the array can't be deleted from under it: remove the thin pool first.
 			if derr := s.dp.DeleteThinPool(cleanup, "", pool.ThinPoolName); derr != nil && !dataplane.IsNotFound(derr) {
 				err = fmt.Errorf("%w (rollback: delete thin pool %s: %v; array %s left in place)", err, pool.ThinPoolName, derr, pool.ArrayName)
 				_ = s.store.DeletePool(pool.ID)
@@ -316,7 +310,7 @@ func (s *Server) handleCreatePool(w http.ResponseWriter, r *http.Request) {
 		fail(false, fmt.Errorf("create the array: %w", err))
 		return
 	}
-	lvsUUID, err := s.dp.CreateThinPool(ctx, pool.Device, pool.ThinPoolName, pool.ChunkSizeBytes)
+	lvsUUID, err := s.dp.CreateThinPool(ctx, pool.Device, pool.ThinPoolName)
 	if err != nil {
 		fail(true, fmt.Errorf("create the thin pool: %w", err))
 		return
@@ -326,10 +320,7 @@ func (s *Server) handleCreatePool(w http.ResponseWriter, r *http.Request) {
 		p.HealthStatus, p.StatusMessage = store.HealthStatusOnline, ""
 		if stores, err := s.dp.ThinPools(ctx, "", lvsUUID); err == nil && len(stores) > 0 {
 			p.TotalBytes, p.FreeBytes = stores[0].TotalBytes, stores[0].FreeBytes
-			if stores[0].ChunkBytes > 0 {
-				// What the data plane used: the kernel one's thin pools always take 64 KiB.
-				p.ChunkSizeBytes = stores[0].ChunkBytes
-			}
+			p.ChunkSizeBytes = stores[0].ChunkBytes
 			p.AllocatedBytes = p.TotalBytes - p.FreeBytes
 		}
 		p.SpaceState = store.SpaceStateOf(p)
@@ -358,7 +349,6 @@ func (s *Server) handleDeletePool(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
-	// SPDK treats uuid and lvs_name as mutually exclusive.
 	lvsUUID, lvsName := pool.ThinPoolUUID, ""
 	if lvsUUID == "" {
 		lvsName = pool.ThinPoolName
@@ -391,8 +381,22 @@ func poolUsable(pool *store.Pool) error {
 	return nil
 }
 
-func qosSet(q store.QosPolicy) bool {
-	return q != (store.QosPolicy{})
+// rejectQoS refuses I/O limits: the kernel targets have none, so they can't be honoured
+// (docs/design/kernel-dataplane.md, section 6). Limits of zero ask for nothing.
+func rejectQoS(raw json.RawMessage) error {
+	var q map[string]uint64
+	if len(raw) == 0 || string(raw) == "null" {
+		return nil
+	}
+	if err := json.Unmarshal(raw, &q); err != nil {
+		return fmt.Errorf("%w: qos_policy: %v", store.ErrInvalidArgument, err)
+	}
+	for k, v := range q {
+		if v != 0 {
+			return fmt.Errorf("%w: I/O limits (qos_policy.%s) are not supported", store.ErrInvalidArgument, k)
+		}
+	}
+	return nil
 }
 
 // volumeSizeUnit is the data plane's allocation unit for volume sizes (an LVM extent).
@@ -413,7 +417,7 @@ func (s *Server) handleCreateVolume(w http.ResponseWriter, r *http.Request) {
 		// counts its full size as committed.
 		ThinProvision bool               `json:"thin_provision"`
 		FilterPolicy  store.FilterPolicy `json:"filter_policy"`
-		QosPolicy     store.QosPolicy    `json:"qos_policy"`
+		QosPolicy     json.RawMessage    `json:"qos_policy"` // refused
 		Labels        map[string]string  `json:"labels"`
 		// DeletionProtection refuses deletion until an administrator turns it off.
 		DeletionProtection bool `json:"deletion_protection"`
@@ -431,7 +435,7 @@ func (s *Server) handleCreateVolume(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	req.SizeBytes = roundVolumeSize(req.SizeBytes)
-	if err := rejectFilters(req.FilterPolicy); err != nil {
+	if err := errors.Join(rejectFilters(req.FilterPolicy), rejectQoS(req.QosPolicy)); err != nil {
 		writeError(w, err)
 		return
 	}
@@ -483,7 +487,6 @@ func (s *Server) handleCreateVolume(w http.ResponseWriter, r *http.Request) {
 		SizeBytes:          req.SizeBytes,
 		ThinProvision:      true,
 		FilterPolicy:       req.FilterPolicy,
-		QosPolicy:          req.QosPolicy,
 		AttachmentState:    store.AttachmentStateUnattached,
 		HealthStatus:       store.HealthStatusOnline,
 		Labels:             req.Labels,
@@ -492,19 +495,12 @@ func (s *Server) handleCreateVolume(w http.ResponseWriter, r *http.Request) {
 	s.finishVolumeCreate(w, r, vol, http.StatusCreated)
 }
 
-// finishVolumeCreate applies QoS and persists a volume whose lvol already exists in SPDK,
-// deleting the lvol again if either step fails.
+// finishVolumeCreate persists a volume that already exists in the data plane, deleting it there
+// again if that fails.
 func (s *Server) finishVolumeCreate(w http.ResponseWriter, r *http.Request, vol *store.Volume, status int) {
 	rollback := func(err error) {
 		_ = s.dp.DeleteVolume(context.WithoutCancel(r.Context()), vol.UUID)
 		writeError(w, err)
-	}
-	if qosSet(vol.QosPolicy) {
-		q := vol.QosPolicy
-		if err := s.dp.SetQoS(r.Context(), vol.Device, q); err != nil {
-			rollback(fmt.Errorf("apply QoS: %w", err))
-			return
-		}
 	}
 	if err := s.store.CreateVolume(vol); err != nil {
 		rollback(err)
@@ -560,40 +556,6 @@ func (s *Server) resizeVolume(w http.ResponseWriter, r *http.Request, id string)
 	}
 	updated, err := s.store.MutateVolume(id, func(v *store.Volume) error {
 		v.SizeBytes = max(v.SizeBytes, req.NewSizeBytes)
-		return nil
-	})
-	if err != nil {
-		writeError(w, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"volume": updated})
-}
-
-func (s *Server) handleSetVolumeQoS(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
-	var req struct {
-		QosPolicy store.QosPolicy `json:"qos_policy"`
-	}
-	if err := decodeJSON(r, &req); err != nil {
-		writeError(w, err)
-		return
-	}
-	vol, err := s.liveVolume(id)
-	if err != nil {
-		writeError(w, err)
-		return
-	}
-	if err := s.requireDataPlane(); err != nil {
-		writeError(w, err)
-		return
-	}
-	q := req.QosPolicy
-	if err := s.dp.SetQoS(r.Context(), vol.Device, q); err != nil {
-		writeError(w, fmt.Errorf("apply QoS: %w", err))
-		return
-	}
-	updated, err := s.store.MutateVolume(id, func(v *store.Volume) error {
-		v.QosPolicy = q
 		return nil
 	})
 	if err != nil {
@@ -699,7 +661,7 @@ func (s *Server) cloneSnapshot(w http.ResponseWriter, r *http.Request, snapID st
 	var req struct {
 		CloneName    string             `json:"clone_name"`
 		FilterPolicy store.FilterPolicy `json:"filter_policy"`
-		QosPolicy    store.QosPolicy    `json:"qos_policy"`
+		QosPolicy    json.RawMessage    `json:"qos_policy"` // refused
 		Labels       map[string]string  `json:"labels"`
 	}
 	if err := decodeJSON(r, &req); err != nil {
@@ -710,7 +672,7 @@ func (s *Server) cloneSnapshot(w http.ResponseWriter, r *http.Request, snapID st
 		writeError(w, err)
 		return
 	}
-	if err := rejectFilters(req.FilterPolicy); err != nil {
+	if err := errors.Join(rejectFilters(req.FilterPolicy), rejectQoS(req.QosPolicy)); err != nil {
 		writeError(w, err)
 		return
 	}
@@ -765,7 +727,6 @@ func (s *Server) cloneSnapshot(w http.ResponseWriter, r *http.Request, snapID st
 		ThinProvision:    true,
 		ParentSnapshotID: snap.ID,
 		FilterPolicy:     req.FilterPolicy,
-		QosPolicy:        req.QosPolicy,
 		AttachmentState:  store.AttachmentStateUnattached,
 		HealthStatus:     store.HealthStatusOnline,
 		Labels:           req.Labels,

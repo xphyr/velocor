@@ -84,7 +84,7 @@ func TestBuildCollectsOnlyThePool(t *testing.T) {
 	}
 	for _, id := range []string{"d1", "d2"} {
 		must(st.UpsertDisk(&store.Disk{ID: id, Type: store.DiskTypeSSD, SerialNumber: "SN-" + id}))
-		_, err := st.ClaimDisk(id, store.DiskDriverStateUringClaimed, "uring_"+id)
+		_, err := st.ClaimDisk(id, store.DiskDriverStateKernel, "/dev/disk/by-id/"+id)
 		must(err)
 	}
 	must(st.CreatePool(&store.Pool{ID: "p1", Name: "p1", DiskIDs: []string{"d1"}}))

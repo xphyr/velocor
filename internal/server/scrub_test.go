@@ -17,6 +17,7 @@ func scrubPool(t *testing.T) (*harness, string, string) {
 	h.addDisk("d1", "0000:01:00.0")
 	h.addDisk("d2", "0000:02:00.0")
 	id := h.pool("p", "RAID1", "d1", "d2")
+	h.reconcile() // the scheduler waits for velod's first pass
 	p, err := h.st.GetPool(id)
 	if err != nil {
 		t.Fatal(err)

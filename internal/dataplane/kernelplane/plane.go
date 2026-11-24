@@ -130,15 +130,6 @@ func (p *Plane) PollingCPUs(context.Context) ([]int, error) { return nil, nil }
 // MaxSnapshotGroup bounds a group snapshot (every member's I/O waits while all are taken).
 func (p *Plane) MaxSnapshotGroup() int { return maxGroup }
 
-// SetQoS: the kernel targets have no per-volume limits; QoS is dropped with the move
-// (docs/design/kernel-dataplane.md §6). Clearing limits succeeds.
-func (p *Plane) SetQoS(_ context.Context, _ string, q store.QosPolicy) error {
-	if q == (store.QosPolicy{}) {
-		return nil
-	}
-	return fmt.Errorf("%w: QoS limits", dataplane.ErrUnsupported)
-}
-
 // Settle brings up what the claimed disks hold, as SPDK's examine did: the targets' modules,
 // every velod array on claimed disks whose members are all present, or all those it still had
 // when it last ran (freshMembers; incomplete ones are kept as waiting), every volume group on them, a wrapper for every volume, and any wrapper a crash

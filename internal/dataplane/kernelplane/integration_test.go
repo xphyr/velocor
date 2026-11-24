@@ -110,7 +110,7 @@ func (e *env) pool() {
 		e.t.Fatal(err)
 	}
 	e.t.Cleanup(e.destroy)
-	u, err := e.p.CreateThinPool(e.ctx, e.array, e.vg, 1<<20)
+	u, err := e.p.CreateThinPool(e.ctx, e.array, e.vg)
 	if err != nil {
 		e.t.Fatal(err)
 	}
@@ -775,7 +775,7 @@ func TestRAID10(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(e.destroy)
-	if _, err := e.p.CreateThinPool(e.ctx, e.array, e.vg, 1<<20); err != nil {
+	if _, err := e.p.CreateThinPool(e.ctx, e.array, e.vg); err != nil {
 		t.Fatal(err)
 	}
 	if a := e.arrayOf(); a.Level != "raid10" || a.Slots != 4 || a.State != dataplane.ArrayOnline {

@@ -9,9 +9,8 @@ import (
 	"time"
 )
 
-// BlockDevice reaches the metadata volume as the block device the data plane already has for it
-// (the kernel data plane's LV): no exposing step, so nothing to recover. The I/O still runs in
-// the helper process ("velod meta-io") with O_DIRECT, so a hung device blocks only the helper.
+// BlockDevice reaches the metadata volume as its block device (an LV). The I/O runs in a helper
+// process ("velod meta-io") with O_DIRECT, so a hung device blocks only the helper.
 type BlockDevice struct {
 	// Path returns the device of the metadata volume with this UUID.
 	Path    func(ctx context.Context, lvolUUID string) (string, error)
@@ -67,6 +66,3 @@ func (b *BlockDevice) ReadSlots(ctx context.Context, lvol string) ([][]byte, err
 	}
 	return slots, nil
 }
-
-// Recover implements Device: there is never a device to release.
-func (b *BlockDevice) Recover(context.Context) error { return nil }

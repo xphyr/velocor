@@ -35,7 +35,7 @@ func Seed(t testing.TB, f *Fake, st store.Store, pool *store.Pool, disks ...*sto
 	}
 	must(st.CreatePool(pool))
 	must(f.CreateArray(ctx, pool.ArrayName, pool.RaidLevel, pool.StripSizeKB, handles))
-	uuid, err := f.CreateThinPool(ctx, pool.ArrayName, pool.ThinPoolName, 0)
+	uuid, err := f.CreateThinPool(ctx, pool.ArrayName, pool.ThinPoolName)
 	must(err)
 	out, err := st.MutatePool(pool.ID, func(p *store.Pool) error { p.ThinPoolUUID = uuid; return nil })
 	must(err)

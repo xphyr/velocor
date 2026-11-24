@@ -101,10 +101,9 @@ func (p *Plane) arrayName(pv string) string {
 	return pv
 }
 
-// CreateThinPool puts a volume group named name on the array, with its thin pool. The chunk
-// size is the kernel data plane's own (64 KiB, kernel.ChunkSize), whatever SPDK's cluster size
-// was.
-func (p *Plane) CreateThinPool(ctx context.Context, array, name string, _ uint32) (string, error) {
+// CreateThinPool puts a volume group named name on the array, with its thin pool (64 KiB chunks,
+// kernel.ChunkSize).
+func (p *Plane) CreateThinPool(ctx context.Context, array, name string) (string, error) {
 	if err := p.k.CreatePool(ctx, kernel.PoolSpec{VG: name, Device: p.k.ArrayPath(array), Thin: thinLV, DataPercent: dataPercent}); err != nil {
 		return "", err
 	}

@@ -133,7 +133,7 @@ func TestStorageEndToEndAndCBT(t *testing.T) {
 	// The extents below are checked at the fake's chunk size (1 MiB).
 	h.expect(h.do("POST", "/api/v1/disks/nvme-data1:claim", h.admin, nil))(http.StatusOK)
 	poolID := field(h.expect(h.do("POST", "/api/v1/pools", h.admin, map[string]any{
-		"name": "pool0", "raid_level": "RAID0", "disk_ids": []string{"nvme-data1"}, "chunk_size_bytes": 65536,
+		"name": "pool0", "raid_level": "RAID0", "disk_ids": []string{"nvme-data1"},
 	}))(http.StatusCreated), "pool", "id").(string)
 	pool, _ := h.st.GetPool(poolID)
 	if pool.ThinPoolUUID == "" || pool.HealthStatus != store.HealthStatusOnline {

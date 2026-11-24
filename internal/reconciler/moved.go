@@ -11,7 +11,7 @@ import (
 )
 
 // relinkMovedMembers finds pool members that came back under a new disk ID (docs/review-history.md P1-14)
-// and moves them to their new disk records, keeping the identity their array knows them by;
+// and moves them to their new disk records;
 // reconcileDisks then attaches them and the data plane assembles the array. It looks only at
 // pools whose array isn't online and members whose disk the last scan didn't find, and
 // identifies the disks by the array metadata on them (Plane.ExamineDisks). It reports whether
@@ -118,10 +118,6 @@ func (r *Reconciler) relinkMovedMembers(ctx context.Context, p *pass, discovered
 		}
 		a := arrays[i]
 		res := "pool:" + g.pool.ID
-		if a.Unplaced != "" {
-			p.notePool(g.pool.ID, "disks came back under new IDs but can't be matched to their slots: "+a.Unplaced)
-			continue
-		}
 		// A slot's gone disk is replaced by the unclaimed disk that now holds the slot.
 		goneBySlot := map[int]*store.Disk{}
 		for _, m := range store.PoolMembers(g.pool) {
@@ -134,7 +130,7 @@ func (r *Reconciler) relinkMovedMembers(ctx context.Context, p *pass, discovered
 			if m.Stale || m.Slot < 0 || m.Disk.Claimed || old == nil {
 				continue
 			}
-			if _, err := r.store.RelinkPoolMember(g.pool.ID, old.ID, m.Disk.ID, m.Identity); err != nil {
+			if _, err := r.store.RelinkPoolMember(g.pool.ID, old.ID, m.Disk.ID); err != nil {
 				p.errs = append(p.errs, fmt.Sprintf("%s: relink disk %s as %s: %v", res, old.ID, m.Disk.ID, err))
 				continue
 			}

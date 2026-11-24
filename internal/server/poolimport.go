@@ -21,7 +21,7 @@ import (
 //	POST /api/v1/pool-imports {pool_id}  import one
 //
 // The configuration comes from the copy on the pool (internal/meta); without a readable copy
-// the pool, its volumes and snapshots are rebuilt from what SPDK knows (the "skeleton").
+// the pool, its volumes and snapshots are rebuilt from what the data plane knows (the "skeleton").
 
 // WithMetaDevice gives the server access to the on-pool metadata copies (pool import).
 func WithMetaDevice(dev meta.Device) Option {
@@ -166,8 +166,6 @@ func (s *Server) importCandidates() ([]ImportCandidate, map[string][]dataplane.D
 		}
 		if _, err := s.store.GetPool(c.PoolID); err == nil {
 			c.Importable, c.Reason = false, "a pool with this ID already exists"
-		} else if a.Unplaced != "" && c.Importable {
-			c.Reason = strings.TrimPrefix(c.Reason+"; ", "; ") + a.Unplaced
 		}
 		out = append(out, c)
 	}
@@ -187,7 +185,7 @@ func (s *Server) handleListImportCandidates(w http.ResponseWriter, _ *http.Reque
 // ImportResult reports what an import recovered.
 type ImportResult struct {
 	Pool *store.Pool `json:"pool"`
-	// Source is "manifest" (the copy on the pool) or "skeleton" (rebuilt from SPDK).
+	// Source is "manifest" (the copy on the pool) or "skeleton" (rebuilt from the data plane).
 	Source           string    `json:"source"`
 	Generation       uint64    `json:"generation,omitempty"`
 	WrittenAt        time.Time `json:"written_at,omitzero"`
@@ -261,8 +259,8 @@ func (s *Server) importPool(ctx context.Context, poolID, rename string, allowDeg
 		}
 	}()
 
-	// 1. Claim the members (no wipe: they carry our RAID by design). SPDK examines each one
-	//    and assembles the array from the superblocks.
+	// 1. Claim the members (no wipe: they carry our array by design). The data plane
+	//    assembles the array from the claimed disks' metadata.
 	var claimed []*store.Disk
 	for _, f := range found[cand.RaidUUID] {
 		if f.Stale {
@@ -272,33 +270,16 @@ func (s *Server) importPool(ctx context.Context, poolID, rename string, allowDeg
 			claimed = append(claimed, f.Disk)
 			continue
 		}
-		disk := f.Disk
-		if f.Identity != "" {
-			// A member under a new disk ID keeps the identity its array knows it by, and must
-			// keep it after restarts: record it before the data plane sees the disk.
-			cp := *f.Disk
-			cp.MemberUUID = f.Identity
-			disk = &cp
-			if _, merr := s.store.MutateDisk(f.Disk.ID, func(cur *store.Disk) error {
-				cur.MemberUUID = f.Identity
-				return nil
-			}); merr != nil {
-				return nil, fmt.Errorf("record the member UUID of disk %s: %w", f.Disk.ID, merr)
-			}
-		}
-		d, cerr := s.attachAndClaim(ctx, disk, true)
+		d, cerr := s.attachAndClaim(ctx, f.Disk, true)
 		if cerr != nil {
 			return nil, fmt.Errorf("claim disk %s: %w", f.Disk.ID, cerr)
 		}
 		claimed = append(claimed, d)
 	}
 	// From here a failure undoes only the database records. The disks stay claimed and the
-	// array assembled, and a retry carries on from there: taking a running array apart again
-	// would change it (detaching RAID1 members one by one records the first as failed in the
-	// others' superblocks), and bdev_raid_delete under a loaded volume store leaves it
-	// half-deleted.
+	// array assembled, and a retry carries on from there.
 
-	// 2. Wait for the array, start it degraded if asked, then wait for the volume store.
+	// 2. Wait for the array, start it degraded if asked, then wait for the thin pool.
 	raid, err := s.waitForRaid(ctx, cand.RaidName, allowDegraded)
 	if err != nil {
 		return nil, err
@@ -312,17 +293,17 @@ func (s *Server) importPool(ctx context.Context, poolID, rename string, allowDeg
 			break
 		}
 		if time.Now().After(deadline) {
-			return nil, fmt.Errorf("the volume store %s did not load from RAID %s", lvsName, cand.RaidName)
+			return nil, fmt.Errorf("thin pool %s did not come up on array %s", lvsName, cand.RaidName)
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
 
-	// 3. What SPDK has in the volume store.
+	// 3. What the thin pool holds.
 	lvols, err := s.dp.Volumes(ctx)
 	if err != nil {
 		return nil, err
 	}
-	inLvs := map[string]dataplane.Volume{} // by lvol name
+	inLvs := map[string]dataplane.Volume{} // by name
 	for _, l := range lvols {
 		if l.Pool == lvs.UUID {
 			inLvs[l.Name] = l
@@ -362,7 +343,7 @@ func (s *Server) importPool(ctx context.Context, poolID, rename string, allowDeg
 		}
 	}
 
-	// 5. The pool record: member disks in slot order from what SPDK assembled.
+	// 5. The pool record: member disks in slot order from the array.
 	pool := plan.Pool
 	if rename != "" {
 		pool.Name = rename
@@ -509,7 +490,7 @@ func (s *Server) recordLvols(vols []*store.Volume, snaps []*store.Snapshot) erro
 	return nil
 }
 
-// waitForRaid waits for SPDK to assemble name from its members' superblocks.
+// waitForRaid waits for the data plane to assemble array name from its members' metadata.
 func (s *Server) waitForRaid(ctx context.Context, name string, allowDegraded bool) (*dataplane.Array, error) {
 	startedDegraded := false
 	for deadline := time.Now().Add(30 * time.Second); ; {
@@ -659,7 +640,6 @@ func (s *Server) importAccess(plan *meta.Manifest, vols []*store.Volume, res *Im
 		if _, err := s.store.GetPortal(p.ID); err == nil {
 			continue
 		}
-		p.IscsiPgTag = 0 // tags are allocated per appliance
 		if err := s.store.CreatePortal(&p); err != nil {
 			return fmt.Errorf("record portal %s: %w", p.ID, err)
 		}
@@ -683,7 +663,6 @@ func (s *Server) importAccess(plan *meta.Manifest, vols []*store.Volume, res *Im
 				why = append(why, "initiator group "+gid+" uses CHAP; set its secrets again, then enable the export")
 			}
 		}
-		e.IscsiIgTag = 0
 		e.HealthStatus, e.StatusMessage = store.HealthStatusReconciling, ""
 		e.Disabled, e.DisabledReason = len(why) > 0, strings.Join(why, "; ")
 		if err := s.store.CreateExport(&e); err != nil {

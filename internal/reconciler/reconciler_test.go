@@ -76,7 +76,7 @@ func (e *env) provisionOn(poolID, name, volID string, level store.RaidLevel, ids
 	pool := &store.Pool{ID: poolID, Name: name, RaidLevel: level, DiskIDs: ids, StripSizeKB: 64}
 	must(e.st.CreatePool(pool))
 	must(e.fake.CreateArray(e.ctx, pool.ArrayName, level, 64, handles))
-	tp, err := e.fake.CreateThinPool(e.ctx, pool.ArrayName, pool.ThinPoolName, 0)
+	tp, err := e.fake.CreateThinPool(e.ctx, pool.ArrayName, pool.ThinPoolName)
 	must(err)
 	_, err = e.st.MutatePool(pool.ID, func(p *store.Pool) error { p.ThinPoolUUID = tp; return nil })
 	must(err)

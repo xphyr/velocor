@@ -22,22 +22,18 @@ type State struct {
 	DriftRepairedCount uint64    `json:"drift_repaired_count"`
 	DegradedResources  []string  `json:"degraded_resources"`
 	LastError          string    `json:"last_error,omitempty"`
-	// Unmanaged lists what spdk_tgt holds that no store record accounts for (P1-5).
+	// Unmanaged lists what the data plane holds that no store record accounts for (P1-5).
 	Unmanaged []UnmanagedObject `json:"unmanaged_objects,omitempty"`
-	// DataPlaneInstance is the spdk_tgt process the last completed pass reconciled
-	// (hardware.SPDKInstance; "" when unknown). When the running one differs, the data plane
-	// was restarted after that pass and isn't restored yet (docs/review-history.md P2-11).
-	DataPlaneInstance string `json:"data_plane_instance,omitempty"`
 }
 
-// Reconciler continuously converges observed state in Linux sysfs and spdk_tgt
+// Reconciler continuously converges the observed state of the hardware and the data plane
 // toward the desired state persisted in bbolt.
 //
 // Safety rules (see TODO C1):
-//   - It never creates RAID bdevs, lvstores or lvols. Pools are created atomically by the
-//     API with an on-disk RAID superblock, so after a restart SPDK examine re-assembles the
-//     array and loads its lvstore; anything still missing is reported, never re-created,
-//     because re-creating it would hand hosts blank storage under the old identity.
+//   - It never creates arrays, thin pools or volumes (but each pool's metadata volume). The API
+//     creates them, and after a reboot the data plane brings them back from the disks (Settle);
+//     anything still missing is reported, never re-created, because re-creating it would hand
+//     hosts blank storage under the old identity.
 //   - It only writes store records whose observed status actually changed, and only the
 //     status fields it owns, via atomic Mutate* calls.
 type Reconciler struct {
@@ -58,10 +54,7 @@ type Reconciler struct {
 
 	now func() time.Time // replaces time.Now (tests)
 
-	// instance identifies the running spdk_tgt (hardware.SPDKInstance; replaceable in tests).
-	instance func() string
-
-	// unmanagedSeen: when each unaccounted SPDK object was first seen (reported after
+	// unmanagedSeen: when each unaccounted data-plane object was first seen (reported after
 	// unmanagedGrace); unmanagedLogged: those already logged.
 	unmanagedSeen   map[string]time.Time
 	unmanagedLogged map[string]bool
@@ -77,36 +70,19 @@ func New(st store.Store, dp dataplane.Plane, hwMgr *hardware.Manager, logger *sl
 		logger = slog.Default()
 	}
 	return &Reconciler{
-		store:    st,
-		dp:       dp,
-		hw:       hwMgr,
-		logger:   logger,
-		instance: hardware.SPDKInstance,
+		store:  st,
+		dp:     dp,
+		hw:     hwMgr,
+		logger: logger,
 	}
 }
 
-// DataPlaneInstance identifies the running spdk_tgt process ("" when unknown).
-func (r *Reconciler) DataPlaneInstance() string {
-	if r.instance == nil {
-		return ""
-	}
-	return r.instance()
-}
-
-// SetDataPlaneInstance replaces how the running spdk_tgt is identified (tests).
-func (r *Reconciler) SetDataPlaneInstance(f func() string) {
-	r.passMu.Lock()
-	defer r.passMu.Unlock()
-	r.instance = f
-}
-
-// Restoring reports whether spdk_tgt was restarted since the last completed pass, so what
-// velod built in it (pools' RAIDs and volume stores, exports) isn't all back yet.
+// Restoring reports whether no pass has finished since velod started, so after a reboot the pools,
+// volumes and exports aren't all back yet.
 func (r *Reconciler) Restoring() bool {
-	cur := r.DataPlaneInstance()
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return cur != "" && cur != r.state.DataPlaneInstance
+	return r.state.LastReconciledAt.IsZero()
 }
 
 // State returns a snapshot of the reconciler's current status.
@@ -128,23 +104,12 @@ func (r *Reconciler) Start(ctx context.Context, interval time.Duration) {
 
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
-	// A restarted spdk_tgt has lost everything velod built in it: restore at once rather than
-	// at the next tick (docs/review-history.md P2-11).
-	watch := time.NewTicker(2 * time.Second)
-	defer watch.Stop()
-
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
 			_, _ = r.ReconcileOnce(ctx)
-		case <-watch.C:
-			if r.Restoring() {
-				r.logger.Warn("the data plane was restarted: restoring pools, volumes and exports now", "instance", r.DataPlaneInstance())
-				_, _ = r.ReconcileOnce(ctx)
-				ticker.Reset(interval)
-			}
 		}
 	}
 }
@@ -185,9 +150,6 @@ func (r *Reconciler) ReconcileOnce(ctx context.Context) (State, error) {
 	r.mu.Unlock()
 
 	p := &pass{}
-	// The spdk_tgt this pass reconciles, read before talking to it: a restart during the pass
-	// then shows as a different instance afterwards.
-	instance := r.DataPlaneInstance()
 	discovered := r.syncHardware(p)
 	r.enforceWriteCache(p)
 
@@ -197,19 +159,19 @@ func (r *Reconciler) ReconcileOnce(ctx context.Context) (State, error) {
 	}
 
 	if r.relinkMovedMembers(ctx, p, discovered) {
-		r.enforceWriteCache(p) // the relinked disks inherit their policy: apply it before SPDK writes
+		r.enforceWriteCache(p) // the relinked disks inherit their policy: apply it before anything is written
 	}
 
 	r.reconcileDisks(ctx, p)
 	r.nvmeWriteCache(ctx, p)
 	r.applySettings(ctx, p)
 
-	// Let SPDK finish examining every base bdev (RAID superblock assembly, lvstore load)
-	// before anything below concludes that on-disk metadata is missing.
+	// Bring up what the claimed disks hold (arrays, thin pools, volumes) before anything below
+	// concludes that it is missing.
 	examined := true
 	if err := r.dp.Settle(ctx, dataplane.ClaimedHandles(r.store)); err != nil {
 		examined = false
-		p.errs = append(p.errs, fmt.Sprintf("bdev_wait_for_examine: %v", err))
+		p.errs = append(p.errs, fmt.Sprintf("bring up the pools: %v", err))
 	}
 
 	poolOnline := r.reconcilePools(ctx, p, examined)
@@ -223,9 +185,6 @@ func (r *Reconciler) ReconcileOnce(ctx context.Context) (State, error) {
 
 	lastErr := strings.Join(p.errs, "; ")
 	r.finishPass(p.repaired, p.degraded, lastErr)
-	r.mu.Lock()
-	r.state.DataPlaneInstance = instance
-	r.mu.Unlock()
 	if p.unmanagedChecked {
 		r.mu.Lock()
 		r.state.Unmanaged = p.unmanaged
@@ -776,7 +735,7 @@ func (r *Reconciler) reconcileVolumes(ctx context.Context, p *pass, poolOnline m
 	for _, vol := range volumes {
 		res := "volume:" + vol.ID
 		health, msg := store.HealthStatusOnline, ""
-		info, found := bdevs[vol.UUID]
+		_, found := bdevs[vol.UUID]
 
 		switch {
 		case !poolOnline[vol.PoolID]:
@@ -795,18 +754,6 @@ func (r *Reconciler) reconcileVolumes(ctx context.Context, p *pass, poolOnline m
 			}
 			if health == store.HealthStatusOnline {
 				online[vol.ID] = vol
-				q := vol.QosPolicy
-				have := info.QoS
-				if eff, ok := bdevs[vol.Device]; ok {
-					have = eff.QoS
-				}
-				if have != q {
-					if err := r.dp.SetQoS(ctx, vol.Device, q); err != nil {
-						p.errs = append(p.errs, fmt.Sprintf("%s: apply QoS: %v", res, err))
-					} else {
-						p.repaired++
-					}
-				}
 			}
 		}
 

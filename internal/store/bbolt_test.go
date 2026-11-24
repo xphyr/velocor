@@ -117,7 +117,7 @@ func TestDiskBootGuardAndClaimLifecycle(t *testing.T) {
 	}
 
 	// Attempting to claim a boot disk must fail with ErrBootDeviceProtected.
-	if _, err := st.ClaimDisk("disk-boot", DiskDriverStateVfioPCI, "nvme0n1"); !errors.Is(err, ErrBootDeviceProtected) {
+	if _, err := st.ClaimDisk("disk-boot", DiskDriverStateKernel, "nvme0n1"); !errors.Is(err, ErrBootDeviceProtected) {
 		t.Fatalf("expected ErrBootDeviceProtected when claiming boot disk, got %v", err)
 	}
 
@@ -147,11 +147,11 @@ func TestDiskBootGuardAndClaimLifecycle(t *testing.T) {
 		t.Fatalf("UpsertDisk(dataDisk) failed: %v", err)
 	}
 
-	claimed, err := st.ClaimDisk("disk-nvme1", DiskDriverStateVfioPCI, "Nvme1n1")
+	claimed, err := st.ClaimDisk("disk-nvme1", DiskDriverStateKernel, "Nvme1n1")
 	if err != nil {
 		t.Fatalf("ClaimDisk failed: %v", err)
 	}
-	if !claimed.Claimed || claimed.DriverState != DiskDriverStateVfioPCI || claimed.Handle != "Nvme1n1" {
+	if !claimed.Claimed || claimed.DriverState != DiskDriverStateKernel || claimed.Handle != "Nvme1n1" {
 		t.Fatalf("unexpected claimed disk state: %+v", claimed)
 	}
 
@@ -192,16 +192,13 @@ func TestPoolVolumeSnapshotAndExportReferentialIntegrity(t *testing.T) {
 
 	// Claim both disks.
 	for _, id := range []string{"disk-1", "disk-2"} {
-		if _, err := st.ClaimDisk(id, DiskDriverStateVfioPCI, "bdev_"+id); err != nil {
+		if _, err := st.ClaimDisk(id, DiskDriverStateKernel, "bdev_"+id); err != nil {
 			t.Fatalf("ClaimDisk(%s) failed: %v", id, err)
 		}
 	}
 
 	if err := st.CreatePool(pool); err != nil {
 		t.Fatalf("CreatePool failed: %v", err)
-	}
-	if pool.ChunkSizeBytes != DefaultChunkSizeBytes {
-		t.Fatalf("expected default ChunkSizeBytes=%d, got %d", DefaultChunkSizeBytes, pool.ChunkSizeBytes)
 	}
 
 	// Verify both disks now have PoolID="pool-1" and cannot be released while in the pool.

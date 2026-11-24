@@ -52,9 +52,6 @@ func (m *MemDevice) ReadSlots(_ context.Context, lvol string) ([][]byte, error) 
 	return [][]byte{append([]byte(nil), b[:SlotBytes]...), append([]byte(nil), b[SlotBytes:]...)}, nil
 }
 
-// Recover implements Device.
-func (m *MemDevice) Recover(context.Context) error { return nil }
-
 // Corrupt overwrites part of a slot (tests of torn writes).
 func (m *MemDevice) Corrupt(lvol string, slot int) {
 	m.mu.Lock()

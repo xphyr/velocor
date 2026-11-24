@@ -87,7 +87,7 @@ type Plane interface {
 	// ThinPools lists thin pools, all of them or the one with the given name or UUID.
 	ThinPools(ctx context.Context, name, uuid string) ([]ThinPool, error)
 	// CreateThinPool creates a thin pool named name on an array and returns its UUID.
-	CreateThinPool(ctx context.Context, array, name string, chunkBytes uint32) (string, error)
+	CreateThinPool(ctx context.Context, array, name string) (string, error)
 	// GrowMetadata grows a thin pool's metadata when it is filling, as far as the room under it
 	// allows, and returns its new size (0: unchanged). An error says it needed to and couldn't.
 	GrowMetadata(ctx context.Context, uuid string) (uint64, error)
@@ -125,8 +125,6 @@ type Plane interface {
 	// with ErrCBTUnsupported when the data plane can't tell.
 	AllocatedBlocks(ctx context.Context, pool *store.Pool, target *store.Snapshot) ([]Extent, error)
 	ChangedBlocks(ctx context.Context, pool *store.Pool, base, target *store.Snapshot) ([]Extent, error)
-	// SetQoS applies a volume's I/O limits to its device (zero = unlimited).
-	SetQoS(ctx context.Context, device string, q store.QosPolicy) error
 
 	// ApplyExport converges the target for exp so that it exposes vol to exactly acl on the
 	// given portals. Portals whose address isn't on this host are left out and reported with
@@ -158,8 +156,6 @@ type DiskArray struct {
 	Generation uint64
 	SizeBytes  uint64
 	Members    []DiskMember
-	// Unplaced says why some disks couldn't be given their slots ("" when none).
-	Unplaced string
 }
 
 // DiskMember is one disk carrying an array's metadata.
@@ -168,10 +164,6 @@ type DiskMember struct {
 	Slot int // -1 when its metadata doesn't say
 	// Stale: the disk left the array (an older copy, or not one of its current members).
 	Stale bool
-	// Identity is how the array knows this disk when that differs from the disk's own: a
-	// member that came back under a new disk ID keeps the SPDK bdev UUID it was created with
-	// (Disk.MemberUUID). "" when no such thing is needed (md knows its members itself).
-	Identity string
 }
 
 // Device is a block device the data plane holds.
@@ -181,8 +173,6 @@ type Device struct {
 	UUID      string
 	Product   string // what the backend calls this kind of device, for reports
 	SizeBytes uint64
-	// QoS is the I/O limit currently applied to the device.
-	QoS store.QosPolicy
 	// Origin is, for a snapshot, the volume it was taken of, and for a clone the snapshot it was
 	// made from: names within the pool ("" when it has none, or when that is deleted).
 	Origin string
