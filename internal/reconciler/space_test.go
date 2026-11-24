@@ -10,16 +10,16 @@ import (
 func TestSpaceAccountingAndStates(t *testing.T) {
 	e := newEnv(t)
 	pool, vol := e.provision(store.RaidLevel0, "0000:01:00.0")
-	e.fake.SetLvstoreClusters(pool.ThinPoolName, 1000)
+	e.fake.SetPoolChunks(pool.ThinPoolName, 4000)
 	write := func(from, to uint64) {
 		for i := from; i < to; i++ {
-			e.fake.WriteCluster(vol.UUID, i)
+			e.fake.WriteChunk(vol.UUID, i)
 		}
 	}
 
 	e.reconcile()
 	p := e.pool()
-	cs := p.TotalBytes / 1000
+	cs := p.TotalBytes / 4000
 	if p.SpaceState != store.SpaceStateOK || p.CommittedBytes != vol.SizeBytes || p.AvailableBytes == 0 {
 		t.Fatalf("empty pool: state %s committed %d available %d", p.SpaceState, p.CommittedBytes, p.AvailableBytes)
 	}
@@ -27,16 +27,16 @@ func TestSpaceAccountingAndStates(t *testing.T) {
 	for _, step := range []struct {
 		upTo  uint64
 		state store.SpaceState
-	}{{500, store.SpaceStateOK}, {850, store.SpaceStateWarning}, {920, store.SpaceStateCritical}, {1000, store.SpaceStateFull}} {
+	}{{2000, store.SpaceStateOK}, {3400, store.SpaceStateWarning}, {3680, store.SpaceStateCritical}, {4000, store.SpaceStateFull}} {
 		write(0, step.upTo)
 		st := e.reconcile()
 		p = e.pool()
 		v, _ := e.st.GetVolume(vol.ID)
 		if v.AllocatedBytes != step.upTo*cs {
-			t.Fatalf("%d clusters written: volume allocated %d, want %d", step.upTo, v.AllocatedBytes, step.upTo*cs)
+			t.Fatalf("%d chunks written: volume allocated %d, want %d", step.upTo, v.AllocatedBytes, step.upTo*cs)
 		}
 		if p.SpaceState != step.state {
-			t.Fatalf("%d/1000 clusters used: space state %s, want %s", step.upTo, p.SpaceState, step.state)
+			t.Fatalf("%d/4000 chunks used: space state %s, want %s", step.upTo, p.SpaceState, step.state)
 		}
 		flagged := strings.Contains(strings.Join(st.DegradedResources, " "), "pool:"+pool.ID)
 		if flagged != (step.state != store.SpaceStateOK) {

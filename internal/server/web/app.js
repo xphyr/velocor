@@ -820,10 +820,9 @@ async function createVolumeDialog(poolId) {
       { name: "name", label: "Name", required: true },
       ...(items.length > 1 || !poolId ? [{ name: "pool", label: "Pool", value: poolId || (items[0] || {}).id, options: items.map((p) => ({ value: p.id, label: `${p.name} (${humanSize(p.free_bytes)} free)` })) }] : []),
       { name: "size", label: "Size", size: true, required: true, value: 10 * 2 ** 30 },
-      { name: "thin", kind: "tick", value: true, text: "Thin provisioned: space is only allocated as it's written" },
       { name: "protect", kind: "tick", value: false, text: "Deletion protection: refuse deletes until an administrator turns it off" },
     ],
-    action: (v) => send("POST", "/volumes", { name: v.name, pool_id: v.pool || poolId, size_bytes: v.size, thin_provision: v.thin, deletion_protection: v.protect }),
+    action: (v) => send("POST", "/volumes", { name: v.name, pool_id: v.pool || poolId, size_bytes: v.size, deletion_protection: v.protect }),
     done: (r) => { notify(`Created ${r.volume.name}.`); location.hash = hash("volume", r.volume.id); },
   });
 }
@@ -978,7 +977,7 @@ function volumeTable(items, poolList, options = {}) {
     { title: "Name", cell: (v) => [el("strong", {}, link(v.name, "volume", v.id)), v.parent_snapshot_id && el("span", { class: "sub" }, "clone of a snapshot")], text: (v) => `${v.name} ${v.id} ${labelsText(v.labels)}` },
     { title: "Health", cell: health, text: (v) => v.health_status },
     { title: "Pool", cell: (v) => (poolsById[v.pool_id] ? link(poolsById[v.pool_id].name, "pool", v.pool_id) : mono(v.pool_id)), text: (v) => (poolsById[v.pool_id] || {}).name || "" },
-    { title: "Size", num: true, cell: (v) => [humanSize(v.size_bytes), el("span", { class: "sub" }, v.thin_provision ? "thin" : "thick")] },
+    { title: "Size", num: true, cell: (v) => humanSize(v.size_bytes) },
     { title: "Allocated", num: true, cell: (v) => humanSize(v.allocated_bytes || 0) },
     { title: "Exported", cell: (v) => (v.attachment_state === "BLOCK_EXPORT" ? pill("Exported", "ok") : pill("Not exported", "quiet")), text: (v) => v.attachment_state },
     { title: "Labels", cell: (v) => labelsText(v.labels) || "-" },
@@ -1045,7 +1044,6 @@ async function volume(id) {
       fact("Health", health(v)),
       fact("Space", usage ? [bar(usage.allocated_bytes, usage.size_bytes), el("span", { class: "sub" }, "Includes what it shares with its snapshots.")] : el("span", { class: "muted" }, "The data plane can't say at the moment.")),
       fact("Pool", p ? link(p.name, "pool", p.id) : mono(v.pool_id)),
-      fact("Provisioning", v.thin_provision ? "Thin" : "Thick"),
       fact("Exported", exps.length ? exps.map((e) => el("div", {}, link(e.name, "export", e.id), ` (${protoName(e.protocol)})`)) : pill("Not exported", "quiet")),
       v.parent_snapshot_id && fact("Cloned from", `snapshot ${v.parent_snapshot_id}`),
       fact("Limits", qos || "None"),

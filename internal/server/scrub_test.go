@@ -58,7 +58,7 @@ func TestScrubScheduleWindowAndResume(t *testing.T) {
 		t.Fatalf("a new pool was scrubbed at once: %v", starts)
 	}
 
-	h.fake.SetScrubStep(1 << 18) // a quarter per bdev_raid_get_bdevs
+	h.fake.SetScrubStep(1 << 18) // a quarter per listing of the arrays
 	now = now.Add(25 * time.Hour)
 	h.tick(now)
 	if starts := h.fake.ScrubStarts(raid); !slices.Equal(starts, []uint64{0}) {
@@ -71,7 +71,7 @@ func TestScrubScheduleWindowAndResume(t *testing.T) {
 	h.fake.SetScrubFindings(raid, 2, 3, 0)
 	h.tick(now)
 
-	// The window ends: the run pauses (once SPDK reports it stopped) and keeps its findings.
+	// The window ends: the run pauses (once the data plane reports it stopped) and keeps its findings.
 	hour := now.Local().Hour()
 	h.expect(h.do("PUT", "/api/v1/system/scrub", h.admin, map[string]any{"window_start_hour": (hour + 2) % 24, "window_end_hour": (hour + 3) % 24}))(http.StatusOK)
 	h.tick(now)
@@ -140,7 +140,7 @@ func TestScrubManualInterruptionsAndStop(t *testing.T) {
 	now := time.Now()
 	h.tick(now)
 
-	// spdk_tgt restarted: the scrub is gone; velod notices and resumes it where it was.
+	// A reboot: the scrub is gone; velod notices and resumes it where it was.
 	reached := h.scrubRecord(id).OffsetBlocks
 	if reached == 0 {
 		t.Fatal("scrub made no progress")
@@ -154,7 +154,7 @@ func TestScrubManualInterruptionsAndStop(t *testing.T) {
 		t.Fatalf("resumed run lost its options: %+v", rec)
 	}
 
-	// An operator stop ends the run once SPDK reports it stopped; it isn't resumed.
+	// An operator stop ends the run once the data plane reports it stopped; it isn't resumed.
 	h.expect(h.do("DELETE", "/api/v1/pools/"+id+"/scrub", h.admin, nil))(http.StatusAccepted)
 	h.tick(now)
 	rec := h.scrubRecord(id)
@@ -169,10 +169,10 @@ func TestScrubManualInterruptionsAndStop(t *testing.T) {
 
 	// A member leaves: the run pauses, and isn't resumed while the pool is degraded.
 	h.expect(h.do("POST", "/api/v1/pools/"+id+"/scrub", h.admin, nil))(http.StatusAccepted)
-	h.fake.FailMedia("0000:02:00.0")
+	h.fake.FailDisk("0000:02:00.0")
 	// The scrub notices before the reconciler has recorded the failed member (as on the lab
 	// appliance, where a scrub's failed repair write failed the member): the pool still says
-	// ONLINE, but SPDK's member count must keep the run paused.
+	// ONLINE, but the array's member count must keep the run paused.
 	h.tick(now)
 	rec = h.scrubRecord(id)
 	if rec.State != store.ScrubPaused || !strings.Contains(rec.Note, "member") {

@@ -12,22 +12,21 @@ import (
 
 	"github.com/velocor/velocor/internal/auth"
 	"github.com/velocor/velocor/internal/dataplane"
-	"github.com/velocor/velocor/internal/dataplane/spdkplane"
+	"github.com/velocor/velocor/internal/dataplane/planetest"
 	"github.com/velocor/velocor/internal/server"
-	"github.com/velocor/velocor/internal/spdk/spdktest"
 	"github.com/velocor/velocor/internal/store"
 )
 
 type fixture struct {
 	cfg  *cliConfig
 	st   *store.BoltStore
-	fake *spdktest.Fake
+	fake *planetest.Fake
 	exp  *store.Export
 	ig   *store.InitiatorGroup
 	vol  *store.Volume
 }
 
-// newFixture serves a real velod API (backed by a fake spdk_tgt) with one exported volume.
+// newFixture serves a real velod API (over an in-memory data plane) with one exported volume.
 func newFixture(t *testing.T) *fixture {
 	t.Helper()
 	t.Setenv("HOME", t.TempDir()) // keep saved tokens out of the real home directory
@@ -36,34 +35,25 @@ func newFixture(t *testing.T) *fixture {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = st.Close() })
-	fake := spdktest.New(t)
+	fake := planetest.New(t)
 	authMgr, err := auth.NewManager(st, "bootstrap-pass-1")
 	if err != nil {
 		t.Fatal(err)
 	}
-	ts := httptest.NewServer(server.New(st, spdkplane.New(fake.Client(), nil), nil, authMgr, nil, nil).Handler())
+	ts := httptest.NewServer(server.New(st, fake, nil, authMgr, nil, nil).Handler())
 	t.Cleanup(ts.Close)
 
-	ctx, c := context.Background(), fake.Client()
-	fake.AddNVMe("0000:01:00.0")
-	bdevs, _ := c.BdevNvmeAttachController(ctx, "Nvme0", "PCIe", "0000:01:00.0")
-	_ = st.UpsertDisk(&store.Disk{ID: "d1", Type: store.DiskTypeNVMe, PCIAddress: "0000:01:00.0", SizeBytes: 1 << 40})
-	_, _ = st.ClaimDisk("d1", store.DiskDriverStateVfioPCI, bdevs[0])
-	pool := &store.Pool{ID: "p1", Name: "p1", DiskIDs: []string{"d1"}, RaidLevel: store.RaidLevel0, HealthStatus: store.HealthStatusOnline}
-	_ = st.CreatePool(pool)
-	_ = c.BdevRaidCreate(ctx, pool.ArrayName, "raid0", 64, bdevs, true)
-	lvs, _ := c.BdevLvolCreateLvstore(ctx, pool.Device, pool.ThinPoolName, 0, "")
-	_, _ = st.MutatePool("p1", func(p *store.Pool) error { p.ThinPoolUUID = lvs; return nil })
-	uuid, _ := c.BdevLvolCreate(ctx, pool.ThinPoolName, "v1", 1<<30, true, "")
-	vol := &store.Volume{ID: "v1", Name: "v1", PoolID: "p1", UUID: uuid, Handle: pool.ThinPoolName + "/v1", SizeBytes: 1 << 30}
-	_ = st.CreateVolume(vol)
+	ctx := context.Background()
+	pool := planetest.Seed(t, fake, st, &store.Pool{ID: "p1", Name: "p1", RaidLevel: store.RaidLevel0, HealthStatus: store.HealthStatusOnline},
+		&store.Disk{ID: "d1", Type: store.DiskTypeNVMe, PCIAddress: "0000:01:00.0", SizeBytes: 1 << 40})
+	vol := planetest.SeedVolume(t, fake, st, pool, &store.Volume{ID: "v1", Name: "v1", SizeBytes: 1 << 30})
 	_ = st.CreatePortal(&store.Portal{ID: "pt", Name: "pt", Protocol: store.ExportProtocolNVMeoFTCP, IPAddress: "10.0.0.1", Port: 4420})
 	ig := &store.InitiatorGroup{ID: "ig1", Name: "g", HostNQNs: []string{"nqn.2026-01.io.example:host-a"}}
 	_ = st.CreateInitiatorGroup(ig)
 	exp := &store.Export{ID: "e1", Name: "e1", VolumeID: "v1", Protocol: store.ExportProtocolNVMeoFTCP, SubsystemNQN: "nqn.test:e1",
 		NamespaceID: 1, PortalIDs: []string{"pt"}, InitiatorGroupIDs: []string{"ig1"}}
 	_ = st.CreateExport(exp)
-	if err := dataplane.EnsureExport(ctx, spdkplane.New(c, nil), st, exp, vol); err != nil {
+	if err := dataplane.EnsureExport(ctx, fake, st, exp, vol); err != nil {
 		t.Fatal(err)
 	}
 
@@ -120,16 +110,16 @@ func TestExportAccessAndConnections(t *testing.T) {
 	if err := f.run(t, "export", "access", "e1", "--allow-any-host", "--initiator-groups", ""); err != nil {
 		t.Fatal(err)
 	}
-	if sub, _ := f.fake.Subsystem("nqn.test:e1"); !sub.AllowAnyHost {
+	if sub, _ := f.fake.Target("nqn.test:e1"); !sub.AnyHost {
 		t.Fatalf("allow-any-host not applied: %+v", sub)
 	}
 	if err := f.run(t, "export", "access", "--allow-any-host=false", "--initiator-groups", "ig1", "e1"); err != nil {
 		t.Fatal(err)
 	}
-	if sub, _ := f.fake.Subsystem("nqn.test:e1"); sub.AllowAnyHost || len(sub.Hosts) != 1 {
+	if sub, _ := f.fake.Target("nqn.test:e1"); sub.AnyHost || len(sub.Hosts) != 1 {
 		t.Fatalf("ACL not restored: %+v", sub)
 	}
-	f.fake.ConnectHost("nqn.test:e1", "nqn.2026-01.io.example:host-a")
+	f.fake.Connect("nqn.test:e1", "nqn.2026-01.io.example:host-a")
 	for _, args := range [][]string{{"export", "connections", "e1"}, {"export", "get", "e1"}, {"volume", "usage", "v1"}, {"volume", "get", "v1"}, {"system", "status"}} {
 		if err := f.run(t, args...); err != nil {
 			t.Fatalf("%v: %v", args, err)
@@ -150,7 +140,7 @@ func TestInitiatorGroupUpdateSendsOnlyGivenLists(t *testing.T) {
 	if len(g.HostNQNs) != 2 || len(g.InitiatorIQNs) != 1 || g.InitiatorIQNs[0] != "iqn.keep" {
 		t.Fatalf("update changed lists it wasn't given: %+v", g)
 	}
-	if sub, _ := f.fake.Subsystem("nqn.test:e1"); len(sub.Hosts) != 2 {
+	if sub, _ := f.fake.Target("nqn.test:e1"); len(sub.Hosts) != 2 {
 		t.Fatalf("group change not re-applied to the export: %+v", sub.Hosts)
 	}
 	if err := f.run(t, "initiator-group", "update", "ig1"); err == nil {
@@ -176,11 +166,10 @@ func TestTLSConfigVerifiesByDefault(t *testing.T) {
 func TestPoolReplaceStartDegradedReleaseAndRebuildCommands(t *testing.T) {
 	f := newFixture(t)
 	signedIn(t, f)
-	ctx := context.Background()
 	for i, id := range []string{"m1", "m2", "m3", "m4", "m5"} {
 		pci := "0000:1" + string(rune('1'+i)) + ":00.0"
-		f.fake.AddNVMe(pci)
-		if err := f.st.UpsertDisk(&store.Disk{ID: id, Type: store.DiskTypeNVMe, PCIAddress: pci, SizeBytes: 1 << 40, DriverState: store.DiskDriverStateVfioPCI}); err != nil {
+		f.fake.AddDisk(pci)
+		if err := f.st.UpsertDisk(&store.Disk{ID: id, Type: store.DiskTypeNVMe, PCIAddress: pci, SizeBytes: 1 << 40}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -199,7 +188,7 @@ func TestPoolReplaceStartDegradedReleaseAndRebuildCommands(t *testing.T) {
 
 	// A member fails; replace it with an unclaimed disk.
 	m2, _ := f.st.GetDisk("m2")
-	f.fake.FailMedia(m2.PCIAddress)
+	f.fake.FailDisk(m2.PCIAddress)
 	if err := f.run(t, "pool", "replace", pool.ID); err == nil {
 		t.Fatal("replace without --new-disk must fail")
 	}
@@ -224,21 +213,17 @@ func TestPoolReplaceStartDegradedReleaseAndRebuildCommands(t *testing.T) {
 	if err := f.run(t, "system", "rebuild", "--max-mb-per-sec", "250"); err != nil {
 		t.Fatal(err)
 	}
-	if f.fake.RebuildMaxMBps() != 250 {
-		t.Fatalf("limit not applied: %d", f.fake.RebuildMaxMBps())
+	if n, _ := f.fake.RebuildLimit(t.Context()); n != 250 {
+		t.Fatalf("limit not applied: %d", n)
 	}
 	if err := f.run(t, "system", "rebuild"); err != nil {
 		t.Fatal(err)
 	}
 
-	// m3 dies while spdk_tgt is down: start the pool degraded (confirmation by name).
-	m1, _ := f.st.GetDisk("m1")
+	// m3 dies while the appliance is down: start the pool degraded (confirmation by name).
 	m3, _ := f.st.GetDisk("m3")
-	f.fake.Restart()
-	f.fake.RemoveMedia(m3.PCIAddress)
-	if _, err := f.fake.Client().BdevNvmeAttachController(ctx, spdkplane.NVMeControllerName(m1.PCIAddress), "PCIe", m1.PCIAddress); err != nil {
-		t.Fatal(err)
-	}
+	f.fake.Reboot()
+	f.fake.RemoveDisk(m3.PCIAddress)
 	if err := f.run(t, "pool", "start-degraded", pool.ID, "--confirm", "wrong"); err == nil {
 		t.Fatal("start-degraded with the wrong name must fail")
 	}

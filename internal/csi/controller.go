@@ -129,16 +129,11 @@ func (s *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVolu
 		if err != nil {
 			return nil, err
 		}
-		thin := true
-		if strings.EqualFold(req.GetParameters()["thin"], "false") {
-			thin = false
-		}
 		vol, err = s.client.CreateVolume(ctx, CreateVolumeRequest{
-			Name:          req.GetName(),
-			PoolID:        poolID,
-			SizeBytes:     uint64(reqBytes),
-			ThinProvision: thin,
-			Labels:        map[string]string{"csi.velocor.io/provisioned": "true"},
+			Name:      req.GetName(),
+			PoolID:    poolID,
+			SizeBytes: uint64(reqBytes),
+			Labels:    map[string]string{"csi.velocor.io/provisioned": "true"},
 		})
 		if err != nil {
 			return nil, mapAPIError(err)

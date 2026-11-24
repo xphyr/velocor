@@ -100,7 +100,9 @@ type Plane interface {
 
 	// Volumes lists every volume and snapshot in every thin pool.
 	Volumes(ctx context.Context) ([]Volume, error)
-	// CreateVolume creates a volume named name in a thin pool (by name) and returns its UUID.
+	// CreateVolume creates a volume named name in a thin pool (by name) and returns its UUID. A
+	// volume that isn't thin is outside the pool and fully allocated, with no snapshots: velod's
+	// own metadata volume only.
 	CreateVolume(ctx context.Context, pool, name string, sizeBytes uint64, thin bool) (string, error)
 	// ResizeVolume grows a volume (by UUID or alias).
 	ResizeVolume(ctx context.Context, volume string, sizeBytes uint64) error
@@ -181,9 +183,9 @@ type Device struct {
 	SizeBytes uint64
 	// QoS is the I/O limit currently applied to the device.
 	QoS store.QosPolicy
-	// ParentSnapshot is, for a volume or snapshot, the name of the snapshot it is based on
-	// ("" when it has none).
-	ParentSnapshot string
+	// Origin is, for a snapshot, the volume it was taken of, and for a clone the snapshot it was
+	// made from: names within the pool ("" when it has none, or when that is deleted).
+	Origin string
 }
 
 // Array states.
@@ -309,6 +311,8 @@ type Volume struct {
 	Thin           bool
 	Snapshot       bool
 	AllocatedBytes uint64
+	// Seq grows with each volume and snapshot created in the pool: the order they were made in.
+	Seq int
 }
 
 // GroupEntry is one volume of a SnapshotGroup: the volume (UUID or alias) and the name for its

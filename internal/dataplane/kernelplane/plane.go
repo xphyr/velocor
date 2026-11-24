@@ -377,8 +377,8 @@ func (p *Plane) Devices(ctx context.Context) ([]dataplane.Device, error) {
 		if !isVolume(lv) {
 			continue
 		}
-		dev := dataplane.Device{Name: lv.VG + "/" + lv.Name, Aliases: []string{volumeUUID(lv)}, Product: "LVM " + lv.SegType,
-			SizeBytes: lv.Size, ParentSnapshot: lv.Origin}
+		dev := dataplane.Device{Name: lv.VG + "/" + lv.Name, UUID: volumeUUID(lv), Aliases: []string{volumeUUID(lv)}, Product: "LVM " + lv.SegType,
+			SizeBytes: lv.Size, Origin: lv.Origin}
 		out = append(out, dev)
 	}
 	for _, kname := range p.wholeDisks() {

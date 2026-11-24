@@ -699,102 +699,62 @@ func (s *Server) importAccess(plan *meta.Manifest, vols []*store.Volume, res *Im
 	return nil
 }
 
-// importSkeleton rebuilds a pool from what SPDK knows when the pool has no readable copy:
-// volumes and snapshots named by their IDs, with sizes and parentage; no exports.
+// importSkeleton rebuilds a pool from what the data plane knows when the pool has no readable
+// copy: volumes and snapshots named by their IDs, with sizes and parentage (LVM's origins: a
+// snapshot's volume, a clone's snapshot); no exports.
 func (s *Server) importSkeleton(ctx context.Context, poolID string, inLvs map[string]dataplane.Volume, raid *dataplane.Array, res *ImportResult) (*meta.Manifest, error) {
-	bdevs, err := s.dp.Devices(ctx)
+	devices, err := s.dp.Devices(ctx)
 	if err != nil {
 		return nil, err
 	}
-	type node struct {
-		l      dataplane.Volume
-		size   uint64
-		parent string // base snapshot's lvol name
-	}
-	nodes := map[string]*node{}
-	for name, l := range inLvs {
-		if name == meta.LvolName {
-			continue
-		}
-		n := &node{l: l}
-		for _, b := range bdevs {
-			if b.UUID != l.UUID {
-				continue
-			}
-			n.size, n.parent = b.SizeBytes, b.ParentSnapshot
-		}
-		nodes[name] = n
-	}
-	children := map[string][]string{}
-	names := make([]string, 0, len(nodes))
-	for name, n := range nodes {
-		names = append(names, name)
-		if n.parent != "" {
-			children[n.parent] = append(children[n.parent], name)
+	byUUID := map[string]dataplane.Device{}
+	for _, d := range devices {
+		if d.UUID != "" {
+			byUUID[d.UUID] = d
 		}
 	}
-	slices.Sort(names)
-	for _, c := range children {
-		slices.Sort(c)
+	var vols []dataplane.Volume
+	for name, v := range inLvs {
+		if name != meta.LvolName {
+			vols = append(vols, v)
+		}
 	}
-	// A snapshot belongs to the volume reached through its snapshot children (the chain of
-	// later snapshots), else to its first volume child; other volume children are clones.
-	var owner func(snap string) string
-	owner = func(snap string) string {
-		for _, c := range children[snap] {
-			if nodes[c].l.Snapshot {
-				if o := owner(c); o != "" {
-					return o
-				}
-			}
+	slices.SortFunc(vols, func(a, b dataplane.Volume) int {
+		if a.Seq != b.Seq {
+			return a.Seq - b.Seq
 		}
-		var vols []string
-		for _, c := range children[snap] {
-			if !nodes[c].l.Snapshot {
-				vols = append(vols, c)
-			}
-		}
-		if len(vols) > 1 {
-			// SPDK keeps no creation order: the volume a snapshot was taken of and the
-			// clones made from it look alike.
-			res.Warnings = append(res.Warnings, fmt.Sprintf("snapshot %s has volumes %s: recorded as taken of %s, the others as its clones; correct this if needed",
-				snap, strings.Join(vols, ", "), vols[0]))
-		}
-		if len(vols) > 0 {
-			return vols[0]
-		}
-		return ""
-	}
+		return strings.Compare(a.Name, b.Name)
+	})
 	m := &meta.Manifest{Format: meta.FormatVersion, Pool: store.Pool{
 		ID: poolID, Name: poolID, RaidLevel: store.RaidLevel(strings.ToUpper(raid.Level)), CreatedAt: time.Now().UTC(),
 	}}
-	snapOwner := map[string]string{}
-	for _, name := range names {
-		if nodes[name].l.Snapshot {
-			snapOwner[name] = owner(name)
-		}
-	}
-	res.Warnings = append(res.Warnings, "recovered from the data plane only: names, labels, QoS, exports and access control are not restored; volumes and snapshots are named by their IDs")
-	for _, name := range names {
-		n := nodes[name]
-		if n.l.Snapshot {
+	res.Warnings = append(res.Warnings, "recovered from the data plane only: names, labels, exports and access control are not restored; volumes and snapshots are named by their IDs")
+	for _, v := range vols {
+		if v.Snapshot {
 			continue
 		}
-		v := store.Volume{ID: name, Name: name, PoolID: poolID, SizeBytes: n.size, ThinProvision: n.l.Thin}
-		if n.parent != "" && snapOwner[n.parent] != name {
-			v.ParentSnapshotID = n.parent // a clone
+		dev := byUUID[v.UUID]
+		out := store.Volume{ID: v.Name, Name: v.Name, PoolID: poolID, SizeBytes: dev.SizeBytes, ThinProvision: v.Thin}
+		if o, ok := inLvs[dev.Origin]; ok && o.Snapshot {
+			out.ParentSnapshotID = dev.Origin // a clone
 		}
-		m.Volumes = append(m.Volumes, v)
+		m.Volumes = append(m.Volumes, out)
 	}
 	seq := uint64(0)
-	for _, name := range names {
-		n := nodes[name]
-		if !n.l.Snapshot || snapOwner[name] == "" {
+	for _, v := range vols {
+		if !v.Snapshot {
+			continue
+		}
+		dev := byUUID[v.UUID]
+		owner, ok := inLvs[dev.Origin]
+		if !ok || owner.Snapshot {
+			// Its volume was deleted: there is nothing to record it under.
+			res.Warnings = append(res.Warnings, fmt.Sprintf("snapshot %s is left out: the volume it was taken of is gone (clone it by hand if its data is needed)", v.Name))
 			continue
 		}
 		seq++
-		m.Snapshots = append(m.Snapshots, store.Snapshot{ID: name, Name: name, VolumeID: snapOwner[name], PoolID: poolID,
-			SizeBytes: n.size, ParentSnapshotID: n.parent, SequenceNumber: seq})
+		m.Snapshots = append(m.Snapshots, store.Snapshot{ID: v.Name, Name: v.Name, VolumeID: owner.Name, PoolID: poolID,
+			SizeBytes: dev.SizeBytes, SequenceNumber: seq})
 	}
 	return m, nil
 }

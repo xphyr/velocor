@@ -201,7 +201,7 @@ func (p *Plane) Volumes(ctx context.Context) ([]dataplane.Volume, error) {
 		}
 		out = append(out, dataplane.Volume{
 			UUID: volumeUUID(lv), Name: lv.Name, Alias: lv.VG + "/" + lv.Name, Pool: vgUUID[lv.VG],
-			Thin: lv.SegType == "thin", Snapshot: isSnapshot(lv), AllocatedBytes: allocated(lv),
+			Thin: lv.SegType == "thin", Snapshot: isSnapshot(lv), AllocatedBytes: allocated(lv), Seq: lv.ThinID,
 		})
 	}
 	return out, nil

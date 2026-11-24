@@ -10,14 +10,14 @@ import (
 
 const mib = uint64(1) << 20
 
-// spacePool makes a RAID0 pool whose volume store has 1000 clusters of 1 MiB (limit 950 MiB at
-// the default 1.0x overcommit and 5% reserve) and returns its ID and lvstore name.
+// spacePool makes a RAID0 pool whose thin pool has 1000 chunks of 1 MiB (limit 950 MiB at
+// the default 1.0x overcommit and 5% reserve) and returns its ID and thin pool name.
 func spacePool(t *testing.T, h *harness) (string, string) {
 	t.Helper()
 	h.addDisk("d1", "0000:01:00.0")
 	id := h.pool("p1", "RAID0", "d1")
 	lvs := h.getPool(id)["thin_pool_name"].(string)
-	h.fake.SetLvstoreClusters(lvs, 1000)
+	h.fake.SetPoolChunks(lvs, 1000)
 	return id, lvs
 }
 
@@ -29,10 +29,10 @@ func TestVolumeAdmissionAtTheLimit(t *testing.T) {
 	if !strings.Contains(resp["error"].(string), "committed") {
 		t.Fatalf("refusal should explain the numbers: %v", resp)
 	}
-	h.volume(pool, "v2", 350*mib) // exactly 950 MiB committed
+	h.volume(pool, "v2", 348*mib) // 948 of 950 MiB committed: sizes come in 4 MiB extents
 	// Expanding beyond the limit is refused too.
 	h.expect(h.do("POST", "/api/v1/volumes/"+v1["id"].(string)+":resize", h.admin, map[string]any{"new_size_bytes": 610 * mib}))(http.StatusInsufficientStorage)
-	if p := h.getPool(pool); p["committed_bytes"] != float64(950*mib) || p["available_bytes"] != float64(0) {
+	if p := h.getPool(pool); p["committed_bytes"] != float64(948*mib) || p["available_bytes"] != float64(2*mib) {
 		t.Fatalf("pool after creates: committed %v available %v", p["committed_bytes"], p["available_bytes"])
 	}
 
@@ -54,7 +54,7 @@ func TestSnapshotAndCloneAdmission(t *testing.T) {
 	v1 := h.volume(pool, "v1", 600*mib)
 	v2 := h.volume(pool, "v2", 300*mib) // 900 of 950 committed
 	for i := range uint64(100) {
-		h.fake.WriteCluster(v1["uuid"].(string), i) // v1 holds 100 MiB
+		h.fake.WriteChunk(v1["uuid"].(string), i) // v1 holds 100 MiB
 	}
 	// A snapshot would hold v1's 100 MiB: over the limit.
 	h.expect(h.do("POST", "/api/v1/volumes/"+v1["id"].(string)+"/snapshots", h.admin, map[string]any{"name": "s1"}))(http.StatusInsufficientStorage)
@@ -76,7 +76,7 @@ func TestCriticalPoolRefusesAllGrowthButDeletes(t *testing.T) {
 	h.expect(h.do("PATCH", "/api/v1/pools/"+pool, h.admin, map[string]any{"space_policy": map[string]any{"max_overcommit": 3}}))(http.StatusOK)
 	v1 := h.volume(pool, "v1", 2000*mib)
 	for i := range uint64(920) {
-		h.fake.WriteCluster(v1["uuid"].(string), i) // 92% used: CRITICAL
+		h.fake.WriteChunk(v1["uuid"].(string), i) // 92% used: CRITICAL
 	}
 	h.reconcile()
 	p := h.getPool(pool)

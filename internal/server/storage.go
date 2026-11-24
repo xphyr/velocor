@@ -395,11 +395,22 @@ func qosSet(q store.QosPolicy) bool {
 	return q != (store.QosPolicy{})
 }
 
+// volumeSizeUnit is the data plane's allocation unit for volume sizes (an LVM extent).
+const volumeSizeUnit = 4 << 20
+
+// roundVolumeSize rounds a volume's size up to what the data plane will make it, so that the
+// record says what hosts see.
+func roundVolumeSize(n uint64) uint64 {
+	return (n + volumeSizeUnit - 1) / volumeSizeUnit * volumeSizeUnit
+}
+
 func (s *Server) handleCreateVolume(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Name          string             `json:"name"`
-		PoolID        string             `json:"pool_id"`
-		SizeBytes     uint64             `json:"size_bytes"`
+		Name      string `json:"name"`
+		PoolID    string `json:"pool_id"`
+		SizeBytes uint64 `json:"size_bytes"`
+		// ThinProvision is accepted and ignored: every volume is thin, and the space accounting
+		// counts its full size as committed.
 		ThinProvision bool               `json:"thin_provision"`
 		FilterPolicy  store.FilterPolicy `json:"filter_policy"`
 		QosPolicy     store.QosPolicy    `json:"qos_policy"`
@@ -419,6 +430,7 @@ func (s *Server) handleCreateVolume(w http.ResponseWriter, r *http.Request) {
 		writeError(w, fmt.Errorf("%w: size_bytes must be > 0", store.ErrInvalidArgument))
 		return
 	}
+	req.SizeBytes = roundVolumeSize(req.SizeBytes)
 	if err := rejectFilters(req.FilterPolicy); err != nil {
 		writeError(w, err)
 		return
@@ -456,7 +468,7 @@ func (s *Server) handleCreateVolume(w http.ResponseWriter, r *http.Request) {
 	}
 	defer release()
 	alias := pool.ThinPoolName + "/" + id
-	uuid, err := s.dp.CreateVolume(r.Context(), pool.ThinPoolName, id, req.SizeBytes, req.ThinProvision)
+	uuid, err := s.dp.CreateVolume(r.Context(), pool.ThinPoolName, id, req.SizeBytes, true)
 	if err != nil {
 		writeError(w, fmt.Errorf("create the volume: %w", err))
 		return
@@ -469,7 +481,7 @@ func (s *Server) handleCreateVolume(w http.ResponseWriter, r *http.Request) {
 		Handle:             alias,
 		Device:             alias,
 		SizeBytes:          req.SizeBytes,
-		ThinProvision:      req.ThinProvision,
+		ThinProvision:      true,
 		FilterPolicy:       req.FilterPolicy,
 		QosPolicy:          req.QosPolicy,
 		AttachmentState:    store.AttachmentStateUnattached,
@@ -523,6 +535,7 @@ func (s *Server) resizeVolume(w http.ResponseWriter, r *http.Request, id string)
 		writeError(w, err)
 		return
 	}
+	req.NewSizeBytes = roundVolumeSize(req.NewSizeBytes)
 	if req.NewSizeBytes < vol.SizeBytes {
 		writeError(w, fmt.Errorf("%w: new_size_bytes (%d) must be >= current size (%d)", store.ErrInvalidArgument, req.NewSizeBytes, vol.SizeBytes))
 		return

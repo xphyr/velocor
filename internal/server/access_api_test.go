@@ -31,34 +31,34 @@ func TestUpdateExportAccess(t *testing.T) {
 	if code, _ := h.do("PATCH", path, h.admin, map[string]any{"initiator_group_ids": []string{}}); code != http.StatusBadRequest {
 		t.Fatalf("emptying the ACL returned %d", code)
 	}
-	if sub, _ := h.fake.Subsystem(nqn); len(sub.Hosts) != 1 {
-		t.Fatalf("refused change touched SPDK: %+v", sub.Hosts)
+	if sub, _ := h.fake.Target(nqn); len(sub.Hosts) != 1 {
+		t.Fatalf("refused change touched the target: %+v", sub.Hosts)
 	}
 
-	// Opening up and closing again is applied to SPDK and persisted.
+	// Opening up and closing again is applied and persisted.
 	h.expect(h.do("PATCH", path, h.admin, map[string]any{"allow_any_host": true, "initiator_group_ids": []string{}}))(http.StatusOK)
-	if sub, _ := h.fake.Subsystem(nqn); !sub.AllowAnyHost || len(sub.Hosts) != 0 {
+	if sub, _ := h.fake.Target(nqn); !sub.AnyHost || len(sub.Hosts) != 0 {
 		t.Fatalf("allow_any_host not applied: %+v", sub)
 	}
 	h.expect(h.do("PATCH", path, h.admin, map[string]any{"allow_any_host": false, "initiator_group_ids": []string{igID}}))(http.StatusOK)
-	sub, _ := h.fake.Subsystem(nqn)
-	if sub.AllowAnyHost || len(sub.Hosts) != 1 || sub.Hosts[0].Nqn != "nqn.2026-01.io.example:host-a" {
+	sub, _ := h.fake.Target(nqn)
+	if sub.AnyHost || len(sub.Hosts) != 1 || sub.Hosts[0] != "nqn.2026-01.io.example:host-a" {
 		t.Fatalf("ACL not restored: %+v", sub)
 	}
 	if e, _ := h.st.GetExport(exp["id"].(string)); e.AllowAnyHost || len(e.InitiatorGroupIDs) != 1 {
 		t.Fatalf("store not updated: %+v", e)
 	}
 
-	// SPDK failure leaves the store unchanged.
-	h.fake.Fail("nvmf_subsystem_allow_any_host", 1)
+	// A data plane failure leaves the store unchanged.
+	h.fake.Fail("ApplyExport", 1)
 	if code, _ := h.do("PATCH", path, h.admin, map[string]any{"allow_any_host": true}); code != http.StatusInternalServerError {
-		t.Fatalf("failing SPDK update returned %d", code)
+		t.Fatalf("a failing update returned %d", code)
 	}
 	if e, _ := h.st.GetExport(exp["id"].(string)); e.AllowAnyHost {
 		t.Fatalf("failed update was persisted")
 	}
 
-	h.fake.ConnectHost(nqn, "nqn.2026-01.io.example:host-a")
+	h.fake.Connect(nqn, "nqn.2026-01.io.example:host-a")
 	conns := h.expect(h.do("GET", path+"/connections", h.admin, nil))(http.StatusOK)["connections"].([]any)
 	if len(conns) != 1 || conns[0].(map[string]any)["host"] != "nqn.2026-01.io.example:host-a" {
 		t.Fatalf("connections wrong: %v", conns)
@@ -72,8 +72,8 @@ func TestUpdateInitiatorGroupReappliesExports(t *testing.T) {
 	path := "/api/v1/initiator-groups/" + igID
 
 	h.expect(h.do("PATCH", path, h.admin, map[string]any{"host_nqns": []string{"nqn.2026-01.io.example:host-b"}}))(http.StatusOK)
-	sub, _ := h.fake.Subsystem(nqn)
-	if len(sub.Hosts) != 1 || sub.Hosts[0].Nqn != "nqn.2026-01.io.example:host-b" {
+	sub, _ := h.fake.Target(nqn)
+	if len(sub.Hosts) != 1 || sub.Hosts[0] != "nqn.2026-01.io.example:host-b" {
 		t.Fatalf("group change not applied to export: %+v", sub.Hosts)
 	}
 	if code, _ := h.do("PATCH", path, h.admin, map[string]any{"host_nqns": []string{}}); code != http.StatusBadRequest {
@@ -87,15 +87,15 @@ func TestUpdateInitiatorGroupReappliesExports(t *testing.T) {
 	if usage["size_bytes"].(float64) != 1<<30 || usage["allocated_bytes"].(float64) != 0 {
 		t.Fatalf("usage wrong: %v", usage)
 	}
-	h.fake.WriteCluster(vol["uuid"].(string), 0)
+	h.fake.WriteChunk(vol["uuid"].(string), 0)
 	usage = h.expect(h.do("GET", "/api/v1/volumes/"+vol["id"].(string)+"/usage", h.admin, nil))(http.StatusOK)
 	if usage["allocated_bytes"].(float64) == 0 {
 		t.Fatalf("allocation not reported: %v", usage)
 	}
 }
 
-// A group snapshot of volumes in use is taken (docs/review-history.md P1-15): SPDK pauses their I/O together
-// (patch 0003), so hosts needn't stop.
+// A group snapshot of volumes in use is taken (docs/review-history.md P1-15): their I/O is held
+// together, so hosts needn't stop.
 func TestGroupSnapshotOfExportedVolumes(t *testing.T) {
 	h := newHarness(t)
 	_, vol, _ := h.nvmeExport("nqn.2026-01.io.example:host-a")

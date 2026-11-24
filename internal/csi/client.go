@@ -61,11 +61,10 @@ type VolumeGroupSnapshotResult struct {
 
 // CreateVolumeRequest specifies parameters for creating a Velocor volume.
 type CreateVolumeRequest struct {
-	Name          string            `json:"name"`
-	PoolID        string            `json:"pool_id"`
-	SizeBytes     uint64            `json:"size_bytes"`
-	ThinProvision bool              `json:"thin_provision"`
-	Labels        map[string]string `json:"labels,omitempty"`
+	Name      string            `json:"name"`
+	PoolID    string            `json:"pool_id"`
+	SizeBytes uint64            `json:"size_bytes"`
+	Labels    map[string]string `json:"labels,omitempty"`
 }
 
 // CreateExportRequest specifies parameters for exporting a Velocor volume.

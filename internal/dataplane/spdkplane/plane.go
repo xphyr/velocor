@@ -133,7 +133,7 @@ func (p *Plane) Devices(ctx context.Context) ([]dataplane.Device, error) {
 			},
 		}
 		if lvol, ok := b.DriverSpecific["lvol"].(map[string]any); ok {
-			out[i].ParentSnapshot, _ = lvol["base_snapshot"].(string)
+			out[i].Origin, _ = lvol["base_snapshot"].(string)
 		}
 	}
 	return out, nil

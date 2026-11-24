@@ -1062,7 +1062,7 @@ func runVolume(cfg *cliConfig, args []string) error {
 		if size > 0 {
 			pct = 100 * float64(alloc) / float64(size)
 		}
-		fmt.Printf("Allocated: %s of %s (%.1f%%), thin=%v\n", humanBytes(alloc), humanBytes(size), pct, resp["thin_provision"])
+		fmt.Printf("Allocated: %s of %s (%.1f%%)\n", humanBytes(alloc), humanBytes(size), pct)
 		return nil
 
 	case "list":
@@ -1074,11 +1074,11 @@ func runVolume(cfg *cliConfig, args []string) error {
 			return printJSON(resp)
 		}
 		tw := newTabWriter()
-		fmt.Fprintln(tw, "ID\tNAME\tPOOL\tSIZE\tALLOCATED\tTHIN\tATTACHMENT\tBDEV\tHEALTH")
+		fmt.Fprintln(tw, "ID\tNAME\tPOOL\tSIZE\tALLOCATED\tATTACHMENT\tDEVICE\tHEALTH")
 		for _, v := range sliceOfMaps(resp["volumes"]) {
-			fmt.Fprintf(tw, "%v\t%v\t%v\t%s\t%s\t%v\t%v\t%v\t%v\n",
+			fmt.Fprintf(tw, "%v\t%v\t%v\t%s\t%s\t%v\t%v\t%v\n",
 				v["id"], v["name"], v["pool_id"], humanBytes(uint64FromAny(v["size_bytes"])), humanBytes(uint64FromAny(v["allocated_bytes"])),
-				v["thin_provision"], v["attachment_state"], v["device"], v["health_status"])
+				v["attachment_state"], v["device"], v["health_status"])
 		}
 		return tw.Flush()
 
@@ -1087,7 +1087,6 @@ func runVolume(cfg *cliConfig, args []string) error {
 		name := fs.String("name", "", "Volume name")
 		poolID := fs.String("pool", "", "Pool ID")
 		sizeGiB := fs.Uint64("size-gib", 10, "Volume size in GiB")
-		thin := fs.Bool("thin", true, "Thin provision volume")
 		protect := fs.Bool("protect", false, "Refuse deletion until an administrator turns protection off")
 		_ = fs.Parse(args[1:])
 		if *name == "" || *poolID == "" {
@@ -1097,7 +1096,6 @@ func runVolume(cfg *cliConfig, args []string) error {
 			"name":                *name,
 			"pool_id":             *poolID,
 			"size_bytes":          *sizeGiB * 1024 * 1024 * 1024,
-			"thin_provision":      *thin,
 			"deletion_protection": *protect,
 		})
 		if err != nil {

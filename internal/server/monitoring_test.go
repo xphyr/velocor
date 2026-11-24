@@ -12,10 +12,9 @@ import (
 	"time"
 
 	"github.com/velocor/velocor/internal/auth"
-	"github.com/velocor/velocor/internal/dataplane/spdkplane"
+	"github.com/velocor/velocor/internal/dataplane/planetest"
 	"github.com/velocor/velocor/internal/monitoring"
 	"github.com/velocor/velocor/internal/reconciler"
-	"github.com/velocor/velocor/internal/spdk/spdktest"
 	"github.com/velocor/velocor/internal/store"
 )
 
@@ -25,7 +24,7 @@ func TestMonitoringSetting(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = st.Close() })
-	f := spdktest.New(t)
+	f := planetest.New(t)
 	authMgr, _ := auth.NewManager(st, "admin-pass-123")
 	clearMustChange(t, st)
 	var mu sync.Mutex
@@ -36,7 +35,7 @@ func TestMonitoringSetting(t *testing.T) {
 		calls = append(calls, name+" "+strings.Join(args, " "))
 		return nil, nil
 	}}
-	srv := New(st, spdkplane.New(f.Client(), nil), nil, authMgr, reconciler.New(st, spdkplane.New(f.Client(), nil), nil, nil), nil, WithMonitoring(mon))
+	srv := New(st, f, nil, authMgr, reconciler.New(st, f, nil, nil), nil, WithMonitoring(mon))
 	h := &harness{t: t, st: st, fake: f, ts: httptest.NewServer(srv.Handler())}
 	t.Cleanup(h.ts.Close)
 	_, resp := h.do("POST", "/api/v1/auth/login", "", map[string]any{"username": "admin", "password": "admin-pass-123"})
@@ -148,13 +147,13 @@ func TestAlertsSilencesAndGraphs(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = st.Close() })
-	f := spdktest.New(t)
+	f := planetest.New(t)
 	authMgr, _ := auth.NewManager(st, "admin-pass-123")
 	clearMustChange(t, st)
 	mon := &monitoring.Manager{Dir: t.TempDir(), Instance: "test",
 		PrometheusAddr: strings.TrimPrefix(prom.URL, "http://"), AlertmanagerAddr: strings.TrimPrefix(am.URL, "http://"),
 		Run: func(context.Context, string, ...string) ([]byte, error) { return nil, nil }}
-	srv := New(st, spdkplane.New(f.Client(), nil), nil, authMgr, reconciler.New(st, spdkplane.New(f.Client(), nil), nil, nil), nil, WithMonitoring(mon))
+	srv := New(st, f, nil, authMgr, reconciler.New(st, f, nil, nil), nil, WithMonitoring(mon))
 	h := &harness{t: t, st: st, fake: f, ts: httptest.NewServer(srv.Handler())}
 	t.Cleanup(h.ts.Close)
 	_, resp := h.do("POST", "/api/v1/auth/login", "", map[string]any{"username": "admin", "password": "admin-pass-123"})

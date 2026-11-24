@@ -6,7 +6,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/velocor/velocor/internal/dataplane/spdkplane"
 	"github.com/velocor/velocor/internal/hardware"
 	"github.com/velocor/velocor/internal/store"
 )
@@ -42,7 +41,7 @@ func TestRefusedWriteCacheIsRecordedNotRetried(t *testing.T) {
 		t.Fatal(err)
 	}
 	rec := func() *Reconciler {
-		r := New(e.st, spdkplane.New(e.fake.Client(), hw), hw, nil)
+		r := New(e.st, e.fake, hw, nil)
 		r.discover = func() ([]*store.Disk, error) { return []*store.Disk{}, nil }
 		return r
 	}

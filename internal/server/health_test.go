@@ -24,13 +24,13 @@ func TestHealthEndpoints(t *testing.T) {
 		t.Fatalf("/healthz: %d %q", code, body)
 	}
 	if code, body := get("/readyz"); code != 200 || body != "ok" {
-		t.Fatalf("/readyz with SPDK answering: %d %q", code, body)
+		t.Fatalf("/readyz with the data plane answering: %d %q", code, body)
 	}
-	h.fake.Fail("spdk_get_version", 1)
+	h.fake.Fail("Version", 1)
 	if code, body := get("/readyz"); code != 503 || body != "not ready" {
-		t.Fatalf("/readyz with SPDK failing: %d %q, want 503 and no detail", code, body)
+		t.Fatalf("/readyz with the data plane failing: %d %q, want 503 and no detail", code, body)
 	}
 	if code, _ := get("/healthz"); code != 200 {
-		t.Fatal("/healthz must not depend on SPDK")
+		t.Fatal("/healthz must not depend on the data plane")
 	}
 }

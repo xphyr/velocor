@@ -13,9 +13,8 @@ import (
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/kubernetes-csi/csi-test/v5/pkg/sanity"
 	"github.com/velocor/velocor/internal/auth"
-	"github.com/velocor/velocor/internal/dataplane/spdkplane"
+	"github.com/velocor/velocor/internal/dataplane/planetest"
 	"github.com/velocor/velocor/internal/server"
-	"github.com/velocor/velocor/internal/spdk/spdktest"
 	"github.com/velocor/velocor/internal/store"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -141,7 +140,7 @@ func TestCSISanitySuite(t *testing.T) {
 		t.Fatalf("CreateApiToken: %v", err)
 	}
 
-	srv := server.New(st, spdkplane.New(fake.Client(), nil), nil, authMgr, nil, nil)
+	srv := server.New(st, fake, nil, authMgr, nil, nil)
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
 
@@ -342,7 +341,7 @@ func TestVolumeGroupSnapshot(t *testing.T) {
 	fake := seedBackend(t, db, "pool-1")
 	pool, _ := db.GetPool("pool-1")
 	for _, vid := range []string{"vol-a", "vol-b"} {
-		uuid, err := fake.Client().BdevLvolCreate(context.Background(), pool.ThinPoolName, vid, 1<<30, true, "")
+		uuid, err := fake.CreateVolume(context.Background(), pool.ThinPoolName, vid, 1<<30, true)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -367,7 +366,7 @@ func TestVolumeGroupSnapshot(t *testing.T) {
 		t.Fatalf("CreateApiToken: %v", err)
 	}
 
-	srv := server.New(db, spdkplane.New(fake.Client(), nil), nil, authMgr, nil, nil)
+	srv := server.New(db, fake, nil, authMgr, nil, nil)
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
 
@@ -504,39 +503,14 @@ func TestVolumeGroupSnapshot(t *testing.T) {
 	}
 }
 
-// seedBackend creates a fake spdk_tgt holding one claimed NVMe disk, a RAID0 bdev and an
-// lvstore, and records the matching disk + pool (ID poolID) in st.
-func seedBackend(t *testing.T, st *store.BoltStore, poolID string) *spdktest.Fake {
+// seedBackend creates a data plane holding one claimed NVMe disk, a RAID0 array and a thin pool,
+// and records the matching disk + pool (ID poolID) in st.
+func seedBackend(t *testing.T, st *store.BoltStore, poolID string) *planetest.Fake {
 	t.Helper()
-	ctx := context.Background()
-	fake := spdktest.New(t)
-	fake.AddNVMe("0000:00:05.0")
-	c := fake.Client()
-	bdevs, err := c.BdevNvmeAttachController(ctx, "Nvme0", "PCIe", "0000:00:05.0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := st.UpsertDisk(&store.Disk{ID: "disk-1", Type: store.DiskTypeNVMe, PCIAddress: "0000:00:05.0", SizeBytes: 100 << 30}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := st.ClaimDisk("disk-1", store.DiskDriverStateVfioPCI, bdevs[0]); err != nil {
-		t.Fatal(err)
-	}
-	pool := &store.Pool{ID: poolID, Name: poolID, DiskIDs: []string{"disk-1"}, RaidLevel: store.RaidLevel0,
-		TotalBytes: 100 << 30, FreeBytes: 100 << 30, HealthStatus: store.HealthStatusOnline}
-	if err := st.CreatePool(pool); err != nil {
-		t.Fatal(err)
-	}
-	if err := c.BdevRaidCreate(ctx, pool.ArrayName, "raid0", 64, bdevs, true); err != nil {
-		t.Fatal(err)
-	}
-	uuid, err := c.BdevLvolCreateLvstore(ctx, pool.Device, pool.ThinPoolName, 0, "")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := st.MutatePool(poolID, func(p *store.Pool) error { p.ThinPoolUUID = uuid; return nil }); err != nil {
-		t.Fatal(err)
-	}
+	fake := planetest.New(t)
+	planetest.Seed(t, fake, st, &store.Pool{ID: poolID, Name: poolID, RaidLevel: store.RaidLevel0, TotalBytes: 100 << 30, FreeBytes: 100 << 30,
+		HealthStatus: store.HealthStatusOnline},
+		&store.Disk{ID: "disk-1", Type: store.DiskTypeNVMe, PCIAddress: "0000:00:05.0", SizeBytes: 100 << 30})
 	return fake
 }
 
@@ -551,7 +525,7 @@ func TestDeleteVolumeProtectionAndRetention(t *testing.T) {
 	defer func() { _ = db.Close() }()
 	fake := seedBackend(t, db, "pool-1")
 	pool, _ := db.GetPool("pool-1")
-	uuid, err := fake.Client().BdevLvolCreate(context.Background(), pool.ThinPoolName, "vol-p", 1<<30, true, "")
+	uuid, err := fake.CreateVolume(context.Background(), pool.ThinPoolName, "vol-p", 1<<30, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -567,7 +541,7 @@ func TestDeleteVolumeProtectionAndRetention(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ts := httptest.NewServer(server.New(db, spdkplane.New(fake.Client(), nil), nil, authMgr, nil, nil).Handler())
+	ts := httptest.NewServer(server.New(db, fake, nil, authMgr, nil, nil).Handler())
 	defer ts.Close()
 	cs := &ControllerServer{client: NewHTTPClient(ts.URL, rawToken, true)}
 	ctx := context.Background()
@@ -584,7 +558,7 @@ func TestDeleteVolumeProtectionAndRetention(t *testing.T) {
 			t.Fatalf("DeleteVolume #%d: %v", i+1, err)
 		}
 	}
-	if v, err := db.GetVolume("vol-p"); err != nil || !v.Deleted() || !fake.LvolExists(pool.ThinPoolName+"/vol-p") {
+	if v, err := db.GetVolume("vol-p"); err != nil || !v.Deleted() || !fake.VolumeExists(pool.ThinPoolName+"/vol-p") {
 		t.Fatalf("volume should be kept as deleted: %+v %v", v, err)
 	}
 	if _, err := cs.ControllerGetVolume(ctx, &csi.ControllerGetVolumeRequest{VolumeId: "vol-p"}); status.Code(err) != codes.NotFound {

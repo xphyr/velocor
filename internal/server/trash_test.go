@@ -33,7 +33,7 @@ func TestDeletedVolumeIsKeptAndRestorable(t *testing.T) {
 	poolID := h.pool("p", "RAID0", "d1")
 	vol := h.volume(poolID, "data", 1<<30)
 	id, lvol := vol["id"].(string), vol["handle"].(string)
-	h.fake.WriteCluster(lvol, 3)
+	h.fake.WriteChunk(lvol, 3)
 	csi := h.csiToken()
 
 	before := time.Now()
@@ -57,11 +57,11 @@ func TestDeletedVolumeIsKeptAndRestorable(t *testing.T) {
 	if vols := trash["volumes"].([]any); len(vols) != 1 || trash["retention_hours"] != float64(24) {
 		t.Fatalf("deleted volumes: %v", trash)
 	}
-	if !h.fake.LvolExists(lvol) {
+	if !h.fake.VolumeExists(lvol) {
 		t.Fatal("deleting a volume removed its lvol")
 	}
 	h.reconcile()
-	if !h.fake.LvolExists(lvol) {
+	if !h.fake.VolumeExists(lvol) {
 		t.Fatal("the reconciler purged a volume before its retention ended")
 	}
 
@@ -87,7 +87,7 @@ func TestDeletedVolumeIsKeptAndRestorable(t *testing.T) {
 		t.Fatalf("restored volume: %v", got)
 	}
 	h.expect(h.do("GET", "/api/v1/volumes/"+id, h.admin, nil))(http.StatusOK)
-	if !h.fake.LvolExists(lvol) {
+	if !h.fake.VolumeExists(lvol) {
 		t.Fatal("restored volume lost its lvol")
 	}
 	h.expect(h.do("POST", "/api/v1/volumes/"+id+"/snapshots", h.admin, map[string]any{"name": "s"}))(http.StatusCreated)
@@ -110,13 +110,13 @@ func TestDeletedVolumeIsPurgedWhenRetentionEnds(t *testing.T) {
 
 	h.expirePurge(gone["id"].(string))
 	h.reconcile()
-	if h.fake.LvolExists(gone["handle"].(string)) {
+	if h.fake.VolumeExists(gone["handle"].(string)) {
 		t.Fatal("expired volume's lvol not purged")
 	}
 	if _, err := h.st.GetVolume(gone["id"].(string)); err == nil {
 		t.Fatal("expired volume's record not purged")
 	}
-	if !h.fake.LvolExists(keep["handle"].(string)) {
+	if !h.fake.VolumeExists(keep["handle"].(string)) {
 		t.Fatal("volume purged before its retention ended")
 	}
 
@@ -126,7 +126,7 @@ func TestDeletedVolumeIsPurgedWhenRetentionEnds(t *testing.T) {
 	}
 	h.expect(h.do("POST", "/api/v1/deleted-volumes/"+keep["id"].(string)+"/restore", h.admin, nil))(http.StatusConflict)
 	h.expect(h.do("DELETE", "/api/v1/deleted-volumes/"+keep["id"].(string), h.admin, nil))(http.StatusOK)
-	if h.fake.LvolExists(keep["handle"].(string)) {
+	if h.fake.VolumeExists(keep["handle"].(string)) {
 		t.Fatal("purge left the lvol")
 	}
 	h.expect(h.do("DELETE", "/api/v1/pools/"+poolID, h.admin, nil))(http.StatusOK)
@@ -178,7 +178,7 @@ func TestVolumeRetentionSetting(t *testing.T) {
 	h.expect(h.do("PUT", "/api/v1/system/volume-retention", h.admin, map[string]any{"hours": 0}))(http.StatusOK)
 	vol = h.volume(poolID, "b", 1<<30)
 	h.expect(h.do("DELETE", "/api/v1/volumes/"+vol["id"].(string), h.admin, nil))(http.StatusOK)
-	if h.fake.LvolExists(vol["handle"].(string)) {
+	if h.fake.VolumeExists(vol["handle"].(string)) {
 		t.Fatal("retention 0 kept the lvol")
 	}
 	if _, err := h.st.GetVolume(vol["id"].(string)); err == nil {
@@ -208,7 +208,7 @@ func TestSnapshotDeleteWaitsForItsClones(t *testing.T) {
 	h.expect(h.do("POST", "/api/v1/snapshots/"+snapID+":clone", h.admin, map[string]any{"clone_name": "again"}))(http.StatusNotFound)
 	h.expect(h.do("DELETE", "/api/v1/snapshots/"+snapID, h.admin, nil))(http.StatusOK) // retry
 	h.reconcile()
-	if !h.fake.LvolExists(snapLvol) {
+	if !h.fake.VolumeExists(snapLvol) {
 		t.Fatal("snapshot purged while a clone depends on it")
 	}
 	// A new snapshot can take the name.
@@ -217,7 +217,7 @@ func TestSnapshotDeleteWaitsForItsClones(t *testing.T) {
 	// Deleted clone: still waits, and the clone can be restored meanwhile.
 	h.expect(h.do("DELETE", "/api/v1/volumes/"+cloneID, h.admin, nil))(http.StatusOK)
 	h.reconcile()
-	if !h.fake.LvolExists(snapLvol) {
+	if !h.fake.VolumeExists(snapLvol) {
 		t.Fatal("snapshot purged while a deleted clone that can be restored depends on it")
 	}
 	h.expect(h.do("POST", "/api/v1/deleted-volumes/"+cloneID+"/restore", h.admin, nil))(http.StatusOK)
@@ -226,7 +226,7 @@ func TestSnapshotDeleteWaitsForItsClones(t *testing.T) {
 	// Once the clone is purged, the snapshot goes too.
 	h.expirePurge(cloneID)
 	h.reconcile()
-	if h.fake.LvolExists(snapLvol) {
+	if h.fake.VolumeExists(snapLvol) {
 		t.Fatal("snapshot not purged after its last clone")
 	}
 	if _, err := h.st.GetSnapshot(snapID); err == nil {
