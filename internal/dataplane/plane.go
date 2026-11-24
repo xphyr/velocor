@@ -33,9 +33,6 @@ type Plane interface {
 	Settle(ctx context.Context, claimed []string) error
 	// Endpoint describes how velod reaches the data plane (a socket path), for status output.
 	Endpoint() string
-	// PollingCPUs lists the CPUs the data plane busy-polls on, so other workloads can avoid
-	// them; nil when it doesn't poll.
-	PollingCPUs(ctx context.Context) ([]int, error)
 
 	// AttachDisk hands a claimed disk to the data plane and returns its handle (stored as
 	// Disk.Handle) and the driver state it is now in.
@@ -226,7 +223,7 @@ type LostExtent struct {
 	Kind   string
 	UUID   string // LostVolume: the volume's or snapshot's UUID
 	Name   string // LostOther: the LV
-	Offset uint64 // LostVolume: within the volume; otherwise within the array
+	Offset uint64 // within the volume (LostVolume) or LV (LostOther, LostPoolMetadata); otherwise informative only
 	Length uint64
 }
 

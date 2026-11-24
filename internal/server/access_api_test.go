@@ -105,3 +105,38 @@ func TestGroupSnapshotOfExportedVolumes(t *testing.T) {
 		t.Fatalf("group snapshot of an exported and an idle volume: %v", resp)
 	}
 }
+
+// Names that would leave their configfs directory are refused wherever they are entered.
+func TestQualifiedNamesAreValidated(t *testing.T) {
+	h := newHarness(t)
+	_, vol, ig := h.nvmeExport("nqn.2026-01.io.example:host-a")
+	ipt := h.expect(h.do("POST", "/api/v1/portals", h.admin, map[string]any{"name": "i", "protocol": "ISCSI", "ip_address": "10.0.0.10"}))(http.StatusCreated)
+	npt := h.expect(h.do("POST", "/api/v1/portals", h.admin, map[string]any{"name": "n2", "protocol": "NVMEOF_TCP", "ip_address": "10.0.0.11"}))(http.StatusCreated)
+	badIQN, badNQN := "iqn.2024-01.x:../../core/x", "nqn.2024-01.x:../../subsystems/evil"
+	for name, do := range map[string]func() (int, map[string]any){
+		"subsystem": func() (int, map[string]any) {
+			return h.do("POST", "/api/v1/exports", h.admin, map[string]any{"name": "e2", "volume_id": vol["id"], "protocol": "NVMEOF_TCP", "subsystem_nqn": badNQN,
+				"portal_ids": []string{field(npt, "portal", "id").(string)}, "allow_any_host": true})
+		},
+		"target": func() (int, map[string]any) {
+			return h.do("POST", "/api/v1/exports", h.admin, map[string]any{"name": "e3", "volume_id": vol["id"], "protocol": "ISCSI", "target_iqn": badIQN,
+				"portal_ids": []string{field(ipt, "portal", "id").(string)}, "allow_any_host": true})
+		},
+		"host IQN": func() (int, map[string]any) {
+			return h.do("POST", "/api/v1/hosts", h.admin, map[string]any{"name": "h", "initiator_iqn": badIQN})
+		},
+		"host NQN": func() (int, map[string]any) {
+			return h.do("POST", "/api/v1/hosts", h.admin, map[string]any{"name": "h", "host_nqn": badNQN})
+		},
+		"group IQN": func() (int, map[string]any) {
+			return h.do("POST", "/api/v1/initiator-groups", h.admin, map[string]any{"name": "g2", "initiator_iqns": []string{badIQN}})
+		},
+		"group update": func() (int, map[string]any) {
+			return h.do("PATCH", "/api/v1/initiator-groups/"+ig, h.admin, map[string]any{"initiator_iqns": []string{badIQN}})
+		},
+	} {
+		if code, body := do(); code != http.StatusBadRequest {
+			t.Errorf("%s: %d %v", name, code, body)
+		}
+	}
+}

@@ -60,8 +60,11 @@ type Reconciler struct {
 	unmanagedLogged map[string]bool
 	unmanagedGrace  *time.Duration // nil: defaultUnmanagedGrace
 
-	mu    sync.Mutex
-	state State
+	started time.Time
+
+	mu       sync.Mutex
+	state    State
+	restored bool // a pass has brought up everything
 }
 
 // New creates a new Reconciler instance.
@@ -70,19 +73,24 @@ func New(st store.Store, dp dataplane.Plane, hwMgr *hardware.Manager, logger *sl
 		logger = slog.Default()
 	}
 	return &Reconciler{
-		store:  st,
-		dp:     dp,
-		hw:     hwMgr,
-		logger: logger,
+		store:   st,
+		dp:      dp,
+		hw:      hwMgr,
+		logger:  logger,
+		started: time.Now(),
 	}
 }
 
-// Restoring reports whether no pass has finished since velod started, so after a reboot the pools,
-// volumes and exports aren't all back yet.
+// restoreTimeout is how long after velod's start Restoring can last: pools that can't be brought
+// up by then are a fault, reported as such.
+const restoreTimeout = 5 * time.Minute
+
+// Restoring reports whether no pass since velod started has brought up everything the claimed
+// disks hold, so after a reboot the pools, volumes and exports aren't all back yet.
 func (r *Reconciler) Restoring() bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return r.state.LastReconciledAt.IsZero()
+	return !r.restored && time.Since(r.started) < restoreTimeout
 }
 
 // State returns a snapshot of the reconciler's current status.
@@ -185,6 +193,11 @@ func (r *Reconciler) ReconcileOnce(ctx context.Context) (State, error) {
 
 	lastErr := strings.Join(p.errs, "; ")
 	r.finishPass(p.repaired, p.degraded, lastErr)
+	if examined {
+		r.mu.Lock()
+		r.restored = true
+		r.mu.Unlock()
+	}
 	if p.unmanagedChecked {
 		r.mu.Lock()
 		r.state.Unmanaged = p.unmanaged
@@ -235,6 +248,9 @@ func (r *Reconciler) enforceWriteCache(p *pass) {
 		return
 	}
 	for _, d := range disks {
+		if d.Type == store.DiskTypeNVMe {
+			continue // nvmeWriteCache
+		}
 		if d.WriteCachePolicy != store.WriteCachePolicyDisabled || d.IsBootDevice || d.WriteCache == store.WriteCacheWriteThrough {
 			if d.WriteCacheError != "" {
 				r.recordWriteCache(p, d.ID, d.WriteCache, "")
@@ -479,6 +495,11 @@ func (r *Reconciler) reconcilePools(ctx context.Context, p *pass, examined bool)
 		msg := strings.Join(reasons, "; ")
 		durability := poolDurability(pool, disks)
 		_, err := r.store.MutatePool(pool.ID, func(cur *store.Pool) error {
+			if !sameSlots(cur, pool) {
+				// A disk was replaced or released while this pass looked at the pool: what it
+				// concluded is about the old members. The next pass looks again.
+				return store.ErrSkipWrite
+			}
 			changed := cur.HealthStatus != health || cur.StatusMessage != msg || cur.Durability != durability
 			cur.Durability = durability
 			if ri >= 0 && (cur.UnreadableBytes != unreadable || !slices.Equal(cur.LostData, lost)) {

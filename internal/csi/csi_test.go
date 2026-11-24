@@ -26,6 +26,7 @@ type fakeMounter struct {
 	mu                  sync.Mutex
 	mounted             map[string]bool
 	disconnectedVolumes []string
+	flushErr            error
 }
 
 func newFakeMounter() *fakeMounter {
@@ -48,7 +49,7 @@ func (f *fakeMounter) DisconnectVolume(_ context.Context, volumeID string) error
 }
 
 func (f *fakeMounter) FlushDevice(_ context.Context, _ string) error {
-	return nil
+	return f.flushErr
 }
 
 func (f *fakeMounter) FormatAndMount(_ context.Context, _, target, _ string, _ []string) error {

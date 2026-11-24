@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"slices"
 	"strings"
@@ -203,5 +204,39 @@ func TestScrubRecordGoesWithThePool(t *testing.T) {
 	h.expect(h.do("DELETE", "/api/v1/pools/"+id, h.admin, nil))(http.StatusOK)
 	if _, err := h.st.GetScrubRecord(id); err == nil {
 		t.Fatal("scrub record outlived its pool")
+	}
+}
+
+// A RAID0 pool (nothing to scrub) is never picked nor overdue, and a pool whose scrub won't start
+// doesn't keep the others from theirs.
+func TestScrubOfOnePoolDoesntStarveTheOthers(t *testing.T) {
+	h := newHarness(t)
+	for i, d := range []string{"d1", "d2", "d3", "d4", "d5"} {
+		h.addDisk(d, fmt.Sprintf("0000:0%d:00.0", i+1))
+	}
+	h.pool("stripe", "RAID0", "d1")
+	first, second := h.pool("m1", "RAID1", "d2", "d3"), h.pool("m2", "RAID1", "d4", "d5")
+	h.reconcile()
+	h.expect(h.do("PUT", "/api/v1/system/scrub", h.admin, map[string]any{"interval_days": 1, "window_start_hour": 0, "window_end_hour": 0}))(http.StatusOK)
+	now := time.Now().Add(72 * time.Hour)
+	h.fake.Fail("StartScrub", 1)
+	if err := h.srv.scrubTick(context.Background(), now); err == nil {
+		t.Error("the scrub that didn't start isn't reported")
+	}
+	r1, err1 := h.st.GetScrubRecord(first)
+	r2, err2 := h.st.GetScrubRecord(second)
+	if err2 != nil || r2.State != store.ScrubRunning {
+		t.Fatalf("the second mirror: %+v %v (first: %+v %v)", r2, err2, r1, err1)
+	}
+	if m := h.metrics(); strings.Contains(m, `velocor_pool_scrub_overdue{pool="stripe"} 1`) {
+		t.Error("a RAID0 pool is overdue for a scrub")
+	}
+	p, _ := h.st.ListPools()
+	for _, x := range p {
+		if x.Name == "stripe" {
+			if code, body := h.do("POST", "/api/v1/pools/"+x.ID+"/scrub", h.admin, map[string]any{}); code != http.StatusBadRequest && code != http.StatusConflict {
+				t.Errorf("scrub of a RAID0 pool: %d %v", code, body)
+			}
+		}
 	}
 }

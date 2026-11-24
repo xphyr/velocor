@@ -170,7 +170,7 @@ type lostData struct {
 func (p *Plane) LostData(ctx context.Context, array string) ([]dataplane.LostExtent, error) {
 	st, err := p.k.ArrayStatus(array)
 	if err != nil {
-		return nil, err
+		return nil, notFound("array %s not found", array)
 	}
 	u := unreadableOf(st)
 	if u.sectors == 0 {

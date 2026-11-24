@@ -20,6 +20,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -510,6 +511,45 @@ func TestExports(t *testing.T) {
 		t.Errorf("iSCSI connections %+v %v", conns, err)
 	}
 
+	// A second iSCSI export of the volume, open to any initiator, shares its backstore; the
+	// initiators on it are listed; removing it leaves the first one working.
+	open := &store.Export{ID: "exp-o" + e.id, VolumeID: vol.ID, Protocol: store.ExportProtocolISCSI, TargetIQN: iscsi.TargetIQN + "-open", AllowAnyHost: true}
+	if err := e.p.ApplyExport(e.ctx, open, vol, dataplane.ACL{}, ipt); err != nil {
+		t.Fatalf("a second iSCSI export of the volume: %v", err)
+	}
+	anyInit := "iqn.2026-11.io.velocor.test:kp-any"
+	odev, err := iscsiLogin(e, open.TargetIQN, anyInit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	verify(t, odev, 0, 4*mib, 4)
+	conns, err = e.p.Connections(e.ctx, open)
+	if err != nil || !slices.ContainsFunc(conns, func(c dataplane.Connection) bool { return c.Host == anyInit }) {
+		t.Errorf("connections of an open iSCSI export %+v %v: %s is missing", conns, err, anyInit)
+	}
+	if err := e.p.RemoveTarget(e.ctx, open); err != nil {
+		t.Fatalf("remove the second export: %v", err)
+	}
+	if err := e.p.ApplyExport(e.ctx, iscsi, vol, dataplane.ACL{IQNs: []string{init1}}, ipt); err != nil {
+		t.Fatalf("the first export after removing the second: %v", err)
+	}
+	verify(t, idev, 4*mib, 4*mib, 3)
+
+	// An NVMe export opens to every host and closes again, with a host linked each time.
+	openACL := *nvme
+	openACL.AllowAnyHost = true
+	for i := range 2 {
+		if err := e.p.ApplyExport(e.ctx, &openACL, vol, dataplane.ACL{}, portals[:1]); err != nil {
+			t.Fatalf("open the NVMe export (%d): %v", i, err)
+		}
+		if _, err := os.Stat("/sys/kernel/config/nvmet/hosts/" + hostNQN); err == nil {
+			t.Errorf("the host object stays after its last subsystem dropped it")
+		}
+		if err := e.p.ApplyExport(e.ctx, nvme, vol, dataplane.ACL{HostNQNs: []string{hostNQN}}, portals[:1]); err != nil {
+			t.Fatalf("close the NVMe export (%d): %v", i, err)
+		}
+	}
+
 	// A volume can't be deleted while exported (its wrapper is busy).
 	if err := e.p.DeleteVolume(e.ctx, vol.UUID); err == nil {
 		t.Fatal("deleted an exported volume")
@@ -518,6 +558,42 @@ func TestExports(t *testing.T) {
 	if !slices.ContainsFunc(un, func(o dataplane.UnmanagedObject) bool { return o.Kind == "ISCSI_TARGET" && o.Name == iscsi.TargetIQN }) ||
 		slices.ContainsFunc(un, func(o dataplane.UnmanagedObject) bool { return o.Name == nvme.SubsystemNQN }) {
 		t.Errorf("unmanaged targets: %+v", un)
+	}
+}
+
+// Exports applied and removed at once each get a listener of their own, on their own port.
+func TestConcurrentExports(t *testing.T) {
+	e := newEnv(t)
+	e.pool()
+	_, vol := e.volume("vol-c", 32*mib)
+	acl := dataplane.ACL{HostNQNs: []string{hostNQN}}
+	const n = 8
+	for round := range 5 {
+		exps := make([]*store.Export, n)
+		errs := make([]error, n)
+		var wg sync.WaitGroup
+		each := func(f func(i int)) {
+			for i := range n {
+				wg.Go(func() { f(i) })
+			}
+			wg.Wait()
+		}
+		each(func(i int) {
+			exps[i] = &store.Export{ID: fmt.Sprintf("exp-c%d%s", i, e.id), VolumeID: vol.ID, Protocol: store.ExportProtocolNVMeoFTCP,
+				SubsystemNQN: fmt.Sprintf("nqn.2026-11.io.velocor.test:%s-%d", e.id, i)}
+			errs[i] = e.p.ApplyExport(e.ctx, exps[i], vol, acl, []*store.Portal{{ID: "pt", IPAddress: "127.0.0.1", Port: uint32(15000 + i)}})
+		})
+		for i, err := range errs {
+			if err != nil {
+				t.Errorf("round %d, export %d: %v", round, i, err)
+			} else if pts := e.k.NVMeSubsystemPorts(exps[i].SubsystemNQN); len(pts) != 1 || pts[0].Port != 15000+i {
+				t.Errorf("round %d, export %d listens on %+v", round, i, pts)
+			}
+		}
+		each(func(i int) { errs[i] = e.p.RemoveTarget(context.Background(), exps[i]) })
+		if err := errors.Join(errs...); err != nil {
+			t.Errorf("round %d: remove: %v", round, err)
+		}
 	}
 }
 

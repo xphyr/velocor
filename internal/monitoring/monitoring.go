@@ -54,11 +54,9 @@ type Manager struct {
 	Instance string
 	// NewToken revokes the previous scrape token and returns a new READONLY one.
 	NewToken func() (string, error)
-	// ReactorCPUs returns the CPUs SPDK polls on, which Prometheus and Alertmanager stay off.
-	ReactorCPUs func(ctx context.Context) ([]int, error)
-	Run         Runner
-	HTTP        *http.Client
-	Logger      *slog.Logger
+	Run      Runner
+	HTTP     *http.Client
+	Logger   *slog.Logger
 	// PrometheusAddr and AlertmanagerAddr override where the services are reached (tests).
 	PrometheusAddr, AlertmanagerAddr string
 
@@ -142,20 +140,13 @@ func (m *Manager) Apply(ctx context.Context, enabled bool, alerting store.Alerti
 	if err := m.writeConfig(alerting); err != nil {
 		return err
 	}
-	cpus := m.allowedCPUs(ctx)
 	for _, u := range []string{AlertmanagerUnit, PrometheusUnit} {
 		// restart, not start: picks up the new scrape token and config either way.
 		if out, err := m.Run(ctx, "systemctl", "restart", u); err != nil {
 			return fmt.Errorf("start %s: %w (%s)", u, err, strings.TrimSpace(string(out)))
 		}
-		if cpus != "" {
-			// Keep off SPDK's polling cores (their reactors spin at 100%); until the next start.
-			if out, err := m.Run(ctx, "systemctl", "set-property", "--runtime", u, "AllowedCPUs="+cpus); err != nil {
-				m.logger().Warn("couldn't keep a monitoring service off SPDK's cores", "unit", u, "err", err, "out", strings.TrimSpace(string(out)))
-			}
-		}
 	}
-	m.logger().Info("built-in monitoring started", "prometheus", PrometheusAddr, "alertmanager", AlertmanagerAddr, "cpus", cpus)
+	m.logger().Info("built-in monitoring started", "prometheus", PrometheusAddr, "alertmanager", AlertmanagerAddr)
 	return nil
 }
 
@@ -189,37 +180,6 @@ func (m *Manager) service(ctx context.Context, unit, addr string) ServiceStatus 
 		s.Detail = resp.Status
 	}
 	return s
-}
-
-// allowedCPUs lists the online CPUs SPDK doesn't poll on, in systemd's syntax ("1-3"), or ""
-// to leave affinity alone (SPDK uses every CPU, or the cores can't be found).
-func (m *Manager) allowedCPUs(ctx context.Context) string {
-	if m.ReactorCPUs == nil {
-		return ""
-	}
-	reactors, err := m.ReactorCPUs(ctx)
-	if err != nil || len(reactors) == 0 {
-		return ""
-	}
-	b, err := os.ReadFile("/sys/devices/system/cpu/online")
-	if err != nil {
-		return ""
-	}
-	online, err := parseCPUList(strings.TrimSpace(string(b)))
-	if err != nil {
-		return ""
-	}
-	busy := map[int]bool{}
-	for _, c := range reactors {
-		busy[c] = true
-	}
-	var free []int
-	for _, c := range online {
-		if !busy[c] {
-			free = append(free, c)
-		}
-	}
-	return formatCPUList(free)
 }
 
 // Reconfigure rewrites the rules and Alertmanager's configuration and reloads both services
@@ -386,49 +346,6 @@ func alertmanagerConfig(a store.AlertingSettings) (string, map[string]string) {
 		sb.WriteString("  - name: heartbeat\n    webhook_configs:\n      - url_file: /etc/velocor-monitoring/heartbeat.url\n        send_resolved: false\n")
 	}
 	return sb.String(), secrets
-}
-
-// parseCPUList parses the kernel's CPU list syntax ("0-3,8,10-11").
-func parseCPUList(s string) ([]int, error) {
-	var out []int
-	for _, part := range strings.Split(s, ",") {
-		if part == "" {
-			continue
-		}
-		lo, hi, isRange := strings.Cut(part, "-")
-		var a, b int
-		if _, err := fmt.Sscanf(lo, "%d", &a); err != nil {
-			return nil, fmt.Errorf("bad CPU list %q", s)
-		}
-		b = a
-		if isRange {
-			if _, err := fmt.Sscanf(hi, "%d", &b); err != nil || b < a {
-				return nil, fmt.Errorf("bad CPU list %q", s)
-			}
-		}
-		for c := a; c <= b; c++ {
-			out = append(out, c)
-		}
-	}
-	return out, nil
-}
-
-// formatCPUList writes sorted CPUs in the same syntax.
-func formatCPUList(cpus []int) string {
-	var parts []string
-	for i := 0; i < len(cpus); {
-		j := i
-		for j+1 < len(cpus) && cpus[j+1] == cpus[j]+1 {
-			j++
-		}
-		if i == j {
-			parts = append(parts, fmt.Sprint(cpus[i]))
-		} else {
-			parts = append(parts, fmt.Sprintf("%d-%d", cpus[i], cpus[j]))
-		}
-		i = j + 1
-	}
-	return strings.Join(parts, ",")
 }
 
 // LocalTarget turns velod's listen address into the address Prometheus scrapes on the

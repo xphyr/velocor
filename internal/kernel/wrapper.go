@@ -66,8 +66,27 @@ func (p *Plane) ResumeWrapper(ctx context.Context, volume string) error {
 	return err
 }
 
-// WrapperSuspended reports whether the wrapper is suspended (velod resumes wrappers left
-// suspended by a crash in the middle of a group snapshot).
+// SuspendedWrappers lists the suspended wrappers' volumes (velod resumes wrappers left suspended
+// by a crash in the middle of a group snapshot).
+func (p *Plane) SuspendedWrappers(ctx context.Context) ([]string, error) {
+	out, err := p.Run.Run(ctx, "dmsetup", "info", "-c", "--noheadings", "--separator", " ", "-o", "name,suspended")
+	if err != nil {
+		return nil, err
+	}
+	var vols []string
+	for _, line := range strings.Split(string(out), "\n") {
+		f := strings.Fields(line)
+		if len(f) != 2 || f[1] != "Suspended" {
+			continue
+		}
+		if v, ok := strings.CutPrefix(f[0], WrapperName("")); ok {
+			vols = append(vols, v)
+		}
+	}
+	return vols, nil
+}
+
+// WrapperSuspended reports whether the wrapper is suspended.
 func (p *Plane) WrapperSuspended(ctx context.Context, volume string) (bool, error) {
 	out, err := p.Run.Run(ctx, "dmsetup", "info", "-c", "--noheadings", "-o", "suspended", WrapperName(volume))
 	if err != nil {
@@ -126,13 +145,16 @@ func (p *Plane) GroupSnapshotWithin(ctx context.Context, members []GroupMember, 
 	}
 	defer cancel()
 	for _, m := range members {
+		// Counted as suspended even if the command fails: killed at the deadline, dmsetup may
+		// already have suspended it (it still waits for udev then). Resuming a wrapper that
+		// isn't suspended does nothing.
+		suspended = append(suspended, m.Volume)
 		if err := p.SuspendWrapper(sctx, m.Volume); err != nil {
 			if sctx.Err() != nil {
 				err = fmt.Errorf("%w: %v", sctx.Err(), err)
 			}
 			return fail(fmt.Errorf("suspend %s: %w", m.Volume, err))
 		}
-		suspended = append(suspended, m.Volume)
 	}
 	for _, m := range members {
 		if err := p.Snapshot(ctx, m.VG, m.LV, m.Snap, m.Tags...); err != nil {
@@ -140,7 +162,10 @@ func (p *Plane) GroupSnapshotWithin(ctx context.Context, members []GroupMember, 
 		}
 		taken = append(taken, m)
 	}
-	return resumeAll()
+	if err := resumeAll(); err != nil {
+		return fail(err) // which tries again, and removes the snapshots the caller won't know of
+	}
+	return nil
 }
 
 func (p *Plane) blockSectors(ctx context.Context, dev string) (uint64, error) {

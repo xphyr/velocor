@@ -77,17 +77,7 @@ func TestApplyWritesConfigAndStartsServices(t *testing.T) {
 	}
 }
 
-func TestCPULists(t *testing.T) {
-	got, err := parseCPUList("0-3,8,10-11")
-	if err != nil || !slices.Equal(got, []int{0, 1, 2, 3, 8, 10, 11}) {
-		t.Fatalf("parse: %v %v", got, err)
-	}
-	if s := formatCPUList([]int{1, 2, 3, 8, 10, 11}); s != "1-3,8,10-11" {
-		t.Fatalf("format: %s", s)
-	}
-	if _, err := parseCPUList("3-1"); err == nil {
-		t.Fatal("a reversed range must fail")
-	}
+func TestLocalTarget(t *testing.T) {
 	for in, want := range map[string]string{":8443": "127.0.0.1:8443", "0.0.0.0:9443": "127.0.0.1:9443", "10.0.0.5:8443": "10.0.0.5:8443"} {
 		if got := LocalTarget(in); got != want {
 			t.Errorf("LocalTarget(%q) = %q, want %q", in, got, want)

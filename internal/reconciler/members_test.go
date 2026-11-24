@@ -1,9 +1,13 @@
 package reconciler
 
 import (
+	"context"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/velocor/velocor/internal/dataplane"
+	"github.com/velocor/velocor/internal/dataplane/planetest"
 	"github.com/velocor/velocor/internal/store"
 )
 
@@ -94,5 +98,70 @@ func TestFailedMemberIsNotPutBack(t *testing.T) {
 		if c == "AddMember" || c == "AttachDisk" {
 			t.Fatalf("%s on the failed disk: %v", c, e.fake.Calls()[before:])
 		}
+	}
+}
+
+// racing runs a function in the middle of every pass, after the pools and arrays were read.
+type racing struct {
+	*planetest.Fake
+	during func()
+}
+
+func (r *racing) ThinPools(ctx context.Context, name, uuid string) ([]dataplane.ThinPool, error) {
+	if f := r.during; f != nil {
+		r.during = nil
+		f()
+	}
+	return r.Fake.ThinPools(ctx, name, uuid)
+}
+
+// A disk replaced while a pass looks at the pool keeps its slot: the pass doesn't write back the
+// members it read before.
+func TestReplaceDuringAPassIsKept(t *testing.T) {
+	e := newEnv(t)
+	e.provision(store.RaidLevel1, "0000:01:00.0", "0000:02:00.0")
+	e.fake.FailDisk("0000:02:00.0")
+	plane := &racing{Fake: e.fake}
+	e.rec = New(e.st, plane, nil, nil)
+	e.reconcile()
+	c := e.addDisk(&store.Disk{ID: "disk-c", Name: "nvme", Type: store.DiskTypeNVMe, PCIAddress: "0000:03:00.0", SizeBytes: 1 << 40})
+	plane.during = func() {
+		if _, err := e.st.ReplacePoolMember("pool-1", 1, c.ID); err != nil {
+			t.Error(err)
+		}
+	}
+	e.reconcile()
+	if p := e.pool(); p.Members[1].DiskID != "disk-c" || p.Members[1].State != store.MemberStateRebuilding {
+		t.Fatalf("slot 1 after the pass: %+v", p.Members[1])
+	}
+}
+
+func TestInRaidIgnoresEmptySlots(t *testing.T) {
+	raids := []dataplane.Array{{Members: []dataplane.ArrayMember{{Name: "a"}, {Name: ""}}}}
+	if inRaid(raids, "") || !inRaid(raids, "a") {
+		t.Fatal("an empty slot has no member")
+	}
+}
+
+// Restoring lasts until a pass has brought up the pools, not just until one has run.
+func TestRestoringUntilThePoolsAreUp(t *testing.T) {
+	e := newEnv(t)
+	e.provision(store.RaidLevel1, "0000:01:00.0", "0000:02:00.0")
+	if !e.rec.Restoring() {
+		t.Fatal("not restoring before the first pass")
+	}
+	e.fake.Fail("Settle", 1)
+	e.reconcile()
+	if !e.rec.Restoring() {
+		t.Fatal("not restoring after a pass that couldn't bring up the pools")
+	}
+	e.reconcile()
+	if e.rec.Restoring() {
+		t.Fatal("still restoring")
+	}
+	e.rec = New(e.st, e.fake, nil, nil)
+	e.rec.started = time.Now().Add(-restoreTimeout)
+	if e.rec.Restoring() {
+		t.Fatal("restoring for ever")
 	}
 }

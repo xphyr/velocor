@@ -69,6 +69,10 @@ func main() {
 		"db", *dbPath,
 	)
 
+	if (*tlsCertFile == "") != (*tlsKeyFile == "") {
+		logger.Error("--tls-cert and --tls-key go together: give both, or neither for a self-signed certificate")
+		os.Exit(2)
+	}
 	if err := os.MkdirAll(filepath.Dir(*dbPath), 0700); err != nil {
 		logger.Error("failed to create state directory", "path", filepath.Dir(*dbPath), "err", err)
 		os.Exit(1)

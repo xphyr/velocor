@@ -38,8 +38,10 @@ func TestParseFeatureValue(t *testing.T) {
 			t.Errorf("%q: %d %v", out, v, err)
 		}
 	}
-	if _, err := parseFeatureValue("NVMe status: INVALID_FIELD"); err == nil {
-		t.Error("garbage parsed")
+	for _, out := range []string{"NVMe status: INVALID_FIELD", "Current value:", "Current value:  \n"} {
+		if _, err := parseFeatureValue(out); err == nil {
+			t.Errorf("%q parsed", out)
+		}
 	}
 }
 
@@ -60,7 +62,7 @@ func TestParseSSPeers(t *testing.T) {
 }
 
 func TestSerial(t *testing.T) {
-	if s := serial(&store.Export{ID: "exp-6f7b3acbf52b"}); s != "VELOEXP6F7B3ACBF52B" {
+	if s := serial("exp-6f7b3acbf52b"); s != "VELOEXP6F7B3ACBF52B" {
 		t.Errorf("serial %q", s)
 	}
 }

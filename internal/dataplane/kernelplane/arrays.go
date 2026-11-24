@@ -53,6 +53,7 @@ func (p *Plane) arrayOf(name string, st *kernel.ArrayStatus) dataplane.Array {
 		Name:        name,
 		UUID:        st.UUID,
 		Level:       st.Level,
+		StripKB:     uint32(st.ChunkSectors / 2),
 		Slots:       uint32(st.RaidDisks),
 		Operational: uint32(max(st.RaidDisks-st.Degraded, 0)),
 		Members:     make([]dataplane.ArrayMember, st.RaidDisks),
@@ -193,6 +194,10 @@ func (p *Plane) StartDegraded(ctx context.Context, array string) error {
 	w, ok := p.waiting[array]
 	p.mu.Unlock()
 	if !ok {
+		// Assembled but not run: the kernel has it, so Settle doesn't.
+		if st, err := p.k.ArrayStatus(array); err == nil && st.ArrayState == "inactive" {
+			return p.k.RunArray(ctx, array)
+		}
 		return notFound("array %s is not waiting for members", array)
 	}
 	if err := p.k.AssembleArray(ctx, w.Name, w.UUID, w.Found, true); err != nil {
@@ -243,11 +248,13 @@ func (p *Plane) StartScrub(_ context.Context, array string, repair bool, mbps ui
 	if err := p.k.SetSyncSpeedMax(array, speed); err != nil {
 		return err
 	}
-	if err := p.k.SetSyncMin(array, offsetBlocks); err != nil {
-		return err
+	err = p.k.SetSyncMin(array, offsetBlocks)
+	if err == nil {
+		err = p.k.StartScrub(array, repair)
 	}
-	if err := p.k.StartScrub(array, repair); err != nil {
-		return err
+	if err != nil {
+		// The limit applies to a rebuild too, which may be why md refused the scrub.
+		return errors.Join(err, p.k.SetSyncSpeedMax(array, "system"))
 	}
 	p.mu.Lock()
 	p.scrubs[array] = &scrubRun{Repair: repair, Start: offsetBlocks, Last: offsetBlocks, Degraded: st.Degraded}

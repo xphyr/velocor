@@ -328,7 +328,7 @@ func (s *Server) handleCreatePool(w http.ResponseWriter, r *http.Request) {
 		return nil
 	})
 	if err != nil {
-		writeError(w, err)
+		fail(true, err)
 		return
 	}
 	writeJSON(w, http.StatusCreated, map[string]any{"pool": updated})
@@ -1118,14 +1118,28 @@ func (s *Server) handleCreateExport(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if dataplane.IsNVMe(req.Protocol) && req.SubsystemNQN == "" {
-		req.SubsystemNQN = "nqn.2026-11.io.velocor:" + req.Name
+	if dataplane.IsNVMe(req.Protocol) {
+		if req.SubsystemNQN == "" {
+			req.SubsystemNQN = "nqn.2026-11.io.velocor:" + req.Name
+		}
+		if err := dataplane.ValidateNQN(req.SubsystemNQN); err != nil {
+			writeError(w, fmt.Errorf("%w: %v", store.ErrInvalidArgument, err))
+			return
+		}
+		req.TargetIQN = ""
 	}
 	if req.NamespaceID == 0 {
 		req.NamespaceID = 1
 	}
-	if req.Protocol == store.ExportProtocolISCSI && req.TargetIQN == "" {
-		req.TargetIQN = "iqn.2026-11.io.velocor:" + strings.ToLower(req.Name)
+	if req.Protocol == store.ExportProtocolISCSI {
+		if req.TargetIQN == "" {
+			req.TargetIQN = "iqn.2026-11.io.velocor:" + strings.ToLower(req.Name)
+		}
+		if err := dataplane.ValidateIQN(req.TargetIQN); err != nil {
+			writeError(w, fmt.Errorf("%w: %v", store.ErrInvalidArgument, err))
+			return
+		}
+		req.SubsystemNQN = ""
 	}
 
 	exp := &store.Export{

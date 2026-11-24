@@ -135,13 +135,16 @@ func (s *Server) handleUpdateInitiatorGroup(w http.ResponseWriter, r *http.Reque
 		writeError(w, err)
 		return
 	}
+	var nqns, iqns []string
 	if req.HostNQNs != nil {
-		for _, nqn := range *req.HostNQNs {
-			if err := dataplane.ValidateNQN(strings.TrimSpace(nqn)); err != nil {
-				writeError(w, fmt.Errorf("%w: %v", store.ErrInvalidArgument, err))
-				return
-			}
-		}
+		nqns = *req.HostNQNs
+	}
+	if req.InitiatorIQNs != nil {
+		iqns = *req.InitiatorIQNs
+	}
+	if err := validateInitiators(nqns, iqns); err != nil {
+		writeError(w, err)
+		return
 	}
 	current, err := s.store.GetInitiatorGroup(id)
 	if err != nil {

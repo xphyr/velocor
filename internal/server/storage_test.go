@@ -401,8 +401,8 @@ func TestIscsiExportACLs(t *testing.T) {
 	v1, v2 := h.volume(poolID, "a", 1<<30), h.volume(poolID, "b", 1<<30)
 	portal := h.expect(h.do("POST", "/api/v1/portals", h.admin, map[string]any{"name": "i", "protocol": "ISCSI", "ip_address": "10.0.0.10"}))(http.StatusCreated)
 	pid := field(portal, "portal", "id").(string)
-	ig1 := field(h.expect(h.do("POST", "/api/v1/initiator-groups", h.admin, map[string]any{"name": "g1", "initiator_iqns": []string{"iqn.a"}}))(http.StatusCreated), "initiator_group", "id").(string)
-	ig2 := field(h.expect(h.do("POST", "/api/v1/initiator-groups", h.admin, map[string]any{"name": "g2", "initiator_iqns": []string{"iqn.b"}}))(http.StatusCreated), "initiator_group", "id").(string)
+	ig1 := field(h.expect(h.do("POST", "/api/v1/initiator-groups", h.admin, map[string]any{"name": "g1", "initiator_iqns": []string{"iqn.2026-01.io.example:a"}}))(http.StatusCreated), "initiator_group", "id").(string)
+	ig2 := field(h.expect(h.do("POST", "/api/v1/initiator-groups", h.admin, map[string]any{"name": "g2", "initiator_iqns": []string{"iqn.2026-01.io.example:b"}}))(http.StatusCreated), "initiator_group", "id").(string)
 
 	if code, _ := h.do("POST", "/api/v1/exports", h.admin, map[string]any{"name": "open", "volume_id": v1["id"], "protocol": "ISCSI", "portal_ids": []string{pid}}); code != http.StatusBadRequest {
 		t.Fatalf("iSCSI export with no initiators and no allow_any_host must be rejected, got %d", code)
@@ -412,7 +412,7 @@ func TestIscsiExportACLs(t *testing.T) {
 
 	t1, _ := h.fake.Target(e1["target_iqn"].(string))
 	t2, _ := h.fake.Target(e2["target_iqn"].(string))
-	if !slices.Equal(t1.Hosts, []string{"iqn.a"}) || !slices.Equal(t2.Hosts, []string{"iqn.b"}) {
+	if !slices.Equal(t1.Hosts, []string{"iqn.2026-01.io.example:a"}) || !slices.Equal(t2.Hosts, []string{"iqn.2026-01.io.example:b"}) {
 		t.Fatalf("each export must have its own ACL: %+v / %+v", t1, t2)
 	}
 

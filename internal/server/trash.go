@@ -122,11 +122,9 @@ func (s *Server) handleRestoreVolume(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Name string `json:"name"`
 	}
-	if r.ContentLength != 0 {
-		if err := decodeJSON(r, &req); err != nil {
-			writeError(w, err)
-			return
-		}
+	if err := decodeOptionalJSON(r, &req); err != nil {
+		writeError(w, err)
+		return
 	}
 	if req.Name != "" {
 		if err := validateDisplayName("volume", req.Name); err != nil {

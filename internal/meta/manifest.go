@@ -62,6 +62,7 @@ func (m *Manifest) Content() []byte {
 	p := c.Pool
 	p.TotalBytes, p.FreeBytes, p.AllocatedBytes, p.CommittedBytes, p.AvailableBytes = 0, 0, 0, 0, 0
 	p.SpaceState, p.HealthStatus, p.StatusMessage, p.Members = "", "", "", nil
+	p.ThinMetadataBytes, p.ThinMetadataUsedBytes, p.UnreadableBytes, p.LostData, p.Durability = 0, 0, 0, nil, ""
 	p.MetaGeneration, p.MetaHash, p.MetaWrittenAt, p.MetaError = 0, "", time.Time{}, ""
 	c.Pool = p
 	disks := make([]store.Disk, len(c.Disks))
@@ -240,7 +241,7 @@ func DecodeSlot(b []byte) (*Manifest, bool) {
 	if err := binary.Read(bytes.NewReader(b[:binary.Size(h)]), binary.LittleEndian, &h); err != nil {
 		return nil, false
 	}
-	if h.Magic != magic || h.Format != FormatVersion || h.Length == 0 || HeaderBytes+h.Length > uint64(len(b)) {
+	if h.Magic != magic || h.Format != FormatVersion || h.Length == 0 || h.Length > uint64(len(b)-HeaderBytes) {
 		return nil, false
 	}
 	body := b[HeaderBytes : HeaderBytes+h.Length]

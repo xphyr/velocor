@@ -465,7 +465,7 @@ func (s *Server) scrubMetrics(m *metricSet, pools []*store.Pool, now time.Time) 
 			m.gauge("velocor_pool_scrub_last_completed_timestamp_seconds", hLast, unixSeconds(rec.LastCompletedAt), l...)
 		}
 		since := maxTime(rec.LastCompletedAt, p.CreatedAt)
-		m.gauge("velocor_pool_scrub_overdue", hOverdue, b2f(!cfg.Disabled && now.Sub(since) > 2*interval), l...)
+		m.gauge("velocor_pool_scrub_overdue", hOverdue, b2f(!cfg.Disabled && redundant(p.RaidLevel) && now.Sub(since) > 2*interval), l...)
 		c := rec.Total()
 		m.gauge("velocor_pool_scrub_repaired_blocks", hRepaired, float64(c.RepairedBlocks), l...)
 		m.gauge("velocor_pool_scrub_mismatched_blocks", hMismatch, float64(c.MismatchedBlocks), l...)

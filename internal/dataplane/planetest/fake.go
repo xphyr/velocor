@@ -374,8 +374,6 @@ func (f *Fake) Version(context.Context) (string, error) {
 
 func (f *Fake) Endpoint() string { return "kernel (test)" }
 
-func (f *Fake) PollingCPUs(context.Context) ([]int, error) { return nil, nil }
-
 // Settle assembles the arrays on claimed disks that are complete (see the package comment).
 func (f *Fake) Settle(_ context.Context, claimed []string) error {
 	done, err := f.read("Settle")

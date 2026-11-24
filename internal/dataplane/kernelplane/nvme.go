@@ -115,6 +115,8 @@ func parseFeatureValue(out string) (uint64, error) {
 	if !ok {
 		return 0, fmt.Errorf("nvme get-feature: unexpected output %q", strings.TrimSpace(out))
 	}
-	v = strings.TrimPrefix(strings.TrimSpace(strings.Fields(v + " ")[0]), "0x")
+	v, _, _ = strings.Cut(strings.TrimSpace(v), " ")
+	v, _, _ = strings.Cut(v, "\n")
+	v = strings.TrimPrefix(strings.TrimSpace(v), "0x")
 	return strconv.ParseUint(v, 16, 64)
 }

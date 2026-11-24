@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"sort"
 	"strconv"
@@ -59,6 +60,15 @@ type Plane struct {
 	// StateDir, if set, keeps the scrubs started (scrubs.json) across velod restarts; md itself
 	// keeps only its last action. A directory cleared at boot (/run/velocor), as md's is.
 	StateDir string
+
+	// wrapMu is held while wrappers are created, changed, suspended or removed, so that a
+	// reconciler pass (Settle) can't resume the volumes a group snapshot is holding, or put back
+	// the wrapper of a volume being deleted.
+	wrapMu sync.Mutex
+
+	// targetMu is held while targets are set up or removed: exports share nvmet's ports (a new
+	// one gets the next free ID, an unused one is removed) and a volume's iSCSI backstore.
+	targetMu sync.Mutex
 
 	mu sync.Mutex
 	// waiting are arrays Settle found incomplete: md doesn't assemble an array with members
@@ -124,21 +134,22 @@ func (p *Plane) Version(_ context.Context) (string, error) {
 
 func (p *Plane) Endpoint() string { return "kernel (md, LVM thin, nvmet, LIO)" }
 
-// PollingCPUs: the kernel doesn't busy-poll.
-func (p *Plane) PollingCPUs(context.Context) ([]int, error) { return nil, nil }
-
 // MaxSnapshotGroup bounds a group snapshot (every member's I/O waits while all are taken).
 func (p *Plane) MaxSnapshotGroup() int { return maxGroup }
 
 // Settle brings up what the claimed disks hold, as SPDK's examine did: the targets' modules,
 // every velod array on claimed disks whose members are all present, or all those it still had
 // when it last ran (freshMembers; incomplete ones are kept as waiting), every volume group on them, a wrapper for every volume, and any wrapper a crash
-// left suspended resumed. An array with a member on a disk velod hasn't claimed is left alone
+// left suspended resumed (before anything else). An array with a member on a disk velod hasn't claimed is left alone
 // (an import candidate, or disks from elsewhere). It is idempotent and runs on every
 // reconciler pass.
 func (p *Plane) Settle(ctx context.Context, claimed []string) error {
 	if err := p.k.LoadTargetModules(ctx); err != nil {
 		return fmt.Errorf("load target modules: %w", err)
+	}
+	// First: mdadm reads every block device below, which would wait forever on a suspended one.
+	if err := p.resumeWrappers(ctx); err != nil {
+		return err
 	}
 	examined, err := p.k.ExamineArrays(ctx)
 	if err != nil {
@@ -191,6 +202,9 @@ func (p *Plane) Settle(ctx context.Context, claimed []string) error {
 	var errs []error
 	for _, vg := range vgs {
 		if err := p.k.ActivatePool(ctx, vg.Name); err != nil {
+			if _, ok, lerr := p.volumeGroup(ctx, vg.Name); lerr == nil && !ok {
+				continue // deleted meanwhile
+			}
 			errs = append(errs, fmt.Errorf("activate %s: %w", vg.Name, err))
 		}
 	}
@@ -202,17 +216,52 @@ func (p *Plane) Settle(ctx context.Context, claimed []string) error {
 		if !isVolume(lv) || isSnapshot(lv) || lv.Name == metaLV {
 			continue
 		}
-		if err := p.k.EnsureWrapper(ctx, lv.Name, p.k.LVPath(lv.VG, lv.Name)); err != nil {
-			errs = append(errs, fmt.Errorf("wrapper of %s/%s: %w", lv.VG, lv.Name, err))
-			continue
-		}
-		if s, err := p.k.WrapperSuspended(ctx, lv.Name); err == nil && s {
-			if err := p.k.ResumeWrapper(ctx, lv.Name); err != nil {
-				errs = append(errs, fmt.Errorf("resume the wrapper of %s: %w", lv.Name, err))
+		if err := p.ensureWrapper(ctx, lv); err != nil {
+			if now, lerr := p.k.ListVolumes(ctx, ""); lerr == nil && !slices.ContainsFunc(now, func(l kernel.LV) bool { return l.VG == lv.VG && l.Name == lv.Name }) {
+				continue // deleted meanwhile
 			}
+			errs = append(errs, fmt.Errorf("wrapper of %s/%s: %w", lv.VG, lv.Name, err))
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// resumeWrappers resumes the wrappers left suspended by a crash in the middle of a group snapshot;
+// with the lock held, no group snapshot is running.
+func (p *Plane) resumeWrappers(ctx context.Context) error {
+	p.wrapMu.Lock()
+	defer p.wrapMu.Unlock()
+	vols, err := p.k.SuspendedWrappers(ctx)
+	if err != nil {
+		return fmt.Errorf("look for suspended wrappers: %w", err)
+	}
+	var errs []error
+	for _, v := range vols {
+		if err := p.k.ResumeWrapper(ctx, v); err != nil {
+			errs = append(errs, fmt.Errorf("resume the wrapper of %s: %w", v, err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// ensureWrapper makes the volume's wrapper match its LV (kernel.EnsureWrapper, which resumes it
+// after a change: not during a group snapshot).
+func (p *Plane) ensureWrapper(ctx context.Context, lv kernel.LV) error {
+	p.wrapMu.Lock()
+	defer p.wrapMu.Unlock()
+	return p.k.EnsureWrapper(ctx, lv.Name, p.k.LVPath(lv.VG, lv.Name))
+}
+
+func (p *Plane) volumeGroup(ctx context.Context, name string) (kernel.VG, bool, error) {
+	vgs, err := p.k.ListVGs(ctx)
+	if err != nil {
+		return kernel.VG{}, false, err
+	}
+	i := slices.IndexFunc(vgs, func(vg kernel.VG) bool { return vg.Name == name })
+	if i < 0 {
+		return kernel.VG{}, false, nil
+	}
+	return vgs[i], true, nil
 }
 
 // freshMembers picks the devices whose md metadata is current and says whether every member the
@@ -261,6 +310,9 @@ func kernelName(path string) string {
 	return filepath.Base(t)
 }
 
+// nvmeByPath matches udev's by-path link of an NVMe namespace: ...-nvme-<namespace ID>.
+var nvmeByPath = regexp.MustCompile(`-nvme-\d+$`)
+
 // diskHandle is the stable link velod keeps for a disk with kernel name kname: the NVMe
 // namespace's by-path link (by PCI address, like SPDK's controller names), else the disk's
 // by-id link, a WWN first; /dev/<kname> if there is none.
@@ -279,7 +331,7 @@ func (p *Plane) diskHandle(kname string) string {
 	}
 	if strings.HasPrefix(kname, "nvme") {
 		for _, l := range links("by-path") {
-			if strings.HasSuffix(l, "-nvme-1") {
+			if nvmeByPath.MatchString(l) {
 				return l
 			}
 		}

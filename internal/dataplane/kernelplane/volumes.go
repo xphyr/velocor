@@ -170,6 +170,8 @@ func (p *Plane) DeleteThinPool(ctx context.Context, uuid, name string) error {
 	if err != nil {
 		return err
 	}
+	p.wrapMu.Lock() // until the LVs are gone, or Settle puts the wrappers back
+	defer p.wrapMu.Unlock()
 	for _, lv := range lvs {
 		if err := p.removeWrapper(ctx, lv.Name); err != nil {
 			return fmt.Errorf("remove the wrapper of %s: %w", lv.Name, err)
@@ -222,7 +224,7 @@ func (p *Plane) CreateVolume(ctx context.Context, pool, name string, sizeBytes u
 		}
 	}
 	if name != metaLV {
-		if err := p.k.EnsureWrapper(ctx, name, p.k.LVPath(pool, name)); err != nil {
+		if err := p.ensureWrapper(ctx, kernel.LV{VG: pool, Name: name}); err != nil {
 			_ = p.k.RemoveVolume(context.WithoutCancel(ctx), pool, name)
 			return "", fmt.Errorf("wrapper: %w", err)
 		}
@@ -239,7 +241,7 @@ func (p *Plane) ResizeVolume(ctx context.Context, volume string, sizeBytes uint6
 	if err := p.k.ResizeVolume(ctx, lv.VG, lv.Name, sizeBytes); err != nil {
 		return err
 	}
-	if err := p.k.EnsureWrapper(ctx, lv.Name, p.k.LVPath(lv.VG, lv.Name)); err != nil {
+	if err := p.ensureWrapper(ctx, lv); err != nil {
 		return err
 	}
 	wrapper := p.k.WrapperPath(lv.Name)
@@ -259,6 +261,8 @@ func (p *Plane) DeleteVolume(ctx context.Context, volume string) error {
 	if err != nil {
 		return err
 	}
+	p.wrapMu.Lock() // until the LV is gone, or Settle puts the wrapper back
+	defer p.wrapMu.Unlock()
 	if err := p.removeWrapper(ctx, lv.Name); err != nil {
 		return err
 	}
@@ -292,6 +296,8 @@ func (p *Plane) Snapshot(ctx context.Context, volume, name string) (string, erro
 func (p *Plane) SnapshotGroup(ctx context.Context, entries []dataplane.GroupEntry, quiesce time.Duration) ([]string, error) {
 	members := make([]kernel.GroupMember, len(entries))
 	uuids := make([]string, len(entries))
+	p.wrapMu.Lock()
+	defer p.wrapMu.Unlock()
 	for i, e := range entries {
 		lv, err := p.resolve(ctx, e.Volume)
 		if err != nil {
@@ -304,7 +310,7 @@ func (p *Plane) SnapshotGroup(ctx context.Context, entries []dataplane.GroupEntr
 		members[i] = kernel.GroupMember{Volume: lv.Name, VG: lv.VG, LV: lv.Name, Snap: e.Snapshot, Tags: []string{tagUUID + uuids[i], tagSnapshot}}
 	}
 	if err := p.k.GroupSnapshotWithin(ctx, members, quiesce); err != nil {
-		if errors.Is(err, context.DeadlineExceeded) {
+		if errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil { // not the caller's own deadline
 			return nil, &tagged{err: err, kind: dataplane.ErrQuiesceTimeout}
 		}
 		return nil, err
@@ -322,7 +328,7 @@ func (p *Plane) Clone(ctx context.Context, snapshot, name string) (string, error
 	if err := p.k.Clone(ctx, lv.VG, lv.Name, name, tagUUID+u); err != nil {
 		return "", err
 	}
-	if err := p.k.EnsureWrapper(ctx, name, p.k.LVPath(lv.VG, name)); err != nil {
+	if err := p.ensureWrapper(ctx, kernel.LV{VG: lv.VG, Name: name}); err != nil {
 		_ = p.k.RemoveVolume(context.WithoutCancel(ctx), lv.VG, name)
 		return "", fmt.Errorf("wrapper: %w", err)
 	}

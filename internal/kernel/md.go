@@ -1,6 +1,7 @@
 package kernel
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -272,12 +273,20 @@ func parseBadBlocks(s string, offset uint64) []SectorRange {
 			n -= offset - start
 			start = offset
 		}
-		r := SectorRange{start - offset, n}
-		if !slices.Contains(out, r) {
-			out = append(out, r)
-		}
+		out = append(out, SectorRange{start - offset, n})
 	}
-	return out
+	// The two logs can overlap: each sector once.
+	slices.SortFunc(out, func(a, b SectorRange) int { return cmp.Compare(a.Start, b.Start) })
+	merged := out[:0]
+	for _, r := range out {
+		if n := len(merged); n > 0 && r.Start < merged[n-1].Start+merged[n-1].Sectors {
+			last := &merged[n-1]
+			last.Sectors = max(last.Start+last.Sectors, r.Start+r.Sectors) - last.Start
+			continue
+		}
+		merged = append(merged, r)
+	}
+	return merged
 }
 
 // arrayKernelName resolves DevRoot/md/<name> to the kernel's md device (md127).
@@ -361,15 +370,28 @@ func parseExamineScan(out string) []ExaminedArray {
 				}
 			}
 			arrays = append(arrays, a)
-		case len(f) == 1 && strings.HasPrefix(f[0], "devices=") && len(arrays) > 0:
-			for _, d := range strings.Split(strings.TrimPrefix(f[0], "devices="), ",") {
-				if d != "" {
-					arrays[len(arrays)-1].Found = append(arrays[len(arrays)-1].Found, d)
+		case len(arrays) > 0:
+			// "devices=/dev/sda,/dev/sdb", after "spares=1" on the same line if there are spares.
+			for _, kv := range f {
+				v, ok := strings.CutPrefix(kv, "devices=")
+				if !ok {
+					continue
+				}
+				for _, d := range strings.Split(v, ",") {
+					if d != "" {
+						arrays[len(arrays)-1].Found = append(arrays[len(arrays)-1].Found, d)
+					}
 				}
 			}
 		}
 	}
 	return arrays
+}
+
+// RunArray starts an assembled but inactive array with the members it has.
+func (p *Plane) RunArray(ctx context.Context, name string) error {
+	_, err := p.Run.Run(ctx, "mdadm", "--run", p.ArrayPath(name))
+	return err
 }
 
 // MemberRole returns a device's slot in its array from its md metadata, or -1 for a spare (or
@@ -427,6 +449,12 @@ func (p *Plane) ExamineMember(ctx context.Context, dev string) (*MemberInfo, err
 	return parseExamine(string(out))
 }
 
+// firstField is the first word of s, "" if it has none.
+func firstField(s string) string {
+	s, _, _ = strings.Cut(strings.TrimSpace(s), " ")
+	return s
+}
+
 func parseExamine(out string) (*MemberInfo, error) {
 	m := &MemberInfo{Role: -1}
 	for _, line := range strings.Split(out, "\n") {
@@ -443,13 +471,13 @@ func parseExamine(out string) (*MemberInfo, error) {
 			if _, n, ok := strings.Cut(v, ":"); ok {
 				m.Name = n
 			}
-			m.Name = strings.Fields(m.Name + " ")[0] // "name  (local to host x)"
+			m.Name = firstField(m.Name) // "name  (local to host x)"
 		case "Raid Level":
 			m.Level = v
 		case "Raid Devices":
 			m.RaidDevices, _ = strconv.Atoi(v)
 		case "Array Size":
-			m.ArrayKiB, _ = strconv.ParseUint(strings.Fields(v + " ")[0], 10, 64)
+			m.ArrayKiB, _ = strconv.ParseUint(firstField(v), 10, 64)
 		case "Device UUID":
 			m.DeviceUUID = v
 		case "Events":
@@ -459,7 +487,7 @@ func parseExamine(out string) (*MemberInfo, error) {
 				m.Role = n
 			}
 		case "Array State":
-			m.ArrayState = strings.Fields(v + " ")[0]
+			m.ArrayState = firstField(v)
 		}
 	}
 	if m.ArrayUUID == "" {

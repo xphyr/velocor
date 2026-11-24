@@ -25,19 +25,35 @@ func poolLock(vg, pool string) *sync.Mutex {
 
 // withMetadataSnap runs fn with a metadata snapshot of the live pool reserved, so the thin tools
 // can read the pool's mappings while it serves I/O, and releases it afterwards.
-func (p *Plane) withMetadataSnap(ctx context.Context, vg, pool string, fn func(meta string) error) error {
+func (p *Plane) withMetadataSnap(ctx context.Context, vg, pool string, fn func(meta string) error) (err error) {
 	l := poolLock(vg, pool)
 	l.Lock()
 	defer l.Unlock()
-	target := dmName(vg, pool) + "-tpool"
-	if _, err := p.Run.Run(ctx, "dmsetup", "message", target, "0", "reserve_metadata_snap"); err != nil {
+	if err := ctx.Err(); err != nil {
 		return err
 	}
-	err := fn(p.DevRoot + "/mapper/" + dmName(vg, pool+"_tmeta"))
-	if _, rerr := p.Run.Run(context.WithoutCancel(ctx), "dmsetup", "message", target, "0", "release_metadata_snap"); rerr != nil {
-		err = errors.Join(err, fmt.Errorf("release metadata snapshot: %w", rerr))
+	target := dmName(vg, pool) + "-tpool"
+	// Neither is cut short by ctx: the kernel may have acted on a message whose dmsetup was killed.
+	message := func(msg string) error {
+		_, err := p.Run.Run(context.WithoutCancel(ctx), "dmsetup", "message", target, "0", msg)
+		return err
 	}
-	return err
+	if err := message("reserve_metadata_snap"); err != nil {
+		// A velod that died in the middle left its snapshot reserved, and a pool has room for one.
+		// Nothing else takes one, and the lock says velod isn't using it: release it, try again.
+		if message("release_metadata_snap") != nil {
+			return err
+		}
+		if err := message("reserve_metadata_snap"); err != nil {
+			return err
+		}
+	}
+	defer func() { // also if fn panics
+		if rerr := message("release_metadata_snap"); rerr != nil {
+			err = errors.Join(err, fmt.Errorf("release metadata snapshot: %w", rerr))
+		}
+	}()
+	return fn(p.DevRoot + "/mapper/" + dmName(vg, pool+"_tmeta"))
 }
 
 // ChangedBlocks returns the ranges where two thin volumes of a pool (snapshots of one volume,

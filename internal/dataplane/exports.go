@@ -112,8 +112,8 @@ func hostCIDR(ip string) string {
 	return ip + "/32"
 }
 
-// ValidateNQN checks an NVMe Qualified Name the way spdk_tgt does, so a bad host NQN is
-// refused when it is entered rather than as an opaque "Internal error" at export time.
+// ValidateNQN checks an NVMe Qualified Name, so a bad one is refused when it is entered rather
+// than at export time.
 func ValidateNQN(nqn string) error {
 	const uuidPrefix = "nqn.2014-08.org.nvmexpress:uuid:"
 	switch {
@@ -143,6 +143,42 @@ func ValidateNQN(nqn string) error {
 	for _, r := range nqn[4:8] + nqn[9:11] {
 		if r < '0' || r > '9' {
 			return fmt.Errorf("NQN %q must start with nqn.yyyy-mm.<reverse domain>", nqn)
+		}
+	}
+	// A subsystem's or host's directory in configfs is named after it.
+	for _, r := range nqn {
+		if r <= ' ' || r > '~' || r == '/' || r == '\\' {
+			return fmt.Errorf("NQN %q contains invalid character %q", nqn, r)
+		}
+	}
+	return nil
+}
+
+// ValidateIQN checks an iSCSI name (RFC 3720): iqn.yyyy-mm.reverse.domain[:anything], eui. and
+// 16 hex digits, or naa. and 16 or 32 hex digits.
+func ValidateIQN(iqn string) error {
+	hex := func(s string, lens ...int) bool {
+		return slices.Contains(lens, len(s)) && strings.Trim(strings.ToLower(s), "0123456789abcdef") == ""
+	}
+	if len(iqn) > 223 {
+		return fmt.Errorf("iSCSI name %q is longer than 223 bytes", iqn)
+	}
+	if s, ok := strings.CutPrefix(iqn, "eui."); ok && hex(s, 16) {
+		return nil
+	}
+	if s, ok := strings.CutPrefix(iqn, "naa."); ok && hex(s, 16, 32) {
+		return nil
+	}
+	if len(iqn) < 13 || !strings.HasPrefix(iqn, "iqn.") || iqn[8] != '-' || iqn[11] != '.' ||
+		strings.Trim(iqn[4:8]+iqn[9:11], "0123456789") != "" {
+		return fmt.Errorf("iSCSI name %q must look like iqn.yyyy-mm.reverse.domain:name, eui.<16 hex digits> or naa.<16 or 32 hex digits>", iqn)
+	}
+	// A target's or initiator's directory in configfs is named after it.
+	for _, r := range iqn {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '.', r == '-', r == ':', r == '_':
+		default:
+			return fmt.Errorf("iSCSI name %q contains invalid character %q (allowed: A-Z a-z 0-9 . - : _)", iqn, r)
 		}
 	}
 	return nil
@@ -267,7 +303,7 @@ func ensureLocked(ctx context.Context, p Plane, st store.Store, exp *store.Expor
 
 // Connection is a host session on an export.
 type Connection struct {
-	Host    string `json:"host,omitempty"`    // host NQN (NVMe-oF)
+	Host    string `json:"host,omitempty"`    // host NQN (NVMe-oF); initiator IQN where its address isn't known (iSCSI)
 	Address string `json:"address,omitempty"` // initiator address (iSCSI)
 	Queues  int    `json:"queues,omitempty"`  // I/O queue pairs (NVMe-oF)
 }

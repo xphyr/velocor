@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"slices"
 	"time"
 
 	"github.com/velocor/velocor/internal/dataplane"
@@ -54,6 +55,8 @@ func scrubCounts(sc *dataplane.Scrub) store.ScrubCounts {
 // scrubEligible reports why a pool can't be scrubbed now ("" if it can).
 func scrubEligible(pool *store.Pool, rb *dataplane.Array) string {
 	switch {
+	case !redundant(pool.RaidLevel):
+		return fmt.Sprintf("it is %s, which keeps no second copy to check against", pool.RaidLevel)
 	case rb == nil:
 		return "its RAID isn't in the data plane"
 	case rb.State != "online":
@@ -139,33 +142,38 @@ func (s *Server) scrubTick(ctx context.Context, now time.Time) error {
 	if cfg.Disabled || !inWindow || scheduledRunning {
 		return nil
 	}
-	var pick *store.Pool
-	var pickDue time.Time
+	type candidate struct {
+		pool *store.Pool
+		due  time.Time
+	}
+	var due []candidate
 	for _, p := range pools {
 		rec := recs[p.ID]
 		if scrubEligible(p, raids[p.ArrayName]) != "" || (rec != nil && rec.State == store.ScrubRunning) {
 			continue
 		}
-		due := scrubDue(p, rec, cfg)
+		at := scrubDue(p, rec, cfg)
 		if rec != nil && rec.State == store.ScrubPaused {
-			due = time.Time{} // an unfinished run goes first
+			at = time.Time{} // an unfinished run goes first
 		}
-		if due.After(now) {
-			continue
-		}
-		if pick == nil || due.Before(pickDue) {
-			pick, pickDue = p, due
+		if !at.After(now) {
+			due = append(due, candidate{p, at})
 		}
 	}
-	if pick == nil {
-		return nil
+	// One at a time, the most overdue first; a pool whose scrub won't start doesn't keep the others
+	// from theirs.
+	slices.SortStableFunc(due, func(a, b candidate) int { return a.due.Compare(b.due) })
+	var errs []error
+	for _, c := range due {
+		rec := recs[c.pool.ID]
+		resume := rec != nil && rec.State == store.ScrubPaused
+		err := s.startScrub(ctx, c.pool, rec, resume, false, true, *cfg.MaxMBps, now)
+		if err == nil {
+			break
+		}
+		errs = append(errs, fmt.Errorf("start scheduled scrub of pool %s: %w", c.pool.Name, err))
 	}
-	rec := recs[pick.ID]
-	resume := rec != nil && rec.State == store.ScrubPaused
-	if err := s.startScrub(ctx, pick, rec, resume, false, true, *cfg.MaxMBps, now); err != nil {
-		return fmt.Errorf("start scheduled scrub of pool %s: %w", pick.Name, err)
-	}
-	return nil
+	return errors.Join(errs...)
 }
 
 // scrubDue is when a pool's next scheduled scrub is due.

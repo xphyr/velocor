@@ -1,6 +1,7 @@
 package meta
 
 import (
+	"bytes"
 	"errors"
 	"path/filepath"
 	"strings"
@@ -46,6 +47,14 @@ func TestTornOrCorruptSlotFallsBack(t *testing.T) {
 	if _, ok := DecodeSlot(nil); ok {
 		t.Fatal("empty slot decoded")
 	}
+	// A length that overflows when the header's size is added, whatever the fields around it.
+	for off := 0; off+8 <= 64; off++ {
+		bad := bytes.Clone(cur)
+		for i := range 8 {
+			bad[off+i] = 0xff
+		}
+		DecodeSlot(bad) // must not panic
+	}
 }
 
 func TestManifestTooLarge(t *testing.T) {
@@ -60,6 +69,8 @@ func TestDigestIgnoresLiveFigures(t *testing.T) {
 	a := manifest(1, "p")
 	b := manifest(9, "p")
 	b.Pool.FreeBytes, b.Pool.SpaceState, b.Pool.MetaGeneration = 123, store.SpaceStateWarning, 9
+	b.Pool.ThinMetadataBytes, b.Pool.ThinMetadataUsedBytes, b.Pool.UnreadableBytes = 1<<30, 1<<20, 4096
+	b.Pool.LostData, b.Pool.Durability = []store.LostExtent{{}}, store.DurabilityAtRisk
 	b.Volumes[0].AllocatedBytes = 1 << 20
 	if a.Digest() != b.Digest() {
 		t.Fatal("generation and live figures must not change the digest")

@@ -16,22 +16,24 @@ const (
 )
 
 // WipeMetadata zeroes the start and end of a disk so that nothing on it is recognised any
-// more: SPDK can't assemble it into an old RAID or load an old volume store from it, and
-// partition tables and filesystem signatures are gone. It destroys the disk's data. The disk
-// must be held by the kernel (not claimed by SPDK), not the boot disk and not in use.
+// more: no old array, volume group, partition table or filesystem signature. It destroys the
+// disk's data. The disk must not be the boot disk, in use or in an array.
 func (m *Manager) WipeMetadata(d *store.Disk) error {
+	if err := m.RefreshBootGuard(); err != nil {
+		return fmt.Errorf("check which disks are in use: %w", err)
+	}
 	if d.IsBootDevice || m.IsBootDevice(d.PCIAddress, d.DevicePath) {
 		return fmt.Errorf("%w: disk %s backs the OS or is mounted / used as swap", store.ErrBootDeviceProtected, d.ID)
 	}
 	if d.DevicePath == "" {
-		return fmt.Errorf("%w: disk %s has no kernel device to wipe (is it claimed by SPDK?)", store.ErrInvalidArgument, d.ID)
+		return fmt.Errorf("%w: disk %s has no kernel device to wipe", store.ErrInvalidArgument, d.ID)
 	}
 	if kname := m.kernelNameForPath(d.DevicePath); kname != "" {
 		if h := m.holders(kname); len(h) > 0 {
 			return fmt.Errorf("%w: disk %s is in use by %s", store.ErrInUse, d.ID, strings.Join(h, ", "))
 		}
 	}
-	// O_EXCL on a block device fails while anything else (a mount, md, SPDK) holds it.
+	// O_EXCL on a block device fails while anything else (a mount, md) holds it.
 	f, err := os.OpenFile(d.DevicePath, os.O_WRONLY|syscall.O_EXCL, 0)
 	if err != nil {
 		return fmt.Errorf("open %s exclusively: %w", d.DevicePath, err)

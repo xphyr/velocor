@@ -169,9 +169,6 @@ func New(
 		if m.NewToken == nil {
 			m.NewToken = s.rotateScrapeToken
 		}
-		if m.ReactorCPUs == nil {
-			m.ReactorCPUs = s.reactorCPUs
-		}
 		if m.Run == nil {
 			m.Run = func(ctx context.Context, name string, args ...string) ([]byte, error) {
 				return hostCommand(ctx, name, args...).CombinedOutput()
@@ -843,6 +840,12 @@ func (s *Server) handleCreateHost(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	if iqn := strings.TrimSpace(req.InitiatorIQN); iqn != "" {
+		if err := dataplane.ValidateIQN(iqn); err != nil {
+			writeError(w, fmt.Errorf("%w: %v", store.ErrInvalidArgument, err))
+			return
+		}
+	}
 	host := &store.Host{
 		ID:           newResourceID("host"),
 		Name:         req.Name,
@@ -896,11 +899,9 @@ func (s *Server) handleCreateInitiatorGroup(w http.ResponseWriter, r *http.Reque
 		writeError(w, fmt.Errorf("%w: invalid json body", store.ErrInvalidArgument))
 		return
 	}
-	for _, nqn := range req.HostNQNs {
-		if err := dataplane.ValidateNQN(strings.TrimSpace(nqn)); err != nil {
-			writeError(w, fmt.Errorf("%w: %v", store.ErrInvalidArgument, err))
-			return
-		}
+	if err := validateInitiators(req.HostNQNs, req.InitiatorIQNs); err != nil {
+		writeError(w, err)
+		return
 	}
 	if strings.TrimSpace(req.CHAPUser) != "" {
 		// Accepting CHAP settings without enforcing them would be a false sense of security.
@@ -921,6 +922,25 @@ func (s *Server) handleCreateInitiatorGroup(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	writeJSON(w, http.StatusCreated, map[string]any{"initiator_group": group})
+}
+
+// validateInitiators checks an initiator group's host NQNs and initiator IQNs (empty entries are
+// dropped when the group is applied).
+func validateInitiators(nqns, iqns []string) error {
+	for _, nqn := range nqns {
+		if err := dataplane.ValidateNQN(strings.TrimSpace(nqn)); err != nil {
+			return fmt.Errorf("%w: %v", store.ErrInvalidArgument, err)
+		}
+	}
+	for _, iqn := range iqns {
+		if iqn = strings.TrimSpace(iqn); iqn == "" {
+			continue
+		}
+		if err := dataplane.ValidateIQN(iqn); err != nil {
+			return fmt.Errorf("%w: %v", store.ErrInvalidArgument, err)
+		}
+	}
+	return nil
 }
 
 func (s *Server) handleDeleteInitiatorGroup(w http.ResponseWriter, r *http.Request) {

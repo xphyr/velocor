@@ -20,6 +20,9 @@ type raidView struct {
 
 // inRaid reports whether bdev is a member of any RAID bdev.
 func inRaid(raids []dataplane.Array, bdev string) bool {
+	if bdev == "" {
+		return false // an empty slot has no member
+	}
 	for _, rb := range raids {
 		for _, b := range rb.Members {
 			if b.Name == bdev {
@@ -114,6 +117,19 @@ func (r *Reconciler) viewRaid(ctx context.Context, pool *store.Pool, rb *datapla
 			rb.Name, strings.Join(empty, ", ")))
 	}
 	return v
+}
+
+// sameSlots reports whether both pools have the same disks in the same slots, and the same disks
+// detached from them.
+func sameSlots(a, b *store.Pool) bool {
+	ids := func(p *store.Pool) []string {
+		var out []string
+		for _, m := range store.PoolMembers(p) {
+			out = append(out, m.DiskID)
+		}
+		return out
+	}
+	return slices.Equal(ids(a), ids(b)) && slices.Equal(a.DetachedDiskIDs, b.DetachedDiskIDs)
 }
 
 func membersEqual(a, b []store.PoolMember) bool { return slices.Equal(a, b) }
