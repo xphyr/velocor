@@ -293,10 +293,41 @@ the unreadable sector fails only that read with EIO, the array stays active, and
 block again heals it. (It does not record the sector in the bad-block log in that case, contrary
 to what this note first assumed.)
 
+K-3 (2026-11-23) found where it does: when md can't rewrite the sector either (a resync, a
+rebuild, or a read error it tries to fix), it records the range in the member's bad-block log,
+and from then on reads there come from another copy. A rebuild whose only source has a bad
+range finishes, and records the range on the new member as well: that data is lost, and reads
+of it fail. Writing it again clears the range on a member that takes the write (seen on the lab
+VM: the new disk's entry went, the faulty one's stayed), so restoring the data heals it there. velod reports both (internal/dataplane/kernelplane/badblocks.go):
+each member's recorded bad blocks (`bad_block_bytes`; a note on the pool, and the
+`VelocorPoolMemberBadBlocks` warning: a copy fewer there until the disk is replaced), and how
+much of the array no in-sync member can supply (`unreadable_bytes`, worked out per level:
+every copy for RAID1, the pair holding the chunk for near-2 RAID10, any for RAID0): the pool is
+DEGRADED and `VelocorPoolDataUnreadable` fires.
+
+What the lost ranges held is worked out too (`Plane.LostData`, `kernel.RangeOwners`): array
+sectors through the RAID layout, then LVM's segments (`lvs -a` physical extent ranges) to the
+LV, and within the thin pool's data LV, a `thin_dump` of a metadata snapshot (shared subtrees
+come as `<def>`s the devices `<ref>`) to every thin volume mapping the block, so a volume and
+its snapshots are all named, with where in them. The pool lists them (`lost_data`, and in its
+message), and each volume is DEGRADED, saying how much from where, while still served. Free
+extents, unmapped thin blocks and LVM's spare metadata copy hold nothing and aren't reported;
+the thin metadata, velod's configuration copy and LVM's own metadata are named as such. The
+answer is cached while the ranges stay the same (10 minutes). RAID0 over disks of different
+sizes (md's zones) isn't located: only the amount is reported. Checked on the lab VM: the
+reported offset in the volume was the one that failed to read, 64 KiB either side read fine.
+A sector that fails on the only copy isn't in any log until md tries to rewrite it from
+another one, so a degraded array's unread bad sectors aren't known ahead.
+
 ## 6. What we give up or must decide
 
 - **Deep random-write IOPS on a mirror:** about 28% lower than SPDK RAID1 at queue depth 64 on
-  this lab (20k vs 29.5k). Accepted. Worth re-measuring on real hardware.
+  this lab (20k vs 29.5k). Accepted. Worth re-measuring on real hardware. K-3 (2026-11-24): most
+  of the deep-queue gap over NVMe/TCP was the test appliance's single-queue NIC putting every
+  connection's nvmet-tcp work on one CPU; with RPS/RFS (now set by the OS image on such NICs)
+  4k random reads beat SPDK (47.1k vs 45.6k IOPS) and random writes are 17% behind (23.1k vs
+  27.9k, the lab's disks busy). iSCSI (one LIO thread per connection) and single-flow
+  sequential reads remain behind; see TODO.md K-3.
 - **CPU efficiency at depth:** SPDK does ~30% more IOPS per CPU spent; in exchange a vCPU
   stops polling while idle. Accepted.
 - **Userspace NVMe driver:** gone. Unmeasured on this lab; the one place SPDK clearly wins.

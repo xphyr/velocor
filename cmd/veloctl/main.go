@@ -340,7 +340,7 @@ func runToken(cfg *cliConfig, args []string) error {
 
 func runSystem(cfg *cliConfig, args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("subcommand required: status | os | reconcile | iostats | upgrade | rollback | reboot | containers | rebuild | scrub | volume-retention | monitoring | network | backup | backups | restore")
+		return fmt.Errorf("subcommand required: status | os | reconcile | iostats | upgrade | rollback | reboot | containers | kernel-options | rebuild | scrub | volume-retention | monitoring | network | backup | backups | restore")
 	}
 	switch args[0] {
 	case "backup", "backups", "restore":
@@ -366,6 +366,38 @@ func runSystem(cfg *cliConfig, args []string) error {
 			fmt.Println("Rebuild speed: unlimited")
 		} else {
 			fmt.Printf("Rebuild speed: at most %d MB/s per pool\n", v)
+		}
+		return nil
+
+	case "kernel-options":
+		fs := flag.NewFlagSet("system kernel-options", flag.ExitOnError)
+		zero := fs.String("init-on-alloc", "", "Zero memory as the kernel allocates it: on (hardened) or off (less CPU per I/O, the default). Applies at the next reboot. Omit to show the current setting")
+		force := fs.Bool("force", false, "Change it even if that replaces the rollback to the previous OS version")
+		_ = fs.Parse(args[1:])
+		var resp map[string]any
+		var err error
+		switch *zero {
+		case "":
+			resp, err = cfg.request("GET", "/api/v1/system/kernel-options", nil)
+		case "on", "off":
+			resp, err = cfg.request("PUT", "/api/v1/system/kernel-options", map[string]any{"init_on_alloc": *zero == "on", "force": *force})
+		default:
+			return fmt.Errorf("--init-on-alloc must be on or off, not %q", *zero)
+		}
+		if err != nil {
+			return err
+		}
+		if cfg.jsonOutput {
+			return printJSON(resp)
+		}
+		o, _ := resp["init_on_alloc"].(map[string]any)
+		onOff := map[any]string{true: "on", false: "off"}
+		fmt.Printf("Zero memory on allocation (init_on_alloc): %s\n", onOff[o["running"]])
+		if o["reboot_required"] == true {
+			fmt.Printf("After the next reboot: %s\n", onOff[o["next_boot"]])
+		}
+		if m := strOrEmpty(o["message"]); m != "" {
+			fmt.Println(m)
 		}
 		return nil
 
@@ -849,14 +881,33 @@ func runPool(cfg *cliConfig, args []string) error {
 			humanBytes(uint64FromAny(p["committed_bytes"])), humanBytes(uint64FromAny(p["available_bytes"])))
 		fmt.Printf("Policy:  overcommit up to %vx, reserve %v%%, warning at %v%%, critical at %v%% (unset = default)\n",
 			orDefault(sp["max_overcommit"], 1.0), orDefault(sp["reserve_percent"], 5.0), orDefault(sp["warning_percent"], 80.0), orDefault(sp["critical_percent"], 90.0))
+		if n := uint64FromAny(p["unreadable_bytes"]); n > 0 {
+			fmt.Printf("Lost:    %s can't be read from any disk (bad blocks on every copy)\n", humanBytes(n))
+			for _, l := range sliceOfMaps(p["lost_data"]) {
+				what := strOrDash(l["kind"])
+				switch {
+				case l["volume_id"] != nil:
+					what = fmt.Sprintf("volume %v", l["volume_id"])
+				case l["snapshot_id"] != nil:
+					what = fmt.Sprintf("snapshot %v", l["snapshot_id"])
+				case l["name"] != nil:
+					what = fmt.Sprintf("%v", l["name"])
+				}
+				fmt.Printf("           %s: %s at %s\n", what, humanBytes(uint64FromAny(l["length_bytes"])), humanBytes(uint64FromAny(l["offset_bytes"])))
+			}
+		}
 		tw := newTabWriter()
-		fmt.Fprintln(tw, "\nSLOT\tDISK\tSTATE\tREBUILD")
+		fmt.Fprintln(tw, "\nSLOT\tDISK\tSTATE\tREBUILD\tBAD BLOCKS")
 		for _, m := range sliceOfMaps(p["members"]) {
 			rebuild := ""
 			if m["state"] == "REBUILDING" {
 				rebuild = fmt.Sprintf("%d%%", uint64FromAny(m["rebuild_percent"]))
 			}
-			fmt.Fprintf(tw, "%v\t%v\t%v\t%v\n", uint64FromAny(m["slot"]), strOrDash(m["disk_id"]), m["state"], rebuild)
+			bad := ""
+			if n := uint64FromAny(m["bad_block_bytes"]); n > 0 {
+				bad = humanBytes(n)
+			}
+			fmt.Fprintf(tw, "%v\t%v\t%v\t%v\t%v\n", uint64FromAny(m["slot"]), strOrDash(m["disk_id"]), m["state"], rebuild, bad)
 		}
 		if err := tw.Flush(); err != nil {
 			return err

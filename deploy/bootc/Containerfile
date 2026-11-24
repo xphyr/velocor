@@ -62,11 +62,16 @@ RUN mkdir -p \
     printf "vfio\nvfio_iommu_type1\nvfio_pci\nuio_pci_generic\nnvme_tcp\nublk_drv\n" > /usr/lib/modules-load.d/velocor.conf && \
     printf "vm.nr_hugepages = 512\n" > /usr/lib/sysctl.d/90-velocor.conf && \
     printf "net.ipv4.tcp_autocorking = 0\n" >> /usr/lib/sysctl.d/90-velocor.conf && \
+    printf "net.core.rps_sock_flow_entries = 32768\n" >> /usr/lib/sysctl.d/90-velocor.conf && \
     printf "d /var/lib/velocor 0700 root root -\nd /run/velocor 0755 root root -\n" > /usr/lib/tmpfiles.d/velocor.conf && \
     printf "d /var/lib/velocor-monitoring 0755 root root -\nd /var/lib/velocor-monitoring/config 0750 root 65534 -\nd /var/lib/velocor-monitoring/prometheus 0750 65534 65534 -\nd /var/lib/velocor-monitoring/alertmanager 0750 65534 65534 -\n" > /usr/lib/tmpfiles.d/velocor-monitoring.conf
 
 # Keep udev away from velod's short-lived metadata device (internal/meta)
 COPY deploy/bootc/59-velocor-ublk.rules /usr/lib/udev/rules.d/59-velocor-ublk.rules
+# NICs with fewer receive queues than CPUs: receive processing spread over every CPU (RPS/RFS),
+# so the kernel targets' per-connection work isn't all on one CPU.
+COPY deploy/bootc/60-velocor-rps.rules /usr/lib/udev/rules.d/60-velocor-rps.rules
+COPY deploy/bootc/velocor-rps.sh /usr/libexec/velocor-rps
 
 # Install operator CLI client on the host
 COPY --from=velod-bin /usr/bin/veloctl /usr/bin/veloctl
@@ -104,8 +109,11 @@ RUN chmod 0440 /etc/sudoers.d/velocor-admin && \
 # servers (found on the P0-1 lab VM). iommu=pt keeps devices the kernel still drives on
 # passthrough mappings, as usual on SPDK/DPDK hosts.
 # rd.md=0: the initramfs assembles no md array either (see the kernel data plane below).
+# init_on_alloc=0: Fedora's kernel otherwise zeroes every page it allocates, which costs the
+# kernel data plane up to 15% of its CPU on large reads. The default: an admin can turn it back
+# on (System page, veloctl system kernel-options; internal/server/kernelopts.go).
 RUN mkdir -p /usr/lib/bootc/kargs.d /etc/systemd/system-generators && \
-    printf 'kargs = ["systemd.gpt_auto=0", "intel_iommu=on", "iommu=pt", "rd.md=0"]\n' > /usr/lib/bootc/kargs.d/10-velocor.toml && \
+    printf 'kargs = ["systemd.gpt_auto=0", "intel_iommu=on", "iommu=pt", "rd.md=0", "init_on_alloc=0"]\n' > /usr/lib/bootc/kargs.d/10-velocor.toml && \
     ln -sf /dev/null /etc/systemd/system-generators/systemd-gpt-auto-generator
 
 # The kernel data plane (docs/design/kernel-dataplane.md; velod --data-plane=kernel, chosen in
@@ -151,7 +159,7 @@ RUN --mount=type=secret,id=registry-auth set -eu; \
     embed "${ALERTMANAGER_IMAGE}" velocor-alertmanager; \
     ! grep -q '@VELOCOR_' /usr/share/containers/systemd/velocor-*.container
 
-RUN chmod 0755 /usr/libexec/velocor-console-banner /usr/libexec/velocor-preload-images /usr/lib/NetworkManager/dispatcher.d/90-velocor-banner && \
+RUN chmod 0755 /usr/libexec/velocor-console-banner /usr/libexec/velocor-preload-images /usr/libexec/velocor-rps /usr/lib/NetworkManager/dispatcher.d/90-velocor-banner && \
     systemctl disable bootc-fetch-apply-updates.timer && \
     systemctl enable velocor-console.service velocor-preload-images.service vmtoolsd.service qemu-guest-agent.service && \
     /usr/lib/systemd/system-generators/podman-system-generator --dryrun >/dev/null && \

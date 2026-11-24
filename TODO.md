@@ -122,7 +122,69 @@ listed until then so nothing is lost if the plan changes.
   pool, array and data plane, and SPDK only where something is SPDK's, 2026-11-23). K-2 is
   complete; K-3 validates it.
 - [ ] **K-3. Validation:** CSI matrix on both clusters, KubeVirt, the P0-7 scenario (an
-  unreadable sector on the last copy keeps the pool up), the benchmark, soak.
+  unreadable sector on the last copy keeps the pool up), the benchmark, soak. The test appliance
+  runs dev-089a781 on the kernel data plane since 2026-11-23, its pools rebuilt on md (64 KiB
+  chunks). Done so far:
+    - CSI matrix (2026-11-23), both protocols: provision, attach and write; online expansion;
+      snapshot, restore and clone with the data checked; iSCSI raw block. Arm SNO 7/7 (v1 group
+      snapshot included); the three-node cluster 6/6 (it has no v1 VolumeGroupSnapshot CRD);
+    - KubeVirt (2026-11-24): a Fedora 44 VM imported onto an RWX block NVMe/TCP volume, three live
+      migrations between nodes, a guest writer (fsync every second) with no gaps: 7/7;
+    - P0-7 (2026-11-23, emulated bad sector, K-2 lab VM): with the other copy gone, only the
+      1 MiB over the bad sector is unreadable, every other MiB matches, the pool stays up
+      (DEGRADED; with SPDK it went offline); the rebuild onto a new disk finishes, records the
+      sector as a bad block on the new member, and the pool is ONLINE;
+    - benchmark (2026-11-24, fio from the Arm SNO, same jobs as the SPDK runs, volumes on a RAID1
+      pool of two virtio-SCSI disks, 4 vCPUs). Against SPDK on the same disks (dev-a548637):
+      queue depth 1 the same (4k read ~565 µs, write ~245 µs); deep queues 25-40% lower (4k
+      random read 32.8k vs 45.6k IOPS over NVMe/TCP, random write 18.6k vs 27.9k; sequential
+      read 551 vs 984 MB/s), probably CPU on the 4 vCPUs (not yet profiled); write + fsync about
+      half. O_DSYNC writes 15-20x slower (208 vs 3933 IOPS): the kernel sends them on as FUA
+      writes down to the disks, which on this lab's disks (LUNs of the hypervisor's Synology)
+      take ~4.5 ms against 157 µs for a plain write (measured on the appliance), while a cache
+      flush there is cheap. A property of the lab disks, not of the stack; to check on real SSDs.
+  Found, to do:
+    - [x] md's bad-block log reported (**done 2026-11-24**): each member's recorded bad blocks
+      (`bad_block_bytes`, a note on the pool, `velocor_pool_member_bad_block_bytes`, the
+      `VelocorPoolMemberBadBlocks` warning) and how much no in-sync copy can supply
+      (`unreadable_bytes`, worked out for RAID1, RAID0 and near-2 RAID10: the pool DEGRADED,
+      `velocor_pool_unreadable_bytes`, `VelocorPoolDataUnreadable` critical); UI and `veloctl
+      pool show`. K-2 VM: the bad sector noted while the other copy exists, lost (DEGRADED)
+      without it and after the rebuild, and back to a note once the range was written again
+      (md clears it on a member that takes the write). What the lost ranges held is worked out
+      (**2026-11-24**): the volumes and snapshots (through LVM's segments and a thin_dump of a
+      metadata snapshot), named on the pool (`lost_data`) and the volumes DEGRADED while still
+      served; K-2 VM: the volume and its snapshot named, the reported offset the one that
+      fails to read.
+    - [x] Deep-queue throughput profiled (**2026-11-24**, fio from the Arm SNO, per-CPU and
+      per-thread time and perf on the appliance). The SAN NIC (virtio-net) has one receive
+      queue, and nvmet-tcp runs each connection's work on the CPU that received it: every
+      connection on CPU 1 (96% busy, the other three ~10%). With RPS/RFS over all CPUs: NVMe/TCP
+      4k random read 31.9k -> 47.1k IOPS (SPDK 45.6k), random write 18.6k -> 23.1k (SPDK 27.9k;
+      the disks 80% busy and 16% steal: the lab's limit). The OS image now sets RPS/RFS on
+      NICs with fewer receive queues than CPUs (udev, `velocor-rps`). Left:
+      - [ ] iSCSI 4k random read 23.6k (SPDK 34.3k): LIO runs a connection in one receive
+        thread (`iscsi_trx`), and the host opens one session: one CPU 80% busy. More sessions
+        per volume (iSCSI multipath from the CSI node plugin) would spread it.
+      - [ ] NVMe/TCP 128k sequential read 425-485 MiB/s (SPDK 984 MB/s) with the CPUs 80% idle
+        and the disks 25-30% busy; the same job locally on the appliance reads 2.7 GB/s. One TCP
+        flow with an inflated RTT (~7 ms, min 0.07), small windows and spurious retransmissions;
+        idle polling (`idle_poll_period_usecs`) and the `fq` qdisc made it worse. Re-measure on
+        real NICs before digging further.
+      - [x] Fedora's kernel zeroes every page it allocates (`init_on_alloc`, hardening): about
+        15% of the appliance's cycles on large reads. **Decided (2026-11-24): off by default**
+        (kargs.d), and an admin can turn it on or off for the next boot (System page, `veloctl
+        system kernel-options`, `PUT /api/v1/system/kernel-options`; `rpm-ostree kargs`, which
+        stages a boot entry of the same OS image and so replaces a rollback to the previous
+        version: refused without force). K-2 VM: both directions and a reboot
+        (`heap alloc:off`); velocor-1's upgrade through the API added the argument. The gain isn't
+        measured yet (benchmark on the next build).
+      - [ ] Fedora's `mdmonitor.service` fails at boot on appliances without arrays at boot (mdadm
+        finds nothing to monitor and exits); velod watches the arrays itself, so disable it in
+        the OS image.
+      - Lab: a multiqueue virtio-net (queues=4) for velocor-1's SAN NIC would make it behave
+        like a real NIC (RSS) without RPS.
+    - [ ] Soak.
 - [ ] **K-4. Cutover:** remove SPDK (images, patches, client, fake, CI stage); rebuild the lab
   appliances; archive the (K) items.
 
@@ -147,6 +209,9 @@ doesn't block the rest.
   online degraded; real-SPDK tests (the blkdebug lab recipe in
   [docs/testing.md](docs/testing.md) reproduces both cases). Scrub (P2-2) lowers the odds by
   rewriting bad sectors while both copies exist, but doesn't remove the failure mode.
+  *Kernel data plane (2026-11-23, K-3):* passes the same scenario: md fails only the bad
+  read, the pool stays up, and the rebuild carries on and records the sector as a bad block.
+  Closed by K-4; reporting the bad blocks is a K-3 follow-up.
 - [ ] **P2-1. CHAP and real host identities.** Any host that can spoof an allowed NQN or IQN gets
   access (the API refuses `chap_user` rather than ignoring it). *Needed:* iSCSI CHAP auth groups
   and NVMe DH-HMAC-CHAP with secrets stored encrypted (and kept out of pool metadata copies, like

@@ -91,6 +91,10 @@ type Plane interface {
 	// GrowMetadata grows a thin pool's metadata when it is filling, as far as the room under it
 	// allows, and returns its new size (0: unchanged). An error says it needed to and couldn't.
 	GrowMetadata(ctx context.Context, uuid string) (uint64, error)
+	// LostData says what the part of an array no member can supply (Array.UnreadableBytes)
+	// held: which volumes and snapshots, and where in them. Nil when nothing is lost or the
+	// backend keeps no bad-block log.
+	LostData(ctx context.Context, array string) ([]LostExtent, error)
 	// DeleteThinPool deletes a thin pool and everything in it, by UUID or else by name.
 	DeleteThinPool(ctx context.Context, uuid, name string) error
 
@@ -208,6 +212,30 @@ type Array struct {
 	Rebuild *Rebuild
 	// Scrub is the running or last scrub since the array was assembled.
 	Scrub *Scrub
+	// UnreadableBytes is how much of the array no member can supply: bad blocks recorded on
+	// every copy. Reads (and writes) there fail; the data is lost. 0 where the backend keeps
+	// no bad-block log (SPDK).
+	UnreadableBytes uint64
+}
+
+// What lost data held (LostExtent.Kind).
+const (
+	LostVolume       = "volume"        // a volume or snapshot (UUID; Offset within it)
+	LostThinMetadata = "thin-metadata" // the thin pool's own metadata: every volume's mappings
+	LostPoolMetadata = "pool-metadata" // the on-pool copy of velod's configuration (P0-3)
+	LostLVMMetadata  = "lvm-metadata"  // LVM's label and metadata, before the first extent
+	LostOther        = "other"         // another LV (Name)
+	LostUnlocated    = "unlocated"     // where in the array isn't worked out (Length only)
+)
+
+// LostExtent is a range of data lost from an array, and what held it. Unused space (free
+// extents, thin blocks nothing maps, LVM's spare copy of the thin metadata) isn't reported.
+type LostExtent struct {
+	Kind   string
+	UUID   string // LostVolume: the volume's or snapshot's UUID
+	Name   string // LostOther: the LV
+	Offset uint64 // LostVolume: within the volume; otherwise within the array
+	Length uint64
 }
 
 // ArrayMember is one slot of an array.
@@ -215,6 +243,9 @@ type ArrayMember struct {
 	Name       string // the disk's handle
 	UUID       string // the member's identity in the array metadata
 	Configured bool   // in sync and in use
+	// BadBlockBytes is the size of the member's bad blocks: ranges it couldn't read or
+	// rewrite, which the array serves from another copy, if any, from then on.
+	BadBlockBytes uint64
 }
 
 // Rebuild is an array rebuilding onto a member (or another background process the backend

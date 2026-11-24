@@ -72,7 +72,7 @@ func (p *Plane) arrayOf(name string, st *kernel.ArrayStatus) dataplane.Array {
 		if m.Slot < 0 || m.Slot >= len(a.Members) || m.Has("faulty") {
 			continue // spares and failed members hold no slot
 		}
-		a.Members[m.Slot] = dataplane.ArrayMember{Name: p.diskHandle(m.Device), Configured: m.Has("in_sync")}
+		a.Members[m.Slot] = dataplane.ArrayMember{Name: p.diskHandle(m.Device), Configured: m.Has("in_sync"), BadBlockBytes: m.BadSectors() * 512}
 		a.Discovered++
 		if st.SyncAction == "recover" && !m.Has("in_sync") {
 			pct := uint32(0)
@@ -83,6 +83,7 @@ func (p *Plane) arrayOf(name string, st *kernel.ArrayStatus) dataplane.Array {
 		}
 	}
 	a.Scrub = p.scrubOf(name, st)
+	a.UnreadableBytes = unreadableOf(st).sectors * 512
 	return a
 }
 

@@ -334,6 +334,8 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /api/v1/system/upgrade", s.withAuth(store.RoleReadOnly, s.handleGetUpgrade))
 	s.mux.HandleFunc("DELETE /api/v1/system/upgrade/warning", s.withAuth(store.RoleAdmin, s.handleDismissUpgradeWarning))
 	s.mux.HandleFunc("POST /api/v1/system/rollback", s.withAuth(store.RoleAdmin, s.handleRollbackUpgrade))
+	s.mux.HandleFunc("GET /api/v1/system/kernel-options", s.withAuth(store.RoleReadOnly, s.handleGetKernelOptions))
+	s.mux.HandleFunc("PUT /api/v1/system/kernel-options", s.withAuth(store.RoleAdmin, s.handlePutKernelOptions))
 	s.mux.HandleFunc("POST /api/v1/system/reboot", s.withAuth(store.RoleAdmin, s.handleRebootSystem))
 	s.mux.HandleFunc("GET /api/v1/system/containers", s.withAuth(store.RoleReadOnly, s.handleListContainers))
 	s.mux.HandleFunc("GET /api/v1/system/network", s.withAuth(store.RoleReadOnly, s.handleGetNetwork))

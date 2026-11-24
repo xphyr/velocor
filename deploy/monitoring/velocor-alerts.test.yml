@@ -118,6 +118,37 @@ tests:
               summary: "Pool m97's thin metadata is nearly full (97%)"
               description: "Writes to new space are about to fail on hosts. Delete snapshots and volumes now."
 
+  # Bad blocks: on every copy, critical at once; on one member, a warning after 10 minutes; none,
+  # nothing.
+  - interval: 1m
+    input_series:
+      - series: 'velocor_pool_unreadable_bytes{instance="a",pool="lost"}'
+        values: '4096x20'
+      - series: 'velocor_pool_unreadable_bytes{instance="a",pool="fine"}'
+        values: '0x20'
+      - series: 'velocor_pool_member_bad_block_bytes{instance="a",pool="fine",slot="1",disk="ssd-B"}'
+        values: '8192x20'
+      - series: 'velocor_pool_member_bad_block_bytes{instance="a",pool="fine",slot="0",disk="ssd-A"}'
+        values: '0x20'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: VelocorPoolDataUnreadable
+        exp_alerts:
+          - exp_labels: {severity: critical, instance: a, pool: lost}
+            exp_annotations:
+              summary: "Pool lost has 4kiB that no disk can supply"
+              description: "Bad blocks are recorded on every copy: the data there is lost, and reading it fails until it is written again. Restore the affected volumes from backups (writing the data again clears it where a disk takes the write)."
+      - eval_time: 5m
+        alertname: VelocorPoolMemberBadBlocks
+        exp_alerts: []
+      - eval_time: 15m
+        alertname: VelocorPoolMemberBadBlocks
+        exp_alerts:
+          - exp_labels: {severity: warning, instance: a, pool: fine, slot: "1", disk: ssd-B}
+            exp_annotations:
+              summary: "Disk ssd-B in pool fine has 8kiB of bad blocks recorded"
+              description: "The pool reads those ranges from another copy, so it has a copy fewer there. Replace the disk to restore full redundancy."
+
   # A pool growing 2% an hour from 60% fills within a day; a flat one doesn't.
   - interval: 1m
     input_series:

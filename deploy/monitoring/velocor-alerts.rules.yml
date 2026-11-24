@@ -182,6 +182,21 @@ groups:
           summary: "Pool {{ $labels.pool }}'s thin metadata is nearly full ({{ $value | humanizePercentage }})"
           description: "Writes to new space are about to fail on hosts. Delete snapshots and volumes now."
 
+      - alert: VelocorPoolDataUnreadable
+        expr: velocor_pool_unreadable_bytes > 0
+        labels: {severity: critical}
+        annotations:
+          summary: "Pool {{ $labels.pool }} has {{ $value | humanize1024 }}B that no disk can supply"
+          description: "Bad blocks are recorded on every copy: the data there is lost, and reading it fails until it is written again. Restore the affected volumes from backups (writing the data again clears it where a disk takes the write)."
+
+      - alert: VelocorPoolMemberBadBlocks
+        expr: velocor_pool_member_bad_block_bytes > 0
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "Disk {{ $labels.disk }} in pool {{ $labels.pool }} has {{ $value | humanize1024 }}B of bad blocks recorded"
+          description: "The pool reads those ranges from another copy, so it has a copy fewer there. Replace the disk to restore full redundancy."
+
       - alert: VelocorPoolFillsWithin24h
         expr: velocor_pool_used_ratio > 0.5 and predict_linear(velocor_pool_used_ratio[6h], 24 * 3600) > 0.95
         for: 1h

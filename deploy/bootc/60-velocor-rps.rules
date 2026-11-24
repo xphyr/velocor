@@ -1,0 +1,3 @@
+# Spread receive processing over every CPU on NICs with fewer receive queues than CPUs
+# (/usr/libexec/velocor-rps; RPS and RFS).
+ACTION=="add", SUBSYSTEM=="net", TEST=="device", RUN+="/usr/libexec/velocor-rps %k"

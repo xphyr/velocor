@@ -516,8 +516,10 @@ const DURABILITY = {
 };
 const durabilityPill = (p) => DURABILITY[p.durability] && pill(DURABILITY[p.durability][0], DURABILITY[p.durability][1]);
 
-function poolTable(items, volumes, options = {}) {
+function poolTable(items, volumes, options = {}, deleted = []) {
   const count = (id) => volumes.filter((v) => v.pool_id === id).length;
+  // Deleted volumes keep their space until they're purged: shown, so a pool doesn't look empty.
+  const trash = (id) => deleted.filter((v) => v.pool_id === id).length;
   return table([
     { title: "Name", cell: (p) => el("strong", {}, link(p.name, "pool", p.id)), text: (p) => p.name },
     { title: "Health", cell: health, text: (p) => p.health_status },
@@ -525,18 +527,19 @@ function poolTable(items, volumes, options = {}) {
     { title: "Durability", cell: (p) => durabilityPill(p) || "", text: (p) => p.durability || "" },
     { title: "Space", cell: (p) => [spacePill(p), poolBar(p)], text: (p) => p.space_state || "" },
     { title: "Committed", num: true, cell: (p) => [humanSize(p.committed_bytes || 0), el("span", { class: "sub" }, `${humanSize(p.available_bytes || 0)} more accepted`)] },
-    { title: "Volumes", num: true, cell: (p) => link(String(count(p.id)), "volumes", p.id) },
+    { title: "Volumes", num: true, cell: (p) => [link(String(count(p.id)), "volumes", p.id), trash(p.id) > 0 && el("span", { class: "sub" }, `${trash(p.id)} deleted`)] },
   ], items, { empty: "No pools yet.", state: stateOf("pools"), ...options });
 }
 
 async function pools() {
-  const [items, volumes] = await Promise.all([list("/pools", "pools"), list("/volumes", "volumes")]);
+  const [items, volumes, deleted] = await Promise.all([list("/pools", "pools"), list("/volumes", "volumes"),
+    list("/deleted-volumes", "volumes").catch((err) => { if (err instanceof Unauthorized) throw err; return []; })]);
   return [
     el("h1", {}, "Pools"),
     el("div", { class: "toolbar" },
       action(can.admin, { class: "primary", id: "create-pool", onclick: createPoolDialog }, "Create pool"),
       action(can.admin, { id: "import-pool", onclick: importPoolDialog }, "Import pool")),
-    poolTable(items, volumes),
+    poolTable(items, volumes, {}, deleted),
   ];
 }
 
@@ -580,9 +583,33 @@ function importResult(r) {
 
 const MEMBER_KIND = { ACTIVE: "ok", REBUILDING: "warn", FAILED: "bad", MISSING: "bad" };
 
+// What a pool's lost data held (lost_data, from the reconciler), a line each.
+const LOST_KIND = {
+  "thin-metadata": "the thin pool's metadata (the volumes' block mappings)",
+  "pool-metadata": "the on-pool configuration copy (rewritten on the next change)",
+  "lvm-metadata": "LVM's metadata (the pool may not be found after a restart)",
+  unlocated: "somewhere in the pool (not worked out for RAID0 over disks of different sizes)",
+};
+
+function lostList(p, vols) {
+  const byID = Object.fromEntries(vols.map((v) => [v.id, v]));
+  const items = (p.lost_data || []).map((l) => {
+    const size = humanSize(l.length_bytes);
+    if (l.volume_id) {
+      const v = byID[l.volume_id];
+      return el("li", {}, ["Volume ", link(v ? v.name : l.volume_id, "volume", l.volume_id), `: ${size} from ${humanSize(l.offset_bytes)}`]);
+    }
+    if (l.snapshot_id) return el("li", {}, ["Snapshot ", mono(l.snapshot_id), `: ${size} from ${humanSize(l.offset_bytes)}`]);
+    return el("li", {}, `${LOST_KIND[l.kind] || l.name || l.kind}: ${size}`);
+  });
+  return items.length > 0 && el("ul", { class: "sub" }, items);
+}
+
 function memberState(m) {
   const state = pill(m.state.toLowerCase(), MEMBER_KIND[m.state]);
-  if (m.state !== "REBUILDING") return state;
+  // md's bad-block log: ranges this disk couldn't read or rewrite, read from another copy since.
+  const bad = m.bad_block_bytes > 0 && el("span", { class: "sub" }, `${humanSize(m.bad_block_bytes)} of bad blocks recorded`);
+  if (m.state !== "REBUILDING") return bad ? [state, bad] : state;
   const pct = Math.min(m.rebuild_percent || 0, 100);
   const fill = el("div");
   fill.style.width = pct + "%";
@@ -710,8 +737,9 @@ function startScrubDialog(p) {
 }
 
 async function pool(id) {
-  const [p, disksAll, volumes, scrubView] = await Promise.all([
+  const [p, disksAll, volumes, deletedVols, scrubView] = await Promise.all([
     api("/pools/" + encodeURIComponent(id)).then((r) => r.pool), list("/disks", "disks"), list("/volumes?pool_id=" + encodeURIComponent(id), "volumes"),
+    list("/deleted-volumes?pool_id=" + encodeURIComponent(id), "volumes").catch((err) => { if (err instanceof Unauthorized) throw err; return []; }),
     api("/pools/" + encodeURIComponent(id) + "/scrub").catch((err) => { if (err instanceof Unauthorized) throw err; return null; }),
   ]);
   const diskOf = (did) => disksAll.find((d) => d.id === did) || {};
@@ -730,6 +758,9 @@ async function pool(id) {
       volumes.length > 0 && can.admin && el("span", { class: "muted" }, "It can't be deleted while it has volumes.")),
     el("dl", { class: "facts" },
       fact("Health", health(p)),
+      p.unreadable_bytes > 0 && fact("Lost data", [pill(humanSize(p.unreadable_bytes), "bad"), el("span", { class: "sub" },
+        "Bad blocks are recorded on every copy of this much of the pool: reading it fails until it is written again. Restore the affected volumes from backups."),
+        lostList(p, [...volumes, ...deletedVols])]),
       fact("Space", [spacePill(p), poolBar(p), SPACE_HINT[p.space_state] && el("span", { class: "sub" }, SPACE_HINT[p.space_state])]),
       fact("Committed", [`${humanSize(p.committed_bytes || 0)} promised`, el("span", { class: "sub" },
         `${humanSize(p.available_bytes || 0)} more accepted. Committed counts every volume as if fully written, plus what snapshots hold.`)]),
@@ -770,6 +801,8 @@ async function pool(id) {
     ],
     el("h2", {}, "Volumes"),
     volumeTable(volumes, [p]),
+    deletedVols.length > 0 && el("p", { class: "muted" }, [`${deletedVols.length} deleted ${deletedVols.length === 1 ? "volume is" : "volumes are"} kept, with their space, until purged: `,
+      el("a", { href: hash("volumes", p.id) }, "see Deleted volumes"), "."]),
     el("h2", {}, "History"),
     graphPanel([{ name: "pool-space", title: "Space allocated" }, { name: "pool-iops", title: "IOPS" },
       { name: "pool-throughput", title: "Throughput" }, { name: "pool-latency", title: "Average latency" }], { pool: p.name }),
@@ -1613,7 +1646,7 @@ function rebootDialog(hostname) {
 
 async function system() {
   const soft = (err) => { if (err instanceof Unauthorized) throw err; return null; };
-  const [st, os, containers, rebuild, backups, retention, mon, upg, scrubCfg] = await Promise.all([api("/system/status"), api("/system/os").catch(soft), api("/system/containers").catch(soft), api("/system/rebuild").catch(soft),
+  const [st, os, kopts, containers, rebuild, backups, retention, mon, upg, scrubCfg] = await Promise.all([api("/system/status"), api("/system/os").catch(soft), api("/system/kernel-options").then((r) => r.init_on_alloc).catch(soft), api("/system/containers").catch(soft), api("/system/rebuild").catch(soft),
     can.admin ? api("/system/backups").catch(soft) : null, api("/system/volume-retention").catch(soft), api("/system/monitoring").catch(soft), api("/system/upgrade").catch(soft),
     api("/system/scrub").then((r) => r.scrub).catch(soft)]);
   const ctr = containers || { available: false };
@@ -1641,6 +1674,7 @@ async function system() {
         os && os.available
           ? el("dl", { class: "facts" }, fact("Booted", dep(os.booted)), fact("Staged", dep(os.staged)), fact("Rollback", dep(os.rollback)))
           : el("div", { class: "panel-notice" }, (os && os.message) || "bootc isn't available on this host."),
+        kopts && zeroMemoryView(kopts),
         upg && upg.warning && el("div", { class: "panel-notice warn" }, upg.warning, " ",
           action(can.admin, { onclick: async () => { try { await send("DELETE", "/system/upgrade/warning"); rerender(); } catch (err) { notify(err.message); } } }, "Dismiss")),
         upg && upg.job && upgradeJobView(upg.job))),
@@ -1804,6 +1838,32 @@ function scrubScheduleDialog(cur) {
         max_mb_per_sec: n(v.limit, 0, 100000, "The limit") });
     },
     done: () => { notify("Saved."); rerender(); },
+  });
+}
+
+// init_on_alloc: Fedora's kernel zeroes the memory it allocates. Changed for the next boot.
+function zeroMemoryView(o) {
+  return [
+    el("div", { class: "section-head" }, el("h3", {}, "Zero memory on allocation"),
+      can.admin && o.available && el("button", { id: "zero-memory", onclick: () => zeroMemoryDialog(o) }, "Change")),
+    el("p", {}, [o.running ? pill("On", "ok") : pill("Off"),
+      o.reboot_required && el("span", { class: "sub" }, `${o.next_boot ? "On" : "Off"} after the next reboot.`)]),
+    el("p", { class: "muted" }, o.message || "A kernel hardening option (init_on_alloc): memory is zeroed as it's handed out, so stale data can't leak through uninitialized memory. It costs CPU on every I/O, so it's off by default. A change applies at the next reboot."),
+  ];
+}
+
+function zeroMemoryDialog(o) {
+  openDialog({
+    title: "Zero memory on allocation",
+    intro: "The setting is written to the next boot entry and applies after a reboot.",
+    submit: "Save",
+    fields: [
+      { name: "state", kind: "radio", label: "Zero memory on allocation", value: o.next_boot ? "on" : "off", options: [
+        { value: "off", label: "Off: less CPU per I/O" }, { value: "on", label: "On: hardened" }] },
+      { name: "force", kind: "tick", text: "Change it even if this replaces the rollback to the previous OS version (after the reboot, rolling back returns to this version with the old setting)", value: false },
+    ],
+    action: (v) => send("PUT", "/system/kernel-options", { init_on_alloc: v.state === "on", force: !!v.force }),
+    done: (r) => { notify(r.init_on_alloc.reboot_required ? "Saved. It applies after a reboot." : "No change needed."); rerender(); },
   });
 }
 
@@ -1980,9 +2040,10 @@ async function dashboard() {
     ...poolList.map((x) => ["Pool", "pool", x]), ...vols.map((x) => ["Volume", "volume", x]), ...exps.map((x) => ["Export", "export", x]),
   ].filter(([, , x]) => x.health_status && x.health_status !== "ONLINE");
   const badDisks = diskList.filter((d) => d.claimed && d.health_status && d.health_status !== "ONLINE");
-  const volByUUID = Object.fromEntries(vols.map((v) => [v.uuid, v]));
+  // SPDK names a volume's device by its UUID, the kernel data plane by its handle (vg/lv).
+  const volByDevice = Object.fromEntries(vols.flatMap((v) => [[v.uuid, v], v.handle && [v.handle, v]].filter(Boolean)));
   const rates = io && ioRates(io.stats || []);
-  const volRates = (rates || []).filter((r) => volByUUID[r.name]).map((r) => ({ ...r, vol: volByUUID[r.name] }));
+  const volRates = (rates || []).filter((r) => volByDevice[r.name]).map((r) => ({ ...r, vol: volByDevice[r.name] }));
   return [
     el("h1", {}, "Overview"),
     !spdk.connected && el("div", { class: "panel-notice bad" }, `The data plane isn't reachable (${spdk.endpoint || "unknown"}), so nothing is being served.`),

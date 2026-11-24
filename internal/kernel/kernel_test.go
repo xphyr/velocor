@@ -154,11 +154,21 @@ func TestArrayStatusDuringRecovery(t *testing.T) {
 	for _, x := range st.Members {
 		m[x.Device] = x
 	}
-	if !m["loop0"].Has("in_sync") || m["loop0"].BadBlocks != 1 || m["loop0"].Slot != 0 {
+	if !m["loop0"].Has("in_sync") || len(m["loop0"].BadBlocks) != 1 || m["loop0"].BadSectors() != 8 || m["loop0"].Slot != 0 {
 		t.Errorf("good member %+v", m["loop0"])
 	}
 	if !m["loop2"].Has("spare") || m["loop2"].Slot != 1 {
 		t.Errorf("rebuilding member %+v", m["loop2"])
+	}
+}
+
+func TestParseBadBlocks(t *testing.T) {
+	// Device sectors; the data starts at 2048. Duplicates (both logs) once; a range in the
+	// metadata area dropped, one straddling it cut.
+	got := parseBadBlocks("4196352 8\n100 8\n2040 16\n4196352 8\n\nbad line\n5000 0\n", 2048)
+	want := []SectorRange{{4194304, 8}, {0, 8}}
+	if !slices.Equal(got, want) {
+		t.Fatalf("got %v, want %v", got, want)
 	}
 }
 

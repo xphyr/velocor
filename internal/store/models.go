@@ -41,6 +41,23 @@ type PoolMember struct {
 	DiskID         string      `json:"disk_id,omitempty"`
 	State          MemberState `json:"state"`
 	RebuildPercent uint32      `json:"rebuild_percent,omitempty"`
+	// BadBlockBytes is the size of the bad blocks the data plane recorded on the member
+	// (kernel data plane: md's bad-block log): ranges it couldn't read or rewrite, which the
+	// pool serves from another copy, if it has one.
+	BadBlockBytes uint64 `json:"bad_block_bytes,omitempty"`
+}
+
+// LostExtent is a range of a pool's data that no disk can supply, and what held it.
+type LostExtent struct {
+	// Kind: "volume" (VolumeID or SnapshotID, OffsetBytes within it), "thin-metadata" (the
+	// thin pool's own: every volume's mappings), "pool-metadata" (the on-pool configuration
+	// copy), "lvm-metadata", "other" (Name), "unlocated" (where isn't known).
+	Kind        string `json:"kind"`
+	VolumeID    string `json:"volume_id,omitempty"`
+	SnapshotID  string `json:"snapshot_id,omitempty"`
+	Name        string `json:"name,omitempty"`
+	OffsetBytes uint64 `json:"offset_bytes"`
+	LengthBytes uint64 `json:"length_bytes"`
 }
 
 // Settings holds operator-adjustable, node-wide settings.
@@ -486,6 +503,13 @@ type Pool struct {
 	CommittedBytes uint64      `json:"committed_bytes"`
 	AvailableBytes uint64      `json:"available_bytes"`
 	SpaceState     SpaceState  `json:"space_state,omitempty"`
+
+	// UnreadableBytes is how much of the pool's array no member can supply: bad blocks
+	// recorded on every copy (on the only one, for RAID0). The data there is lost.
+	UnreadableBytes uint64 `json:"unreadable_bytes,omitempty"`
+	// LostData is what the unreadable part held, where the data plane worked it out.
+	LostData []LostExtent `json:"lost_data,omitempty"`
+
 	// On-pool metadata copy (P0-3): the velocor-meta lvol and the last manifest written to it.
 	// ThinMetadataBytes and ThinMetadataUsedBytes are the thin pool's own metadata (kernel data
 	// plane): finite, and worse to fill than the data. 0 where there is none (SPDK).

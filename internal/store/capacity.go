@@ -154,13 +154,14 @@ func CheckGrowth(p *Pool, committed, delta uint64) error {
 	}
 	if limit := LimitBytes(p); committed+delta > limit {
 		return fmt.Errorf("%w: pool %s has %s committed of %s allowed (%.2gx overcommit of %s, %.0f%% reserved); this needs %s more",
-			ErrInsufficientCapacity, p.Name, humanBytes(committed), humanBytes(limit), e.MaxOvercommit,
-			humanBytes(p.TotalBytes), *e.ReservePercent, humanBytes(delta))
+			ErrInsufficientCapacity, p.Name, HumanBytes(committed), HumanBytes(limit), e.MaxOvercommit,
+			HumanBytes(p.TotalBytes), *e.ReservePercent, HumanBytes(delta))
 	}
 	return nil
 }
 
-func humanBytes(b uint64) string {
+// HumanBytes writes a size in the largest binary unit it fills (4.0 KiB).
+func HumanBytes(b uint64) string {
 	const unit = 1024
 	if b < unit {
 		return fmt.Sprintf("%d B", b)
