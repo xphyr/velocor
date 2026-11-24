@@ -78,6 +78,16 @@ func dirNames(dir string) []string {
 
 // LoadTargetModules loads the kernel targets' modules (configfs directories appear with them).
 func (p *Plane) LoadTargetModules(ctx context.Context) error {
+	loaded := true
+	for _, m := range []string{"nvmet", "nvmet_tcp", "target_core_mod", "target_core_iblock", "iscsi_target_mod"} {
+		if _, err := os.Stat(filepath.Join(p.SysRoot, "module", m)); err != nil {
+			loaded = false // or built in without parameters: modprobe knows
+			break
+		}
+	}
+	if loaded {
+		return nil
+	}
 	_, err := p.Run.Run(ctx, "modprobe", "-a", "nvmet", "nvmet-tcp", "target_core_mod", "target_core_iblock", "iscsi_target_mod")
 	return err
 }

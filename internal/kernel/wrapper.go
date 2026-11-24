@@ -21,6 +21,9 @@ func (p *Plane) WrapperPath(volume string) string {
 // EnsureWrapper makes the volume's wrapper a dm-linear map of all of lower: created when
 // missing, reloaded when lower changed or grew (a resize).
 func (p *Plane) EnsureWrapper(ctx context.Context, volume, lower string) error {
+	if p.WrapperCurrent(volume, lower) {
+		return nil
+	}
 	sectors, err := p.blockSectors(ctx, lower)
 	if err != nil {
 		return err
@@ -86,6 +89,15 @@ func (p *Plane) SuspendedWrappers(ctx context.Context) ([]string, error) {
 	return vols, nil
 }
 
+// dmsetupAll runs one dmsetup command on several volumes' wrappers.
+func (p *Plane) dmsetupAll(ctx context.Context, volumes []string, args ...string) error {
+	for _, v := range volumes {
+		args = append(args, WrapperName(v))
+	}
+	_, err := p.Run.Run(ctx, "dmsetup", args...)
+	return err
+}
+
 // WrapperSuspended reports whether the wrapper is suspended.
 func (p *Plane) WrapperSuspended(ctx context.Context, volume string) (bool, error) {
 	out, err := p.Run.Run(ctx, "dmsetup", "info", "-c", "--noheadings", "-o", "suspended", WrapperName(volume))
@@ -121,10 +133,18 @@ func (p *Plane) GroupSnapshotWithin(ctx context.Context, members []GroupMember, 
 	var suspended []string
 	var taken []GroupMember
 	resumeAll := func() error {
+		if len(suspended) == 0 {
+			return nil
+		}
+		// A fresh context: resuming must happen even when ctx has run out. All at once; dmsetup
+		// stops at the first that fails, so then one by one.
+		cleanup := context.WithoutCancel(ctx)
+		if p.dmsetupAll(cleanup, suspended, "resume") == nil {
+			return nil
+		}
 		var errs []error
 		for _, v := range suspended {
-			// A fresh context: resuming must happen even when ctx has run out.
-			if err := p.ResumeWrapper(context.WithoutCancel(ctx), v); err != nil {
+			if err := p.ResumeWrapper(cleanup, v); err != nil {
 				errs = append(errs, fmt.Errorf("resume %s: %w", v, err))
 			}
 		}
@@ -144,17 +164,17 @@ func (p *Plane) GroupSnapshotWithin(ctx context.Context, members []GroupMember, 
 		sctx, cancel = context.WithTimeout(ctx, quiesce)
 	}
 	defer cancel()
+	// All counted as suspended even if the command fails: it may have got to some of them, and
+	// killed at the deadline, dmsetup may already have suspended one (it still waits for udev
+	// then). Resuming a wrapper that isn't suspended does nothing.
 	for _, m := range members {
-		// Counted as suspended even if the command fails: killed at the deadline, dmsetup may
-		// already have suspended it (it still waits for udev then). Resuming a wrapper that
-		// isn't suspended does nothing.
 		suspended = append(suspended, m.Volume)
-		if err := p.SuspendWrapper(sctx, m.Volume); err != nil {
-			if sctx.Err() != nil {
-				err = fmt.Errorf("%w: %v", sctx.Err(), err)
-			}
-			return fail(fmt.Errorf("suspend %s: %w", m.Volume, err))
+	}
+	if err := p.dmsetupAll(sctx, suspended, "suspend", "--nolockfs"); err != nil {
+		if sctx.Err() != nil {
+			err = fmt.Errorf("%w: %v", sctx.Err(), err)
 		}
+		return fail(fmt.Errorf("suspend %s: %w", strings.Join(suspended, ", "), err))
 	}
 	for _, m := range members {
 		if err := p.Snapshot(ctx, m.VG, m.LV, m.Snap, m.Tags...); err != nil {

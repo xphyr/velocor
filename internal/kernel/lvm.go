@@ -18,10 +18,6 @@ const lvmConfig = `devices { use_devicesfile = 0 filter = [ "a|^/dev/md|", "r|.*
 // (docs/performance.md "LVM thin chunk size and zeroing").
 const ChunkSize = 64 << 10
 
-func (p *Plane) lvm(ctx context.Context, cmd string, args ...string) ([]byte, error) {
-	return p.Run.Run(ctx, "lvm", append([]string{cmd, "--config", lvmConfig}, args...)...)
-}
-
 // PoolSpec describes the volume group and thin pool on an md array.
 type PoolSpec struct {
 	VG     string // volume group name

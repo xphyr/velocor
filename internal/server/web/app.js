@@ -18,6 +18,7 @@ function token() {
 
 function saveToken(value) {
   memoryToken = value;
+  meAt = 0;
   try {
     if (value) sessionStorage.setItem(TOKEN_KEY, value);
     else sessionStorage.removeItem(TOKEN_KEY);
@@ -38,7 +39,24 @@ async function request(method, path, body) {
 }
 
 const api = (path) => request("GET", path);
-const send = (method, path, body) => request(method, path, body);
+const send = (method, path, body) => { slowAnswers.clear(); meAt = 0; return request(method, path, body); };
+
+// The status is asked for once per refresh, though the frame and some screens both show it.
+let statusAnswer = null;
+const systemStatus = () => (statusAnswer ||= api("/system/status"));
+
+// What the host takes a while to answer and seldom changes is asked for again after a minute, or
+// once something was changed here.
+const SLOW_MS = 60000;
+const slowAnswers = new Map();
+function slow(path) {
+  const kept = slowAnswers.get(path);
+  if (kept && Date.now() - kept.at < SLOW_MS) return kept.answer;
+  const answer = api(path);
+  slowAnswers.set(path, { at: Date.now(), answer });
+  answer.catch(() => slowAnswers.delete(path));
+  return answer;
+}
 
 // raw sends a file as the request body (database restore).
 async function raw(method, path, file) {
@@ -351,6 +369,7 @@ const confirmDialog = (opts) => openDialog({ danger: true, ...opts });
 // --- Who's signed in, and what they may do ---
 
 let me = { username: "", role: "" };
+let meAt = 0; // when the API last said so
 const RANK = { READONLY: 1, CSI_PROVISIONER: 2, ADMIN: 3 };
 const can = {
   get provision() { return (RANK[me.role] || 0) >= 2; },
@@ -1615,7 +1634,7 @@ function rebootDialog(hostname) {
 
 async function system() {
   const soft = (err) => { if (err instanceof Unauthorized) throw err; return null; };
-  const [st, os, kopts, containers, rebuild, backups, retention, mon, upg, scrubCfg] = await Promise.all([api("/system/status"), api("/system/os").catch(soft), api("/system/kernel-options").then((r) => r.init_on_alloc).catch(soft), api("/system/containers").catch(soft), api("/system/rebuild").catch(soft),
+  const [st, os, kopts, containers, rebuild, backups, retention, mon, upg, scrubCfg] = await Promise.all([systemStatus(), slow("/system/os").catch(soft), slow("/system/kernel-options").then((r) => r.init_on_alloc).catch(soft), slow("/system/containers").catch(soft), api("/system/rebuild").catch(soft),
     can.admin ? api("/system/backups").catch(soft) : null, api("/system/volume-retention").catch(soft), api("/system/monitoring").catch(soft), api("/system/upgrade").catch(soft),
     api("/system/scrub").then((r) => r.scrub).catch(soft)]);
   const ctr = containers || { available: false };
@@ -1999,7 +2018,7 @@ const perSecond = (bytes) => humanSize(Math.round(bytes)) + "/s";
 
 async function dashboard() {
   const [st, diskList, poolList, vols, snaps, exps, hostList, portalList, io] = await Promise.all([
-    api("/system/status"), list("/disks", "disks"), list("/pools", "pools"), list("/volumes", "volumes"), list("/snapshots", "snapshots"),
+    systemStatus(), list("/disks", "disks"), list("/pools", "pools"), list("/volumes", "volumes"), list("/snapshots", "snapshots"),
     list("/exports", "exports"), list("/hosts", "hosts"), list("/portals", "portals"),
     api("/system/iostats").catch((err) => { if (err instanceof Unauthorized) throw err; return null; }),
   ]);
@@ -2497,9 +2516,13 @@ async function rerender() {
   const { nav: current, draw } = route();
   try {
     if (!token()) throw new Unauthorized();
-    me = await api("/auth/me");
+    if (Date.now() - meAt >= SLOW_MS) {
+      me = await api("/auth/me");
+      meAt = Date.now();
+    }
+    statusAnswer = null;
     if (me.must_change_password) throw new MustChangePassword();
-    const [content, st] = await Promise.all([draw(), api("/system/status").catch(() => ({}))]);
+    const [content, st] = await Promise.all([draw(), systemStatus().catch(() => ({}))]);
     if (mine !== generation) return;
     drawNav(current);
     drawAccount();

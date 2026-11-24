@@ -66,16 +66,16 @@ func (p *Plane) ThinPools(ctx context.Context, name, uuid string) ([]dataplane.T
 	if err != nil {
 		return nil, err
 	}
+	lvs, err := p.k.ListVolumes(ctx, "")
+	if err != nil {
+		return nil, err
+	}
 	var out []dataplane.ThinPool
 	for _, vg := range vgs {
 		if name != "" && vg.Name != name || uuid != "" && vg.UUID != uuid {
 			continue
 		}
-		lvs, err := p.k.ListVolumes(ctx, vg.Name)
-		if err != nil {
-			return nil, err
-		}
-		i := slices.IndexFunc(lvs, func(lv kernel.LV) bool { return lv.SegType == "thin-pool" && lv.Name == thinLV })
+		i := slices.IndexFunc(lvs, func(lv kernel.LV) bool { return lv.VG == vg.Name && lv.SegType == "thin-pool" && lv.Name == thinLV })
 		if i < 0 {
 			continue
 		}
@@ -130,11 +130,11 @@ func (p *Plane) GrowMetadata(ctx context.Context, uuid string) (uint64, error) {
 		return 0, notFound("thin pool %s not found", uuid)
 	}
 	vg := vgs[i]
-	lvs, err := p.k.ListVolumes(ctx, vg.Name)
+	lvs, err := p.k.ListVolumes(ctx, "")
 	if err != nil {
 		return 0, err
 	}
-	j := slices.IndexFunc(lvs, func(lv kernel.LV) bool { return lv.SegType == "thin-pool" && lv.Name == thinLV })
+	j := slices.IndexFunc(lvs, func(lv kernel.LV) bool { return lv.VG == vg.Name && lv.SegType == "thin-pool" && lv.Name == thinLV })
 	if j < 0 || lvs[j].MetadataSize == 0 {
 		return 0, nil
 	}

@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -76,6 +77,19 @@ func OpenBoltStore(path string) (*BoltStore, error) {
 	return &BoltStore{db: db}, nil
 }
 
+// putChanged is putJSON, or ErrSkipWrite (no commit, so no fsync) when the record already says
+// exactly that.
+func putChanged(b *bolt.Bucket, key []byte, v any) error {
+	raw, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+	if bytes.Equal(raw, b.Get(key)) {
+		return ErrSkipWrite
+	}
+	return b.Put(key, raw)
+}
+
 // mutateRecord atomically loads the JSON record id from bucket, applies fn and stores
 // the result, all inside a single bbolt write transaction. fn may return ErrSkipWrite
 // to leave the record untouched. The record's identity is preserved via keepID.
@@ -93,7 +107,7 @@ func mutateRecord[T any](db *bolt.DB, bucket []byte, id string, fn func(*T) erro
 			return err
 		}
 		keepID(&rec, id)
-		return putJSON(b, []byte(id), &rec)
+		return putChanged(b, []byte(id), &rec)
 	})
 	if errors.Is(err, ErrSkipWrite) {
 		err = db.View(func(tx *bolt.Tx) error {
@@ -378,10 +392,12 @@ func (s *BoltStore) upsertDisk(disk *Disk, syncBoot bool) error {
 	if cp.UpdatedAt.IsZero() {
 		cp.UpdatedAt = time.Now().UTC()
 	}
-	return s.db.Update(func(tx *bolt.Tx) error {
+	err := s.db.Update(func(tx *bolt.Tx) error {
 		b := tx.Bucket(bucketDisks)
 		var existing Disk
+		found := false
 		if err := getJSON(b, []byte(cp.ID), &existing); err == nil {
+			found = true
 			// Once marked as a boot device, non-authoritative upserts preserve boot protection.
 			if !syncBoot && existing.IsBootDevice {
 				cp.IsBootDevice = true
@@ -440,8 +456,24 @@ func (s *BoltStore) upsertDisk(disk *Disk, syncBoot bool) error {
 		} else if cp.IsBootDevice && cp.Claimed {
 			return ErrBootDeviceProtected
 		}
+		if syncBoot && found {
+			// A scan runs on every reconciler pass: one that found nothing new writes nothing.
+			same := cp
+			same.UpdatedAt = existing.UpdatedAt
+			raw, err := json.Marshal(&same)
+			if err != nil {
+				return err
+			}
+			if bytes.Equal(raw, b.Get([]byte(cp.ID))) {
+				return ErrSkipWrite
+			}
+		}
 		return putJSON(b, []byte(cp.ID), &cp)
 	})
+	if errors.Is(err, ErrSkipWrite) {
+		return nil
+	}
+	return err
 }
 
 // GetDisk retrieves a Disk by ID.
@@ -1900,4 +1932,52 @@ func getJSON(b *bolt.Bucket, key []byte, dest any) error {
 		return fmt.Errorf("unmarshal json: %w", err)
 	}
 	return nil
+}
+
+// UpdateSpaceUsage records how much volumes and snapshots (by ID) hold, in one transaction.
+func (s *BoltStore) UpdateSpaceUsage(volumes, snapshots map[string]uint64) error {
+	if len(volumes)+len(snapshots) == 0 {
+		return nil
+	}
+	err := s.db.Update(func(tx *bolt.Tx) error {
+		changed := false
+		for _, kind := range []struct {
+			bucket []byte
+			held   map[string]uint64
+		}{{bucketVolumes, volumes}, {bucketSnapshots, snapshots}} {
+			b := tx.Bucket(kind.bucket)
+			for id, n := range kind.held {
+				var rec struct {
+					v Volume
+					s Snapshot
+				}
+				var dst any = &rec.v
+				held := &rec.v.AllocatedBytes
+				if bytes.Equal(kind.bucket, bucketSnapshots) {
+					dst, held = &rec.s, &rec.s.AllocatedBytes
+				}
+				if err := getJSON(b, []byte(id), dst); errors.Is(err, ErrNotFound) {
+					continue // deleted meanwhile
+				} else if err != nil {
+					return err
+				}
+				if *held == n {
+					continue
+				}
+				*held = n
+				if err := putJSON(b, []byte(id), dst); err != nil {
+					return err
+				}
+				changed = true
+			}
+		}
+		if !changed {
+			return ErrSkipWrite
+		}
+		return nil
+	})
+	if errors.Is(err, ErrSkipWrite) {
+		return nil
+	}
+	return err
 }

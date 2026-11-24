@@ -144,7 +144,11 @@ func TestSettleResumesLeftoversFirst(t *testing.T) {
 	if err := p.k.SuspendWrapper(context.Background(), "vol-a"); err != nil {
 		t.Fatal(err)
 	}
-	if err := p.Settle(context.Background(), nil); err != nil {
+	disk := filepath.Join(p.k.DevRoot, "sdz")
+	if err := os.WriteFile(disk, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Settle(context.Background(), []string{disk}); err != nil {
 		t.Fatal(err)
 	}
 	c := calls()
@@ -152,5 +156,52 @@ func TestSettleResumesLeftoversFirst(t *testing.T) {
 	mdadm := slices.IndexFunc(c, func(l string) bool { return strings.HasPrefix(l, "mdadm ") })
 	if resume < 0 || mdadm < 0 || resume > mdadm {
 		t.Fatalf("resume at %d, mdadm at %d: %v", resume, mdadm, c)
+	}
+}
+
+// Looking for arrays to assemble reads every block device, so Settle does it only when a claimed
+// disk is in none, and not again while nothing changed.
+func TestSettleExaminesOnlyWhenNeeded(t *testing.T) {
+	p, calls := groupPlane(t, nil)
+	disk := filepath.Join(p.k.DevRoot, "sdz")
+	if err := os.WriteFile(disk, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sys := filepath.Join(p.k.SysRoot, "block", "sdz")
+	holder := filepath.Join(sys, "holders", "md127")
+	if err := os.MkdirAll(holder, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	examines := func() int {
+		n := len(calls())
+		if err := p.Settle(context.Background(), []string{disk}); err != nil {
+			t.Fatal(err)
+		}
+		got := 0
+		for _, c := range calls()[n:] {
+			if strings.HasPrefix(c, "mdadm ") {
+				got++
+			}
+		}
+		return got
+	}
+	if n := examines(); n != 0 {
+		t.Fatalf("every disk is in an array: %d looks", n)
+	}
+	if err := os.Remove(holder); err != nil {
+		t.Fatal(err)
+	}
+	if a, b := examines(), examines(); a != 1 || b != 0 {
+		t.Fatalf("a disk in no array: %d looks, then %d", a, b)
+	}
+	if err := os.WriteFile(filepath.Join(sys, "diskseq"), []byte("7\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if n := examines(); n != 1 {
+		t.Fatalf("the disk was plugged in again: %d looks", n)
+	}
+	p.examinedAt = time.Now().Add(-2 * examineEvery)
+	if n := examines(); n != 1 {
+		t.Fatalf("a minute later: %d looks", n)
 	}
 }

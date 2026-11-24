@@ -231,7 +231,7 @@ func (s *ControllerServer) DeleteVolume(ctx context.Context, req *csi.DeleteVolu
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	exports, err := s.client.ListExports(ctx)
+	exports, err := s.client.ListVolumeExports(ctx, req.GetVolumeId())
 	if err == nil {
 		for _, exp := range exports {
 			if exp.VolumeID == req.GetVolumeId() {
@@ -297,7 +297,7 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 	}
 
 	proto := normalizeProtocol(req.GetVolumeContext()["protocol"])
-	exports, err := s.client.ListExports(ctx)
+	exports, err := s.client.ListVolumeExports(ctx, req.GetVolumeId())
 	if err != nil {
 		return nil, mapAPIError(err)
 	}
@@ -417,7 +417,7 @@ func (s *ControllerServer) ControllerUnpublishVolume(ctx context.Context, req *c
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	exports, err := s.client.ListExports(ctx)
+	exports, err := s.client.ListVolumeExports(ctx, req.GetVolumeId())
 	if err != nil {
 		return nil, mapAPIError(err)
 	}

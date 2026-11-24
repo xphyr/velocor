@@ -22,7 +22,6 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -75,6 +74,15 @@ type Plane struct {
 	// missing (without --run), so the plane keeps what it found until an operator starts it
 	// degraded or the members come back (SPDK's "configuring" RAID).
 	waiting map[string]kernel.ExaminedArray
+	// handles are the disks' stable links by kernel name, for the kernel plane's InventoryTTL.
+	handles   map[string]string
+	handlesAt time.Time
+	// nvme keeps each NVMe controller's SMART log and write-cache state for nvmeTTL.
+	nvme map[string]nvmeState
+	// examinedKey says which disks and arrays there were when Settle last looked for arrays to
+	// assemble, at examinedAt.
+	examinedKey string
+	examinedAt  time.Time
 	// scrubs are the scrubs started since velod started, by array: md keeps only the last
 	// action, not where it began or whether it was stopped.
 	scrubs map[string]*scrubRun
@@ -151,16 +159,93 @@ func (p *Plane) Settle(ctx context.Context, claimed []string) error {
 	if err := p.resumeWrappers(ctx); err != nil {
 		return err
 	}
+	if err := p.assembleArrays(ctx, claimed); err != nil {
+		return err
+	}
+	vgs, err := p.k.ListVGs(ctx)
+	if err != nil {
+		return fmt.Errorf("list volume groups: %w", err)
+	}
+	lvs, err := p.k.ListVolumes(ctx, "")
+	if err != nil {
+		return fmt.Errorf("list volumes: %w", err)
+	}
+	var errs []error
+	for _, vg := range vgs {
+		if allActive(lvs, vg.Name) {
+			continue
+		}
+		if err := p.k.ActivatePool(ctx, vg.Name); err != nil {
+			if _, ok, lerr := p.volumeGroup(ctx, vg.Name); lerr == nil && !ok {
+				continue // deleted meanwhile
+			}
+			errs = append(errs, fmt.Errorf("activate %s: %w", vg.Name, err))
+		}
+	}
+	for _, lv := range lvs {
+		if !isVolume(lv) || isSnapshot(lv) || lv.Name == metaLV || p.k.WrapperCurrent(lv.Name, p.k.LVPath(lv.VG, lv.Name)) {
+			continue
+		}
+		if err := p.ensureWrapper(ctx, lv); err != nil {
+			if now, lerr := p.k.ListVolumes(ctx, ""); lerr == nil && !slices.ContainsFunc(now, func(l kernel.LV) bool { return l.VG == lv.VG && l.Name == lv.Name }) {
+				continue // deleted meanwhile
+			}
+			errs = append(errs, fmt.Errorf("wrapper of %s/%s: %w", lv.VG, lv.Name, err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// allActive reports whether every LV of a volume group that is meant to be active is. (Velod's
+// snapshots aren't, until they are needed: LVM's skip-activation flag.)
+func allActive(lvs []kernel.LV, vg string) bool {
+	n := 0
+	for _, lv := range lvs {
+		if lv.VG != vg || lv.SkipActivation {
+			continue
+		}
+		if !lv.Active {
+			return false
+		}
+		n++
+	}
+	return n > 0
+}
+
+// examineEvery is the longest Settle goes without looking for arrays to assemble on disks that
+// are claimed but in none, when nothing about them changed.
+const examineEvery = time.Minute
+
+// assembleArrays assembles the arrays on the claimed disks. Looking for them reads every block
+// device (mdadm --examine --scan), so not when every claimed disk is in a running array, nor again
+// when the others are the same as when the last look found nothing to do.
+func (p *Plane) assembleArrays(ctx context.Context, claimed []string) error {
+	running := p.k.ListArrays()
+	slices.Sort(running)
+	owned := map[string]bool{}
+	var idle []string
+	for _, h := range claimed {
+		k := kernelName(h)
+		if k == "" || owned[k] {
+			continue
+		}
+		owned[k] = true
+		if !p.k.ArrayMemberOf(k) {
+			idle = append(idle, k+":"+p.k.DiskSeq(k))
+		}
+	}
+	slices.Sort(idle)
+	key := strings.Join(running, ",") + " " + strings.Join(idle, ",")
+	p.mu.Lock()
+	done := len(p.waiting) == 0 && (len(idle) == 0 || key == p.examinedKey && time.Since(p.examinedAt) < examineEvery)
+	p.mu.Unlock()
+	if done {
+		return nil
+	}
+	at := time.Now()
 	examined, err := p.k.ExamineArrays(ctx)
 	if err != nil {
 		return fmt.Errorf("examine md metadata: %w", err)
-	}
-	running := p.k.ListArrays()
-	owned := map[string]bool{}
-	for _, h := range claimed {
-		if k := kernelName(h); k != "" {
-			owned[k] = true
-		}
 	}
 	waiting := map[string]kernel.ExaminedArray{}
 	for _, a := range examined {
@@ -193,37 +278,9 @@ func (p *Plane) Settle(ctx context.Context, claimed []string) error {
 	}
 	p.mu.Lock()
 	p.waiting = waiting
+	p.examinedKey, p.examinedAt = key, at
 	p.mu.Unlock()
-
-	vgs, err := p.k.ListVGs(ctx)
-	if err != nil {
-		return fmt.Errorf("list volume groups: %w", err)
-	}
-	var errs []error
-	for _, vg := range vgs {
-		if err := p.k.ActivatePool(ctx, vg.Name); err != nil {
-			if _, ok, lerr := p.volumeGroup(ctx, vg.Name); lerr == nil && !ok {
-				continue // deleted meanwhile
-			}
-			errs = append(errs, fmt.Errorf("activate %s: %w", vg.Name, err))
-		}
-	}
-	lvs, err := p.k.ListVolumes(ctx, "")
-	if err != nil {
-		return errors.Join(append(errs, fmt.Errorf("list volumes: %w", err))...)
-	}
-	for _, lv := range lvs {
-		if !isVolume(lv) || isSnapshot(lv) || lv.Name == metaLV {
-			continue
-		}
-		if err := p.ensureWrapper(ctx, lv); err != nil {
-			if now, lerr := p.k.ListVolumes(ctx, ""); lerr == nil && !slices.ContainsFunc(now, func(l kernel.LV) bool { return l.VG == lv.VG && l.Name == lv.Name }) {
-				continue // deleted meanwhile
-			}
-			errs = append(errs, fmt.Errorf("wrapper of %s/%s: %w", lv.VG, lv.Name, err))
-		}
-	}
-	return errors.Join(errs...)
+	return nil
 }
 
 // resumeWrappers resumes the wrappers left suspended by a crash in the middle of a group snapshot;
@@ -317,35 +374,50 @@ var nvmeByPath = regexp.MustCompile(`-nvme-\d+$`)
 // namespace's by-path link (by PCI address, like SPDK's controller names), else the disk's
 // by-id link, a WWN first; /dev/<kname> if there is none.
 func (p *Plane) diskHandle(kname string) string {
-	links := func(dir string) []string {
-		es, _ := os.ReadDir(filepath.Join(p.k.DevRoot, "disk", dir))
-		var out []string
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	h, ok := p.handles[kname]
+	if !ok || time.Since(p.handlesAt) >= p.k.InventoryTTL {
+		p.handles, p.handlesAt = p.diskHandles(), time.Now()
+		h, ok = p.handles[kname]
+	}
+	if !ok {
+		return filepath.Join(p.k.DevRoot, kname)
+	}
+	return h
+}
+
+// diskHandles is diskHandle for every disk with a stable link.
+func (p *Plane) diskHandles() map[string]string {
+	out := map[string]string{}
+	each := func(dir string, f func(link, kname string)) {
+		es, _ := os.ReadDir(filepath.Join(p.k.DevRoot, "disk", dir)) // sorted
 		for _, e := range es {
 			l := filepath.Join(p.k.DevRoot, "disk", dir, e.Name())
-			if kernelName(l) == kname {
-				out = append(out, l)
-			}
-		}
-		sort.Strings(out)
-		return out
-	}
-	if strings.HasPrefix(kname, "nvme") {
-		for _, l := range links("by-path") {
-			if nvmeByPath.MatchString(l) {
-				return l
+			if k := kernelName(l); k != "" && out[k] == "" {
+				f(l, k)
 			}
 		}
 	}
-	ids := links("by-id")
-	for _, l := range ids {
+	each("by-path", func(l, k string) {
+		if strings.HasPrefix(k, "nvme") && nvmeByPath.MatchString(l) {
+			out[k] = l
+		}
+	})
+	each("by-id", func(l, k string) {
 		if strings.HasPrefix(filepath.Base(l), "wwn-") {
-			return l
+			out[k] = l
 		}
-	}
-	if len(ids) > 0 {
-		return ids[0]
-	}
-	return filepath.Join(p.k.DevRoot, kname)
+	})
+	each("by-id", func(l, k string) { out[k] = l })
+	return out
+}
+
+// dropHandles forgets the disks' links: one has just appeared.
+func (p *Plane) dropHandles() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.handles = nil
 }
 
 // AttachDisk: the disk stays on its kernel driver (an NVMe drive SPDK left on vfio-pci goes
@@ -383,6 +455,7 @@ func (p *Plane) AttachDisk(ctx context.Context, d *store.Disk) (string, store.Di
 	if path == "" || kname == "" {
 		return "", "", fmt.Errorf("disk %s has no block device", d.ID)
 	}
+	p.dropHandles()
 	return p.diskHandle(kname), store.DiskDriverStateKernel, nil
 }
 

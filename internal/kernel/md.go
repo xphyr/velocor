@@ -10,6 +10,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Plane drives the kernel data plane: md, LVM, device-mapper and nvmet.
@@ -19,11 +20,16 @@ type Plane struct {
 	SysRoot string
 	// DevRoot is "/dev"; md arrays appear as DevRoot/md/<name>.
 	DevRoot string
+	// InventoryTTL is how long LVM's reports may be reused (0: not at all); anything this Plane
+	// changes drops them at once. They say how full volumes are, which changes with I/O.
+	InventoryTTL time.Duration
+
+	inv inventory
 }
 
 // New returns a Plane on this host's /sys and /dev.
 func New(r Runner) *Plane {
-	return &Plane{Run: r, SysRoot: "/sys", DevRoot: "/dev"}
+	return &Plane{Run: r, SysRoot: "/sys", DevRoot: "/dev", InventoryTTL: 2 * time.Second}
 }
 
 // ArraySpec describes an md array to create.
@@ -47,6 +53,7 @@ func (p *Plane) ArrayPath(name string) string { return filepath.Join(p.DevRoot, 
 // the error to the reader and keeps the array running (TODO.md P0-7, checked by
 // TestLastCopyReadErrorKeepsThePool).
 func (p *Plane) CreateArray(ctx context.Context, s ArraySpec) (string, error) {
+	defer p.DropInventory()
 	if s.Level != "raid0" && s.Level != "raid1" && s.Level != "raid10" {
 		return "", fmt.Errorf("unsupported level %q", s.Level)
 	}
@@ -82,6 +89,7 @@ func (p *Plane) CreateArray(ctx context.Context, s ArraySpec) (string, error) {
 // AssembleArray starts an existing array from its members. Without allowDegraded mdadm starts it
 // only with every member present (an operator decides on a degraded start: TODO.md P1-8).
 func (p *Plane) AssembleArray(ctx context.Context, name, uuid string, devices []string, allowDegraded bool) error {
+	defer p.DropInventory()
 	args := []string{"--assemble", p.ArrayPath(name), "--uuid=" + uuid, "--quiet"}
 	if allowDegraded {
 		args = append(args, "--run")
@@ -92,6 +100,7 @@ func (p *Plane) AssembleArray(ctx context.Context, name, uuid string, devices []
 
 // StopArray stops an array (its volume group must be deactivated first).
 func (p *Plane) StopArray(ctx context.Context, name string) error {
+	defer p.DropInventory()
 	_, err := p.Run.Run(ctx, "mdadm", "--stop", p.ArrayPath(name))
 	return err
 }
@@ -390,6 +399,7 @@ func parseExamineScan(out string) []ExaminedArray {
 
 // RunArray starts an assembled but inactive array with the members it has.
 func (p *Plane) RunArray(ctx context.Context, name string) error {
+	defer p.DropInventory()
 	_, err := p.Run.Run(ctx, "mdadm", "--run", p.ArrayPath(name))
 	return err
 }

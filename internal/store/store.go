@@ -45,6 +45,7 @@ type Store interface {
 	UpsertDisk(disk *Disk) error
 	SyncDiscoveredDisk(disk *Disk) error
 	GetDisk(id string) (*Disk, error)
+	UpdateSpaceUsage(volumes, snapshots map[string]uint64) error
 	ListDisks() ([]*Disk, error)
 	// MutateDisk atomically applies fn to the current Disk record inside one transaction.
 	MutateDisk(id string, fn func(*Disk) error) (*Disk, error)
