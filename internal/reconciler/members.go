@@ -18,14 +18,14 @@ type raidView struct {
 	online  bool // the RAID serves I/O (possibly degraded or rebuilding)
 }
 
-// inRaid reports whether bdev is a member of any RAID bdev.
-func inRaid(raids []dataplane.Array, bdev string) bool {
-	if bdev == "" {
+// inRaid reports whether a disk (by handle) is in any array.
+func inRaid(raids []dataplane.Array, handle string) bool {
+	if handle == "" {
 		return false // an empty slot has no member
 	}
 	for _, rb := range raids {
 		for _, b := range rb.Members {
-			if b.Name == bdev {
+			if b.Name == handle {
 				return true
 			}
 		}
@@ -40,19 +40,19 @@ func diskLabel(id string) string {
 	return "disk " + id
 }
 
-// viewRaid derives a pool's member states and health from SPDK's view of its RAID bdev.
+// viewRaid derives a pool's member states and health from the data plane's view of its array.
 // The data plane is the source of truth for slot membership; the store supplies which disk a
 // now-empty slot held. md resumes an interrupted rebuild itself (after a restart too), so a
 // rebuild target that is gone from the array failed: FAILED, and never re-added on its own.
 func (r *Reconciler) viewRaid(ctx context.Context, pool *store.Pool, rb *dataplane.Array,
-	raids []dataplane.Array, disks []*store.Disk, bdevs map[string]dataplane.Device) raidView {
+	raids []dataplane.Array, disks []*store.Disk, devs map[string]dataplane.Device) raidView {
 	prev := store.PoolMembers(pool)
-	diskByBdev := map[string]*store.Disk{}
+	diskByHandle := map[string]*store.Disk{}
 	diskByID := map[string]*store.Disk{}
 	for _, d := range disks {
 		diskByID[d.ID] = d
 		if d.Handle != "" {
-			diskByBdev[d.Handle] = d
+			diskByHandle[d.Handle] = d
 		}
 	}
 	v := raidView{health: store.HealthStatusOnline}
@@ -67,8 +67,8 @@ func (r *Reconciler) viewRaid(ctx context.Context, pool *store.Pool, rb *datapla
 		switch {
 		case b.Name != "" && (b.Configured || rb.Rebuild != nil && rb.Rebuild.Target == b.Name):
 			// md's rebuild target is in its slot but not in sync, so not Configured, until the
-			// rebuild finishes (SPDK's was).
-			if d := diskByBdev[b.Name]; d != nil {
+			// rebuild finishes.
+			if d := diskByHandle[b.Name]; d != nil {
 				m.DiskID = d.ID
 			}
 			m.State = store.MemberStateActive
@@ -134,8 +134,8 @@ func sameSlots(a, b *store.Pool) bool {
 
 func membersEqual(a, b []store.PoolMember) bool { return slices.Equal(a, b) }
 
-// applySettings re-applies node-wide SPDK settings that differ from what spdk_tgt runs with
-// (it forgets them when it restarts).
+// applySettings re-applies node-wide data-plane settings that differ from what the kernel runs with
+// (it forgets them at a reboot).
 func (r *Reconciler) applySettings(ctx context.Context, p *pass) {
 	st, err := r.store.GetSettings()
 	if err != nil {

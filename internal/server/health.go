@@ -10,7 +10,7 @@ import (
 // authenticated status and velod's log, not something to hand anyone who can reach the port.
 //
 //   GET /healthz  velod is serving requests (liveness: the quadlet's HealthCmd uses it).
-//   GET /readyz   velod can do its job: the database answers and spdk_tgt answers (readiness).
+//   GET /readyz   velod can do its job: the database and the data plane answer (readiness).
 
 func (s *Server) handleHealthz(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")

@@ -22,7 +22,7 @@ func TestUnmanagedObjectsAreReportedNotDeleted(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := e.fake.CreateVolume(e.ctx, pool.ThinPoolName, meta.LvolName, meta.LvolBytes, false); err != nil {
+	if _, err := e.fake.CreateVolume(e.ctx, pool.ThinPoolName, meta.VolumeName, meta.VolumeBytes, false); err != nil {
 		t.Fatal(err)
 	}
 	e.fake.AddDisk("0000:09:00.0")

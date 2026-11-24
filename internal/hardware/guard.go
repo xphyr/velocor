@@ -120,7 +120,7 @@ func (m *Manager) markDisk(sets guardSets, kname string, boot bool) {
 		if boot {
 			sets.bootDevs[disk] = true
 		}
-		// Whole NVMe controllers are unbound to vfio, so protect their PCI address. SATA/SAS
+		// An NVMe drive is known by its PCI address, so protect that. SATA/SAS
 		// HBAs can host both OS and data disks and are never unbound, so their BDF is not marked.
 		if strings.HasPrefix(disk, "nvme") {
 			for _, pci := range m.pciAddressesForDisk(disk) {

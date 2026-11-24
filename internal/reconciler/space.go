@@ -15,14 +15,14 @@ func (r *Reconciler) reconcileSpace(ctx context.Context, p *pass, poolOnline map
 	if err != nil || len(pools) == 0 {
 		return
 	}
-	lvols, err := r.dp.Volumes(ctx)
+	dpVols, err := r.dp.Volumes(ctx)
 	if err != nil {
-		p.errs = append(p.errs, fmt.Sprintf("list lvols: %v", err))
+		p.errs = append(p.errs, fmt.Sprintf("list volumes: %v", err))
 		return
 	}
 	// Bytes each volume and snapshot holds.
-	held := make(map[string]uint64, len(lvols))
-	for _, l := range lvols {
+	held := make(map[string]uint64, len(dpVols))
+	for _, l := range dpVols {
 		held[l.UUID] = l.AllocatedBytes
 	}
 

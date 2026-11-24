@@ -9,7 +9,7 @@ import "velocor/v1/common.proto";
 option go_package = "github.com/velocor/velocor/api/gen/go/velocor/v1;velocorv1";
 
 // DiskDriverState indicates whether a block device is bound to the Linux kernel
-// or claimed by SPDK in user space.
+// or claimed for a pool.
 enum DiskDriverState {
   DISK_DRIVER_STATE_UNSPECIFIED = 0;
   DISK_DRIVER_STATE_KERNEL = 1;
@@ -18,7 +18,7 @@ enum DiskDriverState {
   DISK_DRIVER_STATE_URING_CLAIMED = 4;
 }
 
-// SmartHealth captures NVMe/SSD S.M.A.R.T. telemetry queried via SPDK or sysfs.
+// SmartHealth captures NVMe/SSD S.M.A.R.T. telemetry read with nvme-cli or from sysfs.
 message SmartHealth {
   int32 temperature_celsius = 1;
   uint32 available_spare_percent = 2;
@@ -52,7 +52,7 @@ message Disk {
   bool is_boot_device = 13;
   bool claimed = 14;
   string pool_id = 15;
-  // The disk's handle in the data plane (SPDK bdev name, or the kernel's stable by-id/by-path link).
+  // The disk's handle in the data plane (its stable by-id/by-path link).
   string handle = 16;
   HealthStatus health_status = 17;
   SmartHealth smart = 18;

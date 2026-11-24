@@ -6,8 +6,7 @@ import (
 	"github.com/velocor/velocor/internal/store"
 )
 
-// nvmeWriteCache reads the volatile write cache of the NVMe drives SPDK owns, which the kernel
-// can no longer see, and keeps it off where the policy says so (docs/review-history.md P0-4). Drives can turn
+// nvmeWriteCache reads the volatile write cache of the claimed NVMe drives and keeps it off where the policy says so (docs/review-history.md P0-4). Drives can turn
 // it back on after a power cycle or reset, so it is checked every pass. A refusal is handled
 // like an SSD's (enforceWriteCache): recorded on the disk and tried again only after a restart
 // or a new policy.

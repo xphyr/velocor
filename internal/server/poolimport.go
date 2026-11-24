@@ -48,7 +48,7 @@ type ImportCandidate struct {
 type ImportMember struct {
 	DiskID string `json:"disk_id"`
 	Serial string `json:"serial_number,omitempty"`
-	Slot   *int   `json:"slot,omitempty"` // known for io_uring/AIO disks
+	Slot   *int   `json:"slot,omitempty"` // from the array metadata
 	// Stale: the disk's superblock is older than its array's (it left the array earlier).
 	Stale bool `json:"stale,omitempty"`
 }
@@ -299,12 +299,12 @@ func (s *Server) importPool(ctx context.Context, poolID, rename string, allowDeg
 	}
 
 	// 3. What the thin pool holds.
-	lvols, err := s.dp.Volumes(ctx)
+	dpVols, err := s.dp.Volumes(ctx)
 	if err != nil {
 		return nil, err
 	}
 	inLvs := map[string]dataplane.Volume{} // by name
-	for _, l := range lvols {
+	for _, l := range dpVols {
 		if l.Pool == lvs.UUID {
 			inLvs[l.Name] = l
 		}
@@ -314,7 +314,7 @@ func (s *Server) importPool(ctx context.Context, poolID, rename string, allowDeg
 	res = &ImportResult{Warnings: []string{}}
 	var plan *meta.Manifest
 	metaUUID := ""
-	if l, ok := inLvs[meta.LvolName]; ok {
+	if l, ok := inLvs[meta.VolumeName]; ok {
 		metaUUID = l.UUID
 		if s.metaDev == nil {
 			res.Warnings = append(res.Warnings, "on-pool metadata copies are disabled on this appliance; rebuilt the pool from the data plane")
@@ -351,13 +351,13 @@ func (s *Server) importPool(ctx context.Context, poolID, rename string, allowDeg
 	if err := validateDisplayName("pool", pool.Name); err != nil {
 		return nil, err
 	}
-	diskByBdev := map[string]string{}
+	diskByHandle := map[string]string{}
 	for _, d := range claimed {
-		diskByBdev[d.Handle] = d.ID
+		diskByHandle[d.Handle] = d.ID
 	}
 	pool.DiskIDs, pool.DetachedDiskIDs, pool.Members = nil, nil, nil
 	for _, b := range raid.Members {
-		if id, ok := diskByBdev[b.Name]; ok {
+		if id, ok := diskByHandle[b.Name]; ok {
 			pool.DiskIDs = append(pool.DiskIDs, id)
 		}
 	}
@@ -373,7 +373,7 @@ func (s *Server) importPool(ctx context.Context, poolID, rename string, allowDeg
 	pool.MetaWrittenAt = plan.WrittenAt
 
 	// 6. Check every record before writing any.
-	vols, snaps := s.importableLvols(plan, inLvs, res)
+	vols, snaps := s.importableVolumes(plan, inLvs, res)
 	if err := s.checkImportConflicts(&pool, plan); err != nil {
 		return nil, err
 	}
@@ -394,7 +394,7 @@ func (s *Server) importPool(ctx context.Context, poolID, rename string, allowDeg
 		}
 		_ = s.store.DeletePool(pool.ID)
 	})
-	if err := s.recordLvols(vols, snaps); err != nil {
+	if err := s.recordVolumes(vols, snaps); err != nil {
 		return nil, err
 	}
 	res.Volumes, res.Snapshots = len(vols), len(snaps)
@@ -445,9 +445,9 @@ func (s *Server) importPool(ctx context.Context, poolID, rename string, allowDeg
 	return res, nil
 }
 
-// recordLvols records volumes and snapshots in dependency order: a snapshot after its volume,
+// recordVolumes records volumes and snapshots in dependency order: a snapshot after its volume,
 // a clone after the snapshot it was made from.
-func (s *Server) recordLvols(vols []*store.Volume, snaps []*store.Snapshot) error {
+func (s *Server) recordVolumes(vols []*store.Volume, snaps []*store.Snapshot) error {
 	done := map[string]bool{}
 	for len(done) < len(vols)+len(snaps) {
 		progress := false
@@ -526,8 +526,8 @@ func (s *Server) waitForRaid(ctx context.Context, name string, allowDegraded boo
 	}
 }
 
-// importableLvols returns the plan's volumes and snapshots whose lvols exist, ready to record.
-func (s *Server) importableLvols(plan *meta.Manifest, inLvs map[string]dataplane.Volume, res *ImportResult) ([]*store.Volume, []*store.Snapshot) {
+// importableVolumes returns the plan's volumes and snapshots whose dpVols exist, ready to record.
+func (s *Server) importableVolumes(plan *meta.Manifest, inLvs map[string]dataplane.Volume, res *ImportResult) ([]*store.Volume, []*store.Snapshot) {
 	lvsName := "lvs_" + plan.Pool.ID
 	var vols []*store.Volume
 	present := map[string]bool{}
@@ -694,7 +694,7 @@ func (s *Server) importSkeleton(ctx context.Context, poolID string, inLvs map[st
 	}
 	var vols []dataplane.Volume
 	for name, v := range inLvs {
-		if name != meta.LvolName {
+		if name != meta.VolumeName {
 			vols = append(vols, v)
 		}
 	}

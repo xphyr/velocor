@@ -17,7 +17,7 @@ import (
 type UnmanagedObject = dataplane.UnmanagedObject
 
 // defaultUnmanagedGrace is how long an object must stay unaccounted for before it is
-// reported: the API creates SPDK objects first and records them right after, so a pass can
+// reported: the API creates data-plane objects first and records them right after, so a pass can
 // see one in between.
 const defaultUnmanagedGrace = time.Minute
 
@@ -29,7 +29,7 @@ func (r *Reconciler) SetUnmanagedGrace(d time.Duration) {
 	r.unmanagedGrace = &d
 }
 
-// findUnmanaged lists SPDK's objects and reports those no store record accounts for. Any
+// findUnmanaged lists the data plane's objects and reports those no store record accounts for. Any
 // failed listing skips the check for this pass rather than risk reporting live objects.
 func (r *Reconciler) findUnmanaged(ctx context.Context, p *pass, examined bool) {
 	found, ok := r.scanUnmanaged(ctx, examined)
@@ -92,7 +92,7 @@ func (r *Reconciler) scanUnmanaged(ctx context.Context, examined bool) ([]Unmana
 	}
 	known := dataplane.Known{
 		ThinPools: map[string]bool{}, Devices: map[string]bool{}, Volumes: map[string]bool{},
-		Targets: map[string]bool{}, Skip: map[string]bool{meta.LvolName: true},
+		Targets: map[string]bool{}, Skip: map[string]bool{meta.VolumeName: true},
 	}
 	for _, pl := range pools {
 		known.ThinPools[pl.ThinPoolUUID] = true
@@ -121,7 +121,7 @@ func (r *Reconciler) scanUnmanaged(ctx context.Context, examined bool) ([]Unmana
 	return out, true
 }
 
-// UnmanagedSummary counts a report by kind ("1 LVOL, 2 NVMF_SUBSYSTEM"), or "" if empty.
+// UnmanagedSummary counts a report by kind ("1 LV, 2 NVMET_SUBSYSTEM"), or "" if empty.
 func UnmanagedSummary(objs []UnmanagedObject) string {
 	if len(objs) == 0 {
 		return ""

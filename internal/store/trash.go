@@ -95,7 +95,7 @@ var ErrNotDue = errors.New("retention period not over")
 
 // StartPurge marks a deleted volume as being purged, so it can no longer be restored, and
 // returns it. With due set, only a volume whose retention ended by then qualifies (else
-// ErrNotDue). Callers then delete the lvol and the record (DeleteVolume).
+// ErrNotDue). Callers then delete the volume and the record (DeleteVolume).
 func StartPurge(st Store, id string, due time.Time) (*Volume, error) {
 	return st.MutateVolume(id, func(v *Volume) error {
 		if !v.Deleted() {

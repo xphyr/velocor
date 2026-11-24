@@ -41,8 +41,8 @@ func (b *BlockDevice) helper(ctx context.Context, stdin []byte, args ...string) 
 }
 
 // WriteSlot implements Device.
-func (b *BlockDevice) WriteSlot(ctx context.Context, lvol string, slot int, img []byte) error {
-	dev, err := b.Path(ctx, lvol)
+func (b *BlockDevice) WriteSlot(ctx context.Context, volume string, slot int, img []byte) error {
+	dev, err := b.Path(ctx, volume)
 	if err != nil {
 		return err
 	}
@@ -51,8 +51,8 @@ func (b *BlockDevice) WriteSlot(ctx context.Context, lvol string, slot int, img 
 }
 
 // ReadSlots implements Device.
-func (b *BlockDevice) ReadSlots(ctx context.Context, lvol string) ([][]byte, error) {
-	dev, err := b.Path(ctx, lvol)
+func (b *BlockDevice) ReadSlots(ctx context.Context, volume string) ([][]byte, error) {
+	dev, err := b.Path(ctx, volume)
 	if err != nil {
 		return nil, err
 	}

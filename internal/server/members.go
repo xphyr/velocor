@@ -26,7 +26,7 @@ func redundant(level store.RaidLevel) bool {
 func (s *Server) poolRaid(ctx context.Context, pool *store.Pool) (*dataplane.Array, []dataplane.Array, error) {
 	raids, err := s.dp.Arrays(ctx)
 	if err != nil {
-		return nil, nil, fmt.Errorf("list raid bdevs: %w", err)
+		return nil, nil, fmt.Errorf("list arrays: %w", err)
 	}
 	i := slices.IndexFunc(raids, func(rb dataplane.Array) bool { return rb.Name == pool.ArrayName })
 	if i < 0 {
@@ -35,10 +35,10 @@ func (s *Server) poolRaid(ctx context.Context, pool *store.Pool) (*dataplane.Arr
 	return &raids[i], raids, nil
 }
 
-func memberOf(raids []dataplane.Array, bdev string) string {
+func memberOf(raids []dataplane.Array, handle string) string {
 	for _, rb := range raids {
 		for _, b := range rb.Members {
-			if bdev != "" && b.Name == bdev {
+			if handle != "" && b.Name == handle {
 				return rb.Name
 			}
 		}
@@ -59,7 +59,7 @@ func (s *Server) reconcileNow(ctx context.Context) {
 // Without old_disk_id the first failed or missing slot is filled. Naming a disk that still
 // works (proactive replacement) removes it first, which leaves the pool without redundancy
 // until the rebuild completes: allow_degraded must say so. An unclaimed new disk has any old
-// metadata wiped (so SPDK can't assemble it into an old array) and is claimed.
+// metadata wiped (so it can't be assembled into an old array) and is claimed.
 func (s *Server) handleReplacePoolDisk(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		NewDiskID     string `json:"new_disk_id"`
@@ -105,7 +105,7 @@ func (s *Server) handleReplacePoolDisk(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var slot int
-	removeBdev := ""
+	removeHandle := ""
 	if req.OldDiskID != "" {
 		slot = slices.IndexFunc(members, func(m store.PoolMember) bool { return m.DiskID == req.OldDiskID })
 		if slot < 0 {
@@ -121,7 +121,7 @@ func (s *Server) handleReplacePoolDisk(w http.ResponseWriter, r *http.Request) {
 				writeError(w, fmt.Errorf("%w: disk %s is the pool's only working member", store.ErrInvalidArgument, req.OldDiskID))
 				return
 			}
-			removeBdev = b.Name
+			removeHandle = b.Name
 		}
 	} else {
 		slot = slices.IndexFunc(rb.Members, func(b dataplane.ArrayMember) bool { return b.Name == "" })
@@ -187,8 +187,8 @@ func (s *Server) handleReplacePoolDisk(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if removeBdev != "" {
-		if err := s.dp.RemoveMember(ctx, removeBdev); err != nil {
+	if removeHandle != "" {
+		if err := s.dp.RemoveMember(ctx, removeHandle); err != nil {
 			writeError(w, fmt.Errorf("remove %s from RAID %s: %w", req.OldDiskID, rb.Name, err))
 			return
 		}
@@ -241,7 +241,6 @@ func (s *Server) putBack(w http.ResponseWriter, r *http.Request, pool *store.Poo
 			return
 		}
 	}
-	// SPDK's examine may already have put an attached member back into its slot.
 	if now, err := s.dp.Arrays(ctx); err != nil || memberOf(now, d.Handle) != rb.Name {
 		if err := s.dp.AddMember(ctx, rb.Name, d.Handle); err != nil {
 			writeError(w, fmt.Errorf("add disk %s back to RAID %s: %w", d.ID, rb.Name, err))
@@ -256,7 +255,7 @@ func (s *Server) putBack(w http.ResponseWriter, r *http.Request, pool *store.Poo
 	writeJSON(w, http.StatusAccepted, map[string]any{"pool": pool})
 }
 
-// undoReplace restores a slot after SPDK refused the new disk; the disk stays claimed.
+// undoReplace restores a slot after the array refused the new disk; the disk stays claimed.
 func (s *Server) undoReplace(poolID string, prev store.PoolMember, newDiskID string) {
 	_, _ = s.store.MutatePool(poolID, func(p *store.Pool) error {
 		m := store.PoolMembers(p)
@@ -379,9 +378,8 @@ func (s *Server) handleReleasePoolDisk(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleGetRebuildSettings / handlePutRebuildSettings: GET|PUT /api/v1/system/rebuild
-// {max_mb_per_sec} (0 = unlimited). SPDK applies the limit to every RAID, but only to rebuilds
-// that start after it changes (a running rebuild keeps its rate); the reconciler re-applies it
-// after spdk_tgt restarts.
+// {max_mb_per_sec} (0 = unlimited). md applies the limit to every array, also to a rebuild that
+// is running; the reconciler re-applies it after a reboot.
 func (s *Server) handleGetRebuildSettings(w http.ResponseWriter, _ *http.Request) {
 	st, err := s.store.GetSettings()
 	if err != nil {

@@ -195,9 +195,9 @@ func (s *Server) Handler() http.Handler {
 		}
 		r.Body = http.MaxBytesReader(w, r.Body, limit)
 		if r.Method != http.MethodGet && r.Method != http.MethodHead {
-			// A client that disconnects or times out must not abort a change halfway: SPDK
+			// A client that disconnects or times out must not abort a change halfway: the data plane
 			// finishes what it was asked to do regardless, and a rollback based on a cancelled
-			// call acts on a state it no longer knows. SPDK calls carry their own timeouts.
+			// call acts on a state it no longer knows. Data-plane calls carry their own timeouts.
 			r = r.WithContext(context.WithoutCancel(r.Context()))
 		}
 		s.mux.ServeHTTP(w, r)
@@ -1039,12 +1039,12 @@ func (s *Server) handleTriggerReconcile(w http.ResponseWriter, r *http.Request) 
 }
 
 func (s *Server) handleGetIoStats(w http.ResponseWriter, r *http.Request) {
-	bdevName := r.URL.Query().Get("device")
+	handle := r.URL.Query().Get("device")
 	if s.dp == nil {
 		writeJSON(w, http.StatusOK, map[string]any{"tick_rate": 0, "stats": []any{}})
 		return
 	}
-	res, err := s.dp.IOStats(r.Context(), bdevName)
+	res, err := s.dp.IOStats(r.Context(), handle)
 	if err != nil {
 		writeError(w, err)
 		return

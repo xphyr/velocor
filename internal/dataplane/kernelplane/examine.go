@@ -12,7 +12,7 @@ import (
 
 // ExamineDisks reads each disk's md metadata. Each member's copy names the array (UUID, name)
 // and the member's own slot, and its event count: a member that left the array keeps a lower
-// count than the members still in it. So, unlike SPDK's superblock, a disk that came back
+// count than the members still in it. So a disk that came back
 // under a new ID needs no matching: it says itself which slot it holds.
 func (p *Plane) ExamineDisks(ctx context.Context, disks []*store.Disk) ([]dataplane.DiskArray, error) {
 	type found struct {

@@ -15,7 +15,7 @@ var (
 )
 
 // AddressPresent reports whether ip can be listened on here: one of the appliance's interface
-// addresses, or a wildcard. SPDK refuses a listener on any other address with a bare
+// addresses, or a wildcard. The targets refuse a listener on any other address with a bare
 // "Invalid parameters" and logs four errors per attempt.
 func AddressPresent(ip string) bool {
 	addrMu.RLock()
@@ -47,7 +47,7 @@ func interfaceHasAddress(ip string) bool {
 	}
 	addrs, err := net.InterfaceAddrs()
 	if err != nil {
-		return true // can't tell: let SPDK decide
+		return true // can't tell: let the target decide
 	}
 	for _, a := range addrs {
 		if n, ok := a.(*net.IPNet); ok && n.IP.Equal(want) {

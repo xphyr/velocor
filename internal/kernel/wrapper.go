@@ -126,8 +126,7 @@ func (p *Plane) GroupSnapshot(ctx context.Context, members []GroupMember) error 
 }
 
 // GroupSnapshotWithin is GroupSnapshot with quiesce (if > 0) bounding only the pause: in-flight
-// I/O must drain from every member within it (velod gives it a few seconds, as SPDK patch 0003
-// did), or no snapshot is taken and the error wraps context.DeadlineExceeded. Taking the
+// I/O must drain from every member within it (velod gives it a few seconds), or no snapshot is taken and the error wraps context.DeadlineExceeded. Taking the
 // snapshots afterwards is bounded by ctx alone.
 func (p *Plane) GroupSnapshotWithin(ctx context.Context, members []GroupMember, quiesce time.Duration) error {
 	var suspended []string

@@ -11,15 +11,13 @@ import (
 // Plane is velod's data plane: the claimed disks, the RAID arrays built from them, the thin
 // pools on the arrays, the volumes and snapshots in the pools, and the NVMe-oF and iSCSI
 // targets that export them. velod's API handlers and reconciler reach the data plane only
-// through this interface, so the backend can change without them: SPDK today
-// (internal/dataplane/spdkplane), the kernel stack of md, LVM thin, nvmet and LIO next
-// (docs/design/kernel-dataplane.md, TODO K-2).
+// through this interface: kernelplane, on the kernel's md, LVM thin, nvmet and LIO
+// (docs/design/kernel-dataplane.md), and planetest, an in-memory one for tests.
 //
 // Objects are named by the handles velod keeps in its store records: an array by
 // Pool.ArrayName, a thin pool by Pool.ThinPoolUUID / Pool.ThinPoolName, a volume or snapshot by its
 // UUID (or its "pool/name" alias), a disk by Disk.Handle. The handles are opaque to
-// velod; each backend chooses and interprets them. (The store field names still say SPDK; they
-// are renamed when the kernel backend lands.)
+// velod; the backend chooses and interprets them.
 //
 // Every method is safe for concurrent use. Errors for objects that don't exist satisfy
 // IsNotFound.
@@ -203,7 +201,7 @@ type Array struct {
 	Scrub *Scrub
 	// UnreadableBytes is how much of the array no member can supply: bad blocks recorded on
 	// every copy. Reads (and writes) there fail; the data is lost. 0 where the backend keeps
-	// no bad-block log (SPDK).
+	// no bad-block log.
 	UnreadableBytes uint64
 }
 
@@ -284,7 +282,7 @@ type ThinPool struct {
 	TotalBytes uint64
 	FreeBytes  uint64
 	// MetadataBytes and MetadataUsedBytes are the thin pool's own metadata (the kernel's
-	// dm-thin), finite and worse to fill than the data: 0 where there is none to watch (SPDK).
+	// dm-thin), finite and worse to fill than the data: 0 where there is none to watch.
 	MetadataBytes     uint64
 	MetadataUsedBytes uint64
 }
@@ -348,8 +346,8 @@ type Known struct {
 
 // UnmanagedObject is a data-plane object velod has no record of.
 type UnmanagedObject struct {
-	// Kind is what the backend calls it (LVSTORE, LVOL, RAID, BDEV, NVMF_SUBSYSTEM,
-	// ISCSI_TARGET for SPDK).
+	// Kind is what the backend calls it (MD_ARRAY, VOLUME_GROUP, LV, NVMET_SUBSYSTEM,
+	// ISCSI_TARGET).
 	Kind string `json:"kind"`
 	Name string `json:"name"`
 	UUID string `json:"uuid,omitempty"`

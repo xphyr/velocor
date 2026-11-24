@@ -45,7 +45,7 @@ const (
 	// dataPercent of an array's volume group goes to the thin pool's data; the rest holds the
 	// pool's metadata (and LVM's spare copy), thick volumes and the on-pool metadata copy.
 	dataPercent = 90
-	// maxGroup is the most volumes one group snapshot takes, as with SPDK.
+	// maxGroup is the most volumes one group snapshot takes.
 	maxGroup = 64
 )
 
@@ -72,7 +72,7 @@ type Plane struct {
 	mu sync.Mutex
 	// waiting are arrays Settle found incomplete: md doesn't assemble an array with members
 	// missing (without --run), so the plane keeps what it found until an operator starts it
-	// degraded or the members come back (SPDK's "configuring" RAID).
+	// degraded or the members come back.
 	waiting map[string]kernel.ExaminedArray
 	// handles are the disks' stable links by kernel name, for the kernel plane's InventoryTTL.
 	handles   map[string]string
@@ -145,7 +145,7 @@ func (p *Plane) Endpoint() string { return "kernel (md, LVM thin, nvmet, LIO)" }
 // MaxSnapshotGroup bounds a group snapshot (every member's I/O waits while all are taken).
 func (p *Plane) MaxSnapshotGroup() int { return maxGroup }
 
-// Settle brings up what the claimed disks hold, as SPDK's examine did: the targets' modules,
+// Settle brings up what the claimed disks hold: the targets' modules,
 // every velod array on claimed disks whose members are all present, or all those it still had
 // when it last ran (freshMembers; incomplete ones are kept as waiting), every volume group on them, a wrapper for every volume, and any wrapper a crash
 // left suspended resumed (before anything else). An array with a member on a disk velod hasn't claimed is left alone
@@ -323,7 +323,7 @@ func (p *Plane) volumeGroup(ctx context.Context, name string) (kernel.VG, bool, 
 
 // freshMembers picks the devices whose md metadata is current and says whether every member the
 // newest metadata still counts as active is among them. An array that lost a member while it ran
-// recorded that ("A."), so it comes up degraded again without it, as md and SPDK would; one
+// recorded that ("A."), so it comes up degraded again without it, as md would; one
 // whose member went missing while it was stopped ("AA" but one found) must wait, as the missing
 // copy may be the newer one. A member that left the array has an older event count and takes no
 // part (md itself treats a count one behind as current: an unclean stop can leave that).
@@ -352,7 +352,7 @@ func freshMembers(devs []string, infos map[string]*kernel.MemberInfo) (fresh []s
 	return fresh, need > 0 && active >= need
 }
 
-// metaLV is the on-pool metadata copy's volume (meta.LvolName): velod reads and writes it
+// metaLV is the on-pool metadata copy's volume (meta.VolumeName): velod reads and writes it
 // directly, so it gets no wrapper.
 const metaLV = "velocor-meta"
 
@@ -371,7 +371,7 @@ func kernelName(path string) string {
 var nvmeByPath = regexp.MustCompile(`-nvme-\d+$`)
 
 // diskHandle is the stable link velod keeps for a disk with kernel name kname: the NVMe
-// namespace's by-path link (by PCI address, like SPDK's controller names), else the disk's
+// namespace's by-path link (by PCI address), else the disk's
 // by-id link, a WWN first; /dev/<kname> if there is none.
 func (p *Plane) diskHandle(kname string) string {
 	p.mu.Lock()
@@ -420,7 +420,7 @@ func (p *Plane) dropHandles() {
 	p.handles = nil
 }
 
-// AttachDisk: the disk stays on its kernel driver (an NVMe drive SPDK left on vfio-pci goes
+// AttachDisk: the disk stays on its kernel driver (an NVMe drive a release with SPDK left on vfio-pci goes
 // back to nvme); its handle is its stable link.
 func (p *Plane) AttachDisk(ctx context.Context, d *store.Disk) (string, store.DiskDriverState, error) {
 	if d.IsBootDevice {

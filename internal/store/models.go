@@ -487,7 +487,7 @@ type Pool struct {
 	// LostData is what the unreadable part held, where the data plane worked it out.
 	LostData []LostExtent `json:"lost_data,omitempty"`
 
-	// On-pool metadata copy (P0-3): the velocor-meta lvol and the last manifest written to it.
+	// On-pool metadata copy (P0-3): the velocor-meta volume and the last manifest written to it.
 	// ThinMetadataBytes and ThinMetadataUsedBytes are the thin pool's own metadata (kernel data
 	// plane): finite, and worse to fill than the data.
 	ThinMetadataBytes     uint64       `json:"thin_metadata_bytes,omitempty"`

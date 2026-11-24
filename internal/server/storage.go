@@ -3,13 +3,13 @@ package server
 // Data-plane handlers (disks, pools, volumes, snapshots, exports).
 //
 // Invariants enforced here (see TODO C2-C4):
-//   - SPDK is called first; the store is only updated after SPDK succeeds, and any
-//     partially created SPDK object is rolled back if the store write fails.
-//   - Deletes validate store preconditions, then delete in SPDK (missing objects are
-//     fine), then delete the record, so a failed SPDK delete never leaks an object
+//   - The data plane is called first; the store is only updated after it succeeds, and any
+//     partially created data-plane object is rolled back if the store write fails.
+//   - Deletes validate store preconditions, then delete in the data plane (missing objects are
+//     fine), then delete the record, so a failed delete never leaks an object
 //     that the store has forgotten.
-//   - SPDK object names are derived from resource IDs, never from user-supplied names,
-//     so they are unique across volumes/snapshots and always fit SPDK's limits.
+//   - Data-plane object names are derived from resource IDs, never from user-supplied names,
+//     so they are unique across volumes/snapshots and always fit its limits.
 
 import (
 	"context"
@@ -36,7 +36,7 @@ func (s *Server) requireDataPlane() error {
 	return nil
 }
 
-// validateDisplayName checks user-facing resource names (not used in SPDK identifiers).
+// validateDisplayName checks user-facing resource names (not used in data-plane names).
 func validateDisplayName(kind, name string) error {
 	if name == "" || len(name) > 128 {
 		return fmt.Errorf("%w: %s name must be 1-128 characters", store.ErrInvalidArgument, kind)
@@ -129,7 +129,7 @@ func (s *Server) claimDisk(w http.ResponseWriter, r *http.Request, id string) {
 	writeJSON(w, http.StatusOK, map[string]any{"disk": updated})
 }
 
-// attachAndClaim hands an unclaimed disk to SPDK and records it as claimed; on failure the
+// attachAndClaim hands an unclaimed disk to the data plane and records it as claimed; on failure the
 // disk is returned to the kernel. force skips the existing-data check (never the in-use or
 // boot-disk checks).
 func (s *Server) attachAndClaim(ctx context.Context, d *store.Disk, force bool) (*store.Disk, error) {
@@ -143,7 +143,7 @@ func (s *Server) attachAndClaim(ctx context.Context, d *store.Disk, force bool) 
 			return nil, err
 		}
 	}
-	bdev, drv, err := s.dp.AttachDisk(ctx, d)
+	handle, drv, err := s.dp.AttachDisk(ctx, d)
 	if err != nil {
 		return nil, err
 	}
@@ -152,7 +152,7 @@ func (s *Server) attachAndClaim(ctx context.Context, d *store.Disk, force bool) 
 		// The kernel no longer sees the drive: switch its cache off through the data plane
 		// before anything is written to it.
 		attached := *d
-		attached.Handle = bdev
+		attached.Handle = handle
 		if cacheState, err = s.dp.SetNVMeWriteCache(ctx, &attached, false); err != nil {
 			_ = s.dp.DetachDisk(context.WithoutCancel(ctx), &attached)
 			if s.hw != nil {
@@ -161,13 +161,13 @@ func (s *Server) attachAndClaim(ctx context.Context, d *store.Disk, force bool) 
 			return nil, fmt.Errorf("%w: %v", store.ErrInvalidArgument, err)
 		}
 	}
-	updated, err := s.store.ClaimDisk(d.ID, drv, bdev)
+	updated, err := s.store.ClaimDisk(d.ID, drv, handle)
 	if err == nil && cacheState != store.WriteCacheUnknown {
 		updated, err = s.store.MutateDisk(d.ID, func(cur *store.Disk) error { cur.WriteCache = cacheState; return nil })
 	}
 	if err != nil {
 		attached := *d
-		attached.Handle = bdev
+		attached.Handle = handle
 		_ = s.dp.DetachDisk(context.WithoutCancel(ctx), &attached)
 		if d.Type == store.DiskTypeNVMe && s.hw != nil {
 			_ = s.hw.BindNVMeToKernel(d.PCIAddress)
@@ -251,7 +251,7 @@ func (s *Server) handleCreatePool(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var totalRaw uint64
-	baseBdevs := make([]string, 0, len(req.DiskIDs))
+	members := make([]string, 0, len(req.DiskIDs))
 	for _, diskID := range req.DiskIDs {
 		d, err := s.store.GetDisk(diskID)
 		if err != nil {
@@ -263,7 +263,7 @@ func (s *Server) handleCreatePool(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		totalRaw += d.SizeBytes
-		baseBdevs = append(baseBdevs, d.Handle)
+		members = append(members, d.Handle)
 	}
 
 	id := newResourceID("pool")
@@ -280,7 +280,7 @@ func (s *Server) handleCreatePool(w http.ResponseWriter, r *http.Request) {
 		FreeBytes:    totalRaw,
 		FilterPolicy: req.FilterPolicy,
 		SpacePolicy:  req.SpacePolicy,
-		// The reconciler leaves RECONCILING pools without an lvstore UUID alone.
+		// The reconciler leaves RECONCILING pools without a thin pool UUID alone.
 		HealthStatus:  store.HealthStatusReconciling,
 		StatusMessage: "creating",
 	}
@@ -306,7 +306,7 @@ func (s *Server) handleCreatePool(w http.ResponseWriter, r *http.Request) {
 		_ = s.store.DeletePool(pool.ID)
 		writeError(w, err)
 	}
-	if err := s.dp.CreateArray(ctx, pool.ArrayName, pool.RaidLevel, pool.StripSizeKB, baseBdevs); err != nil {
+	if err := s.dp.CreateArray(ctx, pool.ArrayName, pool.RaidLevel, pool.StripSizeKB, members); err != nil {
 		fail(false, fmt.Errorf("create the array: %w", err))
 		return
 	}
@@ -615,14 +615,14 @@ func (s *Server) handleCreateSnapshot(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, map[string]any{"snapshot": snap})
 }
 
-// takeSnapshot creates the SPDK snapshot lvol (named after the new snapshot ID) and
+// takeSnapshot creates the snapshot (named after the new snapshot ID) and
 // returns an unsaved Snapshot record for it.
 //
 // The snapshot takes over the clusters the volume holds, which then count as committed space:
 // the space is reserved first, and release must be called once the snapshot is in the store
 // (or was rolled back).
 func (s *Server) takeSnapshot(ctx context.Context, vol *store.Volume, pool *store.Pool, name string) (*store.Snapshot, func(), error) {
-	held, err := s.lvolHeldBytes(ctx, vol.UUID)
+	held, err := s.volumeHeldBytes(ctx, vol.UUID)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -945,7 +945,7 @@ func (s *Server) handleCreateVolumeGroupSnapshot(w http.ResponseWriter, r *http.
 	snaps := make([]*store.Snapshot, 0, len(targets))
 	entries := make([]dataplane.GroupEntry, 0, len(targets))
 	for _, t := range targets {
-		held, err := s.lvolHeldBytes(ctx, t.vol.UUID)
+		held, err := s.volumeHeldBytes(ctx, t.vol.UUID)
 		if err != nil {
 			writeError(w, err)
 			return
@@ -971,7 +971,7 @@ func (s *Server) handleCreateVolumeGroupSnapshot(w http.ResponseWriter, r *http.
 
 	// The data plane pauses I/O to every member (hosts' writes wait, nothing fails), snapshots
 	// them all at that instant and resumes I/O, so the snapshots are consistent with each other
-	// whether or not hosts are writing (docs/review-history.md P1-15, SPDK patch 0003).
+	// whether or not hosts are writing (docs/review-history.md P1-15).
 	uuids, err := s.dp.SnapshotGroup(ctx, entries, groupSnapshotQuiesceTimeout)
 	if err != nil {
 		// It may stop at the first failed snapshot and leave earlier ones; remove them.

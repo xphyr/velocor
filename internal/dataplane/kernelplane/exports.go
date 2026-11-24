@@ -15,7 +15,7 @@ import (
 
 // ApplyExport exports the volume's wrapper: an nvmet subsystem with its allowed hosts and a
 // listener per portal, or a LIO target with an ACL per initiator and a network portal per
-// portal. Portals whose address isn't on this host are skipped and reported, as with SPDK.
+// portal. Portals whose address isn't on this host are skipped and reported.
 func (p *Plane) ApplyExport(ctx context.Context, exp *store.Export, vol *store.Volume, acl dataplane.ACL, portals []*store.Portal) error {
 	if err := p.k.LoadTargetModules(ctx); err != nil {
 		return fmt.Errorf("load target modules: %w", err)

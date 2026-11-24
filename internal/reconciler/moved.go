@@ -68,7 +68,7 @@ func (r *Reconciler) relinkMovedMembers(ctx context.Context, p *pass, discovered
 		}
 		if raids == nil {
 			if raids, err = r.dp.Arrays(ctx); err != nil {
-				p.errs = append(p.errs, fmt.Sprintf("list raid bdevs: %v", err))
+				p.errs = append(p.errs, fmt.Sprintf("list arrays: %v", err))
 				return false
 			}
 		}

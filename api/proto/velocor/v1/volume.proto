@@ -9,7 +9,7 @@ import "velocor/v1/common.proto";
 option go_package = "github.com/velocor/velocor/api/gen/go/velocor/v1;velocorv1";
 
 // AttachmentState enforces exclusive ownership of a Volume between SAN exports
-// and local NAS filesystem attachment (SPDK ublk).
+// and local NAS filesystem attachment (not implemented).
 enum AttachmentState {
   ATTACHMENT_STATE_UNSPECIFIED = 0;
   ATTACHMENT_STATE_UNATTACHED = 1;
@@ -17,7 +17,7 @@ enum AttachmentState {
   ATTACHMENT_STATE_FILESYSTEM = 3;
 }
 
-// QosPolicy configures SPDK bdev rate limits (IOPS and bandwidth).
+// QosPolicy holds rate limits (IOPS and bandwidth); not supported by the data plane.
 message QosPolicy {
   uint64 rw_ios_per_sec = 1;
   uint64 rw_mbytes_per_sec = 2;
@@ -25,7 +25,7 @@ message QosPolicy {
   uint64 w_mbytes_per_sec = 4;
 }
 
-// Volume represents a logical volume (SPDK bdev_lvol) inside a Pool.
+// Volume represents a logical volume (an LVM thin volume) inside a Pool.
 message Volume {
   string id = 1;
   string name = 2;
@@ -48,7 +48,7 @@ message Volume {
   google.protobuf.Timestamp created_at = 17;
 }
 
-// Snapshot represents an immutable point-in-time SPDK bdev_lvol_snapshot.
+// Snapshot represents an immutable point-in-time thin snapshot.
 message Snapshot {
   string id = 1;
   string name = 2;

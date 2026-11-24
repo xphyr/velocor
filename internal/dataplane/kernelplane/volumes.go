@@ -216,7 +216,7 @@ func (p *Plane) CreateVolume(ctx context.Context, pool, name string, sizeBytes u
 	}
 	if !thin {
 		// A thick LV gets whatever its extents held: a deleted volume's data, or (seen on the lab
-		// VM) an earlier pool's metadata copy. Zero it, as SPDK's thick volumes read zeros; the
+		// VM) an earlier pool's metadata copy. Zero it; the
 		// thin pool zeroes new chunks itself.
 		if _, err := p.k.Run.Run(ctx, "blkdiscard", "--zeroout", p.k.LVPath(pool, name)); err != nil {
 			_ = p.k.RemoveVolume(context.WithoutCancel(ctx), pool, name)

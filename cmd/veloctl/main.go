@@ -568,7 +568,7 @@ func runSystem(cfg *cliConfig, args []string) error {
 			return printJSON(resp)
 		}
 		tw := newTabWriter()
-		fmt.Fprintln(tw, "BDEV\tREAD OPS\tWRITE OPS\tBYTES READ\tBYTES WRITTEN")
+		fmt.Fprintln(tw, "DEVICE\tREAD OPS\tWRITE OPS\tBYTES READ\tBYTES WRITTEN")
 		for _, item := range sliceOfMaps(resp["stats"]) {
 			fmt.Fprintf(tw, "%v\t%v\t%v\t%v\t%v\n",
 				item["name"], item["num_read_ops"], item["num_write_ops"], item["bytes_read"], item["bytes_written"])

@@ -89,7 +89,7 @@ func (p *Plane) arrayOf(name string, st *kernel.ArrayStatus) dataplane.Array {
 }
 
 // waitingArray describes an incomplete array from its members' metadata, members in their
-// slots and the missing ones empty, like SPDK's configuring RAID.
+// slots and the missing ones empty.
 func (p *Plane) waitingArray(ctx context.Context, e kernel.ExaminedArray) dataplane.Array {
 	a := dataplane.Array{
 		Name: e.Name, UUID: e.UUID, State: dataplane.ArrayConfiguring, Level: e.Level,

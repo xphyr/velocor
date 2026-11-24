@@ -1,6 +1,6 @@
 // Package dataplane is velod's interface to the data plane (Plane) and the backend-neutral
 // logic around it: resolving export ACLs and converging exports, portal addresses, and
-// matching moved disks to pool members. The SPDK backend is in spdkplane.
+// matching moved disks to pool members. The backend is kernelplane; planetest has one for tests.
 //
 // The export functions here are idempotent and convergent: through the Plane they inspect the
 // live state, create what is missing, repair what has drifted and return an error (never
@@ -207,7 +207,7 @@ func CheckACL(exp *store.Export, acl ACL) error {
 	return nil
 }
 
-// AddressFamily returns the SPDK adrfam ("IPv4" / "IPv6") for an IP literal.
+// AddressFamily returns the NVMe address family ("IPv4" / "IPv6") for an IP literal.
 func AddressFamily(ip string) string {
 	if parsed := net.ParseIP(strings.Trim(ip, "[]")); parsed != nil && parsed.To4() == nil {
 		return "IPv6"
@@ -320,7 +320,7 @@ func RemoveExport(ctx context.Context, p Plane, exp *store.Export) error {
 }
 
 // MaxNameLen is the longest export name: it is embedded in NQNs, IQNs and data-plane object
-// names, and SPDK caps those at 63 characters.
+// names.
 const MaxNameLen = 63
 
 // ValidateObjectName checks that name is safe to embed in NQNs, IQNs and data-plane object
