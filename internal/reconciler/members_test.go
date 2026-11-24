@@ -89,43 +89,6 @@ func TestRebuildProgressAndCompletion(t *testing.T) {
 	}
 }
 
-func TestInterruptedRebuildIsRestarted(t *testing.T) {
-	e := newEnv(t)
-	pool, _ := e.provision(store.RaidLevel1, "0000:01:00.0", "0000:02:00.0")
-	e.fake.FailMedia("0000:02:00.0")
-	e.reconcile()
-	spare := e.spareDisk("disk-c", "0000:03:00.0")
-	if _, err := e.st.ReplacePoolMember(pool.ID, 1, spare.ID); err != nil {
-		t.Fatal(err)
-	}
-	if err := e.fake.Client().BdevRaidAddBaseBdev(e.ctx, pool.ArrayName, spare.Handle); err != nil {
-		t.Fatal(err)
-	}
-	e.fake.SetRebuildProgress(pool.ArrayName, 60)
-	e.reconcile()
-
-	// spdk_tgt restarts mid-rebuild: the array comes back degraded without the target.
-	e.fake.Restart()
-	e.reconcile() // re-attaches the disks, SPDK re-assembles the array, the target is re-added
-	p := e.pool()
-	if p.HealthStatus != store.HealthStatusRebuilding || p.Members[1].State != store.MemberStateRebuilding ||
-		!strings.Contains(p.StatusMessage, "restarted") {
-		t.Fatalf("after restart: %s %q %+v, want the rebuild restarted", p.HealthStatus, p.StatusMessage, p.Members)
-	}
-	e.reconcile()
-	if p = e.pool(); p.Members[1].State != store.MemberStateRebuilding {
-		t.Fatalf("next pass: %+v, want still rebuilding", p.Members)
-	}
-	if n := e.fake.CallCount("bdev_raid_add_base_bdev"); n != 2 {
-		t.Fatalf("bdev_raid_add_base_bdev called %d times, want 2 (replace + restart)", n)
-	}
-	e.fake.SetRebuildProgress(pool.ArrayName, 100)
-	e.reconcile()
-	if p = e.pool(); p.HealthStatus != store.HealthStatusOnline {
-		t.Fatalf("after the restarted rebuild: %s %q", p.HealthStatus, p.StatusMessage)
-	}
-}
-
 // A member whose bdev disappears while its drive is still there (an I/O error took it out,
 // a transient disconnect) must not be re-attached: SPDK would re-add it and rebuild onto a
 // disk that just failed. It stays out until an operator acts.

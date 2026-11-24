@@ -38,9 +38,9 @@ func diskLabel(id string) string {
 }
 
 // viewRaid derives a pool's member states and health from SPDK's view of its RAID bdev.
-// SPDK is the source of truth for slot membership; the store supplies which disk a now-empty
-// slot held. An online array whose rebuild target dropped out (e.g. spdk_tgt restarted
-// mid-rebuild, which records nothing) gets the disk re-added, restarting the rebuild.
+// The data plane is the source of truth for slot membership; the store supplies which disk a
+// now-empty slot held. md resumes an interrupted rebuild itself (after a restart too), so a
+// rebuild target that is gone from the array failed: FAILED, and never re-added on its own.
 func (r *Reconciler) viewRaid(ctx context.Context, pool *store.Pool, rb *dataplane.Array,
 	raids []dataplane.Array, disks []*store.Disk, bdevs map[string]dataplane.Device) raidView {
 	prev := store.PoolMembers(pool)
@@ -62,7 +62,9 @@ func (r *Reconciler) viewRaid(ctx context.Context, pool *store.Pool, rb *datapla
 			m.DiskID = prev[i].DiskID
 		}
 		switch {
-		case b.Name != "" && b.Configured:
+		case b.Name != "" && (b.Configured || rb.Rebuild != nil && rb.Rebuild.Target == b.Name):
+			// md's rebuild target is in its slot but not in sync, so not Configured, until the
+			// rebuild finishes (SPDK's was).
 			if d := diskByBdev[b.Name]; d != nil {
 				m.DiskID = d.ID
 			}
@@ -71,22 +73,6 @@ func (r *Reconciler) viewRaid(ctx context.Context, pool *store.Pool, rb *datapla
 			if rb.Rebuild != nil && rb.Rebuild.Target == b.Name {
 				m.State, m.RebuildPercent = store.MemberStateRebuilding, rb.Rebuild.Percent
 			}
-		case v.online && i < len(prev) && prev[i].State == store.MemberStateRebuilding && rb.Rebuild == nil:
-			// The rebuild target isn't in the array any more and nothing is rebuilding: the
-			// rebuild was interrupted (restart) or its disk failed. Re-add it if it's here.
-			m.State = store.MemberStateFailed
-			d := diskByID[m.DiskID]
-			if _, present := bdevs[bdevName(d)]; d == nil || !present || inRaid(raids, d.Handle) {
-				break
-			}
-			if err := r.dp.AddMember(ctx, rb.Name, d.Handle); err != nil {
-				v.reasons = append(v.reasons, fmt.Sprintf("restarting the rebuild of %s failed: %v", diskLabel(d.ID), err))
-				break
-			}
-			m.State = store.MemberStateRebuilding
-			msg := fmt.Sprintf("rebuild of %s restarted from the beginning (it was interrupted)", diskLabel(d.ID))
-			v.reasons = append(v.reasons, msg)
-			r.logger.Warn(msg, "pool", pool.ID, "raid", rb.Name)
 		case !v.online && b.UUID != "":
 			m.State = store.MemberStateMissing // awaited by a configuring array
 		case i < len(prev) && prev[i].State == store.MemberStateMissing:
@@ -128,13 +114,6 @@ func (r *Reconciler) viewRaid(ctx context.Context, pool *store.Pool, rb *datapla
 			rb.Name, strings.Join(empty, ", ")))
 	}
 	return v
-}
-
-func bdevName(d *store.Disk) string {
-	if d == nil {
-		return ""
-	}
-	return d.Handle
 }
 
 func membersEqual(a, b []store.PoolMember) bool { return slices.Equal(a, b) }
