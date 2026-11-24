@@ -464,6 +464,7 @@ func (r *Reconciler) reconcilePools(ctx context.Context, p *pass, examined bool)
 		ri := slices.IndexFunc(raids, func(rb dataplane.Array) bool { return rb.Name == pool.ArrayName })
 		raidOnline := false
 		members := store.PoolMembers(pool)
+		var unreadable uint64
 		if ri >= 0 {
 			v := r.viewRaid(ctx, pool, &raids[ri], raids, disks, bdevs)
 			raidOnline, members = v.online, v.members
@@ -473,6 +474,8 @@ func (r *Reconciler) reconcilePools(ctx context.Context, p *pass, examined bool)
 			if v.health != store.HealthStatusOnline && len(v.reasons) == 0 {
 				fail(v.health, "RAID "+pool.ArrayName+" is "+string(v.health))
 			}
+			unreadable = raids[ri].UnreadableBytes
+			badBlocks(pool, members, unreadable, fail, p)
 		} else {
 			fail(store.HealthStatusUnavailable, fmt.Sprintf("array %s isn't assembled (%d/%d member disks present)",
 				pool.ArrayName, r.presentMembers(pool, bdevs), len(pool.DiskIDs)))
@@ -517,6 +520,10 @@ func (r *Reconciler) reconcilePools(ctx context.Context, p *pass, examined bool)
 		_, err := r.store.MutatePool(pool.ID, func(cur *store.Pool) error {
 			changed := cur.HealthStatus != health || cur.StatusMessage != msg || cur.Durability != durability
 			cur.Durability = durability
+			if ri >= 0 && cur.UnreadableBytes != unreadable {
+				changed = true
+				cur.UnreadableBytes = unreadable
+			}
 			if !membersEqual(store.PoolMembers(cur), members) || len(cur.Members) == 0 {
 				changed = true
 				store.SetPoolMembers(cur, members)
@@ -544,6 +551,26 @@ func (r *Reconciler) reconcilePools(ctx context.Context, p *pass, examined bool)
 		}
 	}
 	return online
+}
+
+// badBlocks reports the bad blocks the data plane recorded on a pool's members (md's bad-block
+// log: ranges a member couldn't read and couldn't rewrite from another copy). Where every copy
+// has them the data is lost and the pool is DEGRADED, until the data is written again (md
+// clears a range on a member that takes the write: restoring the volume does); where only some
+// do, the pool has a copy fewer there: a note, as replacing the disk restores it.
+func badBlocks(pool *store.Pool, members []store.PoolMember, unreadable uint64, fail func(store.HealthStatus, string), p *pass) {
+	if unreadable > 0 {
+		fail(store.HealthStatusDegraded, fmt.Sprintf("%s of the pool can't be read from any disk (bad blocks recorded on every copy): "+
+			"the data there is lost, and reading it fails until it is written again: restore the affected volumes from backups",
+			store.HumanBytes(unreadable)))
+		return
+	}
+	for _, m := range members {
+		if m.BadBlockBytes > 0 && m.State == store.MemberStateActive {
+			p.notePool(pool.ID, fmt.Sprintf("%s has %s of bad blocks recorded (read from the other copy instead): replace it to restore full redundancy there",
+				diskLabel(m.DiskID), store.HumanBytes(m.BadBlockBytes)))
+		}
+	}
 }
 
 // thinMetadataDegradedPercent: a pool whose thin metadata is this full is DEGRADED (growing it

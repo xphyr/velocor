@@ -293,6 +293,18 @@ the unreadable sector fails only that read with EIO, the array stays active, and
 block again heals it. (It does not record the sector in the bad-block log in that case, contrary
 to what this note first assumed.)
 
+K-3 (2026-11-23) found where it does: when md can't rewrite the sector either (a resync, a
+rebuild, or a read error it tries to fix), it records the range in the member's bad-block log,
+and from then on reads there come from another copy. A rebuild whose only source has a bad
+range finishes, and records the range on the new member as well: that data is lost, and reads
+of it fail. Writing it again clears the range on a member that takes the write (seen on the lab
+VM: the new disk's entry went, the faulty one's stayed), so restoring the data heals it there. velod reports both (internal/dataplane/kernelplane/badblocks.go):
+each member's recorded bad blocks (`bad_block_bytes`; a note on the pool, and the
+`VelocorPoolMemberBadBlocks` warning: a copy fewer there until the disk is replaced), and how
+much of the array no in-sync member can supply (`unreadable_bytes`, worked out per level:
+every copy for RAID1, the pair holding the chunk for near-2 RAID10, any for RAID0): the pool is
+DEGRADED and `VelocorPoolDataUnreadable` fires.
+
 ## 6. What we give up or must decide
 
 - **Deep random-write IOPS on a mirror:** about 28% lower than SPDK RAID1 at queue depth 64 on

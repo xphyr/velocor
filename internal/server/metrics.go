@@ -244,10 +244,16 @@ func poolMetrics(m *metricSet, pools []*store.Pool, vols []*store.Volume) {
 				m.gauge("velocor_pool_member_rebuild_ratio", hRebuild, float64(mb.RebuildPercent)/100,
 					"pool", p.Name, "slot", strconv.Itoa(mb.Slot), "disk", mb.DiskID)
 			}
+			if mb.DiskID != "" && mb.State == store.MemberStateActive {
+				m.gauge("velocor_pool_member_bad_block_bytes", "Bad blocks recorded on a pool member (kernel data plane: md's bad-block log): ranges it couldn't read or rewrite, served from another copy if there is one.",
+					float64(mb.BadBlockBytes), "pool", p.Name, "slot", strconv.Itoa(mb.Slot), "disk", mb.DiskID)
+			}
 		}
 		for _, st := range []store.MemberState{store.MemberStateActive, store.MemberStateRebuilding, store.MemberStateFailed, store.MemberStateMissing} {
 			m.gauge("velocor_pool_members", hMembers, float64(states[st]), "pool", p.Name, "state", string(st))
 		}
+		m.gauge("velocor_pool_unreadable_bytes", "How much of a pool no disk can supply: bad blocks recorded on every copy. The data there is lost.",
+			float64(p.UnreadableBytes), l...)
 		m.gauge("velocor_pool_metadata_copy_failed", hMetaFail, b2f(p.MetaError != ""), l...)
 		if !p.MetaWrittenAt.IsZero() {
 			m.gauge("velocor_pool_metadata_copy_timestamp_seconds", hMetaAt, unixSeconds(p.MetaWrittenAt), l...)

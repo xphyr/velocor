@@ -849,14 +849,21 @@ func runPool(cfg *cliConfig, args []string) error {
 			humanBytes(uint64FromAny(p["committed_bytes"])), humanBytes(uint64FromAny(p["available_bytes"])))
 		fmt.Printf("Policy:  overcommit up to %vx, reserve %v%%, warning at %v%%, critical at %v%% (unset = default)\n",
 			orDefault(sp["max_overcommit"], 1.0), orDefault(sp["reserve_percent"], 5.0), orDefault(sp["warning_percent"], 80.0), orDefault(sp["critical_percent"], 90.0))
+		if n := uint64FromAny(p["unreadable_bytes"]); n > 0 {
+			fmt.Printf("Lost:    %s can't be read from any disk (bad blocks on every copy)\n", humanBytes(n))
+		}
 		tw := newTabWriter()
-		fmt.Fprintln(tw, "\nSLOT\tDISK\tSTATE\tREBUILD")
+		fmt.Fprintln(tw, "\nSLOT\tDISK\tSTATE\tREBUILD\tBAD BLOCKS")
 		for _, m := range sliceOfMaps(p["members"]) {
 			rebuild := ""
 			if m["state"] == "REBUILDING" {
 				rebuild = fmt.Sprintf("%d%%", uint64FromAny(m["rebuild_percent"]))
 			}
-			fmt.Fprintf(tw, "%v\t%v\t%v\t%v\n", uint64FromAny(m["slot"]), strOrDash(m["disk_id"]), m["state"], rebuild)
+			bad := ""
+			if n := uint64FromAny(m["bad_block_bytes"]); n > 0 {
+				bad = humanBytes(n)
+			}
+			fmt.Fprintf(tw, "%v\t%v\t%v\t%v\t%v\n", uint64FromAny(m["slot"]), strOrDash(m["disk_id"]), m["state"], rebuild, bad)
 		}
 		if err := tw.Flush(); err != nil {
 			return err

@@ -144,10 +144,15 @@ listed until then so nothing is lost if the plan changes.
       take ~4.5 ms against 157 µs for a plain write (measured on the appliance), while a cache
       flush there is cheap. A property of the lab disks, not of the stack; to check on real SSDs.
   Found, to do:
-    - [ ] md's bad-block log isn't reported: after the P0-7 rebuild the pool is ONLINE although
-      1 MiB is unreadable on every copy. `kernel.MemberState.BadBlocks` is read but unused: a
-      pool with bad blocks recorded should say so (status message, metric, alert), and DEGRADED
-      while a range is bad on every member.
+    - [x] md's bad-block log reported (**done 2026-11-24**): each member's recorded bad blocks
+      (`bad_block_bytes`, a note on the pool, `velocor_pool_member_bad_block_bytes`, the
+      `VelocorPoolMemberBadBlocks` warning) and how much no in-sync copy can supply
+      (`unreadable_bytes`, worked out for RAID1, RAID0 and near-2 RAID10: the pool DEGRADED,
+      `velocor_pool_unreadable_bytes`, `VelocorPoolDataUnreadable` critical); UI and `veloctl
+      pool show`. K-2 VM: the bad sector noted while the other copy exists, lost (DEGRADED)
+      without it and after the rebuild, and back to a note once the range was written again
+      (md clears it on a member that takes the write). Which volumes the lost range belongs to
+      isn't worked out yet (thin_dump of a metadata snapshot, mapped through the LV segments).
     - [ ] Deep-queue throughput: profile the appliance during the IOPS jobs (nvmet/LIO threads,
       dm-thin, md) before tuning.
     - [ ] Soak.

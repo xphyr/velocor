@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 )
@@ -148,15 +149,35 @@ type ArrayStatus struct {
 	SyncDone       uint64 // sectors done of SyncTotal while SyncAction isn't idle
 	SyncTotal      uint64
 	MismatchCnt    uint64 // sectors found different by the last check/repair
+	ChunkSectors   uint64 // chunk size of a striped level (raid0, raid10), in sectors
+	Layout         int    // raid10: md's layout number (0x102: near-2)
 	Members        []MemberStatus
+}
+
+// SectorRange is a range of 512-byte sectors.
+type SectorRange struct {
+	Start, Sectors uint64
 }
 
 // MemberStatus is one member device's state.
 type MemberStatus struct {
-	Device    string   // kernel name: loop0, sdb, dm-3
-	Slot      int      // -1 when not in a slot (spare, faulty)
-	State     []string // in_sync, faulty, blocked, spare, write_mostly, want_replacement, ...
-	BadBlocks int      // entries in the bad-block log
+	Device string   // kernel name: loop0, sdb, dm-3
+	Slot   int      // -1 when not in a slot (spare, faulty)
+	State  []string // in_sync, faulty, blocked, spare, write_mostly, want_replacement, ...
+	// BadBlocks is md's bad-block log for the member: ranges it couldn't read and couldn't
+	// rewrite. md fails reads there (and doesn't write there) and serves them from another
+	// copy if one has them. Relative to the member's data, as Offset is subtracted.
+	BadBlocks []SectorRange
+	Offset    uint64 // where the member's data starts on the device (sectors)
+}
+
+// BadSectors is the total size of the member's bad blocks, in sectors.
+func (m MemberStatus) BadSectors() uint64 {
+	var n uint64
+	for _, r := range m.BadBlocks {
+		n += r.Sectors
+	}
+	return n
 }
 
 // Has reports whether the member's state has flag.
@@ -192,6 +213,10 @@ func (p *Plane) ArrayStatus(name string) (*ArrayStatus, error) {
 	st.RaidDisks, _ = strconv.Atoi(rd("raid_disks"))
 	st.Degraded, _ = strconv.Atoi(rd("degraded"))
 	st.MismatchCnt, _ = strconv.ParseUint(rd("mismatch_cnt"), 10, 64)
+	if b, err := strconv.ParseUint(rd("chunk_size"), 10, 64); err == nil {
+		st.ChunkSectors = b / 512
+	}
+	st.Layout, _ = strconv.Atoi(rd("layout"))
 	if done, total, ok := strings.Cut(rd("sync_completed"), "/"); ok {
 		st.SyncDone, _ = strconv.ParseUint(strings.TrimSpace(done), 10, 64)
 		st.SyncTotal, _ = strconv.ParseUint(strings.TrimSpace(total), 10, 64)
@@ -207,15 +232,47 @@ func (p *Plane) ArrayStatus(name string) (*ArrayStatus, error) {
 		if n, err := strconv.Atoi(strings.TrimSpace(string(b))); err == nil {
 			m.Slot = n
 		}
-		b, _ = os.ReadFile(filepath.Join(d, "bad_blocks"))
-		for _, l := range strings.Split(string(b), "\n") {
-			if strings.TrimSpace(l) != "" {
-				m.BadBlocks++
-			}
+		b, _ = os.ReadFile(filepath.Join(d, "offset"))
+		m.Offset, _ = strconv.ParseUint(strings.TrimSpace(string(b)), 10, 64)
+		// md records a bad block at once (unacknowledged) and in the superblock's log after.
+		var log string
+		for _, f := range []string{"bad_blocks", "unacknowledged_bad_blocks"} {
+			b, _ = os.ReadFile(filepath.Join(d, f))
+			log += string(b) + "\n"
 		}
+		m.BadBlocks = parseBadBlocks(log, m.Offset)
 		st.Members = append(st.Members, m)
 	}
 	return st, nil
+}
+
+// parseBadBlocks parses md's bad_blocks file ("<sector> <length>" a line, sectors on the
+// device) into ranges relative to the member's data, which starts at offset.
+func parseBadBlocks(s string, offset uint64) []SectorRange {
+	var out []SectorRange
+	for _, l := range strings.Split(s, "\n") {
+		f := strings.Fields(l)
+		if len(f) != 2 {
+			continue
+		}
+		start, err1 := strconv.ParseUint(f[0], 10, 64)
+		n, err2 := strconv.ParseUint(f[1], 10, 64)
+		if err1 != nil || err2 != nil || n == 0 {
+			continue
+		}
+		if start < offset { // in the metadata area, before the data: holds no copy of anything
+			if start+n <= offset {
+				continue
+			}
+			n -= offset - start
+			start = offset
+		}
+		r := SectorRange{start - offset, n}
+		if !slices.Contains(out, r) {
+			out = append(out, r)
+		}
+	}
+	return out
 }
 
 // arrayKernelName resolves DevRoot/md/<name> to the kernel's md device (md127).

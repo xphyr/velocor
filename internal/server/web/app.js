@@ -585,7 +585,9 @@ const MEMBER_KIND = { ACTIVE: "ok", REBUILDING: "warn", FAILED: "bad", MISSING: 
 
 function memberState(m) {
   const state = pill(m.state.toLowerCase(), MEMBER_KIND[m.state]);
-  if (m.state !== "REBUILDING") return state;
+  // md's bad-block log: ranges this disk couldn't read or rewrite, read from another copy since.
+  const bad = m.bad_block_bytes > 0 && el("span", { class: "sub" }, `${humanSize(m.bad_block_bytes)} of bad blocks recorded`);
+  if (m.state !== "REBUILDING") return bad ? [state, bad] : state;
   const pct = Math.min(m.rebuild_percent || 0, 100);
   const fill = el("div");
   fill.style.width = pct + "%";
@@ -734,6 +736,8 @@ async function pool(id) {
       volumes.length > 0 && can.admin && el("span", { class: "muted" }, "It can't be deleted while it has volumes.")),
     el("dl", { class: "facts" },
       fact("Health", health(p)),
+      p.unreadable_bytes > 0 && fact("Lost data", [pill(humanSize(p.unreadable_bytes), "bad"), el("span", { class: "sub" },
+        "Bad blocks are recorded on every copy of this much of the pool: reading it fails until it is written again. Restore the affected volumes from backups.")]),
       fact("Space", [spacePill(p), poolBar(p), SPACE_HINT[p.space_state] && el("span", { class: "sub" }, SPACE_HINT[p.space_state])]),
       fact("Committed", [`${humanSize(p.committed_bytes || 0)} promised`, el("span", { class: "sub" },
         `${humanSize(p.available_bytes || 0)} more accepted. Committed counts every volume as if fully written, plus what snapshots hold.`)]),

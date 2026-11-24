@@ -67,6 +67,7 @@ func (r *Reconciler) viewRaid(ctx context.Context, pool *store.Pool, rb *datapla
 				m.DiskID = d.ID
 			}
 			m.State = store.MemberStateActive
+			m.BadBlockBytes = b.BadBlockBytes
 			if rb.Rebuild != nil && rb.Rebuild.Target == b.Name {
 				m.State, m.RebuildPercent = store.MemberStateRebuilding, rb.Rebuild.Percent
 			}

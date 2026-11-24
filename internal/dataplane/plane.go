@@ -208,6 +208,10 @@ type Array struct {
 	Rebuild *Rebuild
 	// Scrub is the running or last scrub since the array was assembled.
 	Scrub *Scrub
+	// UnreadableBytes is how much of the array no member can supply: bad blocks recorded on
+	// every copy. Reads (and writes) there fail; the data is lost. 0 where the backend keeps
+	// no bad-block log (SPDK).
+	UnreadableBytes uint64
 }
 
 // ArrayMember is one slot of an array.
@@ -215,6 +219,9 @@ type ArrayMember struct {
 	Name       string // the disk's handle
 	UUID       string // the member's identity in the array metadata
 	Configured bool   // in sync and in use
+	// BadBlockBytes is the size of the member's bad blocks: ranges it couldn't read or
+	// rewrite, which the array serves from another copy, if any, from then on.
+	BadBlockBytes uint64
 }
 
 // Rebuild is an array rebuilding onto a member (or another background process the backend
