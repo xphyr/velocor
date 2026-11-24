@@ -13,7 +13,8 @@ storage="$(podman info --format '{{.Store.GraphRoot}}' 2>/dev/null || true)"
 root="${storage:-/var/lib/containers/storage}"
 # With a container running it isn't boot: leave the storage alone.
 if [[ -z "$storage" ]] && ! pgrep -x conmon >/dev/null; then
-  echo "podman's storage can't be read: $(podman info 2>&1 | tail -1)" >&2
+  # The message can span lines and quote the damaged file, zero bytes included.
+  echo "podman's storage can't be read: $(podman info 2>&1 | tr -d '\0' | tr '\n' ' ' | cut -c1-300)" >&2
   for f in "$root/overlay-containers/volatile-containers.json" "$root/overlay-containers/containers.json" "$root/overlay-layers/volatile-layers.json"; do
     [[ -e "$f" ]] || continue
     jq -e 'type == "array"' "$f" >/dev/null 2>&1 && continue

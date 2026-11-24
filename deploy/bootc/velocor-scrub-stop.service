@@ -1,0 +1,14 @@
+[Unit]
+Description=Stop Velocor repair scrubs at shutdown
+# Started before velod, so stopped after it.
+Before=velocor-velod.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/true
+ExecStop=/usr/libexec/velocor-scrub-stop
+TimeoutStopSec=90s
+
+[Install]
+WantedBy=multi-user.target
