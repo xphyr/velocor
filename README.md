@@ -1,8 +1,8 @@
 # Velocor
 
-**Velocor** is an open-source, API-first, all-flash SAN/NAS storage appliance distribution built on **SPDK** (Storage Performance Development Kit) and **Fedora Image Mode (`bootc`)**, written in Go.
+**Velocor** is an open-source, API-first, all-flash SAN/NAS storage appliance distribution built on the Linux kernel's storage stack (md RAID, LVM thin provisioning, and its NVMe/TCP and iSCSI targets) and **Fedora Image Mode (`bootc`)**, with a control plane written in Go.
 
-Velocor decouples the user-space block data plane (`spdk_tgt`) from the control plane (`velod`) using Podman Quadlet containers on a thin, immutable `fedora-bootc:45` host OS—so the control plane can be upgraded or restarted without interrupting low-latency NVMe-oF and iSCSI I/O. (Updating the `spdk_tgt` data-plane container itself *does* interrupt I/O and is therefore never automatic.)
+The data plane is the kernel of a thin, immutable `fedora-bootc:45` host OS; the control plane (`velod`) runs in a Podman Quadlet container and only configures it, so `velod` can be restarted without interrupting NVMe/TCP and iSCSI I/O.
 
 ---
 
@@ -30,11 +30,11 @@ Velocor decouples the user-space block data plane (`spdk_tgt`) from the control 
 
 ## Core Components & Features
 
-- **`velod` (`cmd/velod`)**: Node control-plane daemon, hardware manager (`vfio-pci` & hugepages), transactional desired-state store (`bbolt`), background drift reconciler, and single-port (`:8443`) REST/JSON + OpenAPI server, authenticated Prometheus `/metrics` endpoint, and embedded Web UI console.
+- **`velod` (`cmd/velod`)**: Node control-plane daemon, hardware manager, transactional desired-state store (`bbolt`), background drift reconciler, and single-port (`:8443`) REST/JSON + OpenAPI server, authenticated Prometheus `/metrics` endpoint, and embedded Web UI console.
 - **`veloctl` (`cmd/veloctl`)**: Operator CLI for managing users, tokens, disks, pools, volumes, snapshots, network portals, initiator groups, and exports.
-- **`velocor-spdk` (`spdk_tgt`)**: User-space, polled-mode SPDK `v26.09` data plane managing PCIe NVMe (`vfio-pci` / `bdev_nvme`) and SATA/SAS SSD (`io_uring` / `bdev_uring`) devices directly.
+- **The data plane**: the kernel's md RAID 0/1/10 on NVMe and SATA/SAS SSDs, one LVM volume group with a thin pool per array (64 KiB chunks), a device-mapper wrapper per volume (the pause point for group snapshots), and the kernel's NVMe/TCP (nvmet) and iSCSI (LIO) targets.
 - **`velocor-csi` (`cmd/velocor-csi`)**: Kubernetes CSI driver (`csi.velocor.io`) supporting dynamic NVMe-oF/TCP and iSCSI provisioning, online volume expansion, CoW snapshots, cloning, and `VolumeGroupSnapshot`. Changed Block Tracking (CSI `SnapshotMetadata`, KEP-3314) is opt-in; see [Changed Block Tracking](#changed-block-tracking-cbt-for-incremental-backups-opt-in).
-- **Boot-Disk Safety Guard**: Automatically resolves backing devices and PCIe BDF addresses for `/`, `/boot`, `/boot/efi`, and `/sysroot` on startup and permanently marks them `is_boot_device = true` so OS drives can never be unbound or formatted.
+- **Boot-Disk Safety Guard**: Automatically resolves backing devices and PCIe BDF addresses for `/`, `/boot`, `/boot/efi`, and `/sysroot` on startup and permanently marks them `is_boot_device = true` so OS drives can never be claimed or formatted.
 
 ---
 
@@ -45,18 +45,17 @@ Velocor decouples the user-space block data plane (`spdk_tgt`) from the control 
 |                        Velocor Appliance (fedora-bootc:45)                        |
 |                                                                                   |
 |  +-------------------------------------+   +-----------------------------------+  |
-|  | velocor-velod.service (Quadlet)     |   | velocor-spdk.service (Quadlet)    |  |
-|  | - velod Control Plane (:8443 TLS)   |   | - spdk_tgt (User-Space Polled IO) |  |
-|  | - REST + Embedded Web UI            |-->| - bdev_nvme (vfio-pci)            |  |
-|  | - bbolt DB (/var/lib/velocor/*.db)  |   | - bdev_uring (Linux io_uring)     |  |
-|  | - Reconciler & Hardware Manager     |   | - bdev_raid + lvol_store + lvol   |  |
-|  +-------------------------------------+   | - NVMe-oF/TCP (:4420) & iSCSI     |  |
-|                     |                      +-----------------------------------+  |
-|                     +---> /run/velocor/spdk.sock (JSON-RPC 2.0)                   |
+|  | velocor-velod.service (Quadlet)     |   | Linux kernel (data plane)         |  |
+|  | - velod Control Plane (:8443 TLS)   |   | - md RAID 0/1/10 on the disks     |  |
+|  | - REST + Embedded Web UI            |-->| - LVM thin pool per array         |  |
+|  | - bbolt DB (/var/lib/velocor/*.db)  |   | - dm wrapper per volume           |  |
+|  | - Reconciler & Hardware Manager     |   | - nvmet: NVMe/TCP (:4420)         |  |
+|  +-------------------------------------+   | - LIO: iSCSI (:3260)              |  |
+|        mdadm, lvm, dmsetup, configfs       +-----------------------------------+  |
 +-----------------------------------------------------------------------------------+
 ```
 
-See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for a detailed breakdown of the storage hierarchy, filter bdevs, and control/data plane separation.
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for a detailed breakdown of the storage hierarchy and control/data plane separation.
 
 ---
 
@@ -85,22 +84,19 @@ Images are named `$(IMAGE_PREFIX)/<name>:$(TAG)`. `IMAGE_PREFIX` defaults to `gh
 and version tags are pushed only by CI's release job).
 
 ```bash
-# Build velocor-spdk, velocor-velod and velocor-csi locally
+# Build velocor-velod and velocor-csi locally
 make images IMAGE_PREFIX=registry.example.com/velocor
 
 # Push them, then build and push velocor-os (refuses a dirty tree: commit first)
 make push IMAGE_PREFIX=registry.example.com/velocor
 ```
 
-The OS image (`velocor-os`) embeds the `velocor-spdk` and `velocor-velod` images of the same
-build, pinned by digest, so `make push` pushes those first and the OS image build resolves their
-digests from the registry. An appliance therefore runs exactly the containers it was built and
-tested with, needs no registry at boot, and changes them only through an OS upgrade.
+The OS image (`velocor-os`) embeds the `velocor-velod` image of the same build, pinned by digest,
+so `make push` pushes that first and the OS image build resolves its digest from the registry. An
+appliance therefore runs exactly the containers it was built and tested with, needs no registry
+at boot, and changes them only through an OS upgrade.
 
-Local fixes to SPDK live in `deploy/containers/spdk-patches/` (applied at build time; each
-carries unit tests, which `make spdk-unit-tests` and CI run).
-
-The Go toolchain, the SPDK source commit and the GitHub Actions are pinned (`make check-pins`
+The Go toolchain and the GitHub Actions are pinned (`make check-pins`
 verifies it; Renovate proposes bumps). The Fedora base images follow Fedora's rolling release tag
 (e.g. `:45`, set in the Containerfiles; the Makefile uses the same) to pick up its daily fixes: each build resolves the tag to a digest, builds from exactly
 that digest and records it in the image's `org.opencontainers.image.base.name` /
@@ -131,7 +127,7 @@ the repository contains keys or passwords; give `velocor-admin` keys in one of t
 
 ### Option 1: Bare-Metal / VM Installation via Fedora Image Mode (`bootc`)
 
-The recommended production deployment installs the immutable `velocor-os` image (`deploy/bootc/Containerfile`) onto a target boot disk. The image comes preconfigured with `vfio-pci`, `nvme_tcp`, and `ublk_drv` kernel modules, hugepage sysctls, `veloctl`, and the systemd Podman Quadlet definitions.
+The recommended production deployment installs the immutable `velocor-os` image (`deploy/bootc/Containerfile`) onto a target boot disk. The image comes with the storage tools, kernel settings, `veloctl`, and the systemd Podman Quadlet definitions.
 
 1. **Boot the target machine or VM** using a Fedora Live ISO (or any Linux rescue environment with Podman installed).
 2. **Install `velocor-os` to the target boot drive** (e.g., `/dev/sda` or `/dev/nvme0n1`):
@@ -164,19 +160,19 @@ The recommended production deployment installs the immutable `velocor-os` image 
    sudo umount /mnt
    ```
 
-3. **Reboot into the installed disk.** On first boot, systemd automatically generates and starts `velocor-spdk.service` and `velocor-velod.service` from `/usr/share/containers/systemd/`.
+3. **Reboot into the installed disk.** On first boot, systemd automatically generates and starts `velocor-velod.service` from `/usr/share/containers/systemd/`.
 4. **Verify service status on the appliance:**
 
    ```bash
    bootc status
-   systemctl status velocor-spdk.service velocor-velod.service
+   systemctl status velocor-velod.service
    ```
 
 5. **Atomic OS Upgrades & Rollbacks:**
 
    ```bash
    # Upgrade the appliance OS image via veloctl (or `bootc upgrade` on the host). The OS image
-   # carries velod and spdk_tgt, so this is also how the containers are updated.
+   # carries velod, so this is also how it is updated.
    veloctl system upgrade ghcr.io/xphyr/velocor-os:v0.2.0
 
    # Roll back to the previous OS deployment if needed
@@ -214,7 +210,7 @@ hack/build-qcow2.sh \
   cloud-init, which the image includes.
 
 Create the VM from a copy of the qcow2: UEFI firmware, a Q35 machine type, at least 4 vCPUs and
-6 GiB of memory (SPDK reserves 1 GiB of hugepages), the qcow2 as the boot disk, the data disks
+4 GiB of memory, the qcow2 as the boot disk, the data disks
 as separate virtio-scsi or NVMe devices, and a separate NIC for the SAN if you have one. On first
 boot, read the initial admin password as described in the
 [Appliance Quickstart](#appliance-quickstart-veloctl--web-ui). Later OS upgrades come from the
@@ -227,41 +223,26 @@ You can run Velocor on an existing **Fedora 45+**, **RHEL / CentOS Stream 9/10**
 1. **Install required host packages:**
 
    ```bash
-   sudo dnf install -y podman nvme-cli iscsi-initiator-utils pciutils iproute xfsprogs jq
+   sudo dnf install -y podman mdadm lvm2 device-mapper-persistent-data nvme-cli pciutils iproute xfsprogs jq
    ```
 
-2. **Configure kernel modules, hugepages, and runtime directories:**
+2. **Leave arrays and volume groups to velod** (the host must not assemble or activate them, nor
+   scan the volumes' contents), and create its directories:
 
    ```bash
-   cat <<'EOF' | sudo tee /etc/modules-load.d/velocor.conf
-   vfio
-   vfio_iommu_type1
-   vfio_pci
-   uio_pci_generic
-   nvme_tcp
-   ublk_drv
-   EOF
-
-   # Lab VMs without a vIOMMU only: velod refuses to bind NVMe drives without an IOMMU
-   # unless VELOCOR_ALLOW_UNSAFE_NOIOMMU=true is set in velocor-velod.container. Never
-   # enable this on production hardware: it lets SPDK DMA anywhere in host memory.
-
-   # Allocate at least 1024 MiB of 2 MiB hugepages for SPDK
-   echo "vm.nr_hugepages = 512" | sudo tee /etc/sysctl.d/90-velocor.conf
-
-   sudo systemd-modules-load
-   sudo sysctl --system
+   sudo cp deploy/bootc/mdadm.conf /etc/mdadm.conf
+   sudo cp deploy/bootc/lvmlocal.conf /etc/lvm/lvmlocal.conf   # if the host itself doesn't use LVM
+   sudo systemctl mask raid-check.timer mdmonitor.service
    sudo mkdir -p /var/lib/velocor /run/velocor /etc/containers/systemd
    ```
 
-3. **Install the Podman Quadlet service units:**
+3. **Install the Podman Quadlet service unit** (set its `Image=` to a velod image):
 
    ```bash
-   sudo cp deploy/quadlets/velocor-spdk.container /etc/containers/systemd/
    sudo cp deploy/quadlets/velocor-velod.container /etc/containers/systemd/
 
    sudo systemctl daemon-reload
-   sudo systemctl start velocor-spdk.service velocor-velod.service
+   sudo systemctl start velocor-velod.service
    ```
 
 4. **Install the `veloctl` CLI on your workstation or host:**
@@ -317,7 +298,7 @@ veloctl login --username admin                      # prompts for the password
 # (or simply sign in to the Web UI, which prompts for it)
 veloctl passwd
 
-# Check appliance health, SPDK connection, hugepages, and configuration warnings
+# Check appliance health and configuration warnings
 veloctl system status
 ```
 
@@ -330,7 +311,7 @@ veloctl system status
 veloctl disk scan
 veloctl disk list
 
-# Claim non-boot NVMe drives (binds to vfio-pci and attaches to SPDK bdev_nvme)
+# Claim non-boot drives
 veloctl disk claim nvme-0000-00-03-0
 veloctl disk claim nvme-0000-00-04-0
 ```
@@ -338,12 +319,11 @@ veloctl disk claim nvme-0000-00-04-0
 ### 3. Create a Storage Pool & Network Portal
 
 ```bash
-# Create an SPDK RAID1 pool (1 MiB clusters, the default)
+# Create a RAID1 pool
 veloctl pool create \
   --name flash-pool-0 \
   --raid RAID1 \
-  --disks nvme-0000-00-03-0,nvme-0000-00-04-0 \
-  --cluster-size 1048576
+  --disks nvme-0000-00-03-0,nvme-0000-00-04-0
 
 veloctl pool list
 
@@ -371,8 +351,8 @@ veloctl pool scrub <pool-id> --start                   # scrub now, outside the 
 ### 4. Provision Volumes, Snapshots & Manual SAN Exports
 
 ```bash
-# Create a 50 GiB thin-provisioned volume
-veloctl volume create --name app-data --pool <pool-id> --size-gib 50 --thin=true
+# Create a 50 GiB volume (volumes are always thin-provisioned)
+veloctl volume create --name app-data --pool <pool-id> --size-gib 50
 
 # Say which hosts may connect (NQN from /etc/nvme/hostnqn on each host)
 veloctl initiator-group create --name app-hosts --nqns nqn.2014-08.org.nvmexpress:uuid:<host-uuid>
@@ -457,8 +437,6 @@ data in, and the blocks written between two snapshots of a volume, which is what
 such as Kasten copy in an incremental backup. It is **off by default** because it needs pieces
 outside the driver:
 
-- the appliance's data plane with SPDK patch 0005 (`bdev_lvol_get_fragmap`, ported from
-  Longhorn's SPDK fork), shipped with the appliance image;
 - the cluster's `SnapshotMetadataService` CRD (`cbt.storage.k8s.io/v1beta1`), installed from
   [kubernetes-csi/external-snapshot-metadata](https://github.com/kubernetes-csi/external-snapshot-metadata)
   like the VolumeSnapshot CRDs;
@@ -469,11 +447,9 @@ Enable it with the chart's `snapshotMetadata.enabled=true` (and, outside OpenShi
 `snapshotMetadata.tlsSecretName` and `snapshotMetadata.caCert`). Without it the driver doesn't
 advertise the capability and backup tools take full backups, which work normally.
 
-How it's computed: an SPDK snapshot owns exactly the clusters written while it was the newest
-layer of its volume's chain. The blocks a snapshot holds data in are those of its whole chain
-(into a clone's origin); the changes between two snapshots are those of the layers after the
-older one, up to the newer one. Granularity is the pool's cluster size. A data plane that can't
-report the clusters answers `501 Not Implemented` (CSI `Unimplemented`), never a guess.
+How it's computed: from the thin pool's own block mappings, read from a snapshot of its metadata
+while the pool keeps serving I/O (`thin_dump` for the blocks a snapshot holds, `thin_delta` for
+the changes between two). Granularity is the pool's chunk size, 64 KiB.
 `veloctl snapshot allocated-blocks` / `changed-blocks` and the volume page's "Changed blocks"
 show the same answers.
 
@@ -589,7 +565,7 @@ kubectl get storageclass
 | :--- | :--- | :--- | :--- |
 | `protocol` | `NVMEOF_TCP`, `ISCSI` | `NVMEOF_TCP` | SAN transport protocol used to export the volume to Kubernetes nodes. |
 | `pool` | Pool ID or Pool Name | Auto-selected | Target Velocor storage pool. If omitted, selects the first online pool with sufficient free space. |
-| `thin` | `"true"`, `"false"` | `"true"` | Provision thin (`true`) or thick (`false`) SPDK logical volumes. |
+| `thin` | | | Ignored: volumes are always thin-provisioned. (Kept in the shipped classes, as a StorageClass's parameters can't change.) |
 | `portals` | Portal names or IDs, comma-separated | The chart's `defaultPortals`, else the protocol's only portal | Portals the class's volumes are exported on, all of the class's protocol. See below. |
 | `csi.storage.k8s.io/fstype` | `ext4`, `xfs` | `ext4` | Filesystem formatted onto mounted volumes by the CSI node plugin. |
 
@@ -630,7 +606,6 @@ parameters:
   protocol: NVMEOF_TCP
   pool: flash-pool-0
   portals: san-a,san-b
-  thin: "true"
   csi.storage.k8s.io/fstype: xfs
 ```
 

@@ -303,9 +303,29 @@ func TestVolumeLifecycle(t *testing.T) {
 
 	// A group snapshot of two volumes; a clone of the first snapshot reads its data.
 	_, volB := e.volume("vol-b", size)
+	// Reconciler passes meanwhile leave the group alone (and neither waits for the other for ever).
+	stop, passes := make(chan struct{}), make(chan error, 1)
+	go func() {
+		for {
+			if err := e.p.Settle(e.ctx, e.disks); err != nil {
+				passes <- err
+				return
+			}
+			select {
+			case <-stop:
+				passes <- nil
+				return
+			default:
+			}
+		}
+	}()
 	gu, err := e.p.SnapshotGroup(e.ctx, []dataplane.GroupEntry{{Volume: vol.UUID, Snapshot: "gsnap-a"}, {Volume: volB.UUID, Snapshot: "gsnap-b"}}, 5*time.Second)
 	if err != nil || len(gu) != 2 {
 		t.Fatalf("group snapshot %v %v", gu, err)
+	}
+	close(stop)
+	if err := <-passes; err != nil {
+		t.Errorf("a pass during the group snapshot: %v", err)
 	}
 	if s, _ := e.k.WrapperSuspended(e.ctx, "vol-a"); s {
 		t.Fatal("wrapper left suspended")

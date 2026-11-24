@@ -1,5 +1,8 @@
 # Design: metadata copies, backups and pool import (P0-3)
 
+> Written for the SPDK data plane, which was removed on 2026-11-24: kept for the reasoning. What runs
+> now is in [kernel-dataplane.md](kernel-dataplane.md) and [../ARCHITECTURE.md](../ARCHITECTURE.md).
+
 Status: implemented and lab-tested 2026-11-17. Tracks TODO P0-3.
 
 ## What happens today

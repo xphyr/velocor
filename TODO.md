@@ -11,207 +11,47 @@ commit. Keep entries short: the problem, where it stands, the next step.
 
 ---
 
-## Direction change (2026-11-20): kernel data plane
+## Kernel data plane (K-4, the last phase)
 
-Decided 2026-11-20 after P0-7 and the three-way benchmark: the data plane moves from SPDK to
-md RAID + LVM thin + kernel nvmet/LIO. The reasons, the alternatives (incl. the hybrids and a
-GPL port of md/LVM into SPDK), the numbers and the plan are in
-[docs/design/kernel-dataplane.md](docs/design/kernel-dataplane.md). SPDK stays in the lab until
-phase 3. Items below marked **(K)** are resolved by the move and close at the cutover; they stay
-listed until then so nothing is lost if the plan changes.
+The data plane is the kernel's (md, LVM thin, nvmet, LIO) since 2026-11-24; SPDK is gone. K-0 to
+K-3 and what each found are in [docs/review-history.md](docs/review-history.md), the design in
+[docs/design/kernel-dataplane.md](docs/design/kernel-dataplane.md).
 
-- [x] **K-0. Design review** of the note (merged, PR #32). Decided 2026-11-20: QoS **dropped at the cutover**
-  (revisit later); thin pools use **64 KiB chunks with zeroing on**, measured in
-  [docs/performance.md](docs/performance.md) (best after snapshots, finest CBT; zeroing stays on
-  so new volumes can't read old data).
-- [x] **K-1. Spike** (done 2026-11-23): `internal/kernel`, a standalone package not yet wired
-  into velod: md RAID, LVM thin (64 KiB, zeroing), a dm-linear wrapper per volume, group
-  snapshots through the wrappers, CBT from `thin_delta`/`thin_dump`, nvmet and LIO through
-  configfs, seams for optional LUKS/VDO/dm-crypt/dm-integrity layers. Unit tests on captured
-  tool output; seven root integration tests (`make test-kernel`, CI job `kernel-tests`) pass on
-  the lab VM, P0-7 included (EIO for that read only, array stays up, a rewrite heals it).
-  Findings folded into the design note (§5.2, §5.2.1, §5.3, §5.5, §5.6, §6): `--errorwhenfull`
-  needs `lvchange`; `N%VG` leaves no room for pool metadata; `pvcreate` starts an LVM devices
-  file, so every LVM call carries velod's own `--config`; iSCSI portals must stay on
-  SELinux-labelled ports (3260, 3205); md does not use the bad-block log on the last copy.
-- [ ] **K-2. Parity**, starting with a **data-plane interface** in velod: velod calls SPDK
-  directly in about 160 places and there is nothing to slot the kernel stack in behind, so K-2
-  introduces that interface (modelled on `internal/kernel`'s API), moves the SPDK code behind
-  it, then adds the kernel implementation.
-  - [x] **Interface** (2026-11-23): `dataplane.Plane` (disks, arrays, thin pools, volumes and
-    snapshots, group snapshots, allocated/changed blocks, exports, I/O stats, the unmanaged-object
-    inventory) with backend-neutral types and errors; the SPDK backend is
-    `internal/dataplane/spdkplane`. `server` and `reconciler` no longer import `internal/spdk`; no
-    behaviour change (unit tests unchanged apart from construction, SPDK integration suite).
-  - [x] SPDK names outside the interface (**renamed outright 2026-11-23**, no users yet): store
-    and API fields `handle` (disks, volumes, snapshots), `member_uuid`, `array_name`, `device`,
-    `thin_pool_uuid`, `thin_pool_name`, `chunk_size_bytes`, `meta_volume_uuid`; the status
-    JSON's `data_plane` object (`endpoint`) and `data_plane_version`; the reconciler's
-    `data_plane_instance`; `/system/iostats?device=`; metrics `velocor_device_*{device}` and
-    `velocor_unmanaged_objects`; the proto API description. Databases and on-pool metadata
-    copies with the old keys are upgraded when read (`store.UpgradeJSON`; the P0-1 lab VM's
-    database checked). Restart detection, superblock reading and the ublk device now sit
-    behind the interface or apply to SPDK only.
-  - [ ] The kernel implementation of `dataplane.Plane` on `internal/kernel`. **Started
-    2026-11-23:** `internal/dataplane/kernelplane` implements every method; its integration tests
-    (tag `kernelintegration`) pass on the lab VM: volume lifecycle with snapshots, exact CBT, a
-    group snapshot, a clone and a resize; NVMe/TCP and iSCSI exports with allowed and refused
-    hosts and a portal without its address; member replace and rebuild; scrub; `Settle` after a
-    simulated reboot and an array waiting for a missing member, then started degraded.
-    **velod wired (2026-11-23):** `velod --data-plane=kernel` (`VELOCOR_DATA_PLANE`; SPDK stays
-    the default) uses it, with the on-pool metadata copy on its LV (`meta.BlockDevice`, the same
-    out-of-process O_DIRECT I/O, no ublk) and spdk_tgt restart detection off. Thick volumes are
-    zeroed when created (a new pool's metadata LV read the previous pool's copy). A second velod
-    in kernel mode on the lab VM passed end to end through the API: claim, pool, volumes, an
-    NVMe/TCP export with the host connected and the volume's namespace UUID, exact
-    allocated/changed blocks, a group snapshot, a clone, a velod restart, a member replacement
-    with rebuild, a scrub to completion, and a teardown leaving nothing in the kernel. Open:
-    - the appliance (**done 2026-11-23**, `dev-86511f2`): storage tools installed; md
-      auto-assembly off (`AUTO -all`, `rd.md=0`) and host LVM limited to md arrays with no
-      auto-activation; `/etc/velocor/velod.env` (`VELOCOR_DATA_PLANE=kernel`) selects the data
-      plane and `velocor-spdk` skips itself; velod frees SPDK's hugepages. A fresh appliance
-      (the K-2 lab VM) runs it. Found there: velod's `nsenter` must enter the host's IPC
-      namespace too (LVM/dmsetup wait for udev on SysV semaphores; `lvcreate` hung). Found
-      on the P0-1 lab VM: an upgrade through the API (`bootc switch`, bootc 1.17) didn't add
-      the new `rd.md=0` karg (a fresh install has it; `AUTO -all` still covers udev);
-    - discovery took vfio-bound NVMe drives as claimed, so the kernel data plane rebound them
-      to `nvme` (it took both drives from the P0-1 lab VM's running SPDK, 2026-11-23: nvmepool
-      lost slot 0). Fixed: with the kernel data plane such a drive is claimed only by an
-      operator;
-    - a member whose own disk came back (MISSING, or left a running array) is put back with
-      `replace` naming that disk (**done 2026-11-23**): attached if needed, added back, the
-      array rebuilds onto it (md re-adds with its bitmap: only what changed). The array still
-      never takes a returning member back by itself. Lab appliance: sdb unplugged, pool
-      started degraded, data written, sdb re-plugged and put back: ONLINE, data intact;
-    - pool import and moved members (P1-14) on md (**done 2026-11-23**): `Plane.ExamineDisks`
-      groups disks by the array metadata on them (SPDK: the superblock and
-      `MatchMovedMembers`, moved from the server; md: each member's own `mdadm --examine`,
-      which names its slot, so nothing needs matching). `Settle` takes the claimed disks and
-      assembles only arrays on them, from them (an unclaimed copy, an import candidate or a
-      member that left, takes no part). Lab appliance: a fresh velod after a lost database
-      imported a pool from its metadata copy (volume, snapshot, data); a member re-plugged
-      under a new serial was relinked to its slot and the pool came back ONLINE;
-    - RAID10 (**done 2026-11-23**): the level check is the data plane's (`Plane.CheckLevel`):
-      the kernel builds md RAID10 (four disks or more), SPDK still refuses it;
-    - claimed disks stay claimed across scans (the store keeps `Claimed`), checked;
-    - iSCSI ACLs are by IQN only (**decided 2026-11-23**): LIO can't restrict an initiator by
-      address, so a host's IP (which CSI registers) isn't enforced and an address-only ACL is
-      refused; documented (ARCHITECTURE.md, the design note);
-    - NVMe connections (**decided 2026-11-23**): nvmet lists controllers only in debugfs, built
-      into `nvmet.ko` with `CONFIG_NVME_TARGET_DEBUGFS`, which Fedora's kernel has off. Keep the
-      fallback (the listeners' TCP peers via `ss`: never misses a host, over-reports when
-      exports share a listener) and ask Fedora to enable the option; rebuild `nvmet.ko` in the
-      OS image (signed with our own MOK-enrolled key) only if exact per-export connections
-      become a requirement;
-    - **done 2026-11-23:** snapshots are read-only LVs (clones writable); the group snapshot's
-      quiesce bound covers only the pause, not taking the snapshots; per-disk I/O counters are
-      reported (by handle); the scrub's start and stopped/completed state is kept in
-      `/run/velocor/scrubs.json` across velod restarts (cleared at boot, as md's is); the pool
-      records the chunk size the data plane used (always 64 KiB on the kernel one);
-    - the on-pool metadata copy on an LV: done (`meta.BlockDevice`).
-    - thin pool metadata (**done 2026-11-23**): its size and use are on the pool record
-      (`thin_metadata_bytes`, `thin_metadata_used_bytes`) and in the metrics
-      (`velocor_pool_thin_metadata_used_ratio`); the reconciler grows it from half full
-      (`Plane.GrowMetadata`: doubled within the volume group's free space, LVM's spare copy
-      included, up to 15.81 GiB); a pool that couldn't grow it is noted, and DEGRADED from
-      90% full; alerts at 80% (warning, 10 min) and 95% (critical). Fedora VM: grown 64 ->
-      116 MiB until no room, then reported;
-    Then every row of the feature table (iSCSI via LIO, scrub on md, metadata copy
-  on an LV, import, CBT via `thin_delta`, metrics, alerts, veloctl/UI wording, docs): all done
-  (wording: API errors, pool warnings, import results, `veloctl` and the web UI say volume, thin
-  pool, array and data plane, and SPDK only where something is SPDK's, 2026-11-23). K-2 is
-  complete; K-3 validates it.
-- [ ] **K-3. Validation:** CSI matrix on both clusters, KubeVirt, the P0-7 scenario (an
-  unreadable sector on the last copy keeps the pool up), the benchmark, soak. The test appliance
-  runs dev-089a781 on the kernel data plane since 2026-11-23, its pools rebuilt on md (64 KiB
-  chunks). Done so far:
-    - CSI matrix (2026-11-23), both protocols: provision, attach and write; online expansion;
-      snapshot, restore and clone with the data checked; iSCSI raw block. Arm SNO 7/7 (v1 group
-      snapshot included); the three-node cluster 6/6 (it has no v1 VolumeGroupSnapshot CRD);
-    - KubeVirt (2026-11-24): a Fedora 44 VM imported onto an RWX block NVMe/TCP volume, three live
-      migrations between nodes, a guest writer (fsync every second) with no gaps: 7/7;
-    - P0-7 (2026-11-23, emulated bad sector, K-2 lab VM): with the other copy gone, only the
-      1 MiB over the bad sector is unreadable, every other MiB matches, the pool stays up
-      (DEGRADED; with SPDK it went offline); the rebuild onto a new disk finishes, records the
-      sector as a bad block on the new member, and the pool is ONLINE;
-    - benchmark (2026-11-24, fio from the Arm SNO, same jobs as the SPDK runs, volumes on a RAID1
-      pool of two virtio-SCSI disks, 4 vCPUs). Against SPDK on the same disks (dev-a548637):
-      queue depth 1 the same (4k read ~565 µs, write ~245 µs); deep queues 25-40% lower (4k
-      random read 32.8k vs 45.6k IOPS over NVMe/TCP, random write 18.6k vs 27.9k; sequential
-      read 551 vs 984 MB/s), probably CPU on the 4 vCPUs (not yet profiled); write + fsync about
-      half. O_DSYNC writes 15-20x slower (208 vs 3933 IOPS): the kernel sends them on as FUA
-      writes down to the disks, which on this lab's disks (LUNs of the hypervisor's Synology)
-      take ~4.5 ms against 157 µs for a plain write (measured on the appliance), while a cache
-      flush there is cheap. A property of the lab disks, not of the stack; to check on real SSDs.
-  Found, to do:
-    - [x] md's bad-block log reported (**done 2026-11-24**): each member's recorded bad blocks
-      (`bad_block_bytes`, a note on the pool, `velocor_pool_member_bad_block_bytes`, the
-      `VelocorPoolMemberBadBlocks` warning) and how much no in-sync copy can supply
-      (`unreadable_bytes`, worked out for RAID1, RAID0 and near-2 RAID10: the pool DEGRADED,
-      `velocor_pool_unreadable_bytes`, `VelocorPoolDataUnreadable` critical); UI and `veloctl
-      pool show`. K-2 VM: the bad sector noted while the other copy exists, lost (DEGRADED)
-      without it and after the rebuild, and back to a note once the range was written again
-      (md clears it on a member that takes the write). What the lost ranges held is worked out
-      (**2026-11-24**): the volumes and snapshots (through LVM's segments and a thin_dump of a
-      metadata snapshot), named on the pool (`lost_data`) and the volumes DEGRADED while still
-      served; K-2 VM: the volume and its snapshot named, the reported offset the one that
-      fails to read.
-    - [x] Deep-queue throughput profiled (**2026-11-24**, fio from the Arm SNO, per-CPU and
-      per-thread time and perf on the appliance). The SAN NIC (virtio-net) has one receive
-      queue, and nvmet-tcp runs each connection's work on the CPU that received it: every
-      connection on CPU 1 (96% busy, the other three ~10%). With RPS/RFS over all CPUs: NVMe/TCP
-      4k random read 31.9k -> 47.1k IOPS (SPDK 45.6k), random write 18.6k -> 23.1k (SPDK 27.9k;
-      the disks 80% busy and 16% steal: the lab's limit). The OS image now sets RPS/RFS on
-      NICs with fewer receive queues than CPUs (udev, `velocor-rps`). Left:
-      - [ ] iSCSI 4k random read 23.6k (SPDK 34.3k): LIO runs a connection in one receive
-        thread (`iscsi_trx`), and the host opens one session: one CPU 80% busy. More sessions
-        per volume (iSCSI multipath from the CSI node plugin) would spread it.
-      - [ ] NVMe/TCP 128k sequential read 425-485 MiB/s (SPDK 984 MB/s) with the CPUs 80% idle
-        and the disks 25-30% busy; the same job locally on the appliance reads 2.7 GB/s. One TCP
-        flow with an inflated RTT (~7 ms, min 0.07), small windows and spurious retransmissions;
-        idle polling (`idle_poll_period_usecs`) and the `fq` qdisc made it worse. Re-measure on
-        real NICs before digging further.
-      - [x] Fedora's kernel zeroes every page it allocates (`init_on_alloc`, hardening): about
-        15% of the appliance's cycles on large reads. **Decided (2026-11-24): off by default**
-        (kargs.d), and an admin can turn it on or off for the next boot (System page, `veloctl
-        system kernel-options`, `PUT /api/v1/system/kernel-options`; `rpm-ostree kargs`, which
-        stages a boot entry of the same OS image and so replaces a rollback to the previous
-        version: refused without force). K-2 VM: both directions and a reboot
-        (`heap alloc:off`); velocor-1's upgrade through the API added the argument. The gain isn't
-        measured yet (benchmark on the next build).
-      - [ ] Fedora's `mdmonitor.service` fails at boot on appliances without arrays at boot (mdadm
-        finds nothing to monitor and exits); velod watches the arrays itself, so disable it in
-        the OS image.
-      - Lab: a multiqueue virtio-net (queues=4) for velocor-1's SAN NIC would make it behave
-        like a real NIC (RSS) without RPS.
-    - [ ] Soak.
-- [ ] **K-4. Cutover:** remove SPDK (images, patches, client, fake, CI stage); rebuild the lab
-  appliances; archive the (K) items.
+- [ ] **K-4 (rest).**
+  - the soak (12 h, then 24 h) on both clusters with the fixes below;
+  - rebuild the P0-1 lab VM, which still runs SPDK;
+  - *decision:* pool durability. Flushes and FUA writes now reach the drives, so a volatile write
+    cache no longer loses writes a host flushed: the AT_RISK rating and the write-cache policy
+    (P0-4) can become information instead of a warning;
+  - *decision:* [docs/upstream](docs/upstream) (our SPDK findings): keep as a record, send, or
+    delete;
+  - the `thin` StorageClass parameter goes with the next chart that changes the classes anyway (a
+    class's parameters can't be changed by an upgrade).
+- [ ] **K-3 (rest). Performance to look at on real hardware:**
+  - iSCSI 4k random read 23.6k IOPS (SPDK 34.3k): LIO runs a connection in one receive thread,
+    and the host opens one session. More sessions per volume (P1-13) would spread it.
+  - NVMe/TCP 128k sequential read 425-485 MiB/s with CPUs and disks mostly idle (2.7 GB/s locally):
+    one TCP flow with an inflated RTT. Re-measure on real NICs before digging further.
+  - the gain of `init_on_alloc=0` isn't measured yet.
+  - Lab: a multiqueue virtio-net for velocor-1's SAN NIC would make it behave like a real NIC.
 
+## Review of 2026-11-24
+
+An independent review of main (5897481): 47 findings and 19 performance items. All findings are
+fixed, gone with SPDK, or listed here ([docs/review-history.md](docs/review-history.md)).
+
+- [ ] **Multi-namespace NVMe drives** aren't supported: discovery, claims and the disk's link use
+  one namespace. Decide: support them, or refuse them with a reason.
+- [ ] **Performance, not done:** `Connections` runs `ss` per portal (on request only); by-name
+  lookups read whole buckets; the metadata manifest is built every pass; CSI's controller lock
+  is global and `reserveSpace`'s spans pools (both hide races: tests first); Prometheus queries
+  for graphs run one after the other.
+
+## Before the first final release
 
 The first final release waits for these. Hardware validation (below) is part of the gate but
 doesn't block the rest.
 
-- [ ] **(K) P0-7. One unreadable sector on the last good copy takes a mirror pool offline.**
-  Found 2026-11-20 with emulated disk errors (QEMU `blkdebug`, lab VM). SPDK v26.09's RAID1
-  fails a member whenever none of the other copies can supply a read, and the rebuild process
-  does the same on a source read error. So in a degraded mirror (one disk failed or being
-  replaced), a host read or the rebuild hitting a single bad sector fails the **last** member:
-  the RAID goes offline, the volume store closes, every volume in the pool is gone. After an
-  SPDK restart the array re-assembles, velod restarts the rebuild, it hits the same sector, and
-  the pool goes offline again; `start-degraded` doesn't apply (the RAID isn't assembled), so an
-  operator can't even bring it up to copy the data off. Linux md fails just that read (EIO)
-  and keeps the array running. Bad sectors during a rebuild are common on large drives.
-  *Needed:* an SPDK patch so RAID1 fails the I/O, not the last member, on an unreadable read,
-  and the rebuild records the unreadable range (counted, alerted, like the scrub's
-  `unrecoverable_blocks`) and carries on instead of failing its source; velod stops
-  restarting a rebuild that failed on source read errors and offers a way to bring such a pool
-  online degraded; real-SPDK tests (the blkdebug lab recipe in
-  [docs/testing.md](docs/testing.md) reproduces both cases). Scrub (P2-2) lowers the odds by
-  rewriting bad sectors while both copies exist, but doesn't remove the failure mode.
-  *Kernel data plane (2026-11-23, K-3):* passes the same scenario: md fails only the bad
-  read, the pool stays up, and the rebuild carries on and records the sector as a bad block.
-  Closed by K-4; reporting the bad blocks is a K-3 follow-up.
 - [ ] **P2-1. CHAP and real host identities.** Any host that can spoof an allowed NQN or IQN gets
   access (the API refuses `chap_user` rather than ignoring it). *Needed:* iSCSI CHAP auth groups
   and NVMe DH-HMAC-CHAP with secrets stored encrypted (and kept out of pool metadata copies, like
@@ -219,20 +59,10 @@ doesn't block the rest.
   names derived from the node name.
 - [ ] **B14. RPM packages in image builds are not pinned.** Base images are pinned (or rolling by
   decision, B17), but `dnf install` takes whatever the mirrors have. *Option:* RPM lockfiles
-  (e.g. rpm-lockfile-prototype) for the SPDK builder and the OS image.
-- [ ] **P2-16. Writes are slower than on 2026-11-18.** The 2026-11-19 baseline
-  ([docs/performance.md](docs/performance.md)) has QD1 writes at about half and deep writes about
-  20% lower than a day earlier, reads unchanged. Candidates: P0-4's write-cache handling, the
-  built-in monitoring, the NAS behind the lab's virtual disks. *Next:* repeat the write jobs with
-  monitoring off, then on the build of 2026-11-18, before calling it a regression.
-  *Lead (2026-11-20):* the three-way benchmark ([docs/performance.md](docs/performance.md)), with
-  monitoring **on**, got 3,705 QD1 random writes from the same pool through a client that
-  connected to the SAN portal alone; the 2026-11-19 baseline went through the CSI driver, whose
-  NVMe/TCP volumes then had two live paths (SAN and the 1500-MTU management network, P1-13
-  check). Check whether the slow writes went over the management path; monitoring is cleared.
+  (e.g. rpm-lockfile-prototype) for the OS image.
 - [ ] **P1-6. State the single-node scope.** One appliance, one copy of each pool, no HA (ANA
   states are modelled but unused). Document it, with what hosts see during an appliance reboot
-  (NVMe/TCP I/O stalls; the CSI driver never gives up the controller) and during an SPDK restart.
+  (NVMe/TCP I/O stalls; the CSI driver never gives up the controller).
 - [ ] **Hardware validation:** everything under [Waiting on real hardware](#waiting-on-real-hardware).
 - [ ] **B16 (rest).** The pre-review `latest` tags on ghcr.io (build 977d4ae, 2026-11-14) stay
   until the first final release replaces them; check they did.
@@ -240,31 +70,16 @@ doesn't block the rest.
 ## Next
 
 - [ ] **P2-2 (rest). Failing disks, emulated: RAID0 and repeat after P0-7.** Done on the lab
-  VM (2026-11-20, dev-8311b3a, QEMU `blkdebug`): host reads over bad sectors are served from the
+  VM (2026-11-20, SPDK, QEMU `blkdebug`): host reads over bad sectors are served from the
   other copy and the bad copy rewritten; a scrub repaired both bad windows (4096 blocks), failed
   the member whose repair write failed (pool DEGRADED, scrub paused), and the alerts fired
-  (`VelocorScrubRepaired`, `VelocorScrubRepairFailed`, `VelocorPoolFaulted`). Found: P0-7, and
-  two velod bugs fixed on the spot (archive). *Left:* a RAID0 scan counting unrecoverable
-  blocks, and the rebuild cases again once P0-7 is fixed.
-- [ ] **V-1. velod keeps stale member states when a RAID goes offline.** When SPDK fails the
-  last member and the RAID bdev disappears, the pool turns UNAVAILABLE but its members still
-  read ACTIVE / REBUILDING (with "rebuilding 0%"), because member states are only read from a
-  RAID that exists. Show them as unknown or failed, and say why the pool is unavailable.
-- [ ] **(K) L-7. Pools can't be expanded.** Evaluated 2026-11-20 against SPDK v26.09; *needs a
-  decision.* (b) **Grow a RAID1 after every member was replaced by a larger disk** is small: a
-  patch adding `bdev_raid_grow` (SPDK's own resize path, refused while degraded or rebuilding),
-  then `bdev_lvol_grow_lvstore`; data doesn't move; both steps can be re-run after a crash.
-  (a) **Add disks** needs a new pool layout (a concat of RAID1 pairs) and a patch appending a
-  member to a concat: substantial, new pools only, growth by pairs. (c) spreading volumes over
-  pools isn't expansion. *Recommendation:* (b) first; (a) as its own design if needed.
-- [ ] **(K) L-6. A full pool should give hosts ENOSPC, not EIO.** SPDK fails writes to a full thin
-  pool with NVMe Internal Error (EIO; filesystems shut down). Patch lvol ENOSPC to complete with
-  NVMe Capacity Exceeded (0x81). Test with ext4 and XFS hosts.
-- [ ] **(K, optional goodwill) U-1. Send our SPDK patches upstream** and drop each once merged: 0001 WRITE SAME fan-out
-  ([guide](docs/upstream/spdk-scsi-write-same.md)), 0002 degraded start, 0003 group snapshot,
-  0004 scrub, 0005 fragmap (coordinate with Longhorn, whose RPC it matches), and the uring
-  channel crash ([report](docs/upstream/spdk-uring-channel-crash.md); carry it as a patch once
-  `hack/spdk-patch-unit-tests.sh` accepts a module without unit tests).
+  (`VelocorScrubRepaired`, `VelocorScrubRepairFailed`, `VelocorPoolFaulted`). On md: the bad-sector and rebuild cases (K-3). *Left:* the
+  scrub's repair of a bad sector and a failing repair write on md.
+- [ ] **V-1. Stale member states of a pool whose array is gone.** With none of its disks there, the
+  pool is UNAVAILABLE but its members still read ACTIVE (their states are read from the array).
+- [ ] **L-7. Pools can't be expanded.** On md: (b) grow a RAID1 after every member was replaced by a
+  larger disk (`mdadm --grow --size=max`, `pvresize`, extend the thin pool); (a) add disks (a
+  second array as another PV of the group, or a reshape). *Recommendation:* (b) first.
 - [ ] **P1-13 (rest). iSCSI multipath.** NVMe/TCP connects every listed portal; iSCSI logs in to
   one. Add dm-multipath on the node, and check two SAN paths in the lab for both protocols.
 - [ ] **P1-14 (rest). NVMe drives moved to another PCIe slot** aren't relinked (their ID is the PCI
@@ -272,44 +87,26 @@ doesn't block the rest.
 - [ ] **P2-13. virtio-blk disks are invisible.** Discovery drops `vdX` devices (`rotational=1`, no
   model). Treat `virtio_blk` as an SSD candidate; require a serial for pool members and say why
   a disk without one can't be used.
-- [ ] **(K) P2-14. iSCSI splits 128K writes into two 64K disk writes** (177–209 vs 300 MB/s for
-  NVMe/TCP). Find where (data segment or buffer size) and whether a larger
-  `MaxRecvDataSegmentLength` or iobuf size avoids it.
-- [ ] **P2-10 (re-measure in the kernel stack). Recovery after an unclean stop.** About 1 min per 500 GB on lab disks.
-  Report a "recovering" state instead of DEGRADED while volume stores load; iSCSI hosts give up
-  after `replacement_timeout` (120 s) where NVMe/TCP hosts wait, so raise it from the CSI node.
-  Measure on real hardware before lowering the lvstore metadata reservation.
-- [ ] **P2-3. Reconciler cost.** `EnsureExport` lists subsystems / target nodes per export
-  (O(n²) RPCs); fetch once per pass.
+- [ ] **P2-10 (rest). Recovery after an unclean stop** on the kernel stack: measure (md resyncs dirty
+  regions by its bitmap). iSCSI hosts give up after `replacement_timeout` (120 s) where NVMe/TCP
+  hosts wait, so raise it from the CSI node.
 - [ ] **P1-4 (rest).** A `deletionProtection` StorageClass parameter (clones from snapshots take
   another API path, so both need it); a retention period for snapshots without clones.
 - [ ] **P1-3 (rest).** A pending network change is forgotten if velod restarts during its window
   (NetworkManager still rolls it back, but it can't be confirmed any more).
-- [ ] **P1-7 (rest).** Exports aren't stopped before a reboot (SPDK's graceful stop closes them).
+- [ ] **P1-7 (rest).** Exports aren't stopped before a reboot.
 - [ ] **P1-1 (rest).** Alert delivery to a real email / webhook receiver is untested;
   Slack / PagerDuty-native receivers (webhook covers them through relays).
 - [ ] **A-1. API audit log.** Who changed what and when (logins, creates, deletes, access and
   network changes), kept on the appliance and visible to administrators; listed as hardening
   in [docs/ROADMAP.md](docs/ROADMAP.md) and never done.
-- [ ] **T-1. Test gaps.** iSCSI data paths in the integration tests (needs an initiator in the
-  test image); killing SPDK in the middle of a multi-step API operation.
+- [ ] **T-1. Test gaps.** Killing velod in the middle of a multi-step API operation; the CSI driver
+  against a real data plane outside a cluster.
 
 ## Later
 
-- [ ] **(K) L-1. Patch SPDK so flushes reach the drives** (the real fix for P0-4). lvols support FLUSH
-  and pass it to the blobstore's device; RAID reports `write_cache` when a member has one, so
-  NVMe-oF advertises a volatile cache and hosts send FLUSH/FUA. Then drive caches can stay on
-  and the per-disk policy relaxes. Aim upstream; nvweaver's durability patch is prior art.
-  `TestWriteCacheAndFlushAdvertised` is skipped as a known issue until then.
-- [ ] **(K) P2-4. SPDK core sizing.** One core today; on lab disks a second gained nothing. Plan
-  (2026-11-19): a boot step picks the core count (1 on a VM; about a quarter of the cores on
-  hardware, never CPU 0, NUMA-local to NICs and NVMe), an operator override applied at the next
-  SPDK restart, maybe SPDK's dynamic scheduler later. Tune on NVMe hardware.
-- [ ] **(K) L-4. RAID10.** SPDK has no raid10; refused today. Build it as raid0 over raid1 pairs with
-  superblocks; handle assembly after restart, a degraded pair, rebuild, deletion.
-- [ ] **(K) L-3. Parity RAID (RAID5/6).** raid5f takes full-stripe writes only and can't hold a
-  volume store. Options: a write-gathering layer, a read-modify-write RAID5 with a journal, or
-  kernel md RAID5/6 underneath SPDK. Needs a design decision, then power-loss and rebuild tests.
+- [ ] **L-3. Parity RAID (RAID5/6).** md has both; needs a decision on the write hole (journal or
+  PPL), then power-loss and rebuild tests.
 - [ ] **P1-6 (feature). High availability.** Two appliances, ANA paths; after the release.
 - [ ] **L-5. Delta OS upgrades.** Each `bootc upgrade` pulls most of the image (rolling base).
   Evaluate ostree static deltas, rechunking, zstd:chunked and OCI layer deltas; measure between
@@ -329,7 +126,7 @@ covers the software paths (see [docs/testing.md](docs/testing.md)).
   and an NVMe drive (surprise removal) under writes: pool DEGRADED, no host errors, replace,
   rebuild, reboot with the new member, the old drive stays detached.
 - [ ] **P0-1 (rest). Consumer NVMe without NGUID/UUID.** Needs such a drive. Pool survives
-  reboots (stable bdev UUID from serial + NSID).
+  reboots.
 - [ ] **P0-4 (rest). Power-pull test.** Needs a drive without power-loss protection and a way to
   cut power. Write with fsync under load, cut power, verify every acknowledged write, with the
   write-cache policy on and off.
@@ -337,14 +134,10 @@ covers the software paths (see [docs/testing.md](docs/testing.md)).
   rebuild against real read errors (after the emulated test under Next).
 - [ ] **C5/C6 (rest). NVMe native multipath on hardware.** The boot-disk guard and CSI device
   resolution with multipathed NVMe devices.
-- [ ] **P2-4 / P2-10 measurements.** SPDK core count and lvstore recovery time on NVMe hardware.
 
 ## Parked
 
 Decided not to do for now; kept with the reason.
 
-- [ ] **B15. CI compiles SPDK on every run** (Go-only PRs, `main`, tags). A cache keyed on the
-  SPDK inputs and the rolling Fedora base would mostly hit within a day only; freezing SPDK's
-  base would give up B17's daily fixes. Not worth it yet.
 - [ ] **P2-5. Slow test suites.** Auth / server tests take ~50–100 s under `-race` because every
   login runs 600k PBKDF2 iterations; a test-only override would fix it.

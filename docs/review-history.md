@@ -192,6 +192,42 @@ How things are tested: [testing.md](testing.md).
 - **B24.** The Makefile overrode the Containerfiles' Fedora release. c0d0611 (2026-11-19); a
   Fedora 46 build passed but 46 is still pre-release (move when released; TODO.md).
 
+## Kernel data plane (K-0 to K-4) and the review of 2026-11-24
+
+Decided 2026-11-20 after P0-7 and the three-way benchmark: md RAID + LVM thin + nvmet/LIO instead of
+SPDK (design note, performance.md).
+
+- **K-0** (PR #32): design review; QoS dropped; 64 KiB chunks with zeroing.
+- **K-1** (2026-11-23): `internal/kernel`, with root integration tests. Found: `--errorwhenfull` needs
+  `lvchange`; `N%VG` leaves no room for pool metadata; `pvcreate` starts an LVM devices file (every
+  LVM call carries velod's own `--config`); iSCSI portals must stay on SELinux-labelled ports.
+- **K-2** (2026-11-23/24): `dataplane.Plane`, then `kernelplane`; SPDK names renamed in the store and
+  API (`store.UpgradeJSON`). Found: `nsenter` must enter the host's IPC namespace (udev's
+  semaphores); discovery took vfio-bound drives from a running SPDK; LIO admits initiators by IQN
+  only; nvmet lists hosts only in debugfs, which Fedora builds without.
+- **K-3** (PR #45, 2026-11-24): CSI matrix on both clusters, KubeVirt live migration, P0-7 scenario,
+  benchmark. Found and done: bad-block and lost-data reporting; RPS/RFS on single-queue NICs (4k
+  random read 31.9k -> 47.1k IOPS); `init_on_alloc=0` by default with a setting.
+- **K-4** (2026-11-24): SPDK removed from code, images, CI and the appliance; tests moved to an
+  in-memory data plane; volumes always thin. Found by modelling md: a rebuild was shown as FAILED,
+  a degraded pool stayed UNAVAILABLE after a reboot, a stopped scrub was recorded as finished.
+  Found on the appliance: Fedora's weekly `raid-check` would scrub velod's arrays on its own
+  (masked, with `mdmonitor`).
+- **Closed by the move:** P0-7 (one bad sector took a mirror offline: md fails that read only), L-6
+  (a full pool gives ENOSPC), L-1 (flushes reach the drives), L-4 (RAID10), P2-4 (SPDK cores),
+  P2-14 (iSCSI write splitting), P2-16 (the slow writes were SPDK's baseline), P2-3(reconciler
+  cost), B15 (CI compiled SPDK), U-1 (our SPDK patches).
+- **Review of 2026-11-24** (47 findings, 19 performance items; b054fce, 247f5ef). Worst: the
+  reconciler resumed volumes in the middle of a group snapshot (1); names could leave their
+  configfs directory (2); concurrent exports got each other's nvmet port, so one could listen on
+  the wrong address (8: reproduced on a real kernel); the write-cache policy never applied to
+  NVMe (11); one RAID0 pool stopped every scheduled scrub (14); a CSI unstage failed for ever once
+  its device was gone (16). Not changed: 24 and the second half of 13 (several namespaces per
+  drive; TODO.md), 28 (userspace drivers are gone).
+- **Reconciler cost** (K-2 lab VM, 20 volumes and exports): a pass took 20 s and an idle minute
+  started 943 processes; after 247f5ef 0.03 s (its reports reused) and 57. A group snapshot of 16
+  volumes went from 6.4 s to 1.8 s.
+
 ## Found by testing against real SPDK (second review, 2026-11-16, 044f6e9)
 
 - **R1.** SSD bdevs got a random UUID on every creation, so every SSD pool went offline after a

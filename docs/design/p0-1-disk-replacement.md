@@ -1,5 +1,8 @@
 # Design: disk replacement, rebuild and degraded start (P0-1 + P1-8)
 
+> Written for the SPDK data plane, which was removed on 2026-11-24: kept for the reasoning. What runs
+> now is in [kernel-dataplane.md](kernel-dataplane.md) and [../ARCHITECTURE.md](../ARCHITECTURE.md).
+
 Status: proposal, 2026-11-17. Tracks TODO P0-1 and P1-8.
 
 ## Problem
