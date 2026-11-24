@@ -156,8 +156,26 @@ listed until then so nothing is lost if the plan changes.
       metadata snapshot), named on the pool (`lost_data`) and the volumes DEGRADED while still
       served; K-2 VM: the volume and its snapshot named, the reported offset the one that
       fails to read.
-    - [ ] Deep-queue throughput: profile the appliance during the IOPS jobs (nvmet/LIO threads,
-      dm-thin, md) before tuning.
+    - [x] Deep-queue throughput profiled (**2026-11-24**, fio from the Arm SNO, per-CPU and
+      per-thread time and perf on the appliance). The SAN NIC (virtio-net) has one receive
+      queue, and nvmet-tcp runs each connection's work on the CPU that received it: every
+      connection on CPU 1 (96% busy, the other three ~10%). With RPS/RFS over all CPUs: NVMe/TCP
+      4k random read 31.9k -> 47.1k IOPS (SPDK 45.6k), random write 18.6k -> 23.1k (SPDK 27.9k;
+      the disks 80% busy and 16% steal: the lab's limit). The OS image now sets RPS/RFS on
+      NICs with fewer receive queues than CPUs (udev, `velocor-rps`). Left:
+      - [ ] iSCSI 4k random read 23.6k (SPDK 34.3k): LIO runs a connection in one receive
+        thread (`iscsi_trx`), and the host opens one session: one CPU 80% busy. More sessions
+        per volume (iSCSI multipath from the CSI node plugin) would spread it.
+      - [ ] NVMe/TCP 128k sequential read 425-485 MiB/s (SPDK 984 MB/s) with the CPUs 80% idle
+        and the disks 25-30% busy; the same job locally on the appliance reads 2.7 GB/s. One TCP
+        flow with an inflated RTT (~7 ms, min 0.07), small windows and spurious retransmissions;
+        idle polling (`idle_poll_period_usecs`) and the `fq` qdisc made it worse. Re-measure on
+        real NICs before digging further.
+      - [ ] Fedora's kernel zeroes every page it allocates (`init_on_alloc`, hardening): up to
+        15% of the appliance's CPU on large reads. Decide whether the appliance boots with
+        `init_on_alloc=0`.
+      - Lab: a multiqueue virtio-net (queues=4) for velocor-1's SAN NIC would make it behave
+        like a real NIC (RSS) without RPS.
     - [ ] Soak.
 - [ ] **K-4. Cutover:** remove SPDK (images, patches, client, fake, CI stage); rebuild the lab
   appliances; archive the (K) items.

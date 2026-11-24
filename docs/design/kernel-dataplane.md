@@ -322,7 +322,12 @@ another one, so a degraded array's unread bad sectors aren't known ahead.
 ## 6. What we give up or must decide
 
 - **Deep random-write IOPS on a mirror:** about 28% lower than SPDK RAID1 at queue depth 64 on
-  this lab (20k vs 29.5k). Accepted. Worth re-measuring on real hardware.
+  this lab (20k vs 29.5k). Accepted. Worth re-measuring on real hardware. K-3 (2026-11-24): most
+  of the deep-queue gap over NVMe/TCP was the test appliance's single-queue NIC putting every
+  connection's nvmet-tcp work on one CPU; with RPS/RFS (now set by the OS image on such NICs)
+  4k random reads beat SPDK (47.1k vs 45.6k IOPS) and random writes are 17% behind (23.1k vs
+  27.9k, the lab's disks busy). iSCSI (one LIO thread per connection) and single-flow
+  sequential reads remain behind; see TODO.md K-3.
 - **CPU efficiency at depth:** SPDK does ~30% more IOPS per CPU spent; in exchange a vCPU
   stops polling while idle. Accepted.
 - **Userspace NVMe driver:** gone. Unmeasured on this lab; the one place SPDK clearly wins.

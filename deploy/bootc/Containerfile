@@ -62,11 +62,16 @@ RUN mkdir -p \
     printf "vfio\nvfio_iommu_type1\nvfio_pci\nuio_pci_generic\nnvme_tcp\nublk_drv\n" > /usr/lib/modules-load.d/velocor.conf && \
     printf "vm.nr_hugepages = 512\n" > /usr/lib/sysctl.d/90-velocor.conf && \
     printf "net.ipv4.tcp_autocorking = 0\n" >> /usr/lib/sysctl.d/90-velocor.conf && \
+    printf "net.core.rps_sock_flow_entries = 32768\n" >> /usr/lib/sysctl.d/90-velocor.conf && \
     printf "d /var/lib/velocor 0700 root root -\nd /run/velocor 0755 root root -\n" > /usr/lib/tmpfiles.d/velocor.conf && \
     printf "d /var/lib/velocor-monitoring 0755 root root -\nd /var/lib/velocor-monitoring/config 0750 root 65534 -\nd /var/lib/velocor-monitoring/prometheus 0750 65534 65534 -\nd /var/lib/velocor-monitoring/alertmanager 0750 65534 65534 -\n" > /usr/lib/tmpfiles.d/velocor-monitoring.conf
 
 # Keep udev away from velod's short-lived metadata device (internal/meta)
 COPY deploy/bootc/59-velocor-ublk.rules /usr/lib/udev/rules.d/59-velocor-ublk.rules
+# NICs with fewer receive queues than CPUs: receive processing spread over every CPU (RPS/RFS),
+# so the kernel targets' per-connection work isn't all on one CPU.
+COPY deploy/bootc/60-velocor-rps.rules /usr/lib/udev/rules.d/60-velocor-rps.rules
+COPY deploy/bootc/velocor-rps.sh /usr/libexec/velocor-rps
 
 # Install operator CLI client on the host
 COPY --from=velod-bin /usr/bin/veloctl /usr/bin/veloctl
@@ -151,7 +156,7 @@ RUN --mount=type=secret,id=registry-auth set -eu; \
     embed "${ALERTMANAGER_IMAGE}" velocor-alertmanager; \
     ! grep -q '@VELOCOR_' /usr/share/containers/systemd/velocor-*.container
 
-RUN chmod 0755 /usr/libexec/velocor-console-banner /usr/libexec/velocor-preload-images /usr/lib/NetworkManager/dispatcher.d/90-velocor-banner && \
+RUN chmod 0755 /usr/libexec/velocor-console-banner /usr/libexec/velocor-preload-images /usr/libexec/velocor-rps /usr/lib/NetworkManager/dispatcher.d/90-velocor-banner && \
     systemctl disable bootc-fetch-apply-updates.timer && \
     systemctl enable velocor-console.service velocor-preload-images.service vmtoolsd.service qemu-guest-agent.service && \
     /usr/lib/systemd/system-generators/podman-system-generator --dryrun >/dev/null && \
