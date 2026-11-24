@@ -9,7 +9,7 @@ set -euo pipefail
 norm() { echo "${1#sha256:}"; }
 
 refs=()
-for name in velocor-spdk velocor-velod velocor-prometheus velocor-alertmanager; do
+for name in velocor-velod velocor-prometheus velocor-alertmanager; do
   ref="$(awk -F= '/^Image=/{print $2; exit}' "/usr/share/containers/systemd/${name}.container")"
   archive="/usr/share/velocor/images/${name}.oci.tar"
   [[ -n "$ref" && -f "$archive" ]] || { echo "no embedded image for ${name}" >&2; continue; }
@@ -21,7 +21,12 @@ for name in velocor-spdk velocor-velod velocor-prometheus velocor-alertmanager; 
   refs+=("$ref")
 done
 
-# Remove superseded images of the same repositories (left behind by earlier OS versions).
+# Remove superseded images of the same repositories (left behind by earlier OS versions), and the
+# SPDK image of releases that still had it.
+while read -r id; do
+  [[ -n "$id" ]] || continue
+  if podman image rm "$id" >/dev/null 2>&1; then echo "Removed the old velocor-spdk image $(norm "$id" | cut -c1-12)"; fi
+done < <(podman images --no-trunc --filter "reference=*/*/velocor-spdk" --format '{{.ID}}' | sort -u)
 for ref in "${refs[@]}"; do
   keep="$(norm "$(podman image inspect --format '{{.Id}}' "$ref")")"
   repo="${ref%@*}"

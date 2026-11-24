@@ -23,7 +23,7 @@ groups:
         for: 2m
         labels: {severity: critical}
         annotations:
-          summary: "SPDK (the data plane) on {{ $labels.instance }} doesn't answer"
+          summary: "The data plane on {{ $labels.instance }} doesn't answer"
           description: "The data plane doesn't answer velod: volumes are probably not being served."
 
       - alert: VelocorReconcilerStalled
@@ -42,12 +42,12 @@ groups:
           summary: "Velocor's reconciler keeps failing on {{ $labels.instance }}"
           description: "Its passes have ended with an error for 15 minutes; the error is on the appliance's status page and in velod's log."
 
-      - alert: VelocorUnmanagedSPDKObjects
+      - alert: VelocorUnmanagedObjects
         expr: sum by (instance, kind) (velocor_unmanaged_objects) > 0
         for: 15m
         labels: {severity: warning}
         annotations:
-          summary: "SPDK holds {{ $value }} {{ $labels.kind }} object(s) Velocor doesn't manage"
+          summary: "The data plane holds {{ $value }} {{ $labels.kind }} object(s) Velocor doesn't manage"
           description: "Listed on the System page. Unmanaged NVMe-oF subsystems or iSCSI targets may give hosts access that no export controls. Velocor never removes them itself."
 
       - alert: VelocorBackupMissing

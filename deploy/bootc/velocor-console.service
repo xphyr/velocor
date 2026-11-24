@@ -1,6 +1,6 @@
 [Unit]
 Description=Update Velocor appliance console splash screen (/etc/issue)
-After=network-online.target velocor-spdk.service velocor-velod.service
+After=network-online.target velocor-velod.service
 Wants=network-online.target
 
 [Service]

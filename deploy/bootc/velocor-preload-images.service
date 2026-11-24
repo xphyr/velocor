@@ -2,7 +2,7 @@
 Description=Preload embedded Velocor container images into Podman storage
 DefaultDependencies=no
 After=local-fs.target
-Before=velocor-spdk.service velocor-velod.service
+Before=velocor-velod.service
 ConditionPathExists=/usr/share/velocor/images
 
 [Service]

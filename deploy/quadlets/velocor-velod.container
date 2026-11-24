@@ -1,7 +1,7 @@
 [Unit]
 Description=Velocor Control-Plane Container (velod)
-After=network-online.target velocor-spdk.service
-Wants=velocor-spdk.service
+After=network-online.target
+Wants=network-online.target
 
 [Container]
 # Filled in by the OS image build with the embedded image, pinned by digest.
@@ -18,25 +18,17 @@ Volume=/var/lib/velocor-monitoring:/var/lib/velocor-monitoring:rw
 Volume=/run/velocor:/run/velocor:rw
 Volume=/sys:/sys:rw
 Volume=/dev:/dev:rslave
-# The data plane, from /etc/velocor/velod.env (loaded in [Service]): VELOCOR_DATA_PLANE=kernel
-# selects the kernel data plane (md, LVM thin, nvmet, LIO); without it, SPDK.
-Environment=VELOCOR_DATA_PLANE=${VELOCOR_DATA_PLANE}
-# Lab VMs without a (v)IOMMU: uncomment to allow binding NVMe drives in unsafe no-IOMMU mode.
-# Never enable this on production hardware; it lets SPDK DMA anywhere in host memory.
-#Environment=VELOCOR_ALLOW_UNSAFE_NOIOMMU=true
 # A velod that stops answering (hung, deadlocked) is killed; systemd's Restart=always starts it
-# again. /healthz only says velod serves requests, so a missing SPDK doesn't restart it.
+# again. /healthz only says velod serves requests, so a data-plane problem doesn't restart it.
 HealthCmd=/usr/bin/velod healthcheck -listen :8443
 HealthInterval=30s
 HealthTimeout=10s
 HealthRetries=3
 HealthStartPeriod=2m
 HealthOnFailure=kill
-Exec=--listen :8443 --db /var/lib/velocor/velocor.db --spdk-socket /run/velocor/spdk.sock --hugepages-mb 1024
+Exec=--listen :8443 --db /var/lib/velocor/velocor.db
 
 [Service]
-# Optional; velocor-spdk.service checks the same file and doesn't start with the kernel data plane.
-EnvironmentFile=-/etc/velocor/velod.env
 ExecStartPre=/usr/bin/mkdir -p /var/lib/velocor /run/velocor
 Restart=always
 RestartSec=3s

@@ -1,8 +1,8 @@
 name: Build, Test & Release Velocor
 
 # Build logic lives in the Makefile; this workflow only decides what to call it with.
-#  - pull requests: lint, unit + integration tests, the SPDK unit tests of our SPDK patches, and
-#    a full image build pushed to a throwaway local registry (so the OS image build is exercised
+#  - pull requests: lint, unit tests, the data plane's tests on a real kernel, and a full
+#    image build pushed to a throwaway local registry (so the OS image build is exercised
 #    too). Nothing is published. Only the jobs the changed files need run (hack/ci-changes.sh):
 #    a chart- or docs-only change runs lint alone. Skipped jobs count as passed checks.
 #  - main: images as sha-<sha> (+ moving tag "main"), signed and attested; dev Helm chart.
@@ -38,7 +38,6 @@ jobs:
       contents: read
     outputs:
       go: ${{ steps.areas.outputs.go }}
-      spdk: ${{ steps.areas.outputs.spdk }}
       images: ${{ steps.areas.outputs.images }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -54,7 +53,7 @@ jobs:
           if [[ "$EVENT" == pull_request ]]; then
             git diff --name-only "$BASE...HEAD" | tee /dev/stderr | hack/ci-changes.sh | tee -a "$GITHUB_OUTPUT"
           else
-            printf 'go=true\nspdk=true\nimages=true\n' | tee -a "$GITHUB_OUTPUT"
+            printf 'go=true\nimages=true\n' | tee -a "$GITHUB_OUTPUT"
           fi
 
   lint:
@@ -76,11 +75,11 @@ jobs:
       - name: go vet
         run: |
           go vet ./...
-          go vet -tags integration ./internal/integration/
+          go vet -tags kernelintegration ./internal/kernel ./internal/dataplane/kernelplane
       - uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
         with:
           version: v2.15.0
-          args: --build-tags integration
+          args: --build-tags kernelintegration
       - name: shellcheck
         run: make shellcheck
       - name: Alert rules (promtool check and unit tests)
@@ -148,13 +147,13 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
-  # The kernel data plane's integration tests (TODO.md K-1/K-2) against real md, LVM thin,
+  # The data plane's integration tests against real md, LVM thin,
   # device-mapper, nvmet and LIO on loop devices, as root, in a Fedora VM under the runner's
   # KVM (hack/kernel-tests-vm.sh): the runner's own Azure kernel has no installable extra
   # modules (dm-dust, nvmet, LIO), and the VM matches the appliance's kernel family and tools.
-  # Not yet a gate for the images.
+  # Images aren't published unless they pass.
   kernel-tests:
-    name: Kernel data plane tests
+    name: Data plane tests (real kernel)
     needs: changes
     if: needs.changes.outputs.go == 'true'
     runs-on: ubuntu-24.04
@@ -180,35 +179,17 @@ jobs:
           key: fedora-cloud-${{ hashFiles('hack/kernel-tests-vm.sh') }}
       - run: make test-kernel-vm
 
-  # SPDK's unit tests for the libraries our carried SPDK patches touch (deploy/containers/
-  # spdk-patches): a separate SPDK compile with unit tests enabled. Images aren't published
-  # unless they pass.
-  spdk-unit-tests:
-    name: SPDK patch unit tests
-    needs: changes
-    if: needs.changes.outputs.spdk == 'true'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 60
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - run: make spdk-unit-tests
-
-  # One job builds every image so the OS image embeds the spdk/velod images of this very run
-  # (pinned by digest), and SPDK is compiled once for both the integration tests and the image.
+  # One job builds every image so the OS image embeds the velod image of this very run
+  # (pinned by digest).
   images:
-    name: Images (integration tests, build, push)
-    needs: [changes, lint, test, spdk-unit-tests]
+    name: Images (build, push)
+    needs: [changes, lint, test, kernel-tests]
     # Runs when the jobs before it passed or were skipped (not needed for this change).
     if: ${{ !cancelled() && !failure() && needs.changes.outputs.images == 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     env:
-      # Resolve each rolling Fedora base once for this run: the integration-tested SPDK image and
-      # the pushed one then share one base and one SPDK compile.
+      # Resolve each rolling Fedora base once for this run.
       BASE_PIN_DIR: bin/base-pins
     permissions:
       contents: read
@@ -230,7 +211,7 @@ jobs:
         with:
           platforms: arm64
 
-      - name: Free disk space (SPDK build + bootc image)
+      - name: Free disk space (bootc image)
         run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL && df -h /
 
       - name: Decide registry and tags
@@ -240,7 +221,7 @@ jobs:
           PR: ${{ github.event.pull_request.number }}
         run: |
           # One credentials file for podman login, skopeo and the OS image build (which pulls the
-          # just-pushed spdk/velod images, private while the repository is; a build secret).
+          # just-pushed velod image, private while the repository is; a build secret).
           echo "REGISTRY_AUTH_FILE=$RUNNER_TEMP/registry-auth.json" >> "$GITHUB_ENV"
           owner="${GITHUB_REPOSITORY_OWNER,,}"
           if [[ "$EVENT" == pull_request ]]; then
@@ -271,9 +252,6 @@ jobs:
           podman login -u "$GITHUB_ACTOR" --password-stdin "$REGISTRY" <<<"$TOKEN"
           docker login -u "$GITHUB_ACTOR" --password-stdin "$REGISTRY" <<<"$TOKEN"   # cosign, attest
 
-      - name: Integration tests against real SPDK
-        run: make test-integration
-
       - name: Build and push images
         env:
           IMAGE_PREFIX: ${{ steps.vars.outputs.image_prefix }}
@@ -303,7 +281,7 @@ jobs:
         if: github.event_name != 'pull_request'
         env:
           IMAGE_PREFIX: ${{ steps.vars.outputs.image_prefix }}
-        run: for n in velocor-spdk velocor-velod velocor-csi velocor-os; do cosign sign --yes "$IMAGE_PREFIX/$n@$(cat "bin/digests/$n")"; done
+        run: for n in velocor-velod velocor-csi velocor-os; do cosign sign --yes "$IMAGE_PREFIX/$n@$(cat "bin/digests/$n")"; done
 
       # GitHub artifact attestations aren't available for private repositories owned by a user
       # ("Feature not available for user-owned private repositories"): they start once the
@@ -311,13 +289,7 @@ jobs:
       - name: Read digests for attestations
         if: github.event_name != 'pull_request' && !github.event.repository.private
         id: digests
-        run: for n in velocor-spdk velocor-velod velocor-csi velocor-os; do echo "${n#velocor-}=$(cat "bin/digests/$n")" >> "$GITHUB_OUTPUT"; done
-      - uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
-        if: github.event_name != 'pull_request' && !github.event.repository.private
-        with:
-          subject-name: ${{ steps.vars.outputs.image_prefix }}/velocor-spdk
-          subject-digest: ${{ steps.digests.outputs.spdk }}
-          push-to-registry: true
+        run: for n in velocor-velod velocor-csi velocor-os; do echo "${n#velocor-}=$(cat "bin/digests/$n")" >> "$GITHUB_OUTPUT"; done
       - uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         if: github.event_name != 'pull_request' && !github.event.repository.private
         with:
@@ -458,7 +430,7 @@ jobs:
 
             - Appliance OS (bootc): `${{ needs.images.outputs.image_prefix }}/velocor-os:${{ needs.images.outputs.tag }}`
             - Kubernetes CSI driver: `${{ needs.images.outputs.image_prefix }}/velocor-csi:${{ needs.images.outputs.tag }}`
-            - velod and spdk_tgt are embedded in the OS image; they are not deployed separately.
+            - velod is embedded in the OS image; it is not deployed separately.
 
             ## CSI driver
 
