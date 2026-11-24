@@ -177,7 +177,11 @@ listed until then so nothing is lost if the plan changes.
         system kernel-options`, `PUT /api/v1/system/kernel-options`; `rpm-ostree kargs`, which
         stages a boot entry of the same OS image and so replaces a rollback to the previous
         version: refused without force). K-2 VM: both directions and a reboot
-        (`heap alloc:off`). The gain isn't measured yet (benchmark on the next build).
+        (`heap alloc:off`); velocor-1's upgrade through the API added the argument. The gain isn't
+        measured yet (benchmark on the next build).
+      - [ ] Fedora's `mdmonitor.service` fails at boot on appliances without arrays at boot (mdadm
+        finds nothing to monitor and exits); velod watches the arrays itself, so disable it in
+        the OS image.
       - Lab: a multiqueue virtio-net (queues=4) for velocor-1's SAN NIC would make it behave
         like a real NIC (RSS) without RPS.
     - [ ] Soak.
