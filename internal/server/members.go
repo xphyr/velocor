@@ -278,7 +278,10 @@ func (s *Server) handleStartPoolDegraded(w http.ResponseWriter, r *http.Request)
 	var req struct {
 		Confirm string `json:"confirm"`
 	}
-	_ = json.NewDecoder(r.Body).Decode(&req)
+	if err := decodeOptionalJSON(r, &req); err != nil {
+		writeError(w, err)
+		return
+	}
 	if err := s.requireDataPlane(); err != nil {
 		writeError(w, err)
 		return

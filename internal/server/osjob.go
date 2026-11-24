@@ -2,7 +2,6 @@ package server
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
@@ -120,7 +119,10 @@ func (s *Server) handleStageUpgrade(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		ImageRef string `json:"image_ref"`
 	}
-	_ = json.NewDecoder(r.Body).Decode(&req)
+	if err := decodeOptionalJSON(r, &req); err != nil {
+		writeError(w, err)
+		return
+	}
 	imageRef := strings.TrimSpace(req.ImageRef)
 	// The reference reaches bootc's command line: anything that could be read as an option
 	// (or carries whitespace / control characters) is refused.
@@ -302,7 +304,10 @@ func (s *Server) handleRebootSystem(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Force bool `json:"force"`
 	}
-	_ = json.NewDecoder(r.Body).Decode(&req)
+	if err := decodeOptionalJSON(r, &req); err != nil {
+		writeError(w, err)
+		return
+	}
 	if j := s.os.snapshot(); j != nil && j.State == "RUNNING" {
 		writeError(w, fmt.Errorf("%w: an OS upgrade is running; rebooting now would lose it", store.ErrInUse))
 		return

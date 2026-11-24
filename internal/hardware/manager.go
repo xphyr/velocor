@@ -309,6 +309,10 @@ func (m *Manager) BindNVMeToKernel(pciAddr string) error {
 	if err := os.WriteFile(probePath, []byte(bdf), 0200); err != nil {
 		return fmt.Errorf("drivers_probe %s: %w", bdf, err)
 	}
+	// Writing to drivers_probe succeeds whether or not a driver took the device.
+	if d := readSymlinkBase(filepath.Join(devDir, "driver")); d != "nvme" {
+		return fmt.Errorf("the nvme driver didn't take %s (driver now: %q)", bdf, d)
+	}
 	return nil
 }
 

@@ -92,13 +92,14 @@ func (m *metricSet) writeTo(w io.Writer) error {
 
 // escapeLabel escapes a label value as the text format requires: backslash, double quote and
 // line feed; everything else, including non-ASCII, is written as UTF-8.
-func escapeLabel(s string) string {
-	return strings.NewReplacer(`\`, `\\`, `"`, `\"`, "\n", `\n`).Replace(s)
-}
+func escapeLabel(s string) string { return labelEscaper.Replace(s) }
 
-func escapeHelp(s string) string {
-	return strings.NewReplacer(`\`, `\\`, "\n", `\n`).Replace(s)
-}
+func escapeHelp(s string) string { return helpEscaper.Replace(s) }
+
+var (
+	labelEscaper = strings.NewReplacer(`\`, `\\`, `"`, `\"`, "\n", `\n`)
+	helpEscaper  = strings.NewReplacer(`\`, `\\`, "\n", `\n`)
+)
 
 func formatValue(v float64) string {
 	switch {

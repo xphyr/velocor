@@ -407,21 +407,14 @@ func (p *Plane) RunArray(ctx context.Context, name string) error {
 // MemberRole returns a device's slot in its array from its md metadata, or -1 for a spare (or
 // a device md doesn't place).
 func (p *Plane) MemberRole(ctx context.Context, dev string) (int, error) {
-	out, err := p.Run.Run(ctx, "mdadm", "--examine", dev)
+	m, err := p.ExamineMember(ctx, dev)
 	if err != nil {
 		return -1, err
 	}
-	for _, line := range strings.Split(string(out), "\n") {
-		k, v, ok := strings.Cut(line, ":")
-		if !ok || strings.TrimSpace(k) != "Device Role" {
-			continue
-		}
-		if n, err := strconv.Atoi(strings.TrimPrefix(strings.TrimSpace(v), "Active device ")); err == nil {
-			return n, nil
-		}
-		return -1, nil
+	if m == nil {
+		return -1, fmt.Errorf("mdadm --examine %s: no md metadata", dev)
 	}
-	return -1, fmt.Errorf("mdadm --examine %s: no device role", dev)
+	return m.Role, nil
 }
 
 // ZeroSuperblock erases md metadata from a device that left its array.

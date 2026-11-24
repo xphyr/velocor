@@ -191,7 +191,7 @@ func (p *Plane) Unmanaged(ctx context.Context, known dataplane.Known) ([]datapla
 	for _, vg := range vgs {
 		if !known.ThinPools[vg.UUID] {
 			out = append(out, dataplane.UnmanagedObject{Kind: "VOLUME_GROUP", Name: vg.Name, UUID: vg.UUID,
-				Detail: fmt.Sprintf("on %s, %s used", vg.PV, humanBytes(vg.Size-vg.Free))})
+				Detail: fmt.Sprintf("on %s, %s used", vg.PV, store.HumanBytes(vg.Size-vg.Free))})
 		}
 	}
 	lvs, err := p.k.ListVolumes(ctx, "")
@@ -227,17 +227,6 @@ func (p *Plane) Unmanaged(ctx context.Context, known dataplane.Known) ([]datapla
 		}
 	}
 	return out, nil
-}
-
-func humanBytes(b uint64) string {
-	switch {
-	case b >= 1<<40:
-		return fmt.Sprintf("%.1f TiB", float64(b)/(1<<40))
-	case b >= 1<<30:
-		return fmt.Sprintf("%.1f GiB", float64(b)/(1<<30))
-	default:
-		return fmt.Sprintf("%.1f MiB", float64(b)/(1<<20))
-	}
 }
 
 func kernelNVMePort(id int, addr string, port int) kernel.NVMePort {

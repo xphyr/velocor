@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/velocor/velocor/internal/monitoring"
@@ -163,18 +164,24 @@ func (s *Server) handleGraph(w http.ResponseWriter, r *http.Request) {
 		Name   string             `json:"name"`
 		Points []monitoring.Point `json:"points"`
 	}
-	out := []line{}
-	for _, l := range def.lines {
-		series, err := s.monitoring.QueryRange(r.Context(), graphQuery(l, selector, step), end.Add(-rng), end, step)
+	out, errs := make([]line, len(def.lines)), make([]error, len(def.lines))
+	var wg sync.WaitGroup
+	for i, l := range def.lines {
+		wg.Go(func() {
+			series, err := s.monitoring.QueryRange(r.Context(), graphQuery(l, selector, step), end.Add(-rng), end, step)
+			pts := []monitoring.Point{}
+			if len(series) > 0 {
+				pts = series[0].Points
+			}
+			out[i], errs[i] = line{Name: l.name, Points: pts}, err
+		})
+	}
+	wg.Wait()
+	for _, err := range errs {
 		if err != nil {
 			writeMonitoringError(w, err)
 			return
 		}
-		pts := []monitoring.Point{}
-		if len(series) > 0 {
-			pts = series[0].Points
-		}
-		out = append(out, line{Name: l.name, Points: pts})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"unit": def.unit, "step_seconds": int(step.Seconds()), "lines": out})
 }
