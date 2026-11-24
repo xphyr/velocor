@@ -151,8 +151,11 @@ listed until then so nothing is lost if the plan changes.
       `velocor_pool_unreadable_bytes`, `VelocorPoolDataUnreadable` critical); UI and `veloctl
       pool show`. K-2 VM: the bad sector noted while the other copy exists, lost (DEGRADED)
       without it and after the rebuild, and back to a note once the range was written again
-      (md clears it on a member that takes the write). Which volumes the lost range belongs to
-      isn't worked out yet (thin_dump of a metadata snapshot, mapped through the LV segments).
+      (md clears it on a member that takes the write). What the lost ranges held is worked out
+      (**2026-11-24**): the volumes and snapshots (through LVM's segments and a thin_dump of a
+      metadata snapshot), named on the pool (`lost_data`) and the volumes DEGRADED while still
+      served; K-2 VM: the volume and its snapshot named, the reported offset the one that
+      fails to read.
     - [ ] Deep-queue throughput: profile the appliance during the IOPS jobs (nvmet/LIO threads,
       dm-thin, md) before tuning.
     - [ ] Soak.

@@ -83,7 +83,7 @@ func (p *Plane) arrayOf(name string, st *kernel.ArrayStatus) dataplane.Array {
 		}
 	}
 	a.Scrub = p.scrubOf(name, st)
-	a.UnreadableBytes = unreadableSectors(st) * 512
+	a.UnreadableBytes = unreadableOf(st).sectors * 512
 	return a
 }
 

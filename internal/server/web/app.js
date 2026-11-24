@@ -583,6 +583,28 @@ function importResult(r) {
 
 const MEMBER_KIND = { ACTIVE: "ok", REBUILDING: "warn", FAILED: "bad", MISSING: "bad" };
 
+// What a pool's lost data held (lost_data, from the reconciler), a line each.
+const LOST_KIND = {
+  "thin-metadata": "the thin pool's metadata (the volumes' block mappings)",
+  "pool-metadata": "the on-pool configuration copy (rewritten on the next change)",
+  "lvm-metadata": "LVM's metadata (the pool may not be found after a restart)",
+  unlocated: "somewhere in the pool (not worked out for RAID0 over disks of different sizes)",
+};
+
+function lostList(p, vols) {
+  const byID = Object.fromEntries(vols.map((v) => [v.id, v]));
+  const items = (p.lost_data || []).map((l) => {
+    const size = humanSize(l.length_bytes);
+    if (l.volume_id) {
+      const v = byID[l.volume_id];
+      return el("li", {}, ["Volume ", link(v ? v.name : l.volume_id, "volume", l.volume_id), `: ${size} from ${humanSize(l.offset_bytes)}`]);
+    }
+    if (l.snapshot_id) return el("li", {}, ["Snapshot ", mono(l.snapshot_id), `: ${size} from ${humanSize(l.offset_bytes)}`]);
+    return el("li", {}, `${LOST_KIND[l.kind] || l.name || l.kind}: ${size}`);
+  });
+  return items.length > 0 && el("ul", { class: "sub" }, items);
+}
+
 function memberState(m) {
   const state = pill(m.state.toLowerCase(), MEMBER_KIND[m.state]);
   // md's bad-block log: ranges this disk couldn't read or rewrite, read from another copy since.
@@ -737,7 +759,8 @@ async function pool(id) {
     el("dl", { class: "facts" },
       fact("Health", health(p)),
       p.unreadable_bytes > 0 && fact("Lost data", [pill(humanSize(p.unreadable_bytes), "bad"), el("span", { class: "sub" },
-        "Bad blocks are recorded on every copy of this much of the pool: reading it fails until it is written again. Restore the affected volumes from backups.")]),
+        "Bad blocks are recorded on every copy of this much of the pool: reading it fails until it is written again. Restore the affected volumes from backups."),
+        lostList(p, [...volumes, ...deletedVols])]),
       fact("Space", [spacePill(p), poolBar(p), SPACE_HINT[p.space_state] && el("span", { class: "sub" }, SPACE_HINT[p.space_state])]),
       fact("Committed", [`${humanSize(p.committed_bytes || 0)} promised`, el("span", { class: "sub" },
         `${humanSize(p.available_bytes || 0)} more accepted. Committed counts every volume as if fully written, plus what snapshots hold.`)]),

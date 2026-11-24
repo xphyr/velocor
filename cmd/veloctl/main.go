@@ -851,6 +851,18 @@ func runPool(cfg *cliConfig, args []string) error {
 			orDefault(sp["max_overcommit"], 1.0), orDefault(sp["reserve_percent"], 5.0), orDefault(sp["warning_percent"], 80.0), orDefault(sp["critical_percent"], 90.0))
 		if n := uint64FromAny(p["unreadable_bytes"]); n > 0 {
 			fmt.Printf("Lost:    %s can't be read from any disk (bad blocks on every copy)\n", humanBytes(n))
+			for _, l := range sliceOfMaps(p["lost_data"]) {
+				what := strOrDash(l["kind"])
+				switch {
+				case l["volume_id"] != nil:
+					what = fmt.Sprintf("volume %v", l["volume_id"])
+				case l["snapshot_id"] != nil:
+					what = fmt.Sprintf("snapshot %v", l["snapshot_id"])
+				case l["name"] != nil:
+					what = fmt.Sprintf("%v", l["name"])
+				}
+				fmt.Printf("           %s: %s at %s\n", what, humanBytes(uint64FromAny(l["length_bytes"])), humanBytes(uint64FromAny(l["offset_bytes"])))
+			}
 		}
 		tw := newTabWriter()
 		fmt.Fprintln(tw, "\nSLOT\tDISK\tSTATE\tREBUILD\tBAD BLOCKS")

@@ -253,6 +253,9 @@ func (p *Plane) CreateThinPool(ctx context.Context, array, name string, chunkByt
 // GrowMetadata: an lvstore keeps its metadata in its own clusters; nothing to grow.
 func (p *Plane) GrowMetadata(context.Context, string) (uint64, error) { return 0, nil }
 
+// LostData: SPDK keeps no bad-block log (Array.UnreadableBytes is always 0).
+func (p *Plane) LostData(context.Context, string) ([]dataplane.LostExtent, error) { return nil, nil }
+
 func (p *Plane) DeleteThinPool(ctx context.Context, uuid, name string) error {
 	return wrap(p.c.BdevLvolDeleteLvstore(ctx, uuid, name))
 }

@@ -305,6 +305,20 @@ much of the array no in-sync member can supply (`unreadable_bytes`, worked out p
 every copy for RAID1, the pair holding the chunk for near-2 RAID10, any for RAID0): the pool is
 DEGRADED and `VelocorPoolDataUnreadable` fires.
 
+What the lost ranges held is worked out too (`Plane.LostData`, `kernel.RangeOwners`): array
+sectors through the RAID layout, then LVM's segments (`lvs -a` physical extent ranges) to the
+LV, and within the thin pool's data LV, a `thin_dump` of a metadata snapshot (shared subtrees
+come as `<def>`s the devices `<ref>`) to every thin volume mapping the block, so a volume and
+its snapshots are all named, with where in them. The pool lists them (`lost_data`, and in its
+message), and each volume is DEGRADED, saying how much from where, while still served. Free
+extents, unmapped thin blocks and LVM's spare metadata copy hold nothing and aren't reported;
+the thin metadata, velod's configuration copy and LVM's own metadata are named as such. The
+answer is cached while the ranges stay the same (10 minutes). RAID0 over disks of different
+sizes (md's zones) isn't located: only the amount is reported. Checked on the lab VM: the
+reported offset in the volume was the one that failed to read, 64 KiB either side read fine.
+A sector that fails on the only copy isn't in any log until md tries to rewrite it from
+another one, so a degraded array's unread bad sectors aren't known ahead.
+
 ## 6. What we give up or must decide
 
 - **Deep random-write IOPS on a mirror:** about 28% lower than SPDK RAID1 at queue depth 64 on

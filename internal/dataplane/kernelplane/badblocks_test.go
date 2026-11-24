@@ -1,6 +1,7 @@
 package kernelplane
 
 import (
+	"slices"
 	"testing"
 
 	"github.com/velocor/velocor/internal/kernel"
@@ -53,8 +54,41 @@ func TestUnreadableSectors(t *testing.T) {
 		{"raid10: another layout isn't worked out", &kernel.ArrayStatus{Level: "raid10", RaidDisks: 4, Layout: 0x201, ChunkSectors: 128,
 			Members: []kernel.MemberStatus{member(0, "in_sync", br(10, 8)), member(1, "in_sync", br(10, 8))}}, 0},
 	} {
-		if got := unreadableSectors(tc.st); got != tc.want {
-			t.Errorf("%s: %d sectors, want %d", tc.name, got, tc.want)
+		if got := unreadableOf(tc.st); got.sectors != tc.want {
+			t.Errorf("%s: %d sectors, want %d", tc.name, got.sectors, tc.want)
+		}
+	}
+}
+
+// Where in the array the lost ranges are: what the volumes are mapped from.
+func TestUnreadableRanges(t *testing.T) {
+	raid10 := func(n int, ms ...kernel.MemberStatus) *kernel.ArrayStatus {
+		return &kernel.ArrayStatus{Level: "raid10", RaidDisks: n, Layout: raid10Near2, ChunkSectors: 128, Members: ms}
+	}
+	for _, tc := range []struct {
+		name    string
+		st      *kernel.ArrayStatus
+		want    []kernel.SectorRange
+		located bool
+	}{
+		{"raid1: member sectors are array sectors", &kernel.ArrayStatus{Level: "raid1", RaidDisks: 2, Members: []kernel.MemberStatus{
+			member(0, "in_sync", br(4194304, 8), br(100, 8)), member(1, "in_sync", br(4194304, 8))}}, []kernel.SectorRange{br(4194304, 8)}, true},
+		// Two members, 128-sector chunks: member 1's row 2 is array chunk 5.
+		{"raid0: striped", &kernel.ArrayStatus{Level: "raid0", RaidDisks: 2, ChunkSectors: 128, Members: []kernel.MemberStatus{
+			member(0, "in_sync"), member(1, "in_sync", br(2*128+10, 4))}}, []kernel.SectorRange{br(5*128+10, 4)}, true},
+		{"raid0: members of different sizes: zones, not located", &kernel.ArrayStatus{Level: "raid0", RaidDisks: 2, ChunkSectors: 128, Members: []kernel.MemberStatus{
+			{Device: "a", Slot: 0, State: []string{"in_sync"}, Size: 1000}, {Device: "b", Slot: 1, State: []string{"in_sync"}, Size: 2000, BadBlocks: []kernel.SectorRange{br(5, 4)}}}},
+			nil, false},
+		// Four members: row 1 of members 2 and 3 holds array chunk 3.
+		{"raid10/4: chunk 3", raid10(4, member(0, "in_sync"), member(1, "in_sync"), member(2, "in_sync", br(128+10, 8)),
+			member(3, "in_sync", br(128+12, 8))), []kernel.SectorRange{br(3*128+12, 6)}, true},
+		// Five members: position 4 (member 4, row 0) and 5 (member 0, row 1) hold array chunk 2.
+		{"raid10/5: across rows", raid10(5, member(0, "in_sync", br(128+5, 4)), member(1, "in_sync"), member(2, "in_sync"),
+			member(3, "in_sync"), member(4, "in_sync", br(5, 4))), []kernel.SectorRange{br(2*128+5, 4)}, true},
+	} {
+		got := unreadableOf(tc.st)
+		if !slices.Equal(got.ranges, tc.want) || got.located != tc.located {
+			t.Errorf("%s: %v (located %v), want %v", tc.name, got.ranges, got.located, tc.want)
 		}
 	}
 }

@@ -155,6 +155,7 @@ type pass struct {
 	degraded []string
 	errs     []string
 	notes    map[string][]string // pool ID -> extra reasons for its status message
+	lostVols map[string]string   // volume ID -> why it is DEGRADED: part of its data is lost
 
 	unmanaged        []UnmanagedObject
 	unmanagedChecked bool // false: keep the last report
@@ -465,6 +466,7 @@ func (r *Reconciler) reconcilePools(ctx context.Context, p *pass, examined bool)
 		raidOnline := false
 		members := store.PoolMembers(pool)
 		var unreadable uint64
+		var lost []store.LostExtent
 		if ri >= 0 {
 			v := r.viewRaid(ctx, pool, &raids[ri], raids, disks, bdevs)
 			raidOnline, members = v.online, v.members
@@ -475,7 +477,7 @@ func (r *Reconciler) reconcilePools(ctx context.Context, p *pass, examined bool)
 				fail(v.health, "RAID "+pool.ArrayName+" is "+string(v.health))
 			}
 			unreadable = raids[ri].UnreadableBytes
-			badBlocks(pool, members, unreadable, fail, p)
+			lost = r.badBlocks(ctx, p, pool, members, unreadable, fail)
 		} else {
 			fail(store.HealthStatusUnavailable, fmt.Sprintf("array %s isn't assembled (%d/%d member disks present)",
 				pool.ArrayName, r.presentMembers(pool, bdevs), len(pool.DiskIDs)))
@@ -520,9 +522,9 @@ func (r *Reconciler) reconcilePools(ctx context.Context, p *pass, examined bool)
 		_, err := r.store.MutatePool(pool.ID, func(cur *store.Pool) error {
 			changed := cur.HealthStatus != health || cur.StatusMessage != msg || cur.Durability != durability
 			cur.Durability = durability
-			if ri >= 0 && cur.UnreadableBytes != unreadable {
+			if ri >= 0 && (cur.UnreadableBytes != unreadable || !slices.Equal(cur.LostData, lost)) {
 				changed = true
-				cur.UnreadableBytes = unreadable
+				cur.UnreadableBytes, cur.LostData = unreadable, lost
 			}
 			if !membersEqual(store.PoolMembers(cur), members) || len(cur.Members) == 0 {
 				changed = true
@@ -556,21 +558,108 @@ func (r *Reconciler) reconcilePools(ctx context.Context, p *pass, examined bool)
 // badBlocks reports the bad blocks the data plane recorded on a pool's members (md's bad-block
 // log: ranges a member couldn't read and couldn't rewrite from another copy). Where every copy
 // has them the data is lost and the pool is DEGRADED, until the data is written again (md
-// clears a range on a member that takes the write: restoring the volume does); where only some
-// do, the pool has a copy fewer there: a note, as replacing the disk restores it.
-func badBlocks(pool *store.Pool, members []store.PoolMember, unreadable uint64, fail func(store.HealthStatus, string), p *pass) {
-	if unreadable > 0 {
-		fail(store.HealthStatusDegraded, fmt.Sprintf("%s of the pool can't be read from any disk (bad blocks recorded on every copy): "+
-			"the data there is lost, and reading it fails until it is written again: restore the affected volumes from backups",
-			store.HumanBytes(unreadable)))
-		return
-	}
-	for _, m := range members {
-		if m.BadBlockBytes > 0 && m.State == store.MemberStateActive {
-			p.notePool(pool.ID, fmt.Sprintf("%s has %s of bad blocks recorded (read from the other copy instead): replace it to restore full redundancy there",
-				diskLabel(m.DiskID), store.HumanBytes(m.BadBlockBytes)))
+// clears a range on a member that takes the write: restoring the volume does); the volumes and
+// snapshots it held are named, and those volumes DEGRADED too. Where only some copies have
+// them, the pool has a copy fewer there: a note, as replacing the disk restores it.
+func (r *Reconciler) badBlocks(ctx context.Context, p *pass, pool *store.Pool, members []store.PoolMember, unreadable uint64,
+	fail func(store.HealthStatus, string)) []store.LostExtent {
+	if unreadable == 0 {
+		for _, m := range members {
+			if m.BadBlockBytes > 0 && m.State == store.MemberStateActive {
+				p.notePool(pool.ID, fmt.Sprintf("%s has %s of bad blocks recorded (read from the other copy instead): replace it to restore full redundancy there",
+					diskLabel(m.DiskID), store.HumanBytes(m.BadBlockBytes)))
+			}
 		}
+		return nil
 	}
+	msg := fmt.Sprintf("%s of the pool can't be read from any disk (bad blocks recorded on every copy): the data there is lost, and reading it fails until it is written again",
+		store.HumanBytes(unreadable))
+	found, err := r.dp.LostData(ctx, pool.ArrayName)
+	if err != nil {
+		fail(store.HealthStatusDegraded, msg+"; what it held couldn't be worked out ("+err.Error()+"): restore the affected volumes from backups")
+		return nil
+	}
+	lost, what := r.describeLost(p, found)
+	if len(what) > 0 {
+		msg += "; it held " + strings.Join(what, ", ")
+	}
+	fail(store.HealthStatusDegraded, msg+": restore the affected volumes from backups")
+	return lost
+}
+
+// describeLost resolves lost data to the store's volumes and snapshots, marks those volumes for
+// reconcileVolumes, and describes each thing lost (in volume web: 4.0 KiB at 1.2 GiB).
+func (r *Reconciler) describeLost(p *pass, found []dataplane.LostExtent) ([]store.LostExtent, []string) {
+	vols, _ := r.store.ListVolumes("")
+	snaps, _ := r.store.ListSnapshots("", "")
+	type item struct {
+		what, note    string
+		bytes, offset uint64
+	}
+	var order []string
+	items := map[string]*item{}
+	add := func(key, what, note string, e dataplane.LostExtent) {
+		if items[key] == nil {
+			items[key] = &item{what: what, note: note, offset: e.Offset}
+			order = append(order, key)
+		}
+		items[key].bytes += e.Length
+		items[key].offset = min(items[key].offset, e.Offset)
+	}
+	var lost []store.LostExtent
+	for _, e := range found {
+		l := store.LostExtent{Kind: e.Kind, Name: e.Name, OffsetBytes: e.Offset, LengthBytes: e.Length}
+		switch e.Kind {
+		case dataplane.LostVolume:
+			if i := slices.IndexFunc(vols, func(v *store.Volume) bool { return v.UUID == e.UUID }); i >= 0 {
+				v := vols[i]
+				l.VolumeID = v.ID
+				what := "volume " + v.Name
+				if v.Deleted() {
+					what = "deleted volume " + v.Name
+				}
+				add(v.ID, what, "", e)
+				if p.lostVols == nil {
+					p.lostVols = map[string]string{}
+				}
+				p.lostVols[v.ID] = "" // described below, once its extents are summed
+			} else if i := slices.IndexFunc(snaps, func(s *store.Snapshot) bool { return s.UUID == e.UUID }); i >= 0 {
+				l.SnapshotID = snaps[i].ID
+				add(snaps[i].ID, "snapshot "+snaps[i].Name, "", e)
+			} else {
+				add("uuid:"+e.UUID, "a volume velod doesn't manage", e.UUID, e)
+			}
+		case dataplane.LostThinMetadata:
+			add(e.Kind, "the thin pool's metadata", "the volumes' block mappings", e)
+		case dataplane.LostPoolMetadata:
+			add(e.Kind, "the on-pool configuration copy", "rewritten on the next change", e)
+		case dataplane.LostLVMMetadata:
+			add(e.Kind, "LVM's metadata", "the pool may not be found after a restart", e)
+		case dataplane.LostUnlocated:
+			add(e.Kind, "data whose place in the pool isn't worked out", "RAID0 over disks of different sizes", e)
+		default:
+			add("other:"+e.Name, e.Name, "", e)
+		}
+		lost = append(lost, l)
+	}
+	var what []string
+	for _, k := range order {
+		it := items[k]
+		desc := it.what + " (" + store.HumanBytes(it.bytes)
+		if _, isVol := p.lostVols[k]; isVol || strings.HasPrefix(it.what, "snapshot ") {
+			desc += " from " + store.HumanBytes(it.offset)
+		}
+		if it.note != "" {
+			desc += "; " + it.note
+		}
+		desc += ")"
+		if _, isVol := p.lostVols[k]; isVol {
+			p.lostVols[k] = fmt.Sprintf("%s of its data, from %s, can't be read from any disk of its pool: lost; reads there fail until it is written again; restore it from a backup",
+				store.HumanBytes(it.bytes), store.HumanBytes(it.offset))
+		}
+		what = append(what, desc)
+	}
+	return lost, what
 }
 
 // thinMetadataDegradedPercent: a pool whose thin metadata is this full is DEGRADED (growing it
@@ -719,6 +808,12 @@ func (r *Reconciler) reconcileVolumes(ctx context.Context, p *pass, poolOnline m
 					}
 				}
 			}
+		}
+
+		if lostMsg := p.lostVols[vol.ID]; lostMsg != "" && health == store.HealthStatusOnline {
+			// Still served (online stays set): the rest of it reads fine.
+			health, msg = store.HealthStatusDegraded, lostMsg
+			p.degrade(res, msg)
 		}
 
 		if _, err := r.store.MutateVolume(vol.ID, func(cur *store.Volume) error {

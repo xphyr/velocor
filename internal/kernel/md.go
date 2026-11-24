@@ -169,6 +169,7 @@ type MemberStatus struct {
 	// copy if one has them. Relative to the member's data, as Offset is subtracted.
 	BadBlocks []SectorRange
 	Offset    uint64 // where the member's data starts on the device (sectors)
+	Size      uint64 // the member's data size (sectors)
 }
 
 // BadSectors is the total size of the member's bad blocks, in sectors.
@@ -234,6 +235,10 @@ func (p *Plane) ArrayStatus(name string) (*ArrayStatus, error) {
 		}
 		b, _ = os.ReadFile(filepath.Join(d, "offset"))
 		m.Offset, _ = strconv.ParseUint(strings.TrimSpace(string(b)), 10, 64)
+		b, _ = os.ReadFile(filepath.Join(d, "size")) // KiB
+		if kib, err := strconv.ParseUint(strings.TrimSpace(string(b)), 10, 64); err == nil {
+			m.Size = kib * 2
+		}
 		// md records a bad block at once (unacknowledged) and in the superblock's log after.
 		var log string
 		for _, f := range []string{"bad_blocks", "unacknowledged_bad_blocks"} {

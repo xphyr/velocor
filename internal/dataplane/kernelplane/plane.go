@@ -68,6 +68,8 @@ type Plane struct {
 	// scrubs are the scrubs started since velod started, by array: md keeps only the last
 	// action, not where it began or whether it was stopped.
 	scrubs map[string]*scrubRun
+	// lost caches LostData by array, while its unreadable ranges stay the same.
+	lost map[string]lostData
 }
 
 type scrubRun struct {
