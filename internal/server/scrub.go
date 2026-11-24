@@ -25,13 +25,6 @@ import (
 // scrubTickInterval is how often the scheduler follows running scrubs and starts due ones.
 const scrubTickInterval = 30 * time.Second
 
-// Why the data plane stopped a scrub (Scrub.Status, negative errno).
-const (
-	scrubStatusMemberRemoved = -19  // ENODEV
-	scrubStatusRebuild       = -16  // EBUSY
-	scrubStatusCanceled      = -125 // ECANCELED
-)
-
 // RunScrubScheduler follows and schedules pool scrubs until ctx ends.
 func (s *Server) RunScrubScheduler(ctx context.Context) {
 	t := time.NewTicker(scrubTickInterval)
@@ -249,11 +242,11 @@ func (s *Server) syncScrub(ctx context.Context, p *store.Pool, rb *dataplane.Arr
 				r.Note = fmt.Sprintf("the data plane's scrub failed (error %d)", sc.Status)
 			default: // stopped
 				switch {
-				case r.Stopping != "" && sc.Status == scrubStatusCanceled:
+				case r.Stopping != "" && sc.Status == dataplane.ScrubStatusCanceled:
 					r.State = r.Stopping
-				case sc.Status == scrubStatusMemberRemoved:
+				case sc.Status == dataplane.ScrubStatusMemberRemoved:
 					r.State, r.Note = store.ScrubPaused, "a member left the RAID; the scrub resumes once the pool is ONLINE"
-				case sc.Status == scrubStatusRebuild:
+				case sc.Status == dataplane.ScrubStatusRebuild:
 					r.State, r.Note = store.ScrubPaused, "a rebuild started; the scrub resumes after it"
 				default:
 					r.State, r.Note = store.ScrubPaused, fmt.Sprintf("the data plane stopped the scrub (error %d)", sc.Status)

@@ -73,9 +73,15 @@ type Plane struct {
 }
 
 type scrubRun struct {
-	Repair  bool   `json:"repair"`
-	Start   uint64 `json:"start"` // sectors
-	Stopped bool   `json:"stopped"`
+	Repair   bool   `json:"repair"`
+	Start    uint64 `json:"start"`    // sectors
+	Degraded int    `json:"degraded"` // the array's missing members when it started
+	Last     uint64 `json:"last"`     // how far it was last seen (sectors)
+	Stopped  bool   `json:"stopped"`  // StopScrub
+	// Outcome is how it ended ("" while it runs), kept so that what happens to the array later
+	// doesn't change it: dataplane.ScrubCompleted or ScrubStopped, with Status saying why.
+	Outcome string `json:"outcome,omitempty"`
+	Status  int32  `json:"status,omitempty"`
 }
 
 var _ dataplane.Plane = (*Plane)(nil)
@@ -134,8 +140,8 @@ func (p *Plane) SetQoS(_ context.Context, _ string, q store.QosPolicy) error {
 }
 
 // Settle brings up what the claimed disks hold, as SPDK's examine did: the targets' modules,
-// every velod array on claimed disks whose members are all present (incomplete ones are kept
-// as waiting), every volume group on them, a wrapper for every volume, and any wrapper a crash
+// every velod array on claimed disks whose members are all present, or all those it still had
+// when it last ran (freshMembers; incomplete ones are kept as waiting), every volume group on them, a wrapper for every volume, and any wrapper a crash
 // left suspended resumed. An array with a member on a disk velod hasn't claimed is left alone
 // (an import candidate, or disks from elsewhere). It is idempotent and runs on every
 // reconciler pass.
@@ -165,11 +171,21 @@ func (p *Plane) Settle(ctx context.Context, claimed []string) error {
 		if len(a.Found) == 0 {
 			continue
 		}
-		if len(a.Found) < a.Devices {
+		infos := map[string]*kernel.MemberInfo{}
+		for _, dev := range a.Found {
+			if info, err := p.k.ExamineMember(ctx, dev); err == nil && info != nil {
+				infos[dev] = info
+			}
+		}
+		fresh, complete := freshMembers(a.Found, infos)
+		a.Found = fresh
+		if !complete {
 			waiting[a.Name] = a
 			continue
 		}
-		if err := p.k.AssembleArray(ctx, a.Name, a.UUID, a.Found, false); err != nil {
+		// Already degraded before it was stopped (its failed member is gone): mdadm needs to
+		// be told to run it with the members it knew it had.
+		if err := p.k.AssembleArray(ctx, a.Name, a.UUID, fresh, len(fresh) < a.Devices); err != nil {
 			waiting[a.Name] = a
 		}
 	}
@@ -206,6 +222,37 @@ func (p *Plane) Settle(ctx context.Context, claimed []string) error {
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// freshMembers picks the devices whose md metadata is current and says whether every member the
+// newest metadata still counts as active is among them. An array that lost a member while it ran
+// recorded that ("A."), so it comes up degraded again without it, as md and SPDK would; one
+// whose member went missing while it was stopped ("AA" but one found) must wait, as the missing
+// copy may be the newer one. A member that left the array has an older event count and takes no
+// part (md itself treats a count one behind as current: an unclean stop can leave that).
+func freshMembers(devs []string, infos map[string]*kernel.MemberInfo) (fresh []string, complete bool) {
+	var newest *kernel.MemberInfo
+	for _, dev := range devs {
+		if m := infos[dev]; m != nil && (newest == nil || m.Events > newest.Events) {
+			newest = m
+		}
+	}
+	if newest == nil {
+		return nil, false
+	}
+	active := 0
+	for _, dev := range devs {
+		m := infos[dev]
+		if m == nil || m.Events+1 < newest.Events {
+			continue
+		}
+		fresh = append(fresh, dev)
+		if m.Role >= 0 && m.Role < newest.RaidDevices {
+			active++
+		}
+	}
+	need := strings.Count(newest.ArrayState, "A") + strings.Count(newest.ArrayState, "R")
+	return fresh, need > 0 && active >= need
 }
 
 // metaLV is the on-pool metadata copy's volume (meta.LvolName): velod reads and writes it

@@ -1,9 +1,13 @@
 package kernelplane
 
 import (
+	"os"
+	"path/filepath"
 	"slices"
 	"testing"
 
+	"github.com/velocor/velocor/internal/dataplane"
+	"github.com/velocor/velocor/internal/kernel"
 	"github.com/velocor/velocor/internal/store"
 )
 
@@ -80,5 +84,65 @@ func TestScrubStateKept(t *testing.T) {
 	}
 	if err := New(nil, nil).LoadState(); err != nil { // no StateDir: nothing to do
 		t.Fatal(err)
+	}
+}
+
+// How a scrub ended, from what md shows: completed, stopped by an operator (with how far it got),
+// cut short by a member that failed or a rebuild, and nothing that happens later changes it.
+func TestScrubOutcome(t *testing.T) {
+	sys := t.TempDir()
+	md := filepath.Join(sys, "block", "md127")
+	if err := os.MkdirAll(filepath.Join(md, "md"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for f, v := range map[string]string{"size": "2000000", "md/component_size": "500000", "md/sync_speed_max": ""} {
+		if err := os.WriteFile(filepath.Join(md, f), []byte(v), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	const total = 1000000 // component_size in sectors
+	status := func(action, last string, degraded int, done uint64) *kernel.ArrayStatus {
+		return &kernel.ArrayStatus{Kernel: "md127", Level: "raid1", RaidDisks: 2, Degraded: degraded, SyncAction: action, LastSyncAction: last, SyncDone: done, SyncTotal: total}
+	}
+	plane := func(run *scrubRun) *Plane {
+		p := New(&kernel.Plane{SysRoot: sys, DevRoot: sys}, nil)
+		p.scrubs["a"] = run
+		return p
+	}
+
+	p := plane(&scrubRun{Start: 64, Last: 64})
+	if sc := p.scrubOf("a", status("check", "check", 0, 400000)); sc.State != dataplane.ScrubRunning || sc.OffsetBlocks != 400000 || sc.StartOffsetBlocks != 64 {
+		t.Fatalf("running: %+v", sc)
+	}
+	if sc := p.scrubOf("a", status("idle", "check", 0, 0)); sc.State != dataplane.ScrubCompleted || sc.OffsetBlocks != total || sc.Status != 0 {
+		t.Fatalf("completed: %+v", sc)
+	}
+	// A member failing after the scrub completed doesn't make it interrupted.
+	if sc := p.scrubOf("a", status("idle", "check", 1, 0)); sc.State != dataplane.ScrubCompleted {
+		t.Fatalf("completed, then degraded: %+v", sc)
+	}
+
+	p = plane(&scrubRun{Start: 0, Stopped: true, Last: 300000})
+	if sc := p.scrubOf("a", status("idle", "check", 0, 0)); sc.State != dataplane.ScrubStopped || sc.Status != dataplane.ScrubStatusCanceled || sc.OffsetBlocks != 300000 {
+		t.Fatalf("stopped by an operator: %+v", sc)
+	}
+
+	p = plane(&scrubRun{})
+	p.scrubOf("a", status("check", "check", 0, 250000))
+	if sc := p.scrubOf("a", status("idle", "check", 1, 0)); sc.State != dataplane.ScrubStopped || sc.Status != dataplane.ScrubStatusMemberRemoved || sc.OffsetBlocks != 250000 {
+		t.Fatalf("cut short by a member: %+v", sc)
+	}
+	p = plane(&scrubRun{})
+	p.scrubOf("a", status("check", "check", 0, 250000))
+	if sc := p.scrubOf("a", status("recover", "recover", 1, 10)); sc.State != dataplane.ScrubStopped || sc.OffsetBlocks != 250000 {
+		t.Fatalf("a rebuild right after a member failed: %+v", sc)
+	}
+	p = plane(&scrubRun{Degraded: 1})
+	p.scrubOf("a", status("check", "check", 1, 250000))
+	if sc := p.scrubOf("a", status("recover", "recover", 1, 10)); sc.Status != dataplane.ScrubStatusRebuild || sc.OffsetBlocks != 250000 {
+		t.Fatalf("a rebuild started: %+v", sc)
+	}
+	if sc := plane(nil).scrubOf("a", status("idle", "check", 0, 0)); sc != nil {
+		t.Fatalf("a check velod didn't start, finished: %+v", sc)
 	}
 }

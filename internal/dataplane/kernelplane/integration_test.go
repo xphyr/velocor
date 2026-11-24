@@ -644,7 +644,40 @@ func TestSettleAfterReboot(t *testing.T) {
 		t.Fatalf("started degraded: %+v", a)
 	}
 	verify(t, dev, 0, 32*mib, 6)
-	_, _ = e.k.Run.Run(e.ctx, "losetup", e.disks[1], lost) // back, for the cleanup
+
+	// It ran degraded and was written to, so it comes back degraded by itself after another
+	// reboot (until the first write md may not have recorded that the member is gone).
+	fill(t, dev, 0, 32*mib, 8)
+	reboot()
+	if err := e.p.Settle(e.ctx, e.disks); err != nil {
+		t.Fatal(err)
+	}
+	if a := e.arrayOf(); a.State != dataplane.ArrayOnline || a.Operational != 1 {
+		t.Fatalf("degraded before the reboot: %+v", a)
+	}
+	verify(t, dev, 0, 32*mib, 8)
+
+	// The disk that missed all that comes back stale: it takes no part, and alone (its metadata
+	// still says both members are active) it can't start the array.
+	_, _ = e.k.Run.Run(e.ctx, "losetup", e.disks[1], lost)
+	reboot()
+	if err := e.p.Settle(e.ctx, e.disks); err != nil {
+		t.Fatal(err)
+	}
+	if a := e.arrayOf(); a.State != dataplane.ArrayOnline || a.Operational != 1 || a.Members[0].Name != e.disks[0] {
+		t.Fatalf("with the stale member back: %+v", a)
+	}
+	verify(t, dev, 0, 32*mib, 8)
+	reboot()
+	if err := e.p.Settle(e.ctx, e.disks[1:]); err != nil {
+		t.Fatal(err)
+	}
+	if a := e.arrayOf(); a.State != dataplane.ArrayConfiguring {
+		t.Fatalf("the stale member alone started the array: %+v", a)
+	}
+	if err := e.p.Settle(e.ctx, e.disks); err != nil { // running again, for the cleanup
+		t.Fatal(err)
+	}
 }
 
 // ExamineDisks finds a stopped pool's array on its disks, each member in its slot, and a member

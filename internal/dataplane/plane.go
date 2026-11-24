@@ -263,6 +263,13 @@ const (
 	ScrubFailed    = "failed"
 )
 
+// Why a scrub stopped (Scrub.Status, negative errno).
+const (
+	ScrubStatusMemberRemoved = -19  // ENODEV: a member left the array
+	ScrubStatusRebuild       = -16  // EBUSY: a rebuild started
+	ScrubStatusCanceled      = -125 // ECANCELED: on request
+)
+
 // Scrub is an array's running or last scrub. Offsets and counts are in blocks of the members'
 // data area; the counters cover the run since StartOffsetBlocks.
 type Scrub struct {

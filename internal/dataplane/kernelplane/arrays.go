@@ -232,7 +232,8 @@ func (p *Plane) SetRebuildLimit(_ context.Context, mbps uint32) error {
 
 // StartScrub starts md's check (or repair) at offsetBlocks (sectors), limited to mbps.
 func (p *Plane) StartScrub(_ context.Context, array string, repair bool, mbps uint32, offsetBlocks uint64) error {
-	if _, err := p.k.ArrayStatus(array); err != nil {
+	st, err := p.k.ArrayStatus(array)
+	if err != nil {
 		return notFound("array %s not found", array)
 	}
 	speed := "system"
@@ -249,19 +250,23 @@ func (p *Plane) StartScrub(_ context.Context, array string, repair bool, mbps ui
 		return err
 	}
 	p.mu.Lock()
-	p.scrubs[array] = &scrubRun{Repair: repair, Start: offsetBlocks}
+	p.scrubs[array] = &scrubRun{Repair: repair, Start: offsetBlocks, Last: offsetBlocks, Degraded: st.Degraded}
 	p.saveScrubsLocked()
 	p.mu.Unlock()
 	return nil
 }
 
 func (p *Plane) StopScrub(_ context.Context, array string) error {
-	if _, err := p.k.ArrayStatus(array); err != nil {
+	st, err := p.k.ArrayStatus(array)
+	if err != nil {
 		return notFound("array %s not found", array)
 	}
 	p.mu.Lock()
-	if r := p.scrubs[array]; r != nil {
+	if r := p.scrubs[array]; r != nil && r.Outcome == "" {
 		r.Stopped = true
+		if scrubbing(st) {
+			r.Last = st.SyncDone
+		}
 		p.saveScrubsLocked()
 	}
 	p.mu.Unlock()
@@ -271,34 +276,59 @@ func (p *Plane) StopScrub(_ context.Context, array string) error {
 	return p.k.SetSyncSpeedMax(array, "system")
 }
 
-// scrubOf reports the running scrub from md, or the last one this plane started: md says
-// only that the last action was a check or repair, so whether it finished or was stopped,
-// and where it began, come from the plane's own record.
+func scrubbing(st *kernel.ArrayStatus) bool {
+	return st.SyncAction == "check" || st.SyncAction == "repair"
+}
+
+// scrubOf reports the running scrub from md, or the last one this plane started: md says only
+// that the last action was a check or repair, so whether it finished, where it began and how far
+// it got, and what cut it short, come from the plane's own record of it. A check a failing
+// member cuts short looks finished to md: the array has fewer members than when it started.
 func (p *Plane) scrubOf(name string, st *kernel.ArrayStatus) *dataplane.Scrub {
 	p.mu.Lock()
+	defer p.mu.Unlock()
 	run := p.scrubs[name]
-	p.mu.Unlock()
 	sc := &dataplane.Scrub{MismatchedBlocks: st.MismatchCnt}
-	switch {
-	case st.SyncAction == "check" || st.SyncAction == "repair":
+	if scrubbing(st) {
 		sc.State, sc.Repair = dataplane.ScrubRunning, st.SyncAction == "repair"
 		sc.OffsetBlocks, sc.TotalBlocks = st.SyncDone, st.SyncTotal
 		if run != nil {
 			sc.StartOffsetBlocks = run.Start
+			run.Last = max(run.Last, st.SyncDone)
 		}
-	case run != nil && (st.LastSyncAction == "check" || st.LastSyncAction == "repair"):
-		sc.Repair, sc.StartOffsetBlocks = run.Repair, run.Start
-		sc.TotalBlocks = p.sizeOf(st.Kernel) / 512
-		if st.Level == "raid1" {
-			sc.TotalBlocks = p.componentSectors(st.Kernel, sc.TotalBlocks)
+		if sc.Repair {
+			sc.MismatchRepairedBlocks = sc.MismatchedBlocks
 		}
-		sc.State, sc.OffsetBlocks = dataplane.ScrubCompleted, sc.TotalBlocks
-		if run.Stopped {
-			sc.State, sc.OffsetBlocks = dataplane.ScrubStopped, 0
+		return sc
+	}
+	if run == nil {
+		return nil
+	}
+	if run.Outcome == "" {
+		rebuilding := st.SyncAction == "recover" || st.SyncAction == "resync"
+		switch {
+		case run.Stopped:
+			run.Outcome, run.Status = dataplane.ScrubStopped, dataplane.ScrubStatusCanceled
+		case st.Degraded > run.Degraded:
+			run.Outcome, run.Status = dataplane.ScrubStopped, dataplane.ScrubStatusMemberRemoved
+		case rebuilding:
+			run.Outcome, run.Status = dataplane.ScrubStopped, dataplane.ScrubStatusRebuild
+		case st.LastSyncAction == "check" || st.LastSyncAction == "repair":
+			run.Outcome = dataplane.ScrubCompleted
+		default:
+			return nil // md doesn't say it ran one
 		}
 		_ = p.k.SetSyncSpeedMax(name, "system")
-	default:
-		return nil
+		p.saveScrubsLocked()
+	}
+	sc.State, sc.Status, sc.Repair, sc.StartOffsetBlocks = run.Outcome, run.Status, run.Repair, run.Start
+	sc.TotalBlocks = p.sizeOf(st.Kernel) / 512
+	if st.Level == "raid1" {
+		sc.TotalBlocks = p.componentSectors(st.Kernel, sc.TotalBlocks)
+	}
+	sc.OffsetBlocks = sc.TotalBlocks
+	if run.Outcome != dataplane.ScrubCompleted {
+		sc.OffsetBlocks = min(run.Last, sc.TotalBlocks)
 	}
 	if sc.Repair {
 		sc.MismatchRepairedBlocks = sc.MismatchedBlocks
