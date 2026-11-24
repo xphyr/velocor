@@ -46,10 +46,14 @@ type osLifecycle struct {
 	// upgrade or dismissal).
 	warning string
 	// Replaceable in tests.
-	run    func(ctx context.Context, w *tailBuffer, args ...string) error
-	status func(ctx context.Context) OSStatus
-	bootID func() string
-	reboot func() // tests must never reach the real one
+	run     func(ctx context.Context, w *tailBuffer, args ...string) error
+	status  func(ctx context.Context) OSStatus
+	bootID  func() string
+	reboot  func() // tests must never reach the real one
+	kargs   func(ctx context.Context, args ...string) (string, error)
+	cmdline func() string
+	// kargsMu: one kernel option change at a time, and no upgrade started meanwhile.
+	kargsMu sync.Mutex
 }
 
 // tailBuffer keeps the last 32 KiB written to it.
@@ -125,6 +129,11 @@ func (s *Server) handleStageUpgrade(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	o := &s.os
+	if !o.kargsMu.TryLock() {
+		writeError(w, fmt.Errorf("%w: a kernel option change is running", store.ErrInUse))
+		return
+	}
+	defer o.kargsMu.Unlock()
 	o.mu.Lock()
 	if o.job != nil && o.job.State == "RUNNING" {
 		o.mu.Unlock()

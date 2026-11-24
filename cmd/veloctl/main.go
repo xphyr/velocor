@@ -340,7 +340,7 @@ func runToken(cfg *cliConfig, args []string) error {
 
 func runSystem(cfg *cliConfig, args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("subcommand required: status | os | reconcile | iostats | upgrade | rollback | reboot | containers | rebuild | scrub | volume-retention | monitoring | network | backup | backups | restore")
+		return fmt.Errorf("subcommand required: status | os | reconcile | iostats | upgrade | rollback | reboot | containers | kernel-options | rebuild | scrub | volume-retention | monitoring | network | backup | backups | restore")
 	}
 	switch args[0] {
 	case "backup", "backups", "restore":
@@ -366,6 +366,38 @@ func runSystem(cfg *cliConfig, args []string) error {
 			fmt.Println("Rebuild speed: unlimited")
 		} else {
 			fmt.Printf("Rebuild speed: at most %d MB/s per pool\n", v)
+		}
+		return nil
+
+	case "kernel-options":
+		fs := flag.NewFlagSet("system kernel-options", flag.ExitOnError)
+		zero := fs.String("init-on-alloc", "", "Zero memory as the kernel allocates it: on (hardened) or off (less CPU per I/O, the default). Applies at the next reboot. Omit to show the current setting")
+		force := fs.Bool("force", false, "Change it even if that replaces the rollback to the previous OS version")
+		_ = fs.Parse(args[1:])
+		var resp map[string]any
+		var err error
+		switch *zero {
+		case "":
+			resp, err = cfg.request("GET", "/api/v1/system/kernel-options", nil)
+		case "on", "off":
+			resp, err = cfg.request("PUT", "/api/v1/system/kernel-options", map[string]any{"init_on_alloc": *zero == "on", "force": *force})
+		default:
+			return fmt.Errorf("--init-on-alloc must be on or off, not %q", *zero)
+		}
+		if err != nil {
+			return err
+		}
+		if cfg.jsonOutput {
+			return printJSON(resp)
+		}
+		o, _ := resp["init_on_alloc"].(map[string]any)
+		onOff := map[any]string{true: "on", false: "off"}
+		fmt.Printf("Zero memory on allocation (init_on_alloc): %s\n", onOff[o["running"]])
+		if o["reboot_required"] == true {
+			fmt.Printf("After the next reboot: %s\n", onOff[o["next_boot"]])
+		}
+		if m := strOrEmpty(o["message"]); m != "" {
+			fmt.Println(m)
 		}
 		return nil
 

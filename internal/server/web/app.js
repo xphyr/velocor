@@ -1646,7 +1646,7 @@ function rebootDialog(hostname) {
 
 async function system() {
   const soft = (err) => { if (err instanceof Unauthorized) throw err; return null; };
-  const [st, os, containers, rebuild, backups, retention, mon, upg, scrubCfg] = await Promise.all([api("/system/status"), api("/system/os").catch(soft), api("/system/containers").catch(soft), api("/system/rebuild").catch(soft),
+  const [st, os, kopts, containers, rebuild, backups, retention, mon, upg, scrubCfg] = await Promise.all([api("/system/status"), api("/system/os").catch(soft), api("/system/kernel-options").then((r) => r.init_on_alloc).catch(soft), api("/system/containers").catch(soft), api("/system/rebuild").catch(soft),
     can.admin ? api("/system/backups").catch(soft) : null, api("/system/volume-retention").catch(soft), api("/system/monitoring").catch(soft), api("/system/upgrade").catch(soft),
     api("/system/scrub").then((r) => r.scrub).catch(soft)]);
   const ctr = containers || { available: false };
@@ -1674,6 +1674,7 @@ async function system() {
         os && os.available
           ? el("dl", { class: "facts" }, fact("Booted", dep(os.booted)), fact("Staged", dep(os.staged)), fact("Rollback", dep(os.rollback)))
           : el("div", { class: "panel-notice" }, (os && os.message) || "bootc isn't available on this host."),
+        kopts && zeroMemoryView(kopts),
         upg && upg.warning && el("div", { class: "panel-notice warn" }, upg.warning, " ",
           action(can.admin, { onclick: async () => { try { await send("DELETE", "/system/upgrade/warning"); rerender(); } catch (err) { notify(err.message); } } }, "Dismiss")),
         upg && upg.job && upgradeJobView(upg.job))),
@@ -1837,6 +1838,32 @@ function scrubScheduleDialog(cur) {
         max_mb_per_sec: n(v.limit, 0, 100000, "The limit") });
     },
     done: () => { notify("Saved."); rerender(); },
+  });
+}
+
+// init_on_alloc: Fedora's kernel zeroes the memory it allocates. Changed for the next boot.
+function zeroMemoryView(o) {
+  return [
+    el("div", { class: "section-head" }, el("h3", {}, "Zero memory on allocation"),
+      can.admin && o.available && el("button", { id: "zero-memory", onclick: () => zeroMemoryDialog(o) }, "Change")),
+    el("p", {}, [o.running ? pill("On", "ok") : pill("Off"),
+      o.reboot_required && el("span", { class: "sub" }, `${o.next_boot ? "On" : "Off"} after the next reboot.`)]),
+    el("p", { class: "muted" }, o.message || "A kernel hardening option (init_on_alloc): memory is zeroed as it's handed out, so stale data can't leak through uninitialized memory. It costs CPU on every I/O, so it's off by default. A change applies at the next reboot."),
+  ];
+}
+
+function zeroMemoryDialog(o) {
+  openDialog({
+    title: "Zero memory on allocation",
+    intro: "The setting is written to the next boot entry and applies after a reboot.",
+    submit: "Save",
+    fields: [
+      { name: "state", kind: "radio", label: "Zero memory on allocation", value: o.next_boot ? "on" : "off", options: [
+        { value: "off", label: "Off: less CPU per I/O" }, { value: "on", label: "On: hardened" }] },
+      { name: "force", kind: "tick", text: "Change it even if this replaces the rollback to the previous OS version (after the reboot, rolling back returns to this version with the old setting)", value: false },
+    ],
+    action: (v) => send("PUT", "/system/kernel-options", { init_on_alloc: v.state === "on", force: !!v.force }),
+    done: (r) => { notify(r.init_on_alloc.reboot_required ? "Saved. It applies after a reboot." : "No change needed."); rerender(); },
   });
 }
 

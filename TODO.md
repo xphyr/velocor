@@ -171,9 +171,13 @@ listed until then so nothing is lost if the plan changes.
         flow with an inflated RTT (~7 ms, min 0.07), small windows and spurious retransmissions;
         idle polling (`idle_poll_period_usecs`) and the `fq` qdisc made it worse. Re-measure on
         real NICs before digging further.
-      - [ ] Fedora's kernel zeroes every page it allocates (`init_on_alloc`, hardening): up to
-        15% of the appliance's CPU on large reads. Decide whether the appliance boots with
-        `init_on_alloc=0`.
+      - [x] Fedora's kernel zeroes every page it allocates (`init_on_alloc`, hardening): about
+        15% of the appliance's cycles on large reads. **Decided (2026-11-24): off by default**
+        (kargs.d), and an admin can turn it on or off for the next boot (System page, `veloctl
+        system kernel-options`, `PUT /api/v1/system/kernel-options`; `rpm-ostree kargs`, which
+        stages a boot entry of the same OS image and so replaces a rollback to the previous
+        version: refused without force). K-2 VM: both directions and a reboot
+        (`heap alloc:off`). The gain isn't measured yet (benchmark on the next build).
       - Lab: a multiqueue virtio-net (queues=4) for velocor-1's SAN NIC would make it behave
         like a real NIC (RSS) without RPS.
     - [ ] Soak.

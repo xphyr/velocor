@@ -109,8 +109,11 @@ RUN chmod 0440 /etc/sudoers.d/velocor-admin && \
 # servers (found on the P0-1 lab VM). iommu=pt keeps devices the kernel still drives on
 # passthrough mappings, as usual on SPDK/DPDK hosts.
 # rd.md=0: the initramfs assembles no md array either (see the kernel data plane below).
+# init_on_alloc=0: Fedora's kernel otherwise zeroes every page it allocates, which costs the
+# kernel data plane up to 15% of its CPU on large reads. The default: an admin can turn it back
+# on (System page, veloctl system kernel-options; internal/server/kernelopts.go).
 RUN mkdir -p /usr/lib/bootc/kargs.d /etc/systemd/system-generators && \
-    printf 'kargs = ["systemd.gpt_auto=0", "intel_iommu=on", "iommu=pt", "rd.md=0"]\n' > /usr/lib/bootc/kargs.d/10-velocor.toml && \
+    printf 'kargs = ["systemd.gpt_auto=0", "intel_iommu=on", "iommu=pt", "rd.md=0", "init_on_alloc=0"]\n' > /usr/lib/bootc/kargs.d/10-velocor.toml && \
     ln -sf /dev/null /etc/systemd/system-generators/systemd-gpt-auto-generator
 
 # The kernel data plane (docs/design/kernel-dataplane.md; velod --data-plane=kernel, chosen in

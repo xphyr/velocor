@@ -29,6 +29,49 @@ While the jobs ran, a sampler on the appliance recorded every 10 s: CPU time, pe
 utilisation (`/proc/diskstats`), SAN NIC bytes, and each SPDK thread's busy/idle ticks
 (`thread_get_stats`).
 
+## 2026-11-24: the kernel data plane on the test appliance, and where its CPU goes
+
+**Setup.** The test appliance (4 vCPU Ryzen V1780B VM, virtio-scsi disks on the hypervisor's
+Synology, virtio-net SAN NIC with one receive queue, MTU 9000), kernel data plane (md RAID1, LVM
+thin at 64 KiB chunks, nvmet-tcp and LIO), against SPDK on the same disks (one reactor, 2026-11-18
+run). Client: one arm64 node, volumes of 16 GiB.
+
+Queue depth 1 is even (4k read ~565 µs, write ~245 µs). At depth (IOPS, MB/s for 128k), kernel as
+measured first / SPDK:
+
+| Job | NVMe/TCP | iSCSI |
+|---|---|---|
+| 4k random read, 16 × 4 | 32.8k / 45.6k | 24.8k / 34.3k |
+| 4k random write, 16 × 4 | 18.6k / 27.9k | 15.9k / 21.9k |
+| 4k 70/30 mix, 16 × 4 | 23.8k / 29.0k | 19.7k / 22.7k |
+| 128k sequential read | 551 / 984 | 665 / 788 |
+| 128k sequential write | 438 / 513 | 462 / 446 |
+| 4k write + fsync, depth 1 | 1860 / 3800 | 1973 / 3789 |
+| 4k `O_DSYNC` write, depth 1 | 208 / 3933 | 207 / 4043 |
+
+The `O_DSYNC` gap is the lab's disks: the kernel passes the writes on as FUA, which this hypervisor
+storage takes ~4.5 ms for against 157 µs for a plain write (measured on the appliance); a cache
+flush there is cheap. Real drives with power-loss protection don't behave like that.
+
+**Profile** (per-CPU and per-thread time and perf on the appliance during the jobs):
+
+- *One CPU did all of it.* nvmet-tcp runs a connection's work on the CPU that received its
+  packets, and a NIC with one receive queue gives every connection the same one: CPU 1 at 96%, the
+  others ~10%. With receive packet steering and flow steering over all CPUs (now set by the OS
+  image on NICs with fewer receive queues than CPUs, `velocor-rps`) NVMe/TCP 4k random read went
+  from 31.9k to 47.1k IOPS, and random write from 18.6k to 23.1k with the disks 80% busy and 16%
+  of CPU stolen by the hypervisor. Real NICs with RSS need nothing.
+- *iSCSI* handles a connection in one receive thread (`iscsi_trx`), and the host opens one session:
+  a single CPU 80% busy, 23.6k random reads. More sessions per volume would spread it.
+- *NVMe/TCP sequential read* (425-485 MiB/s in several runs) is limited neither by CPU (20% busy)
+  nor by the disks (25-30% busy; the same job on the appliance itself reads 2.7 GB/s), but by the
+  single TCP connection: RTT inflated to ~7 ms (min 0.07), small windows, spurious retransmissions.
+  nvmet-tcp idle polling and the `fq` qdisc made it worse. To re-measure on real NICs.
+- *Zeroing pages* as they are allocated (`init_on_alloc`, on in Fedora's kernel): about 15% of the
+  appliance's cycles during sequential reads, 3% at 4k. The OS image boots with
+  `init_on_alloc=0`; an admin can turn it back on (System page; `veloctl system kernel-options`).
+  The gain has not been measured yet.
+
 ## 2026-11-20: LVM thin chunk size and zeroing
 
 **Question.** Which thin-pool chunk size, and should zeroing stay on, for the kernel data plane
