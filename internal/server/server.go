@@ -776,6 +776,11 @@ func (s *Server) handleCreatePortal(w http.ResponseWriter, r *http.Request) {
 	if req.Protocol == "" {
 		req.Protocol = store.ExportProtocolNVMeoFTCP
 	}
+	// A portal with any other protocol would never match an export.
+	if !dataplane.IsNVMe(req.Protocol) && req.Protocol != store.ExportProtocolISCSI {
+		writeError(w, fmt.Errorf("%w: unsupported protocol %q", store.ErrInvalidArgument, req.Protocol))
+		return
+	}
 	if req.Port == 0 {
 		if req.Protocol == store.ExportProtocolISCSI {
 			req.Port = 3260
