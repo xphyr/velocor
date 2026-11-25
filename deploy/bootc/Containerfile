@@ -15,7 +15,7 @@ ARG VELOD_IMAGE
 ARG BOOTC_BASE_IMAGE=quay.io/fedora/fedora-bootc:45
 # Built-in monitoring (docs/review-history.md P1-1): embedded like velod, started only when turned on.
 ARG PROMETHEUS_IMAGE=quay.io/prometheus/prometheus:v3.16.0@sha256:9332054523223e2ddc18d8101799d54a4a8d823b030c53216f063a6c117773cd
-ARG ALERTMANAGER_IMAGE=quay.io/prometheus/alertmanager:v0.35.0@sha256:5f6e66c01bd610aef6dd671642a52eee775fd3a89bd8788ebada33efaf373d10
+ARG ALERTMANAGER_IMAGE=quay.io/prometheus/alertmanager:v0.35.1@sha256:03d4e362b9948eee910802ddac55f9175b320862a2de1fdef5206c3213875a09
 
 # veloctl for the host comes from the same velod image the appliance runs.
 FROM ${VELOD_IMAGE} AS velod-bin
