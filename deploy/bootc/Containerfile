@@ -124,6 +124,8 @@ COPY deploy/bootc/90-velocor-banner /usr/lib/NetworkManager/dispatcher.d/90-velo
 # them by digest after loading) and pin the quadlets to exactly what was embedded.
 COPY deploy/bootc/velocor-preload-images.sh /usr/libexec/velocor-preload-images
 COPY deploy/bootc/velocor-preload-images.service /usr/lib/systemd/system/velocor-preload-images.service
+COPY deploy/bootc/velocor-scrub-stop.sh /usr/libexec/velocor-scrub-stop
+COPY deploy/bootc/velocor-scrub-stop.service /usr/lib/systemd/system/velocor-scrub-stop.service
 # Registry credentials for private registries come in as a build secret (mounted for this step
 # only, never written to a layer); `make image-os` passes REGISTRY_AUTH_FILE, or an empty one.
 RUN --mount=type=secret,id=registry-auth set -eu; \
@@ -146,9 +148,9 @@ RUN --mount=type=secret,id=registry-auth set -eu; \
     embed "${ALERTMANAGER_IMAGE}" velocor-alertmanager; \
     ! grep -q '@VELOCOR_' /usr/share/containers/systemd/velocor-*.container
 
-RUN chmod 0755 /usr/libexec/velocor-console-banner /usr/libexec/velocor-preload-images /usr/libexec/velocor-rps /usr/lib/NetworkManager/dispatcher.d/90-velocor-banner && \
+RUN chmod 0755 /usr/libexec/velocor-console-banner /usr/libexec/velocor-preload-images /usr/libexec/velocor-scrub-stop /usr/libexec/velocor-rps /usr/lib/NetworkManager/dispatcher.d/90-velocor-banner && \
     systemctl disable bootc-fetch-apply-updates.timer && \
     systemctl mask raid-check.timer mdmonitor.service mdmonitor-oneshot.timer && \
-    systemctl enable velocor-console.service velocor-preload-images.service vmtoolsd.service qemu-guest-agent.service && \
+    systemctl enable velocor-console.service velocor-preload-images.service velocor-scrub-stop.service vmtoolsd.service qemu-guest-agent.service && \
     /usr/lib/systemd/system-generators/podman-system-generator --dryrun >/dev/null && \
     bootc container lint
