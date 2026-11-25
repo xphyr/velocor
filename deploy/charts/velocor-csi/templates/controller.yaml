@@ -14,6 +14,13 @@ spec:
       app: velocor-csi-controller
   template:
     metadata:
+      {{- with include (print $.Template.BasePath "/secret.yaml") . | trim }}
+      annotations:
+        # The credentials are environment variables, read only at start: a change must restart the
+        # pod. Covers the secret this chart makes, not auth.existingSecret. (The node pods don't
+        # use the credentials.)
+        checksum/auth: {{ . | sha256sum }}
+      {{- end }}
       labels:
         app: velocor-csi-controller
         {{- include "velocor-csi.labels" . | nindent 8 }}

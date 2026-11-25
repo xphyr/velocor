@@ -541,6 +541,13 @@ images) are missing. The chart fills in its `snapshotMetadata` defaults itself e
 helm upgrade velocor-csi deploy/charts/velocor-csi --namespace velocor-csi --reset-then-reuse-values
 ```
 
+The controller reads its credentials when it starts. The chart restarts it when the credentials in
+its values change; after changing a secret of your own (`auth.existingSecret`), restart it:
+
+```bash
+kubectl -n velocor-csi rollout restart deployment/velocor-csi-controller
+```
+
 Optionally, install the `VolumeSnapshotClass` and `VolumeGroupSnapshotClass`:
 
 ```bash
