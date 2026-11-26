@@ -129,9 +129,22 @@ func TestScrubScheduleWindowAndResume(t *testing.T) {
 }
 
 // An operator's scrub: refused while one runs, resumed by itself after a data-plane restart or a
-// member removal (once the pool is ONLINE), and ended by a stop.
+// member removal (once the pool is ONLINE), and ended by a stop; the same inside and outside the
+// scrub window (inside, the schedule once started the resumed run a second time).
 func TestScrubManualInterruptionsAndStop(t *testing.T) {
+	for _, inWindow := range []bool{true, false} {
+		t.Run(fmt.Sprintf("in window %v", inWindow), func(t *testing.T) { testScrubManualInterruptionsAndStop(t, inWindow) })
+	}
+}
+
+func testScrubManualInterruptionsAndStop(t *testing.T, inWindow bool) {
 	h, id, raid := scrubPool(t)
+	hour := time.Now().Local().Hour()
+	window := map[string]any{"window_start_hour": 0, "window_end_hour": 0} // equal hours: any time
+	if !inWindow {
+		window = map[string]any{"window_start_hour": (hour + 2) % 24, "window_end_hour": (hour + 3) % 24}
+	}
+	h.expect(h.do("PUT", "/api/v1/system/scrub", h.admin, window))(http.StatusOK)
 	h.fake.SetScrubStep(1 << 18)
 
 	resp := h.expect(h.do("POST", "/api/v1/pools/"+id+"/scrub", h.admin, map[string]any{"repair": false, "max_mb_per_sec": 10}))(http.StatusAccepted)

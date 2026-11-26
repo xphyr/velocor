@@ -135,6 +135,8 @@ func (s *Server) scrubTick(ctx context.Context, now time.Time) error {
 		if rec != nil && rec.State == store.ScrubPaused && rec.Manual && scrubEligible(p, raids[p.ArrayName]) == "" {
 			if err := s.startScrub(ctx, p, rec, true, true, rec.Repair, rec.MaxMBps, now); err != nil {
 				s.logger.Warn("scrub: resuming failed", "pool", p.Name, "error", err)
+			} else {
+				rec.State = store.ScrubRunning // not paused any more: the schedule below must not start it again
 			}
 		}
 	}
