@@ -100,6 +100,17 @@
         "ARG [A-Z_]+_IMAGE=(?<depName>[^:@\\s]+):(?<currentValue>[^@\\s]+)@(?<currentDigest>sha256:[a-f0-9]{64})"
       ],
       "datasourceTemplate": "docker"
+    },
+    {
+      "customType": "regex",
+      "description": "Images in the static manifests (deploy/k8s), which must match the chart's values (hack/check-pins.sh). Renovate's kubernetes manager has no default file patterns, and this also catches the commented-out optional sidecars",
+      "managerFilePatterns": [
+        "/^deploy/k8s/.+\\.ya?ml$/"
+      ],
+      "matchStrings": [
+        "image: (?<depName>[^:@\\s]+):(?<currentValue>[^@\\s]+)@(?<currentDigest>sha256:[a-f0-9]{64})"
+      ],
+      "datasourceTemplate": "docker"
     }
   ]
 }
