@@ -77,7 +77,7 @@ sidecars:
 # certificate for the sidecar's service. The sidecar is pinned like the others above.
 snapshotMetadata:
   enabled: false
-  image: registry.k8s.io/sig-storage/csi-snapshot-metadata:v1.1.0@sha256:8069b3bc03f21fe804f6f362c26037598b9f947a9e3e9d60336988ca7c07f61e
+  image: registry.k8s.io/sig-storage/csi-snapshot-metadata:v1.2.0@sha256:e54a3e0570836e867b3c12bd7b274f90f281e4822c717b05fa5ce267c1e30d7a
   resources: {}
   # Secret with tls.crt and tls.key, valid for velocor-csi-snapshot-metadata.<namespace>.svc.
   # Empty: on OpenShift the service CA issues one; elsewhere it is required.
