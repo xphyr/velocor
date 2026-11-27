@@ -33,7 +33,7 @@ func (s *IdentityServer) GetPluginInfo(_ context.Context, _ *csi.GetPluginInfoRe
 	}
 	v := version.Version
 	if v == "" {
-		v = "v0.1.0"
+		v = "v0.2.0"
 	}
 	return &csi.GetPluginInfoResponse{
 		Name:          s.driverName,
