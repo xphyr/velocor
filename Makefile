@@ -149,11 +149,17 @@ image-velod:
 
 # Always built as a manifest list (also for one platform) so single- and multi-arch builds push
 # the same way. The list is recreated each time; reusing it would accumulate old images.
+# --pull=always: the velod build has just pulled the same base (by digest) for the build host's
+# platform, and CI's podman 4.9 used that local image for every platform (v0.2.0's arm64 image
+# had x86-64 tools); a pull resolves the base per platform. check-image-arch.sh then refuses a
+# list whose tools don't match their platform.
+CSI_TOOLS := /usr/bin/ls /usr/bin/mount /usr/sbin/nvme /usr/sbin/iscsiadm /usr/sbin/mkfs.xfs /usr/sbin/mkfs.ext4 /usr/bin/velocor-csi
 image-csi:
 	-$(PODMAN) manifest rm $(CSI_IMAGE) >/dev/null 2>&1
 	$(call base-pin,FEDORA_MINIMAL_IMAGE,$(FEDORA_MINIMAL_IMAGE)) \
-	$(PODMAN) build $(LABEL_ARGS) $$base_args $(GO_BUILD_ARGS) --platform $(CSI_PLATFORMS) --manifest $(CSI_IMAGE) \
+	$(PODMAN) build --pull=always $(LABEL_ARGS) $$base_args $(GO_BUILD_ARGS) --platform $(CSI_PLATFORMS) --manifest $(CSI_IMAGE) \
 		-f deploy/containers/Containerfile.csi .
+	PODMAN=$(PODMAN) hack/check-image-arch.sh $(CSI_IMAGE) $(CSI_TOOLS)
 
 # Needs the velod image in the registry: its digest is resolved there and pinned.
 # The build pulls it, so registry credentials (REGISTRY_AUTH_FILE, else podman's default auth
