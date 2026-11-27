@@ -149,16 +149,21 @@ image-velod:
 
 # Always built as a manifest list (also for one platform) so single- and multi-arch builds push
 # the same way. The list is recreated each time; reusing it would accumulate old images.
-# --pull=always: the velod build has just pulled the same base (by digest) for the build host's
-# platform, and CI's podman 4.9 used that local image for every platform (v0.2.0's arm64 image
-# had x86-64 tools); a pull resolves the base per platform. check-image-arch.sh then refuses a
-# list whose tools don't match their platform.
+# One build per platform, each on that platform's own base image (hack/platform-image.sh): CI's
+# podman 4.9 resolves a FROM that names a list by digest for the build host whatever --platform
+# says, even with --pull=always, so v0.2.0's arm64 image had x86-64 tools. check-image-arch.sh
+# then refuses a list whose tools don't match their platform.
 CSI_TOOLS := /usr/bin/ls /usr/bin/mount /usr/sbin/nvme /usr/sbin/iscsiadm /usr/sbin/mkfs.xfs /usr/sbin/mkfs.ext4 /usr/bin/velocor-csi
 image-csi:
 	-$(PODMAN) manifest rm $(CSI_IMAGE) >/dev/null 2>&1
 	$(call base-pin,FEDORA_MINIMAL_IMAGE,$(FEDORA_MINIMAL_IMAGE)) \
-	$(PODMAN) build --pull=always $(LABEL_ARGS) $$base_args $(GO_BUILD_ARGS) --platform $(CSI_PLATFORMS) --manifest $(CSI_IMAGE) \
-		-f deploy/containers/Containerfile.csi .
+	for platform in $$(tr , ' ' <<<"$(CSI_PLATFORMS)"); do \
+	  pbase=$$(INSECURE_REGISTRY=false hack/platform-image.sh "$$base" "$$platform") || exit 1; \
+	  echo "$$platform base image $$pbase"; \
+	  $(PODMAN) build $(LABEL_ARGS) $$base_args --build-arg FEDORA_MINIMAL_IMAGE=$$pbase \
+	    --label org.opencontainers.image.base.digest=$${pbase#*@} $(GO_BUILD_ARGS) \
+	    --platform $$platform --manifest $(CSI_IMAGE) -f deploy/containers/Containerfile.csi . || exit 1; \
+	done
 	PODMAN=$(PODMAN) hack/check-image-arch.sh $(CSI_IMAGE) $(CSI_TOOLS)
 
 # Needs the velod image in the registry: its digest is resolved there and pinned.
